@@ -1,0 +1,33 @@
+[package]
+name = "dawn"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dawn"
+path = "src/main.rs"
+
+[dependencies]
+smithay = { git = "https://github.com/Smithay/smithay.git", rev = "5312d5caedd0c2ce563a63719d38ae2183149210", default-features = false, features = [
+    "backend_winit",
+    "backend_udev",
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_egl",
+    "renderer_gl",
+    "wayland_frontend",
+    "desktop",
+    "xwayland",
+] }
+smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git", rev = "5312d5caedd0c2ce563a63719d38ae2183149210" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+calloop = { version = "0.14", features = ["signals"] }
+xcursor = "0.3"
+libc = "0.2"
+bitflags = "2"
+
+[profile.release]
+lto = "thin"

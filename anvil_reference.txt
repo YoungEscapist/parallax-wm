@@ -1,0 +1,510 @@
+════════════════════════════════════════
+ anvil/src/main.rs — точка входа + event loop
+════════════════════════════════════════
+static POSSIBLE_BACKENDS: &[&str] = &[
+    #[cfg(feature = "winit")]
+    "--winit : Run anvil as a X11 or Wayland client using winit.",
+    #[cfg(feature = "udev")]
+    "--tty-udev : Run anvil as a tty udev client (requires root if without logind).",
+    #[cfg(feature = "x11")]
+    "--x11 : Run anvil as an X11 client.",
+];
+
+#[cfg(feature = "profile-with-tracy-mem")]
+#[global_allocator]
+static GLOBAL: profiling::tracy_client::ProfiledAllocator<std::alloc::System> =
+    profiling::tracy_client::ProfiledAllocator::new(std::alloc::System, 10);
+
+// Allow in this function because of existing usage
+#[allow(clippy::uninlined_format_args)]
+fn main() {
+    if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        tracing_subscriber::fmt()
+            .compact()
+            .with_env_filter(env_filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().compact().init();
+    }
+
+    #[cfg(feature = "profile-with-tracy")]
+    profiling::tracy_client::Client::start();
+
+    profiling::register_thread!("Main Thread");
+
+    #[cfg(feature = "profile-with-puffin")]
+    let _server = puffin_http::Server::new(&format!("0.0.0.0:{}", puffin_http::DEFAULT_PORT)).unwrap();
+    #[cfg(feature = "profile-with-puffin")]
+    profiling::puffin::set_scopes_on(true);
+
+    let arg = ::std::env::args().nth(1);
+    match arg.as_ref().map(|s| &s[..]) {
+        #[cfg(feature = "winit")]
+        Some("--winit") => {
+            tracing::info!("Starting anvil with winit backend");
+            anvil::winit::run_winit();
+        }
+        #[cfg(feature = "udev")]
+        Some("--tty-udev") => {
+            tracing::info!("Starting anvil on a tty using udev");
+            anvil::udev::run_udev();
+        }
+        #[cfg(feature = "x11")]
+        Some("--x11") => {
+            tracing::info!("Starting anvil with x11 backend");
+            anvil::x11::run_x11();
+        }
+        Some(other) => {
+            tracing::error!("Unknown backend: {}", other);
+        }
+        None => {
+            #[allow(clippy::disallowed_macros)]
+            {
+                println!("USAGE: anvil --backend");
+                println!();
+                println!("Possible backends are:");
+                for b in POSSIBLE_BACKENDS {
+                    println!("\t{b}");
+                }
+            }
+        }
+    }
+}
+
+════════════════════════════════════════
+ anvil/src/bin/tty_udev.rs (если есть отдельный бинарь)
+════════════════════════════════════════
+/home/yarik/.cargo/git/checkouts/smithay-312425d48e59d8c8/5312d5c/anvil/src/winit.rs
+/home/yarik/.cargo/git/checkouts/smithay-312425d48e59d8c8/5312d5c/anvil/src/x11.rs
+/home/yarik/.cargo/git/checkouts/smithay-312425d48e59d8c8/5312d5c/anvil/src/udev.rs
+
+════════════════════════════════════════
+ Функция run_udev / инициализации в udev.rs
+════════════════════════════════════════
+pub fn run_udev() {
+    let mut event_loop = EventLoop::try_new().unwrap();
+    let display = Display::new().unwrap();
+    let mut display_handle = display.handle();
+
+    /*
+     * Initialize session
+     */
+    let (session, notifier) = match LibSeatSession::new() {
+        Ok(ret) => ret,
+        Err(err) => {
+            error!("Could not initialize a session: {}", err);
+            return;
+        }
+    };
+
+    /*
+     * Initialize the compositor
+     */
+    let primary_gpu = if let Ok(var) = std::env::var("ANVIL_DRM_DEVICE") {
+        DrmNode::from_path(var).expect("Invalid drm device path")
+    } else {
+        primary_gpu(session.seat())
+            .unwrap()
+            .and_then(|x| DrmNode::from_path(x).ok()?.node_with_type(NodeType::Render)?.ok())
+            .unwrap_or_else(|| {
+                all_gpus(session.seat())
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|x| DrmNode::from_path(x).ok())
+                    .expect("No GPU!")
+            })
+    };
+    info!("Using {} as primary gpu.", primary_gpu);
+
+    let gpus = GpuManager::new(GbmGlesBackend::with_factory(|display| {
+        let context = EGLContext::new_with_priority(display, ContextPriority::High)?;
+        let mut capabilities = unsafe { GlesRenderer::supported_capabilities(&context)? };
+        if std::env::var("ANVIL_GLES_DISABLE_INSTANCING").is_ok() {
+            capabilities.retain(|capability| *capability != Capability::Instancing);
+        }
+        Ok(unsafe { GlesRenderer::with_capabilities(context, capabilities)? })
+    }))
+    .unwrap();
+
+    let data = UdevData {
+        dh: display_handle.clone(),
+        dmabuf_state: None,
+        syncobj_state: None,
+        session,
+        primary_gpu,
+        gpus,
+        backends: HashMap::new(),
+        pointer_image: crate::cursor::Cursor::load(),
+        pointer_images: Vec::new(),
+        pointer_element: PointerElement::default(),
+        #[cfg(feature = "debug")]
+        fps_texture: None,
+        debug_flags: DebugFlags::empty(),
+        keyboards: Vec::new(),
+    };
+    let mut state = AnvilState::init(display, event_loop.handle(), data, true);
+
+    /*
+     * Initialize the udev backend
+     */
+    let udev_backend = match UdevBackend::new(&state.seat_name) {
+        Ok(ret) => ret,
+        Err(err) => {
+            error!(error = ?err, "Failed to initialize udev backend");
+            return;
+        }
+    };
+
+    /*
+     * Initialize libinput backend
+     */
+    let mut libinput_context = Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(
+        state.backend_data.session.clone().into(),
+    );
+    libinput_context.udev_assign_seat(&state.seat_name).unwrap();
+    let libinput_backend = LibinputInputBackend::new(libinput_context.clone());
+
+    /*
+     * Bind all our objects that get driven by the event loop
+     */
+    event_loop
+        .handle()
+        .insert_source(libinput_backend, move |mut event, _, data| {
+            let dh = data.backend_data.dh.clone();
+            if let InputEvent::DeviceAdded { device } = &mut event {
+                if device.has_capability(DeviceCapability::Keyboard) {
+                    if let Some(led_state) = data.seat.get_keyboard().map(|keyboard| keyboard.led_state()) {
+                        device.led_update(led_state.into());
+                    }
+                    data.backend_data.keyboards.push(device.clone());
+                }
+            } else if let InputEvent::DeviceRemoved { ref device } = event {
+                if device.has_capability(DeviceCapability::Keyboard) {
+                    data.backend_data.keyboards.retain(|item| item != device);
+                }
+            }
+
+            data.process_input_event(&dh, event)
+        })
+        .unwrap();
+
+    event_loop
+        .handle()
+        .insert_source(notifier, move |event, &mut (), data| match event {
+            SessionEvent::PauseSession => {
+                libinput_context.suspend();
+                info!("pausing session");
+
+                for backend in data.backend_data.backends.values_mut() {
+                    backend.drm_output_manager.pause();
+                    backend.active_leases.clear();
+                    if let Some(lease_global) = backend.leasing_global.as_mut() {
+                        lease_global.suspend();
+                    }
+                }
+            }
+            SessionEvent::ActivateSession => {
+                info!("resuming session");
+
+                if let Err(err) = libinput_context.resume() {
+                    error!("Failed to resume libinput context: {:?}", err);
+                }
+                for (node, backend) in data
+                    .backend_data
+                    .backends
+                    .iter_mut()
+                    .map(|(handle, backend)| (*handle, backend))
+                {
+                    // if we do not care about flicking (caused by modesetting) we could just
+                    // pass true for disable connectors here. this would make sure our drm
+                    // device is in a known state (all connectors and planes disabled).
+                    // but for demonstration we choose a more optimistic path by leaving the
+                    // state as is and assume it will just work. If this assumption fails
+                    // we will try to reset the state when trying to queue a frame.
+                    backend
+                        .drm_output_manager
+                        .lock()
+                        .activate(false)
+                        .expect("failed to activate drm backend");
+                    if let Some(lease_global) = backend.leasing_global.as_mut() {
+                        lease_global.resume::<AnvilState<UdevData>>();
+                    }
+                    data.handle
+                        .insert_idle(move |data| data.render(node, None, data.clock.now()));
+
+════════════════════════════════════════
+ Финальный event_loop.run(...) в udev.rs
+════════════════════════════════════════
+
+════════════════════════════════════════
+ Session notifier init в udev.rs (insert_source для session)
+════════════════════════════════════════
+225-     * Initialize session
+226-     */
+227:    let (session, notifier) = match LibSeatSession::new() {
+228-        Ok(ret) => ret,
+229-        Err(err) => {
+230-            error!("Could not initialize a session: {}", err);
+231-            return;
+232-        }
+233-    };
+234-
+235-    /*
+236-     * Initialize the compositor
+237-     */
+238-    let primary_gpu = if let Ok(var) = std::env::var("ANVIL_DRM_DEVICE") {
+239-        DrmNode::from_path(var).expect("Invalid drm device path")
+240-    } else {
+241-        primary_gpu(session.seat())
+242-            .unwrap()
+243-            .and_then(|x| DrmNode::from_path(x).ok()?.node_with_type(NodeType::Render)?.ok())
+244-            .unwrap_or_else(|| {
+245-                all_gpus(session.seat())
+246-                    .unwrap()
+247-                    .into_iter()
+248-                    .find_map(|x| DrmNode::from_path(x).ok())
+249-                    .expect("No GPU!")
+250-            })
+251-    };
+252-    info!("Using {} as primary gpu.", primary_gpu);
+--
+326-    event_loop
+327-        .handle()
+328:        .insert_source(notifier, move |event, &mut (), data| match event {
+329-            SessionEvent::PauseSession => {
+330-                libinput_context.suspend();
+331-                info!("pausing session");
+332-
+333-                for backend in data.backend_data.backends.values_mut() {
+334-                    backend.drm_output_manager.pause();
+335-                    backend.active_leases.clear();
+336-                    if let Some(lease_global) = backend.leasing_global.as_mut() {
+337-                        lease_global.suspend();
+338-                    }
+339-                }
+340-            }
+341-            SessionEvent::ActivateSession => {
+342-                info!("resuming session");
+343-
+344-                if let Err(err) = libinput_context.resume() {
+345-                    error!("Failed to resume libinput context: {:?}", err);
+346-                }
+347-                for (node, backend) in data
+348-                    .backend_data
+349-                    .backends
+350-                    .iter_mut()
+351-                    .map(|(handle, backend)| (*handle, backend))
+352-                {
+353-                    // if we do not care about flicking (caused by modesetting) we could just
+
+════════════════════════════════════════
+ Libinput init + insert_source
+════════════════════════════════════════
+294-     * Initialize libinput backend
+295-     */
+296:    let mut libinput_context = Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(
+297-        state.backend_data.session.clone().into(),
+298-    );
+299-    libinput_context.udev_assign_seat(&state.seat_name).unwrap();
+300:    let libinput_backend = LibinputInputBackend::new(libinput_context.clone());
+301-
+302-    /*
+303-     * Bind all our objects that get driven by the event loop
+304-     */
+305-    event_loop
+306-        .handle()
+307-        .insert_source(libinput_backend, move |mut event, _, data| {
+308-            let dh = data.backend_data.dh.clone();
+309-            if let InputEvent::DeviceAdded { device } = &mut event {
+310-                if device.has_capability(DeviceCapability::Keyboard) {
+311-                    if let Some(led_state) = data.seat.get_keyboard().map(|keyboard| keyboard.led_state()) {
+312-                        device.led_update(led_state.into());
+313-                    }
+314-                    data.backend_data.keyboards.push(device.clone());
+315-                }
+
+════════════════════════════════════════
+ DRM notifier per device (insert_source для DrmEvent)
+════════════════════════════════════════
+760-}
+761-
+762-impl AnvilState<UdevData> {
+763:    fn device_added(&mut self, node: DrmNode, path: &Path) -> Result<(), DeviceAddError> {
+764-        // Try to open the device
+765-        let fd = self
+766-            .backend_data
+767-            .session
+768-            .open(
+769-                path,
+770-                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+771-            )
+772-            .map_err(DeviceAddError::DeviceOpen)?;
+773-
+774-        let fd = DrmDeviceFd::new(DeviceFd::from(fd));
+775-
+776-        let (drm, notifier) = DrmDevice::new(fd.clone(), true).map_err(DeviceAddError::DrmDevice)?;
+777-        let gbm = GbmDevice::new(fd).map_err(DeviceAddError::GbmDevice)?;
+778-
+779-        let registration_token = self
+780-            .handle
+781-            .insert_source(
+782-                notifier,
+783-                move |event, metadata, data: &mut AnvilState<_>| match event {
+784-                    DrmEvent::VBlank(crtc) => {
+785-                        profiling::scope!("vblank", &format!("{crtc:?}"));
+786-                        data.frame_finish(node, crtc, metadata);
+787-                    }
+788-                    DrmEvent::Error(error) => {
+789-                        error!("{:?}", error);
+790-                    }
+791-                },
+792-            )
+793-            .unwrap();
+794-
+795-        let mut try_initialize_gpu = || {
+796-            let display = unsafe { EGLDisplay::new(gbm.clone()).map_err(DeviceAddError::AddNode)? };
+797-            let egl_device = EGLDevice::device_for_display(&display).map_err(DeviceAddError::AddNode)?;
+798-
+799-            if egl_device.is_software() {
+800-                return Err(DeviceAddError::NoRenderNode);
+801-            }
+802-
+803-            let render_node = egl_device.try_get_render_node().ok().flatten().unwrap_or(node);
+
+════════════════════════════════════════
+ fn render — как рендерится кадр
+════════════════════════════════════════
+1376-
+1377-    // If crtc is `Some()`, render it, else render all crtcs
+1378:    fn render(&mut self, node: DrmNode, crtc: Option<crtc::Handle>, frame_target: Time<Monotonic>) {
+1379-        let device_backend = match self.backend_data.backends.get_mut(&node) {
+1380-            Some(backend) => backend,
+1381-            None => {
+1382-                error!("Trying to render on non-existent backend {}", node);
+1383-                return;
+1384-            }
+1385-        };
+1386-
+1387-        if let Some(crtc) = crtc {
+1388-            self.render_surface(node, crtc, frame_target);
+1389-        } else {
+1390-            let crtcs: Vec<_> = device_backend.surfaces.keys().copied().collect();
+1391-            for crtc in crtcs {
+1392-                self.render_surface(node, crtc, frame_target);
+1393-            }
+1394-        };
+1395-    }
+1396-
+1397-    fn render_surface(&mut self, node: DrmNode, crtc: crtc::Handle, frame_target: Time<Monotonic>) {
+1398-        profiling::scope!("render_surface", &format!("{crtc:?}"));
+1399-
+1400-        let output = if let Some(output) = self.space.outputs().find(|o| {
+1401-            o.user_data().get::<UdevOutputId>()
+1402-                == Some(&UdevOutputId {
+1403-                    device_id: node,
+1404-                    crtc,
+1405-                })
+1406-        }) {
+1407-            output.clone()
+1408-        } else {
+1409-            // somehow we got called with an invalid output
+1410-            return;
+1411-        };
+1412-
+1413-        self.pre_repaint(&output, frame_target);
+1414-
+1415-        let device = if let Some(device) = self.backend_data.backends.get_mut(&node) {
+1416-            device
+1417-        } else {
+1418-            return;
+1419-        };
+1420-
+1421-        let surface = if let Some(surface) = device.surfaces.get_mut(&crtc) {
+1422-            surface
+1423-        } else {
+1424-            return;
+1425-        };
+1426-
+1427-        let start = Instant::now();
+1428-
+1429-        // TODO get scale from the rendersurface when supporting HiDPI
+1430-        let frame = self
+1431-            .backend_data
+1432-            .pointer_image
+1433-            .get_image(1 /*scale*/, self.clock.now().into());
+1434-
+1435-        let primary_gpu = self.backend_data.primary_gpu;
+1436-        let render_node = surface.render_node.unwrap_or(primary_gpu);
+1437-        let mut renderer = if primary_gpu == render_node {
+1438-            self.backend_data.gpus.single_renderer(&render_node)
+
+════════════════════════════════════════
+ Конец run_udev — event_loop.run/dispatch
+════════════════════════════════════════
+                if icon.surface.alive() {
+                    custom_elements.extend(AsRenderElements::<UdevRenderer<'a>>::render_elements(
+                        &SurfaceTree::from_surface(&icon.surface),
+                        renderer,
+                        dnd_icon_pos,
+                        scale,
+                        1.0,
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    if let Some(element) = surface.fps_element.as_mut() {
+        element.update_fps(surface.fps.avg().round() as u32);
+        surface.fps.tick();
+        custom_elements.push(CustomRenderElements::Fps(element.clone()));
+    }
+
+    let (elements, clear_color) =
+        output_elements(output, space, custom_elements, renderer, show_window_preview);
+
+    let frame_mode = if surface.disable_direct_scanout {
+        FrameFlags::empty()
+    } else {
+        FrameFlags::DEFAULT
+    };
+    let (rendered, states) = surface
+        .drm_output
+        .render_frame(renderer, &elements, clear_color, frame_mode)
+        .map(|render_frame_result| {
+            #[cfg(feature = "renderer_sync")]
+            if let PrimaryPlaneElement::Swapchain(element) = render_frame_result.primary_element {
+                element.sync.wait();
+            }
+            (!render_frame_result.is_empty, render_frame_result.states)
+        })
+        .map_err(|err| match err {
+            smithay::backend::drm::compositor::RenderFrameError::PrepareFrame(err) => {
+                SwapBuffersError::from(err)
+            }
+            smithay::backend::drm::compositor::RenderFrameError::RenderFrame(
+                OutputDamageTrackerError::Rendering(err),
+            ) => SwapBuffersError::from(err),
+            _ => unreachable!(),
+        })?;
+
+    update_primary_scanout_output(space, output, dnd_icon, cursor_status, &states);
+
+    if rendered {
+        let output_presentation_feedback = take_presentation_feedback(output, space, &states);
+        surface
+            .drm_output
+            .queue_frame(Some(output_presentation_feedback))
+            .map_err(Into::<SwapBuffersError>::into)?;
+    }
+
+    Ok((rendered, states))
+}
+
+════════════════════════════════════════
+ main.rs / lib.rs — где вызывается event_loop.run финально
+════════════════════════════════════════
+/home/yarik/.cargo/git/checkouts/smithay-312425d48e59d8c8/5312d5c/anvil/src/udev.rs:535:        let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state);
+/home/yarik/.cargo/git/checkouts/smithay-312425d48e59d8c8/5312d5c/anvil/src/winit.rs:442:        let result = event_loop.dispatch(Some(Duration::from_millis(1)), &mut state);
+/home/yarik/.cargo/git/checkouts/smithay-312425d48e59d8c8/5312d5c/anvil/src/x11.rs:478:        let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state);

@@ -1,0 +1,753 @@
+use std::collections::VecDeque;
+use std::time::Duration;
+
+use smithay::utils::{Logical, Point, Rectangle, Size};
+
+
+/// Hard floor for zoom — prevents division by zero / absurd values.
+pub const MIN_ZOOM_FLOOR: f64 = 0.001;
+/// Maximum zoom level (100% — native resolution, no magnification).
+pub const MAX_ZOOM: f64 = 1.0;
+
+/// A position in screen-local coordinates (0,0 = top-left of the output).
+#[derive(Debug, Clone, Copy)]
+pub struct ScreenPos(pub Point<f64, Logical>);
+
+/// A position in infinite canvas coordinates (absolute world position).
+#[derive(Debug, Clone, Copy)]
+pub struct CanvasPos(pub Point<f64, Logical>);
+
+/// screen_pos = (canvas_pos - camera) * zoom  ⟹  canvas = screen / zoom + camera
+#[inline]
+pub fn screen_to_canvas(screen: ScreenPos, camera: Point<f64, Logical>, zoom: f64) -> CanvasPos {
+    CanvasPos(Point::from((
+        screen.0.x / zoom + camera.x,
+        screen.0.y / zoom + camera.y,
+    )))
+}
+
+/// canvas_pos → screen_pos = (canvas - camera) * zoom
+#[inline]
+pub fn canvas_to_screen(canvas: CanvasPos, camera: Point<f64, Logical>, zoom: f64) -> ScreenPos {
+    ScreenPos(Point::from((
+        (canvas.0.x - camera.x) * zoom,
+        (canvas.0.y - camera.y) * zoom,
+    )))
+}
+
+/// Focus location for a screen-space surface (wlr layer, screen-pinned window):
+/// smithay derives surface-local coords as `location - focus_loc` with the
+/// pointer/touch location in canvas coords, so the surface's screen origin is
+/// shifted by (canvas - screen) to make the subtraction come out in screen space.
+#[inline]
+pub fn screen_space_focus_loc(
+    origin: ScreenPos,
+    canvas: CanvasPos,
+    screen: ScreenPos,
+) -> Point<f64, Logical> {
+    origin.0 + (canvas.0 - screen.0)
+}
+
+/// Inverse of [`screen_space_focus_loc`]: recover the surface's screen origin
+/// from an adjusted focus location.
+#[inline]
+pub fn screen_space_origin(
+    focus_loc: Point<f64, Logical>,
+    canvas: CanvasPos,
+    screen: ScreenPos,
+) -> ScreenPos {
+    ScreenPos(focus_loc - (canvas.0 - screen.0))
+}
+
+/// Convert internal canvas coords (top-left origin, Y-down) to the user-facing
+/// window-rule convention (center, Y-up) used by config rules, the state file, and IPC.
+#[inline]
+pub fn internal_to_rule(loc: Point<i32, Logical>, size: Size<i32, Logical>) -> (i32, i32) {
+    (loc.x + size.w / 2, -(loc.y + size.h / 2))
+}
+
+/// Inverse of [`internal_to_rule`]: window-rule coords (center, Y-up) back to
+/// internal top-left, Y-down canvas coords.
+#[inline]
+pub fn rule_to_internal(x: i32, y: i32, size: Size<i32, Logical>) -> Point<i32, Logical> {
+    Point::from((x - size.w / 2, -y - size.h / 2))
+}
+
+/// A screen-pinned window's top-left screen position (output-relative, top-left
+/// origin, Y-down) for a window-rule `position` `(x, y)` — window center,
+/// output-center origin, Y-up — on an output of `output_size`. Callers clamp the
+/// result into the output. Inverse of [`screen_top_left_to_rule`].
+#[inline]
+pub fn rule_to_screen_top_left(
+    x: i32,
+    y: i32,
+    size: Size<i32, Logical>,
+    output_size: Size<i32, Logical>,
+) -> Point<i32, Logical> {
+    let internal = rule_to_internal(x, y, size);
+    Point::from((
+        output_size.w / 2 + internal.x,
+        output_size.h / 2 + internal.y,
+    ))
+}
+
+/// Inverse of [`rule_to_screen_top_left`]: a screen-pinned window's top-left
+/// screen position back to window-rule coords (window center, output-center
+/// origin, Y-up) — the numbers a `pinned_to_screen` rule's `position` takes, so
+/// `driftwm msg state` values paste straight into a rule.
+#[inline]
+pub fn screen_top_left_to_rule(
+    screen_pos: Point<i32, Logical>,
+    size: Size<i32, Logical>,
+    output_size: Size<i32, Logical>,
+) -> (i32, i32) {
+    let internal = Point::from((
+        screen_pos.x - output_size.w / 2,
+        screen_pos.y - output_size.h / 2,
+    ));
+    internal_to_rule(internal, size)
+}
+
+/// The viewport center in canvas coords, in the user-facing convention (Y-up).
+/// Shared by the state file and IPC so they can't drift. Inverse of
+/// [`camera_for_center`].
+#[inline]
+pub fn viewport_center(
+    camera: Point<f64, Logical>,
+    zoom: f64,
+    viewport: Size<i32, Logical>,
+) -> (f64, f64) {
+    (
+        camera.x + viewport.w as f64 / (2.0 * zoom),
+        -(camera.y + viewport.h as f64 / (2.0 * zoom)),
+    )
+}
+
+/// The camera (internal top-left, Y-down) that centers the viewport on the Y-up
+/// point `(x, y)`. Inverse of [`viewport_center`].
+#[inline]
+pub fn camera_for_center(
+    x: f64,
+    y: f64,
+    zoom: f64,
+    viewport: Size<i32, Logical>,
+) -> Point<f64, Logical> {
+    Point::from((
+        x - viewport.w as f64 / (2.0 * zoom),
+        -y - viewport.h as f64 / (2.0 * zoom),
+    ))
+}
+
+/// Compute the camera position that centers a window at `screen_center` on screen.
+/// `screen_center` is the screen-space point where the window center should appear
+/// (typically the usable area center, accounting for panel exclusive zones).
+pub fn camera_to_center_window(
+    window_loc: Point<i32, Logical>,
+    window_size: Size<i32, Logical>,
+    screen_center: Point<f64, Logical>,
+    zoom: f64,
+    bar: i32,
+) -> Point<f64, Logical> {
+    let window_center_x = window_loc.x as f64 + window_size.w as f64 / 2.0;
+    let bar_f = bar as f64;
+    let window_center_y = window_loc.y as f64 - bar_f + (window_size.h as f64 + bar_f) / 2.0;
+    Point::from((
+        window_center_x - screen_center.x / zoom,
+        window_center_y - screen_center.y / zoom,
+    ))
+}
+
+/// Fraction of a rectangle's area visible in the current viewport (0.0–1.0).
+/// Returns 0.0 for zero-area rectangles.
+pub fn visible_fraction(
+    rect_loc: Point<i32, Logical>,
+    rect_size: Size<i32, Logical>,
+    camera: Point<f64, Logical>,
+    viewport_size: Size<i32, Logical>,
+    zoom: f64,
+) -> f64 {
+    let area = rect_size.w as f64 * rect_size.h as f64;
+    if area <= 0.0 {
+        return 0.0;
+    }
+
+    let vw = viewport_size.w as f64 / zoom;
+    let vh = viewport_size.h as f64 / zoom;
+
+    let ix_min = (rect_loc.x as f64).max(camera.x);
+    let ix_max = ((rect_loc.x + rect_size.w) as f64).min(camera.x + vw);
+    let iy_min = (rect_loc.y as f64).max(camera.y);
+    let iy_max = ((rect_loc.y + rect_size.h) as f64).min(camera.y + vh);
+
+    let iw = (ix_max - ix_min).max(0.0);
+    let ih = (iy_max - iy_min).max(0.0);
+
+    (iw * ih) / area
+}
+
+/// Check whether the canvas origin (0, 0) is visible in the current viewport.
+/// At zoom < 1.0, the visible area is larger: viewport_size / zoom.
+pub fn is_origin_visible(
+    camera: Point<f64, Logical>,
+    viewport_size: Size<i32, Logical>,
+    zoom: f64,
+) -> bool {
+    let visible_w = viewport_size.w as f64 / zoom;
+    let visible_h = viewport_size.h as f64 / zoom;
+    camera.x <= 0.0 && 0.0 <= camera.x + visible_w && camera.y <= 0.0 && 0.0 <= camera.y + visible_h
+}
+
+/// The canvas rectangle visible at the current camera + zoom.
+/// Used to cull windows outside the viewport for `render_elements_for_region`.
+///
+/// `camera_i32` must be `camera.to_i32_round()` — the same rounding used by
+/// `update_output_from_camera` — so that element position offsets match the
+/// output mapping used for input hit-testing.
+pub fn visible_canvas_rect(
+    camera_i32: Point<i32, Logical>,
+    viewport_size: Size<i32, Logical>,
+    zoom: f64,
+) -> Rectangle<i32, Logical> {
+    let w = (viewport_size.w as f64 / zoom).ceil() as i32 + 2;
+    let h = (viewport_size.h as f64 / zoom).ceil() as i32 + 2;
+    Rectangle::new(camera_i32, (w, h).into())
+}
+
+/// Bounding box of all windows. Returns None if the iterator is empty.
+pub fn all_windows_bbox(
+    windows: impl Iterator<Item = (Point<i32, Logical>, Size<i32, Logical>)>,
+) -> Option<Rectangle<i32, Logical>> {
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    let mut any = false;
+
+    for (loc, size) in windows {
+        any = true;
+        min_x = min_x.min(loc.x);
+        min_y = min_y.min(loc.y);
+        max_x = max_x.max(loc.x + size.w);
+        max_y = max_y.max(loc.y + size.h);
+    }
+
+    if any {
+        Some(Rectangle::new(
+            (min_x, min_y).into(),
+            (max_x - min_x, max_y - min_y).into(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Zoom level that fits `bbox` inside `viewport` with `padding` viewport pixels
+/// on each side. Padding is screen-space so the gutter stays constant regardless
+/// of the resulting zoom.
+/// Clamped to [MIN_ZOOM_FLOOR, MAX_ZOOM] — zooms out as far as needed to fit.
+pub fn zoom_to_fit(
+    bbox: Rectangle<i32, Logical>,
+    viewport_size: Size<i32, Logical>,
+    padding: f64,
+) -> f64 {
+    let avail_w = (viewport_size.w as f64 - padding * 2.0).max(1.0);
+    let avail_h = (viewport_size.h as f64 - padding * 2.0).max(1.0);
+    let zoom_x = avail_w / bbox.size.w.max(1) as f64;
+    let zoom_y = avail_h / bbox.size.h.max(1) as f64;
+    zoom_x.min(zoom_y).clamp(MIN_ZOOM_FLOOR, MAX_ZOOM)
+}
+
+/// Dynamic minimum zoom based on the current window layout.
+/// Uses a virtual 5x5 window at the origin as baseline when no windows exist,
+/// so the limit stays consistent as the first window appears.
+pub fn dynamic_min_zoom(
+    windows: impl Iterator<Item = (Point<i32, Logical>, Size<i32, Logical>)>,
+    viewport_size: Size<i32, Logical>,
+    padding: f64,
+) -> f64 {
+    let bbox =
+        all_windows_bbox(windows).unwrap_or_else(|| Rectangle::new((-2, -2).into(), (5, 5).into()));
+    // Allow zooming out to 50% beyond the fit zoom for breathing room
+    let fit = zoom_to_fit(bbox, viewport_size, padding);
+    (fit * 0.5).max(MIN_ZOOM_FLOOR)
+}
+
+/// Camera position that keeps `anchor_canvas` at `anchor_screen` after a zoom change.
+/// Derived from: screen = (canvas - camera) * zoom  ⟹  camera = canvas - screen / zoom.
+pub fn zoom_anchor_camera(
+    anchor_canvas: Point<f64, Logical>,
+    anchor_screen: Point<f64, Logical>,
+    new_zoom: f64,
+) -> Point<f64, Logical> {
+    Point::from((
+        anchor_canvas.x - anchor_screen.x / new_zoom,
+        anchor_canvas.y - anchor_screen.y / new_zoom,
+    ))
+}
+
+/// Snap zoom to 1.0 if within ±0.05 dead zone (avoids stuck-near-1.0 feel).
+pub fn snap_zoom(z: f64) -> f64 {
+    if (z - 1.0).abs() < 0.05 { 1.0 } else { z }
+}
+
+/// Closest point on an axis-aligned rect to `origin`.
+/// If origin is inside the rect, returns origin itself (distance 0).
+pub fn closest_point_on_rect(
+    origin: Point<f64, Logical>,
+    loc: Point<i32, Logical>,
+    size: Size<i32, Logical>,
+) -> Point<f64, Logical> {
+    Point::from((
+        origin.x.clamp(loc.x as f64, (loc.x + size.w) as f64),
+        origin.y.clamp(loc.y as f64, (loc.y + size.h) as f64),
+    ))
+}
+
+
+
+/// Sliding-window velocity tracker for scroll/gesture input.
+/// Computes launch velocity from recent displacement over a fixed time window,
+/// avoiding the EMA bias where the last 1-2 events dominate.
+///
+/// Timestamps are libinput event times (ms), not processing time: under CPU
+/// load the event loop can drain a burst of events with near-identical
+/// processing times, which collapses `elapsed` and explodes the launch velocity.
+/// Event times are stamped when the input occurred, so they retain real spacing.
+#[derive(Clone, Default)]
+pub struct VelocityTracker {
+    samples: VecDeque<(u32, Point<f64, Logical>)>,
+}
+
+const VELOCITY_WINDOW_MS: u32 = 80;
+
+impl VelocityTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, time_ms: u32, delta: Point<f64, Logical>) {
+        self.samples.push_back((time_ms, delta));
+        // wrapping_sub keeps eviction correct across the u32 ms wrap (~49.7 days).
+        while self
+            .samples
+            .front()
+            .is_some_and(|(t, _)| time_ms.wrapping_sub(*t) > VELOCITY_WINDOW_MS)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Total displacement / elapsed time = px/sec. Zero if < 2 samples.
+    pub fn launch_velocity(&self) -> Point<f64, Logical> {
+        if self.samples.len() < 2 {
+            return Point::from((0.0, 0.0));
+        }
+        let first_time = self.samples.front().unwrap().0;
+        let last_time = self.samples.back().unwrap().0;
+        let elapsed_ms = last_time.wrapping_sub(first_time);
+        // Event times are ms-quantized, so a sub-ms window (only reachable by a
+        // sub-millisecond flick on a >1000Hz device) would divide by zero. Guard
+        // the clock resolution, not a device rate: any real fling spans many ms,
+        // so no device is throttled.
+        if elapsed_ms == 0 {
+            return Point::from((0.0, 0.0));
+        }
+        let elapsed = elapsed_ms as f64 / 1000.0;
+        let total: Point<f64, Logical> = self
+            .samples
+            .iter()
+            .fold(Point::from((0.0, 0.0)), |acc, (_, d)| {
+                Point::from((acc.x + d.x, acc.y + d.y))
+            });
+        Point::from((total.x / elapsed, total.y / elapsed))
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+}
+
+/// Stop threshold in px/sec (15 px/sec ≈ 0.25 px/frame at 60Hz)
+const MOMENTUM_STOP_THRESHOLD: f64 = 15.0;
+
+/// Scroll momentum physics with time-based drift.
+/// Velocity is in px/sec; drift is applied via `powf(dt * 60)` for
+/// frame-rate independence.
+#[derive(Clone)]
+pub struct MomentumState {
+    pub velocity: Point<f64, Logical>,
+    pub tracker: VelocityTracker,
+    pub drift: f64,
+    pub coasting: bool,
+}
+
+impl MomentumState {
+    pub fn new(drift: f64) -> Self {
+        Self {
+            velocity: Point::from((0.0, 0.0)),
+            tracker: VelocityTracker::new(),
+            drift,
+            coasting: false,
+        }
+    }
+
+    /// Record an input delta. Resets coasting — we're receiving live input.
+    /// `time_ms` is the libinput event timestamp, not processing time.
+    pub fn accumulate(&mut self, delta: Point<f64, Logical>, time_ms: u32) {
+        self.tracker.push(time_ms, delta);
+        self.coasting = false;
+    }
+
+    /// Snapshot launch velocity from the tracker and begin coasting.
+    pub fn launch(&mut self) {
+        self.velocity = self.tracker.launch_velocity();
+        self.coasting = true;
+        self.tracker.clear();
+    }
+
+    /// Advance momentum by `dt`. Returns Some(canvas delta) to apply, or None.
+    pub fn tick(&mut self, dt: Duration) -> Option<Point<f64, Logical>> {
+        if !self.coasting {
+            return None;
+        }
+        let speed = (self.velocity.x.powi(2) + self.velocity.y.powi(2)).sqrt();
+        if speed < MOMENTUM_STOP_THRESHOLD {
+            self.velocity = Point::from((0.0, 0.0));
+            self.coasting = false;
+            return None;
+        }
+
+        let dt_secs = dt.as_secs_f64();
+
+        // Speed-dependent drift: gentle scrolls stop quickly, fast flings coast longer
+        let effective_drift = speed_dependent_drift(self.drift, speed);
+        let decay = effective_drift.powf(dt_secs * 60.0);
+        let delta = Point::from((self.velocity.x * dt_secs, self.velocity.y * dt_secs));
+        self.velocity = Point::from((self.velocity.x * decay, self.velocity.y * decay));
+        Some(delta)
+    }
+
+    pub fn stop(&mut self) {
+        self.velocity = Point::from((0.0, 0.0));
+        self.tracker.clear();
+        self.coasting = false;
+    }
+}
+
+/// Per-frame velocity retention for momentum coasting, from the user's `drift`
+/// knob (0 = off … 1 = floatiest) and the current `speed`.
+///
+/// The knob is log-spaced in coast time: each step multiplies how long a fling
+/// coasts by a roughly constant factor, so the slider feels perceptually even
+/// instead of cramming every usable value into 0.9–1.0. Gentle scrolls (low
+/// speed) stop sooner than hard flings (high speed). The result is normalized to
+/// 60fps; `tick` applies `powf(dt * 60)` for frame-rate independence.
+fn speed_dependent_drift(drift: f64, speed: f64) -> f64 {
+    if drift <= 0.0 {
+        return 0.0; // momentum disabled
+    }
+    // Fling coast time as a velocity half-life (seconds), spaced geometrically
+    // across the knob. Endpoints and the default (0.5) are tuned so 0.5
+    // reproduces the original feel (≈0.88 slow / ≈0.965 fast retention).
+    const FLING_HALFLIFE_MIN: f64 = 0.05;
+    const FLING_HALFLIFE_MAX: f64 = 2.3;
+    const SLOW_COAST_RATIO: f64 = 0.28; // gentle scrolls coast ~1/3.6 as long
+    let fling = FLING_HALFLIFE_MIN * (FLING_HALFLIFE_MAX / FLING_HALFLIFE_MIN).powf(drift.min(1.0));
+    let reference_speed = 2500.0; // px/sec; at or above this, full fling coast
+    let t = (speed / reference_speed).min(1.0);
+    let half_life = fling * SLOW_COAST_RATIO.powf(1.0 - t);
+    // Retention that halves the velocity every `half_life` seconds.
+    0.5_f64.powf(1.0 / (60.0 * half_life)).min(0.995)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cam(x: f64, y: f64) -> Point<f64, Logical> {
+        Point::from((x, y))
+    }
+    fn vp(w: i32, h: i32) -> Size<i32, Logical> {
+        Size::from((w, h))
+    }
+    /// Screen center point for a viewport of given size (no panels).
+    fn vp_center(w: i32, h: i32) -> Point<f64, Logical> {
+        Point::from((w as f64 / 2.0, h as f64 / 2.0))
+    }
+
+    #[test]
+    fn rule_coords_round_trip() {
+        // internal -> rule -> internal is identity, even for odd sizes where
+        // integer halving truncates (same truncated half is used both ways).
+        for (loc, size) in [
+            ((0, 0), (100, 100)),
+            ((200, -300), (640, 480)),
+            ((-15, 7), (101, 51)),
+        ] {
+            let loc = Point::<i32, Logical>::from(loc);
+            let size = vp(size.0, size.1);
+            let (rx, ry) = internal_to_rule(loc, size);
+            assert_eq!(rule_to_internal(rx, ry, size), loc);
+        }
+    }
+
+    #[test]
+    fn rule_coords_center_y_up() {
+        assert_eq!(internal_to_rule((0, 0).into(), vp(100, 100)), (50, -50));
+    }
+
+    #[test]
+    fn pinned_rule_screen_round_trip() {
+        // rule coords -> screen top-left -> rule coords is identity, including
+        // odd window/output sizes where integer halving truncates (the same
+        // truncated halves cancel in both directions).
+        for (rule, size, out) in [
+            ((0, 0), (320, 240), (1920, 1080)),
+            ((200, -150), (640, 480), (1920, 1080)),
+            ((-37, 61), (101, 51), (1365, 767)),
+            ((450, 320), (100, 100), (801, 601)),
+        ] {
+            let size = vp(size.0, size.1);
+            let out = vp(out.0, out.1);
+            let screen = rule_to_screen_top_left(rule.0, rule.1, size, out);
+            assert_eq!(screen_top_left_to_rule(screen, size, out), rule);
+        }
+    }
+
+    #[test]
+    fn viewport_center_round_trip() {
+        let viewport = vp(1920, 1080);
+        for (camera, zoom) in [
+            (cam(0.0, 0.0), 1.0),
+            (cam(-960.0, -540.0), 1.0),
+            (cam(123.0, -45.0), 0.5),
+            (cam(-200.0, 300.0), 2.0),
+        ] {
+            let (x, y) = viewport_center(camera, zoom, viewport);
+            let back = camera_for_center(x, y, zoom, viewport);
+            assert!((back.x - camera.x).abs() < 1e-9 && (back.y - camera.y).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn camera_for_center_centers_origin() {
+        let viewport = vp(1000, 800);
+        let camera = camera_for_center(0.0, 0.0, 1.0, viewport);
+        assert_eq!(viewport_center(camera, 1.0, viewport), (0.0, 0.0));
+    }
+
+    #[test]
+    fn fully_visible() {
+        // 100x100 window at (200, 200), camera at (0,0), viewport 1000x1000, zoom 1.0
+        let f = visible_fraction(
+            (200, 200).into(),
+            (100, 100).into(),
+            cam(0.0, 0.0),
+            vp(1000, 1000),
+            1.0,
+        );
+        assert!((f - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fully_off_screen() {
+        // Window completely to the right of viewport
+        let f = visible_fraction(
+            (2000, 0).into(),
+            (100, 100).into(),
+            cam(0.0, 0.0),
+            vp(1000, 1000),
+            1.0,
+        );
+        assert!((f - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn half_off_right_edge() {
+        // 100x100 window, right half off-screen
+        let f = visible_fraction(
+            (950, 0).into(),
+            (100, 100).into(),
+            cam(0.0, 0.0),
+            vp(1000, 1000),
+            1.0,
+        );
+        assert!((f - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_area_window() {
+        let f = visible_fraction(
+            (0, 0).into(),
+            (0, 100).into(),
+            cam(0.0, 0.0),
+            vp(1000, 1000),
+            1.0,
+        );
+        assert!((f - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zoom_affects_viewport() {
+        // At zoom 0.5, viewport covers 2000x2000 canvas units.
+        // 100x100 window at (1500, 0) is fully visible.
+        let f = visible_fraction(
+            (1500, 0).into(),
+            (100, 100).into(),
+            cam(0.0, 0.0),
+            vp(1000, 1000),
+            0.5,
+        );
+        assert!((f - 1.0).abs() < 1e-9);
+
+        // Same window at zoom 1.0 is fully off-screen.
+        let f = visible_fraction(
+            (1500, 0).into(),
+            (100, 100).into(),
+            cam(0.0, 0.0),
+            vp(1000, 1000),
+            1.0,
+        );
+        assert!((f - 0.0).abs() < 1e-9);
+    }
+
+    // -- Coordinate transform round-trip tests --
+
+    #[test]
+    fn screen_canvas_round_trip_zoom_1() {
+        let camera = cam(100.0, 200.0);
+        let original = ScreenPos(Point::from((400.0, 300.0)));
+        let canvas = screen_to_canvas(original, camera, 1.0);
+        let back = canvas_to_screen(canvas, camera, 1.0);
+        assert!((back.0.x - original.0.x).abs() < 1e-9);
+        assert!((back.0.y - original.0.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn screen_canvas_round_trip_zoomed_out() {
+        let camera = cam(-500.0, -300.0);
+        let zoom = 0.25;
+        let original = ScreenPos(Point::from((640.0, 480.0)));
+        let canvas = screen_to_canvas(original, camera, zoom);
+        let back = canvas_to_screen(canvas, camera, zoom);
+        assert!((back.0.x - original.0.x).abs() < 1e-9);
+        assert!((back.0.y - original.0.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn screen_to_canvas_math() {
+        // screen = (canvas - camera) * zoom  ⟹  canvas = screen / zoom + camera
+        let canvas = screen_to_canvas(ScreenPos(Point::from((100.0, 50.0))), cam(10.0, 20.0), 0.5);
+        // 100/0.5 + 10 = 210, 50/0.5 + 20 = 120
+        assert!((canvas.0.x - 210.0).abs() < 1e-9);
+        assert!((canvas.0.y - 120.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn canvas_to_screen_math() {
+        // screen = (canvas - camera) * zoom
+        let screen = canvas_to_screen(CanvasPos(Point::from((210.0, 120.0))), cam(10.0, 20.0), 0.5);
+        // (210 - 10) * 0.5 = 100, (120 - 20) * 0.5 = 50
+        assert!((screen.0.x - 100.0).abs() < 1e-9);
+        assert!((screen.0.y - 50.0).abs() < 1e-9);
+    }
+
+    // -- camera_to_center_window tests --
+
+    #[test]
+    fn center_window_zoom_1() {
+        // 200x100 window at (300, 400), 1920x1080 viewport, zoom 1.0
+        let cam = camera_to_center_window(
+            (300, 400).into(),
+            (200, 100).into(),
+            vp_center(1920, 1080),
+            1.0,
+            0,
+        );
+        // window center: (400, 450), viewport center offset: (960, 540)
+        assert!((cam.x - (400.0 - 960.0)).abs() < 1e-9);
+        assert!((cam.y - (450.0 - 540.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn center_window_zoomed_out() {
+        // At zoom 0.5, viewport center = viewport_size / (2 * 0.5) = viewport_size
+        let cam = camera_to_center_window(
+            (0, 0).into(),
+            (100, 100).into(),
+            vp_center(1000, 1000),
+            0.5,
+            0,
+        );
+        // window center: (50, 50), viewport center offset at 0.5: (1000, 1000)
+        assert!((cam.x - (50.0 - 1000.0)).abs() < 1e-9);
+        assert!((cam.y - (50.0 - 1000.0)).abs() < 1e-9);
+    }
+
+    // -- find_nearest tests --
+
+    fn pt(x: f64, y: f64) -> Point<f64, Logical> {
+        Point::from((x, y))
+    }
+
+    #[test]
+    fn find_nearest_right() {
+        let origin = pt(0.0, 0.0);
+        let items = vec![
+            ("a", pt(100.0, 0.0)),  // directly right
+            ("b", pt(-100.0, 0.0)), // directly left
+            ("c", pt(200.0, 0.0)),  // further right
+        ];
+        let result = find_nearest(origin, &Direction::Right, items.into_iter(), None::<&&str>);
+        assert_eq!(result, Some("a"));
+    }
+
+    #[test]
+    fn find_nearest_up() {
+        let origin = pt(0.0, 0.0);
+        let items = vec![("above", pt(0.0, -100.0)), ("below", pt(0.0, 100.0))];
+        let result = find_nearest(origin, &Direction::Up, items.into_iter(), None::<&&str>);
+        assert_eq!(result, Some("above"));
+    }
+
+    #[test]
+    fn find_nearest_down() {
+        let origin = pt(0.0, 0.0);
+        let items = vec![("above", pt(0.0, -100.0)), ("below", pt(0.0, 100.0))];
+        let result = find_nearest(origin, &Direction::Down, items.into_iter(), None::<&&str>);
+        assert_eq!(result, Some("below"));
+    }
+
+    #[test]
+    fn find_nearest_left() {
+        let origin = pt(0.0, 0.0);
+        let items = vec![("left", pt(-100.0, 0.0)), ("right", pt(100.0, 0.0))];
+        let result = find_nearest(origin, &Direction::Left, items.into_iter(), None::<&&str>);
+        assert_eq!(result, Some("left"));
+    }
+
+    #[test]
+    fn find_nearest_outside_cone() {
+        // Item at 60° from the right axis — outside the 45° cone
+        let origin = pt(0.0, 0.0);
+        let items = vec![("diagonal", pt(50.0, 100.0))];
+        let result = find_nearest(origin, &Direction::Right, items.into_iter(), None::<&&str>);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_nearest_skips_self() {
+        let origin = pt(0.0, 0.0);
+        let items = vec![("self", pt(10.0, 0.0)), ("other", pt(20.0, 0.0))];
+        let result = find_nearest(origin, &Direction::Right, items.into_iter(), Some(&"self"));
+        assert_eq!(result, Some("other"));
+    }
+
+    #[test]
+    fn find_nearest_empty() {
+        let origin = pt(0.0, 0.0);
+        let items: Vec<(&str, Point<f64, Logical>)> = vec![];
+        let result = find_nearest(origin, &Direction::Right, items.into_iter(), None::<&&str>);
+        assert_eq!(result, None);
+    }
+}
