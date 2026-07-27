@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use smithay::utils::{Logical, Point, Rectangle, Size};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 
 
 /// Hard floor for zoom — prevents division by zero / absurd values.
@@ -458,6 +458,121 @@ fn speed_dependent_drift(drift: f64, speed: f64) -> f64 {
     let half_life = fling * SLOW_COAST_RATIO.powf(1.0 - t);
     // Retention that halves the velocity every `half_life` seconds.
     0.5_f64.powf(1.0 / (60.0 * half_life)).min(0.995)
+}
+
+// ── Миникарта (Module 3) ────────────────────────────────────────────────────
+// Панель — фиксированного физического (экранного) размера в правом нижнем
+// углу, независимо от zoom холста (как курсор — вручную позиционируется в
+// Physical, а не идёт через Space/output scale).
+
+pub const MINIMAP_MARGIN_PX: i32 = 24;
+pub const MINIMAP_PANEL_W: i32 = 460;
+pub const MINIMAP_PANEL_H: i32 = 300;
+const MINIMAP_PADDING_PX: f64 = 16.0;
+
+/// Физическая позиция левого-верхнего угла панели миникарты (правый верхний угол экрана).
+pub fn minimap_panel_origin(output_physical_size: Size<i32, Physical>) -> Point<i32, Physical> {
+    Point::from((
+        output_physical_size.w - MINIMAP_PANEL_W - MINIMAP_MARGIN_PX,
+        MINIMAP_MARGIN_PX,
+    ))
+}
+
+pub struct MinimapBox {
+    /// Координаты относительно левого-верхнего угла панели (не экрана целиком).
+    pub loc: Point<i32, Physical>,
+    pub size: Size<i32, Physical>,
+    pub focused: bool,
+}
+
+pub struct MinimapProjection {
+    pub boxes: Vec<MinimapBox>,
+    pub viewport_box: MinimapBox,
+    /// Для обратного клика (3.3)
+    pub bbox: Rectangle<i32, Logical>,
+    pub scale: f64,
+}
+
+/// Проекция окон на миникарту: статичный "вид сверху" на ВСЕ окна текущего тега.
+/// bbox считается от всех окон (с запасом 20%), масштаб подгоняет их под размер
+/// панели. Не зависит от камеры/zoom холста — миникарта всегда показывает
+/// все окна, независимо от того куда направил камеру пользователь.
+pub fn project_minimap(
+    windows: &[(Point<i32, Logical>, Size<i32, Logical>, bool)],
+) -> MinimapProjection {
+    let panel_size = Size::<i32, Physical>::from((MINIMAP_PANEL_W, MINIMAP_PANEL_H));
+
+    // bbox всех окон с запасом 20% (чтобы окна не упирались в края панели)
+    let bbox_margin = 0.20;
+    let bbox = match all_windows_bbox(windows.iter().map(|(loc, size, _)| (*loc, *size))) {
+        Some(mut b) => {
+            let margin_w = (b.size.w as f64 * bbox_margin).ceil() as i32;
+            let margin_h = (b.size.h as f64 * bbox_margin).ceil() as i32;
+            b.loc.x -= margin_w;
+            b.loc.y -= margin_h;
+            b.size.w += margin_w * 2;
+            b.size.h += margin_h * 2;
+            b
+        }
+        None => {
+            // Нет окон — показываем область вокруг начала координат
+            let size = Size::from((panel_size.w * 2, panel_size.h * 2));
+            Rectangle::new((-size.w / 2, -size.h / 2).into(), size)
+        }
+    };
+
+    let panel_log_size = Size::<i32, Logical>::from((panel_size.w, panel_size.h));
+    let scale = zoom_to_fit(bbox, panel_log_size, MINIMAP_PADDING_PX);
+
+    let project = |loc: Point<i32, Logical>, size: Size<i32, Logical>| -> (Point<i32, Physical>, Size<i32, Physical>) {
+        let x = MINIMAP_PADDING_PX + (loc.x - bbox.loc.x) as f64 * scale;
+        let y = MINIMAP_PADDING_PX + (loc.y - bbox.loc.y) as f64 * scale;
+        let w = (size.w as f64 * scale).max(1.0);
+        let h = (size.h as f64 * scale).max(1.0);
+        (
+            Point::from((x.round() as i32, y.round() as i32)),
+            Size::from((w.round() as i32, h.round() as i32)),
+        )
+    };
+
+    let boxes = windows.iter().map(|(loc, size, focused)| {
+        let (p, s) = project(*loc, *size);
+        MinimapBox { loc: p, size: s, focused: *focused }
+    }).collect();
+
+    MinimapProjection {
+        boxes,
+        viewport_box: MinimapBox { loc: (0, 0).into(), size: (0, 0).into(), focused: false },
+        bbox,
+        scale,
+    }
+}
+
+/// Обратное преобразование клика по миникарте (3.3): панель-локальные
+/// физические координаты клика → точка на бесконечном холсте.
+pub fn minimap_click_to_canvas(
+    click_in_panel: Point<f64, Physical>,
+    bbox: Rectangle<i32, Logical>,
+    scale: f64,
+) -> Point<f64, Logical> {
+    Point::from((
+        bbox.loc.x as f64 + (click_in_panel.x - MINIMAP_PADDING_PX) / scale,
+        bbox.loc.y as f64 + (click_in_panel.y - MINIMAP_PADDING_PX) / scale,
+    ))
+}
+
+/// Прямая проекция одной точки холста на панель миникарты — теми же bbox/scale,
+/// что и [`project_minimap`]. Возвращает координаты относительно левого-верхнего
+/// угла панели (не экрана). Используется для крестиков закладок камеры.
+pub fn project_point_minimap(
+    anchor: Point<f64, Logical>,
+    bbox: Rectangle<i32, Logical>,
+    scale: f64,
+) -> Point<i32, Physical> {
+    Point::from((
+        (MINIMAP_PADDING_PX + (anchor.x - bbox.loc.x as f64) * scale).round() as i32,
+        (MINIMAP_PADDING_PX + (anchor.y - bbox.loc.y as f64) * scale).round() as i32,
+    ))
 }
 
 #[cfg(test)]

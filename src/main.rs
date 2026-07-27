@@ -1,17 +1,31 @@
+mod anim;
 mod canvas;
+mod columns;
+mod config;
 mod grabs;
 mod handlers;
 mod input;
+mod overview;
+mod selection;
+mod session;
 mod state;
 mod udev;
 mod tiling;
 mod winit;
 
-use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
+use smithay::reexports::{
+    calloop::{
+        timer::{TimeoutAction, Timer},
+        EventLoop,
+    },
+    wayland_server::Display,
+};
 pub use state::Dawn;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     tracing::info!("dawn starting");
 
     let mut event_loop: EventLoop<Dawn> = EventLoop::try_new()?;
@@ -51,12 +65,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
     }
 
-    if tty_mode && state.udev_devices.is_empty() {
-        eprintln!("dawn: ERROR — нет DRM устройств!");
-        std::process::exit(1);
-    }
-
     tracing::info!("dawn socket: {:?}", state.socket_name);
+
+    // Анимационный тик (~60Hz): двигает камеру/zoom пока есть активные
+    // LERP-анимации или инерция скролла; когда всё осело — просто быстро
+    // возвращается без рендера (дешёвая проверка нескольких Option/bool).
+    let anim_timer = Timer::from_duration(std::time::Duration::from_millis(16));
+    event_loop.handle().insert_source(anim_timer, |_, _, state| {
+        crate::anim::tick(state);
+        TimeoutAction::ToDuration(std::time::Duration::from_millis(16))
+    })?;
 
     // Как в anvil — dispatch с timeout чтобы seatd не голодал
     loop {
@@ -68,6 +86,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.space.refresh();
         state.popups.cleanup();
         let _ = state.display_handle.flush_clients();
+        // Один render_all() на весь дозреваемый в dispatch() пакет событий
+        // (клавиши/мышь/anim-тик) вместо N вызовов, раскиданных по хендлерам —
+        // см. Dawn::request_redraw() и комментарии на каждом старом callsite.
+        if state.needs_redraw {
+            state.needs_redraw = false;
+            crate::udev::render_all(&mut state);
+        }
     }
 
     Ok(())

@@ -1,6 +1,6 @@
 pub mod move_grab;
 pub mod pan_grab;
 pub mod resize_grab;
+pub mod select_grab;
 
-pub use move_grab::MoveSurfaceGrab;
-pub use resize_grab::ResizeSurfaceGrab;
+pub use select_grab::SelectGrab;

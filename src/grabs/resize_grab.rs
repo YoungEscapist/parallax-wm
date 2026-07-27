@@ -44,6 +44,13 @@ pub struct ResizeSurfaceGrab {
     pub edges: ResizeEdge,
     pub initial_rect: Rectangle<i32, Logical>,
     pub last_window_size: Size<i32, Logical>,
+    /// Остальные окна из "созвездия" этого окна и их геометрия на момент
+    /// начала ресайза — на отпускании масштабируются вокруг общего опорного
+    /// угла на тот же коэффициент, что и перетаскиваемое окно (см. button()).
+    group_initial: Vec<(Window, Rectangle<i32, Logical>)>,
+    /// Начальный mfact при старте ресайза (Tile mode) — чтобы delta.x
+    /// правильно менял master-фактор относительно исходного значения.
+    initial_mfact: f32,
 }
 
 impl ResizeSurfaceGrab {
@@ -52,11 +59,14 @@ impl ResizeSurfaceGrab {
         window: Window,
         edges: ResizeEdge,
         initial_window_rect: Rectangle<i32, Logical>,
+        group_initial: Vec<(Window, Rectangle<i32, Logical>)>,
+        initial_mfact: f32,
     ) -> Self {
         ResizeSurfaceState::with(window.toplevel().unwrap().wl_surface(), |state| {
             *state = ResizeSurfaceState::Resizing {
                 edges,
                 initial_rect: initial_window_rect,
+                last_rect: initial_window_rect,
             };
         });
         Self {
@@ -65,6 +75,8 @@ impl ResizeSurfaceGrab {
             edges,
             initial_rect: initial_window_rect,
             last_window_size: initial_window_rect.size,
+            group_initial,
+            initial_mfact,
         }
     }
 }
@@ -89,7 +101,23 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
             });
 
         if is_tiled {
-            // В tiling resize недоступен — dwindle сам управляет размерами
+            let delta = event.location - self.start_data.location;
+            if data.tile_config.layout == Layout::Tile {
+                // Tile: горизонтальный drag меняет mfact (master-фактор).
+                let out_w = data.space.outputs().next()
+                    .and_then(|o| data.space.output_geometry(o))
+                    .map(|g| g.size.w as f64)
+                    .unwrap_or(1920.0);
+                let delta_mfact = (delta.x / out_w) as f32;
+                data.tile_config.mfact = (self.initial_mfact + delta_mfact).clamp(0.1, 0.9);
+                data.arrange();
+                data.request_redraw();
+            } else if data.tile_config.layout == Layout::Columns {
+                // Columns: горизонтальный drag меняет ширину активной колонки
+                // непрерывно (drag_width от 15% до 100% экрана).
+                data.columns_resize_active_width(delta.x);
+            }
+            // Monocle: не поддерживается.
             return;
         }
 
@@ -130,6 +158,37 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
             state.size = Some(self.last_window_size);
         });
         xdg.send_pending_configure();
+
+        // "Созвездие": остальные окна группы масштабируются ЖИВО вместе с
+        // перетаскиваемым (раньше это делалось только на отпускании — соседи
+        // лишь перестраивались, но не меняли размер во время драга).
+        if !self.group_initial.is_empty() {
+            let scale_x = self.last_window_size.w as f64 / self.initial_rect.size.w.max(1) as f64;
+            let scale_y = self.last_window_size.h as f64 / self.initial_rect.size.h.max(1) as f64;
+            let anchor_x = if self.edges.intersects(ResizeEdge::LEFT) {
+                self.initial_rect.loc.x + self.initial_rect.size.w
+            } else {
+                self.initial_rect.loc.x
+            };
+            let anchor_y = if self.edges.intersects(ResizeEdge::TOP) {
+                self.initial_rect.loc.y + self.initial_rect.size.h
+            } else {
+                self.initial_rect.loc.y
+            };
+            for (member, geo) in self.group_initial.clone() {
+                let new_w = ((geo.size.w as f64) * scale_x).round().max(50.0) as i32;
+                let new_h = ((geo.size.h as f64) * scale_y).round().max(50.0) as i32;
+                let new_x = (anchor_x as f64 + (geo.loc.x - anchor_x) as f64 * scale_x).round() as i32;
+                let new_y = (anchor_y as f64 + (geo.loc.y - anchor_y) as f64 * scale_y).round() as i32;
+                if let Some(t) = member.toplevel() {
+                    t.with_pending_state(|s| { s.size = Some((new_w, new_h).into()); });
+                    t.send_pending_configure();
+                }
+                let new_loc: Point<i32, Logical> = (new_x, new_y).into();
+                data.space.map_element(member.clone(), new_loc, false);
+            }
+            data.request_redraw();
+        }
     }
 
     fn relative_motion(
@@ -153,7 +212,9 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
         if !handle.current_pressed().contains(&BTN_RIGHT) {
             handle.unset_grab(self, data, event.serial, event.time, true);
 
-            // Только для floating — финализируем resize
+            // Только для floating — финализируем resize.
+            // В tiling/columns: сбрасываем ResizeSurfaceState (commit-хендлер
+            // не должен корректировать позицию — ей управляет layout).
             let is_tiled = data.tile_config.layout != Layout::Float
                 && data.tagged_windows.iter().any(|tw| {
                     !tw.floating
@@ -162,7 +223,13 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
                             .unwrap_or(false)
                 });
 
-            if !is_tiled {
+            if is_tiled {
+                if let Some(t) = self.window.toplevel() {
+                    ResizeSurfaceState::with(t.wl_surface(), |state| {
+                        *state = ResizeSurfaceState::Idle;
+                    });
+                }
+            } else {
                 let xdg = self.window.toplevel().unwrap();
                 xdg.with_pending_state(|state| {
                     state.states.unset(xdg_toplevel::State::Resizing);
@@ -170,12 +237,58 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
                 });
                 xdg.send_pending_configure();
 
+                // Сохраняем float_size
+                if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
+                    tw.window.toplevel().zip(self.window.toplevel())
+                        .map(|(a, b)| a.wl_surface() == b.wl_surface())
+                        .unwrap_or(false)
+                }) {
+                    tw.float_size = Some(self.last_window_size);
+                }
+
                 ResizeSurfaceState::with(xdg.wl_surface(), |state| {
                     *state = ResizeSurfaceState::WaitingForLastCommit {
                         edges: self.edges,
                         initial_rect: self.initial_rect,
                     };
                 });
+
+                // "Созвездие" (Super+G): остальные окна группы масштабируются
+                // вокруг общего неподвижного угла на тот же коэффициент.
+                if !self.group_initial.is_empty() {
+                    let scale_x = self.last_window_size.w as f64 / self.initial_rect.size.w.max(1) as f64;
+                    let scale_y = self.last_window_size.h as f64 / self.initial_rect.size.h.max(1) as f64;
+                    let anchor_x = if self.edges.intersects(ResizeEdge::LEFT) {
+                        self.initial_rect.loc.x + self.initial_rect.size.w
+                    } else {
+                        self.initial_rect.loc.x
+                    };
+                    let anchor_y = if self.edges.intersects(ResizeEdge::TOP) {
+                        self.initial_rect.loc.y + self.initial_rect.size.h
+                    } else {
+                        self.initial_rect.loc.y
+                    };
+                    for (member, geo) in self.group_initial.clone() {
+                        let new_w = ((geo.size.w as f64) * scale_x).round().max(50.0) as i32;
+                        let new_h = ((geo.size.h as f64) * scale_y).round().max(50.0) as i32;
+                        let new_x = (anchor_x as f64 + (geo.loc.x - anchor_x) as f64 * scale_x).round() as i32;
+                        let new_y = (anchor_y as f64 + (geo.loc.y - anchor_y) as f64 * scale_y).round() as i32;
+                        if let Some(t) = member.toplevel() {
+                            t.with_pending_state(|s| { s.size = Some((new_w, new_h).into()); });
+                            t.send_pending_configure();
+                        }
+                        data.animate_window_to_dur(&member, (new_x, new_y).into(), std::time::Duration::from_millis(180));
+                        if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
+                            tw.window.toplevel().zip(member.toplevel())
+                                .map(|(a, b)| a.wl_surface() == b.wl_surface())
+                                .unwrap_or(false)
+                        }) {
+                            tw.float_size = Some((new_w, new_h).into());
+                            tw.float_position = (new_x, new_y).into();
+                        }
+                    }
+                    data.request_plane_reset();
+                }
             }
         }
     }
@@ -223,6 +336,9 @@ enum ResizeSurfaceState {
     Resizing {
         edges: ResizeEdge,
         initial_rect: Rectangle<i32, Logical>,
+        /// Прямоугольник на прошлом коммите этого же resize-жеста — от него
+        /// считается инкрементальная дельта для эластичного расталкивания (2.3).
+        last_rect: Rectangle<i32, Logical>,
     },
     WaitingForLastCommit {
         edges: ResizeEdge,
@@ -244,12 +360,95 @@ impl ResizeSurfaceState {
 
     fn commit(&mut self) -> Option<(ResizeEdge, Rectangle<i32, Logical>)> {
         match *self {
-            Self::Resizing { edges, initial_rect } => Some((edges, initial_rect)),
+            Self::Resizing { edges, initial_rect, .. } => Some((edges, initial_rect)),
             Self::WaitingForLastCommit { edges, initial_rect } => {
                 *self = Self::Idle;
                 Some((edges, initial_rect))
             }
             Self::Idle => None,
+        }
+    }
+
+    /// Только для активного (не финального) resize-коммита: возвращает
+    /// прямоугольник с прошлого коммита и запоминает `new_rect` как новый
+    /// "прошлый" — на его основе (2.3) считается инкрементальный push соседей.
+    fn take_last_rect_for_elastic(
+        &mut self,
+        new_rect: Rectangle<i32, Logical>,
+    ) -> Option<Rectangle<i32, Logical>> {
+        match self {
+            Self::Resizing { last_rect, .. } => {
+                let old = *last_rect;
+                *last_rect = new_rect;
+                Some(old)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Эластичное расталкивание соседей (2.3): окна, чей край примыкал (в
+/// пределах ADJACENCY_TOLERANCE) к соответствующему краю `old`, сдвигаются на
+/// ту же дельту, на которую этот край сместился в `new`. При уменьшении окна
+/// дельта отрицательная — соседи стягиваются обратно.
+const ADJACENCY_TOLERANCE: i32 = 20;
+
+fn elastic_displace(
+    space: &mut Space<Window>,
+    resized: &Window,
+    old: Rectangle<i32, Logical>,
+    new: Rectangle<i32, Logical>,
+) {
+    let old_right = old.loc.x + old.size.w;
+    let old_bottom = old.loc.y + old.size.h;
+    let new_right = new.loc.x + new.size.w;
+    let new_bottom = new.loc.y + new.size.h;
+
+    let delta_left = new.loc.x - old.loc.x;
+    let delta_top = new.loc.y - old.loc.y;
+    let delta_right = new_right - old_right;
+    let delta_bottom = new_bottom - old_bottom;
+
+    if delta_left == 0 && delta_top == 0 && delta_right == 0 && delta_bottom == 0 {
+        return;
+    }
+
+    let others: Vec<(Window, Rectangle<i32, Logical>)> = space
+        .elements()
+        .filter(|w| {
+            w.toplevel()
+                .zip(resized.toplevel())
+                .map(|(a, b)| a.wl_surface() != b.wl_surface())
+                .unwrap_or(true)
+        })
+        .filter_map(|w| space.element_geometry(w).map(|g| (w.clone(), g)))
+        .collect();
+
+    for (other, geo) in others {
+        let mut dx = 0;
+        let mut dy = 0;
+
+        let other_right = geo.loc.x + geo.size.w;
+        let other_bottom = geo.loc.y + geo.size.h;
+        let overlaps_y = geo.loc.y < old_bottom && other_bottom > old.loc.y;
+        let overlaps_x = geo.loc.x < old_right && other_right > old.loc.x;
+
+        if delta_right != 0 && overlaps_y && (geo.loc.x - old_right).abs() <= ADJACENCY_TOLERANCE {
+            dx += delta_right;
+        }
+        if delta_left != 0 && overlaps_y && (old.loc.x - other_right).abs() <= ADJACENCY_TOLERANCE {
+            dx += delta_left;
+        }
+        if delta_bottom != 0 && overlaps_x && (geo.loc.y - old_bottom).abs() <= ADJACENCY_TOLERANCE {
+            dy += delta_bottom;
+        }
+        if delta_top != 0 && overlaps_x && (old.loc.y - other_bottom).abs() <= ADJACENCY_TOLERANCE {
+            dy += delta_top;
+        }
+
+        if dx != 0 || dy != 0 {
+            let new_other_loc = Point::from((geo.loc.x + dx, geo.loc.y + dy));
+            space.map_element(other, new_other_loc, false);
         }
     }
 }
@@ -279,7 +478,15 @@ pub fn handle_commit(space: &mut Space<Window>, surface: &WlSurface) -> Option<(
     if let Some(new_y) = new_loc.y { window_loc.y = new_y; }
 
     if new_loc.x.is_some() || new_loc.y.is_some() {
-        space.map_element(window, window_loc, false);
+        space.map_element(window.clone(), window_loc, false);
+    }
+
+    // Эластичное расталкивание соседей (2.3) — только на промежуточных
+    // коммитах активного resize, не на финальном после отпускания кнопки.
+    let new_rect = Rectangle::new(window_loc, geometry.size);
+    let old_rect = ResizeSurfaceState::with(surface, |state| state.take_last_rect_for_elastic(new_rect));
+    if let Some(old_rect) = old_rect {
+        elastic_displace(space, &window, old_rect, new_rect);
     }
 
     Some(())

@@ -14,7 +14,7 @@ use crate::Dawn;
 
 pub struct PanGrab {
     pub start_data: PointerGrabStartData<Dawn>,
-    pub last_screen_pos: Point<f64, Logical>,
+    pub last_canvas_pos: Point<f64, Logical>,
 }
 
 impl PointerGrab<Dawn> for PanGrab {
@@ -25,30 +25,44 @@ impl PointerGrab<Dawn> for PanGrab {
         _focus: Option<(WlSurface, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
-        let zoom = data.viewport.zoom;
-        
-        // Позиция курсора на экране сейчас (исходя из текущей камеры)
-        let current_screen_pos = Point::<f64, Logical>::from((
-            (event.location.x - data.viewport.cam_x) * zoom,
-            (event.location.y - data.viewport.cam_y) * zoom,
+        // event.location = ptr_canvas (PointerMotion уже добавил +delta_canvas к ptr).
+        // Нам нужно: cursor_screen = const, canvas движется в направлении drag.
+        //
+        // Для canvas в направлении drag: cam -= delta_canvas
+        //   screen_window = (W - cam_new) = (W - cam + delta) → окна движутся вправо ✓
+        //
+        // Для cursor_screen = const при cam -= delta_canvas:
+        //   (ptr_new - cam_new)*zoom = (ptr_old - cam_old)*zoom
+        //   ptr_new = ptr_old + (cam_new - cam_old) = ptr_old - delta_canvas
+        //   Но PointerMotion уже поставил ptr_new = ptr_old + delta_canvas
+        //   → нужна коррекция ptr -= 2*delta_canvas
+        let delta_x = event.location.x - self.last_canvas_pos.x;
+        let delta_y = event.location.y - self.last_canvas_pos.y;
+
+        // Холст движется в направлении drag
+        data.viewport.cam_x -= delta_x;
+        data.viewport.cam_y -= delta_y;
+
+        // Курсор фиксирован на экране (чистая коррекция: -2 * canvas_delta)
+        data.pointer_location.x -= 2.0 * delta_x;
+        data.pointer_location.y -= 2.0 * delta_y;
+
+        data.apply_camera();
+        data.request_redraw();
+
+        // last_canvas_pos = скорректированная позиция (ptr после коррекции)
+        self.last_canvas_pos = Point::from((
+            data.pointer_location.x,
+            data.pointer_location.y,
         ));
 
-        // На сколько пикселей сдвинулась мышь по коврику
-        let delta_screen = current_screen_pos - self.last_screen_pos;
-
-        // Двигаем камеру в обратную сторону (панорамирование)
-        // CameraDelta = -DeltaScreen / Zoom
-        data.viewport.cam_x -= delta_screen.x / zoom;
-        data.viewport.cam_y -= delta_screen.y / zoom;
-        
-        data.apply_camera();
-
-        // Обновляем экранный якорь
-        self.last_screen_pos = current_screen_pos;
-
-        // Посылаем "пустое" движение, чтобы Smithay обновил внутреннее состояние, 
-        // но не передаем его окнам (focus=None)
-        handle.motion(data, None, event);
+        // Синхронизируем smithay со скорректированной позицией
+        let corrected = MotionEvent {
+            location: data.pointer_location,
+            serial: event.serial,
+            time: event.time,
+        };
+        handle.motion(data, None, &corrected);
     }
 
     fn button(
