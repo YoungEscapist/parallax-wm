@@ -34,7 +34,7 @@ pub fn toplevel_app_id(surface: &ToplevelSurface) -> Option<String> {
 }
 
 pub fn window_app_id(window: &Window) -> Option<String> {
-    window.toplevel().and_then(toplevel_app_id)
+    crate::xwin::app_id(window)
 }
 
 /// Сохраняет app_id + позицию (float_position, глобальные canvas-координаты)

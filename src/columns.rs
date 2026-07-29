@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use smithay::{
     desktop::Window,
-    utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
+    utils::{Logical, Point, Rectangle},
 };
 
 use crate::anim::CameraAnim;
@@ -24,37 +24,60 @@ use crate::state::Dawn;
 use crate::tiling::{GAP_INNER, GAP_OUTER, Layout};
 
 fn same_window(a: &Window, b: &Window) -> bool {
-    a.toplevel().zip(b.toplevel())
-        .map(|(x, y)| x.wl_surface() == y.wl_surface())
-        .unwrap_or(false)
+    a == b
 }
 
-/// Пресеты ширины колонки (доля ширины экрана), циклятся по Super+R.
+/// Зазор между колонками и вокруг них. У niri это `layout { gaps }`, по
+/// умолчанию 16 — совпадает с dawn'овским GAP_INNER, так что берём его.
+pub const COL_GAP: f64 = GAP_INNER as f64;
+
+/// Ширина колонки — ровно модель niri: либо доля рабочей области, либо
+/// фиксированное число пикселей (после ручного ресайза).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColumnWidth {
-    Third,
-    Half,
-    TwoThirds,
-    Full,
+    Proportion(f64),
+    Fixed(f64),
 }
 
+/// Пресеты ширины (niri: `preset-column-widths`, по умолчанию ⅓, ½, ⅔).
+pub const PRESET_WIDTHS: [f64; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
+/// Пресеты высоты окна в колонке (niri: `preset-window-heights`).
+pub const PRESET_HEIGHTS: [f64; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
+
 impl ColumnWidth {
-    pub fn factor(self) -> f64 {
+    /// Пиксели по формуле niri (`resolve_column_width`): доля берётся от
+    /// рабочей ширины БЕЗ одного зазора, и ещё один зазор вычитается — так
+    /// колонка на всю ширину (доля 1.0) оставляет поля слева и справа, а две
+    /// половинки ровно делят экран вместе с зазором между ними.
+    pub fn resolve(self, working_w: f64) -> f64 {
         match self {
-            ColumnWidth::Third => 1.0 / 3.0,
-            ColumnWidth::Half => 0.5,
-            ColumnWidth::TwoThirds => 2.0 / 3.0,
-            ColumnWidth::Full => 1.0,
+            ColumnWidth::Proportion(p) => ((working_w - COL_GAP) * p - COL_GAP).max(50.0),
+            ColumnWidth::Fixed(px) => px.clamp(50.0, working_w.max(50.0)),
         }
     }
-    pub fn next(self) -> Self {
+
+    /// Текущая доля (для ±% и для перехода Fixed → Proportion).
+    pub fn proportion(self, working_w: f64) -> f64 {
         match self {
-            ColumnWidth::Third => ColumnWidth::Half,
-            ColumnWidth::Half => ColumnWidth::TwoThirds,
-            ColumnWidth::TwoThirds => ColumnWidth::Full,
-            ColumnWidth::Full => ColumnWidth::Third,
+            ColumnWidth::Proportion(p) => p,
+            ColumnWidth::Fixed(px) => {
+                let full = working_w - COL_GAP;
+                if full <= 0.0 { 1.0 } else { (px + COL_GAP) / full }
+            }
         }
     }
+}
+
+/// Как вести вид относительно активной колонки (niri: `center-focused-column`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum CenterFocusedColumn {
+    /// Подтягивать вид минимально — только чтобы колонка попала в кадр.
+    #[default]
+    Never,
+    /// Всегда ставить активную колонку по центру.
+    Always,
+    /// Центрировать, только если переход не влезает в экран целиком.
+    OnOverflow,
 }
 
 /// Одна колонка: вертикальная стопка окон + активная строка + ширина +
@@ -63,18 +86,88 @@ pub struct Column {
     pub windows: Vec<Window>,
     pub active_row: usize,
     pub width: ColumnWidth,
+    /// Номер пресета, если ширина сейчас ровно на нём. None — ширина задана
+    /// вручную (drag/±%), и следующий Super+R начнёт цикл с начала: так же
+    /// ведёт себя `switch-preset-column-width` в niri.
+    pub preset_idx: Option<usize>,
     /// Переопределение ширины, установленное через Super+RMB drag
     /// (непрерывное значение, сбрасывается при columns_cycle_width).
     pub drag_width: Option<f64>,
+    /// Вкладочный показ (niri: `toggle-column-tabbed-display`): вместо стопки
+    /// видно только активное окно во всю высоту колонки, слева — полоска
+    /// вкладок. Остальные окна колонки снимаются со space, то есть не
+    /// рисуются, не получают frame callback и не ловят клики — как в niri.
+    pub tabbed: bool,
+    /// Веса высот строк (параллельно `windows`), niri-стиль: высота строки
+    /// пропорциональна весу. Пусто/неверная длина → равные высоты (self-heal
+    /// в row_fraction/apply_columns_layout). Меняется вертикальным Super+RMB drag.
+    pub row_weights: Vec<f64>,
 }
 
 impl Column {
     fn single(w: Window) -> Self {
-        Self { windows: vec![w], active_row: 0, width: ColumnWidth::Half, drag_width: None }
+        Self {
+            windows: vec![w],
+            active_row: 0,
+            // niri: `default-column-width` = ½ экрана.
+            width: ColumnWidth::Proportion(0.5),
+            preset_idx: Some(1),
+            drag_width: None,
+            tabbed: false,
+            row_weights: Vec::new(),
+        }
+    }
+
+    /// Ширина колонки в пикселях (без зазора).
+    fn width_px(&self, working_w: f64) -> f64 {
+        match self.drag_width {
+            Some(f) => ColumnWidth::Proportion(f).resolve(working_w),
+            None => self.width.resolve(working_w),
+        }
     }
     fn clamp_row(&mut self) {
         if self.active_row >= self.windows.len() {
             self.active_row = self.windows.len().saturating_sub(1);
+        }
+    }
+
+    /// Доля высоты (0..1) строки `row`. Если веса не заданы/рассинхронены —
+    /// равные доли (1/n).
+    pub fn row_fraction(&self, row: usize) -> f64 {
+        let n = self.windows.len();
+        if n == 0 || row >= n {
+            return 0.0;
+        }
+        if self.row_weights.len() != n {
+            return 1.0 / n as f64;
+        }
+        let s: f64 = self.row_weights.iter().sum();
+        if s <= 0.0 { 1.0 / n as f64 } else { self.row_weights[row] / s }
+    }
+
+    /// Задаёт строке `row` долю высоты `f`, остальные строки масштабируются,
+    /// чтобы заполнить `1-f`, сохраняя свои пропорции. Для колонок из 1 окна —
+    /// no-op (окно и так на всю высоту).
+    pub fn set_row_fraction(&mut self, row: usize, f: f64) {
+        let n = self.windows.len();
+        if n <= 1 || row >= n {
+            return;
+        }
+        if self.row_weights.len() != n {
+            self.row_weights = vec![1.0 / n as f64; n];
+        }
+        let f = f.clamp(0.1, 0.9);
+        let others: f64 = (0..n).filter(|&i| i != row).map(|i| self.row_weights[i]).sum();
+        if others <= 0.0 {
+            let rest = (1.0 - f) / (n - 1) as f64;
+            for i in 0..n {
+                self.row_weights[i] = if i == row { f } else { rest };
+            }
+        } else {
+            let scale = (1.0 - f) / others;
+            for i in 0..n {
+                self.row_weights[i] = if i == row { f } else { self.row_weights[i] * scale };
+            }
         }
     }
 }
@@ -83,6 +176,8 @@ impl Column {
 pub struct ColumnLayout {
     pub columns: Vec<Column>,
     pub active: usize,
+    /// Поведение вида при смене активной колонки (niri: center-focused-column).
+    pub center_focused: CenterFocusedColumn,
 }
 
 impl ColumnLayout {
@@ -143,31 +238,59 @@ impl Dawn {
         }
 
         let avail_h = (geo.size.h - GAP_OUTER * 2).max(1);
+        let working_w = geo.size.w as f64;
+        // Этаж текущего стола в вертикальной ленте: вся раскладка ниже
+        // считается от него, а не от нуля холста.
+        let floor_y = self.columns_cur_y().round() as i32;
 
         // Собираем план, чтобы не держать &self.columns во время resize_window (&mut self).
         let mut plan: Vec<(Window, Rectangle<i32, Logical>)> = Vec::new();
-        let mut x = 0i32;
+        // Первая колонка стоит на COL_GAP от начала полосы — в niri это поле
+        // даёт view_offset, но dawn возит камеру по холсту, поэтому проще
+        // заложить его прямо в координаты.
+        let mut x = COL_GAP as i32;
         for col in &self.columns.columns {
-            // drag_width переопределяет пресет, если установлен через Super+RMB.
-            let factor = col.drag_width.unwrap_or_else(|| col.width.factor());
-            let col_full_w = (factor * geo.size.w as f64).round() as i32;
-            let win_w = (col_full_w - GAP_INNER).max(1);
-            let n = col.windows.len().max(1) as i32;
-            let cell_h = avail_h / n;
+            let win_w = col.width_px(working_w).round().max(1.0) as i32;
+            let col_full_w = win_w + COL_GAP as i32;
+            let n = col.windows.len();
+            // Высоты по весам строк (niri-стиль); при рассинхроне — равные.
+            let weights: Vec<f64> = if col.row_weights.len() == n && n > 0 {
+                col.row_weights.clone()
+            } else {
+                vec![1.0; n.max(1)]
+            };
+            let wsum: f64 = weights.iter().sum::<f64>().max(1e-6);
+            // Вкладочная колонка: каждое окно — во всю высоту, видно только
+            // активное (остальные снимаются со space, см.
+            // columns_apply_tabbed_visibility). Размер задаём всем, чтобы при
+            // переключении вкладки окно уже было нужного размера.
+            if col.tabbed {
+                let rect = Rectangle::new(
+                    (x, floor_y + GAP_OUTER).into(),
+                    (win_w, avail_h).into(),
+                );
+                for w in &col.windows {
+                    plan.push((w.clone(), rect));
+                }
+                x += col_full_w;
+                continue;
+            }
+            let mut acc_top = floor_y + GAP_OUTER;
             for (ri, w) in col.windows.iter().enumerate() {
-                let top = GAP_OUTER + ri as i32 * cell_h;
-                // Последнее окно дотягивается до низа (компенсируем остаток от деления).
-                let bottom = if ri as i32 == n - 1 {
-                    GAP_OUTER + avail_h
+                let top = acc_top;
+                // Последнее окно дотягивается до низа (компенсируем остаток округления).
+                let bottom = if ri + 1 == n {
+                    floor_y + GAP_OUTER + avail_h
                 } else {
-                    top + cell_h
+                    top + (avail_h as f64 * weights[ri] / wsum).round() as i32
                 };
+                acc_top = bottom;
                 let ry = top + GAP_INNER / 2;
                 let rh = (bottom - GAP_INNER / 2 - ry).max(1);
-                let rect = Rectangle::new(
-                    (x + GAP_INNER / 2, ry).into(),
-                    (win_w, rh).into(),
-                );
+                // x — левый край окна: зазор между колонками уже заложен в
+                // col_full_w, так что половинку GAP_INNER здесь прибавлять не
+                // нужно (иначе колонки разъезжались бы с расчётом прокрутки).
+                let rect = Rectangle::new((x, ry).into(), (win_w, rh).into());
                 plan.push((w.clone(), rect));
             }
             x += col_full_w;
@@ -176,6 +299,476 @@ impl Dawn {
         for (w, rect) in plan {
             self.resize_window(&w, rect);
         }
+        self.columns_apply_tabbed_visibility();
+    }
+
+    /// Во вкладочных колонках на экране остаётся только активное окно.
+    ///
+    /// Скрываем снятием со `space` — тогда окно не рисуется, не получает frame
+    /// callback (клиент перестаёт тратить кадры) и не ловит клики. Обратное
+    /// отображение делает эта же функция: она идемпотентна и зовётся из
+    /// apply_columns_layout, то есть после каждого arrange и каждой смены тега.
+    fn columns_apply_tabbed_visibility(&mut self) {
+        // Собираем заранее: ниже нужен &mut self.space.
+        let mut hide: Vec<Window> = Vec::new();
+        let mut show: Vec<(Window, Point<i32, Logical>)> = Vec::new();
+        for col in &self.columns.columns {
+            for (ri, w) in col.windows.iter().enumerate() {
+                let visible = !col.tabbed || ri == col.active_row;
+                if visible {
+                    if self.space.element_location(w).is_none() {
+                        let pos = self.tagged_windows.iter()
+                            .find(|tw| &tw.window == w)
+                            .map(|tw| tw.position)
+                            .unwrap_or_default();
+                        show.push((w.clone(), pos));
+                    }
+                } else if self.space.element_location(w).is_some() {
+                    hide.push(w.clone());
+                }
+            }
+        }
+        if hide.is_empty() && show.is_empty() {
+            return;
+        }
+        for w in hide {
+            self.space.unmap_elem(&w);
+        }
+        for (w, pos) in show {
+            self.space.map_element(w, pos, false);
+        }
+        // Показ/скрытие меняет весь набор окон в кадре — иначе на экране
+        // остаётся «тень» скрытой вкладки в закэшированном DRM-плане.
+        self.request_plane_reset();
+    }
+
+    // ── Раскладка колонок у КАЖДОГО стола своя ───────────────────────────────
+    //
+    // `Dawn::columns` — это полоса ТЕКУЩЕГО стола; полосы остальных лежат в
+    // `columns_by_tag`. В niri каждый воркспейс держит свои колонки, и уход на
+    // соседний с возвратом ничего не меняет. Раньше структура была одна на весь
+    // композитор: при возврате reconcile разбивал окна заново по одной колонке,
+    // теряя стопки, ширины и вкладки.
+
+    /// Плавающие окна в ленте держатся ЭКРАНА, а не холста.
+    ///
+    /// В niri floating-слой лежит поверх полосы и не уезжает вместе с
+    /// колонками: прокрутил ленту — плавающее окно осталось на своём месте
+    /// экрана. В dawn же всё живёт в canvas-координатах, поэтому при движении
+    /// камеры плавающие окна текущего стола сдвигаются на ту же дельту.
+    ///
+    /// Зовётся из apply_camera и работает только в Columns — в остальных
+    /// раскладках плавающее окно, наоборот, ОБЯЗАНО стоять на холсте (там
+    /// камера и есть способ до него доехать).
+    pub fn columns_pin_floating(&mut self) {
+        if self.tile_config.layout != Layout::Columns {
+            // Запоминаем текущую камеру, чтобы при возврате в Columns не
+            // «догонять» накопленную за это время разницу одним рывком.
+            self.columns_float_cam = (self.viewport.cam_x, self.viewport.cam_y);
+            return;
+        }
+        let dx = self.viewport.cam_x - self.columns_float_cam.0;
+        // По Y плавающие окна НЕ таскаем: вертикаль в ленте — это переход
+        // между этажами-столами, а плавающее окно принадлежит своему столу и
+        // обязано остаться на нём. Держим экрана только по горизонтали, вдоль
+        // прокрутки колонок.
+        let dy: f64 = 0.0;
+        self.columns_float_cam = (self.viewport.cam_x, self.viewport.cam_y);
+        if dx.abs() < 0.01 {
+            return;
+        }
+        let current = self.viewport.current_tags();
+        let moves: Vec<(Window, Point<i32, Logical>)> = self.tagged_windows.iter()
+            .filter(|tw| tw.floating && tw.tags & current != 0)
+            .filter_map(|tw| {
+                let loc = self.space.element_location(&tw.window)?;
+                Some((
+                    tw.window.clone(),
+                    Point::from((
+                        loc.x + dx.round() as i32,
+                        loc.y + dy.round() as i32,
+                    )),
+                ))
+            })
+            .collect();
+        for (w, loc) in moves {
+            self.space.map_element(w.clone(), loc, false);
+            if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| tw.window == w) {
+                tw.position = loc;
+                tw.float_position = loc;
+            }
+        }
+    }
+    // ── Вертикальная лента столов ────────────────────────────────────────────
+    //
+    // Столы в niri — не подменяемые «страницы», а этажи ОДНОЙ вертикальной
+    // ленты: стол N живёт на холсте со сдвигом N × высота экрана, а переход
+    // между столами это движение камеры по Y. Поэтому окна всех ленточных
+    // столов остаются на space (см. refresh_tags) и полосы соседей
+    // действительно существуют: до них можно доехать и видно, как они уезжают.
+
+    /// Номер стола в ленте (0-based) по маске тега.
+    pub fn columns_ws_index(tag: u32) -> i32 {
+        tag.trailing_zeros() as i32
+    }
+
+    /// Сдвиг этажа стола по Y на холсте.
+    pub fn columns_ws_y(&self, tag: u32) -> f64 {
+        let h = self.primary_output_geo().map(|g| g.size.h as f64).unwrap_or(1080.0);
+        Self::columns_ws_index(tag) as f64 * h
+    }
+
+    /// Y текущего стола — база для горизонтальной прокрутки.
+    pub fn columns_cur_y(&self) -> f64 {
+        self.columns_ws_y(self.viewport.current_tags())
+    }
+
+    /// Ленточный ли стол (его раскладка — Columns). Текущий считаем по живому
+    /// layout, остальные — по запомненному в tag_layouts.
+    pub fn columns_is_strip_tag(&self, tag: u32) -> bool {
+        if tag == self.viewport.current_tags() {
+            self.tile_config.layout == Layout::Columns
+        } else {
+            *self.tag_layouts.get(&tag).unwrap_or(&Layout::Tile) == Layout::Columns
+        }
+    }
+
+    /// Перелёт камеры на этаж стола `tag`. Горизонталь берём у уже поставленной
+    /// прокрутки к активной колонке, иначе перелёт затёр бы её.
+    pub fn columns_fly_to_workspace(&mut self, tag: u32) {
+        if self.tile_config.layout != Layout::Columns {
+            return;
+        }
+        self.columns_ws_slide = 0;
+        let y = self.columns_ws_y(tag);
+        let target_x = match &self.camera_anim {
+            Some(a) => a.to.x,
+            None => self.viewport.cam_x,
+        };
+        let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
+        let to = Point::from((target_x, y));
+        if (to.x - from.x).abs() > 0.5 || (to.y - from.y).abs() > 0.5 {
+            self.camera_anim = Some(CameraAnim::new(from, to, Duration::from_millis(220)));
+        } else {
+            self.viewport.cam_y = y;
+            self.apply_camera();
+        }
+        self.request_redraw();
+    }
+
+    /// Убрать текущую полосу на полку тега `tag`.
+    pub fn columns_save_for(&mut self, tag: u32) {
+        let layout = std::mem::take(&mut self.columns);
+        if layout.columns.is_empty() {
+            self.columns_by_tag.remove(&tag);
+        } else {
+            self.columns_by_tag.insert(tag, layout);
+        }
+    }
+
+    /// Достать полосу тега `tag` как текущую. Настройка вида
+    /// (center-focused-column) общая на композитор, поэтому переносится.
+    pub fn columns_load_for(&mut self, tag: u32) {
+        let center = self.columns.center_focused;
+        let mut layout = self.columns_by_tag.remove(&tag).unwrap_or_default();
+        layout.center_focused = center;
+        self.columns = layout;
+    }
+
+    /// Перенести полосу с тега `from` на тег `to` (при схлопывании ленты).
+    fn columns_rekey(&mut self, from: u32, to: u32) {
+        if from == to {
+            return;
+        }
+        if let Some(l) = self.columns_by_tag.remove(&from) {
+            self.columns_by_tag.insert(to, l);
+        }
+    }
+
+    /// niri: `switch-focus-between-floating-and-tiling` — перекинуть фокус
+    /// между плавающим слоем и полосой колонок. Плавающие окна в Columns уже
+    /// живут поверх полосы (columns_reconcile их не берёт), не хватало только
+    /// способа попасть в них с клавиатуры и вернуться обратно.
+    pub fn columns_focus_other_layer(&mut self) {
+        if self.tile_config.layout != Layout::Columns {
+            return;
+        }
+        let current = self.viewport.current_tags();
+        let focused_floating = self.focused_surface()
+            .and_then(|s| self.tagged_windows.iter().find(|tw| crate::xwin::is_surface(&tw.window, &s)))
+            .map(|tw| tw.floating)
+            .unwrap_or(false);
+
+        if focused_floating {
+            // Обратно в полосу — на активную колонку.
+            self.columns_reconcile();
+            if let Some(w) = self.columns_active_window() {
+                self.columns_give_focus(&w);
+                self.columns_scroll_to_active();
+                self.request_redraw();
+            }
+            return;
+        }
+
+        // В плавающий слой: берём верхнее плавающее окно этого стола.
+        let target = self.tagged_windows.iter()
+            .filter(|tw| tw.floating && tw.tags & current != 0)
+            .map(|tw| tw.window.clone())
+            .next_back();
+        if let Some(w) = target {
+            self.columns_give_focus(&w);
+            self.request_redraw();
+        } else {
+            tracing::debug!("dawn/columns: плавающих окон на этом столе нет");
+        }
+    }
+
+    /// Куда встанет окно, если бросить его сейчас: номер колонки, перед которой
+    /// оно вставится, и «в стопку ли» (бросили на середину существующей
+    /// колонки). Это модель niri: между колонками — новая колонка, поверх
+    /// колонки — в её стопку.
+    pub fn columns_insert_target(&self, pos_x: f64) -> (usize, bool) {
+        let working_w = self.primary_output_geo().map(|g| g.size.w as f64).unwrap_or(1920.0);
+        for i in 0..self.columns.columns.len() {
+            let x = self.columns_column_x(i, working_w);
+            let w = self.columns.columns[i].width_px(working_w);
+            if pos_x < x - COL_GAP / 2.0 {
+                return (i, false);
+            }
+            if pos_x < x + w {
+                // Внутри колонки: треть слева/справа — вставка рядом, середина —
+                // в стопку.
+                let rel = (pos_x - x) / w.max(1.0);
+                if rel < 0.25 {
+                    return (i, false);
+                } else if rel > 0.75 {
+                    return (i + 1, false);
+                }
+                return (i, true);
+            }
+        }
+        (self.columns.columns.len(), false)
+    }
+
+    /// Прямоугольник подсказки вставки (canvas-координаты) для текущей позиции
+    /// курсора — рисуется в udev.rs, пока тащат окно.
+    pub fn columns_insert_hint_rect(&self, pos_x: f64) -> Option<Rectangle<i32, Logical>> {
+        let geo = self.primary_output_geo()?;
+        let working_w = geo.size.w as f64;
+        let avail_h = (geo.size.h - GAP_OUTER * 2).max(1);
+        let (idx, into_stack) = self.columns_insert_target(pos_x);
+        if into_stack {
+            let col = self.columns.columns.get(idx)?;
+            let x = self.columns_column_x(idx, working_w);
+            let w = col.width_px(working_w);
+            // Подсказка «в стопку» — нижняя половина колонки.
+            let h = avail_h / 2;
+            Some(Rectangle::new(
+                (x.round() as i32, GAP_OUTER + avail_h - h).into(),
+                (w.round() as i32, h).into(),
+            ))
+        } else {
+            // Новая колонка: узкая полоса в шов между колонками.
+            let x = self.columns_column_x(idx, working_w);
+            let w = (COL_GAP as i32).max(6);
+            Some(Rectangle::new(
+                ((x - COL_GAP) as i32, GAP_OUTER).into(),
+                (w, avail_h).into(),
+            ))
+        }
+    }
+
+    /// Бросили окно в полосу: вставить его туда, куда показывала подсказка.
+    pub fn columns_drop_window(&mut self, window: &Window, pos_x: f64) {
+        if self.tile_config.layout != Layout::Columns {
+            return;
+        }
+        let (idx, into_stack) = self.columns_insert_target(pos_x);
+        // Убираем окно с прежнего места в полосе (если оно там было).
+        for col in &mut self.columns.columns {
+            col.windows.retain(|w| w != window);
+            col.row_weights.clear();
+            col.clamp_row();
+        }
+        self.columns.columns.retain(|c| !c.windows.is_empty());
+        let idx = idx.min(self.columns.columns.len());
+        if into_stack && idx < self.columns.columns.len() {
+            let col = &mut self.columns.columns[idx];
+            col.windows.push(window.clone());
+            col.active_row = col.windows.len() - 1;
+        } else {
+            self.columns.columns.insert(idx, Column::single(window.clone()));
+        }
+        self.columns.active = idx.min(self.columns.columns.len().saturating_sub(1));
+        // Окно вернулось в полосу — оно больше не плавающее.
+        if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| &tw.window == window) {
+            tw.floating = false;
+        }
+        self.arrange();
+        self.columns_give_focus(&window.clone());
+        self.columns_scroll_to_active();
+        self.request_redraw();
+    }
+
+    /// Схлопнуть дыры в ленте столов — niri-модель динамических воркспейсов:
+    /// пустой стол в СЕРЕДИНЕ не живёт, лента всегда плотная, а пустой ровно
+    /// один и всегда последний.
+    ///
+    /// В dawn стол — это бит тега, поэтому «схлопнуть» значит перенумеровать
+    /// теги окон так, чтобы занятыми оказались 1..k без пропусков. Текущий
+    /// просматриваемый стол едет вместе со своим содержимым.
+    ///
+    /// Работает ТОЛЬКО в Columns: в Tile/Float/Monocle теги — это девять
+    /// независимых полок, где пустая середина нормальна, и трогать их нельзя.
+    pub fn columns_compact_workspaces(&mut self) {
+        if self.tile_config.layout != Layout::Columns {
+            return;
+        }
+        // Занятые теги по порядку.
+        let mut occupied: Vec<u32> = Vec::new();
+        for tw in &self.tagged_windows {
+            if tw.tags != 0 && !occupied.contains(&tw.tags) {
+                occupied.push(tw.tags);
+            }
+        }
+        occupied.sort_unstable();
+        if occupied.is_empty() {
+            return;
+        }
+        // Куда переезжает каждый занятый тег: первый → 1, второй → 2, ...
+        let mut moved = false;
+        let mut remap: Vec<(u32, u32)> = Vec::new();
+        for (i, &old) in occupied.iter().enumerate() {
+            let new = 1u32 << i;
+            if new != old {
+                moved = true;
+            }
+            remap.push((old, new));
+        }
+        if !moved {
+            return;
+        }
+        let cur = self.viewport.current_tags();
+        for tw in &mut self.tagged_windows {
+            if let Some(&(_, new)) = remap.iter().find(|(old, _)| *old == tw.tags) {
+                tw.tags = new;
+            }
+        }
+        // Текущий стол мог переехать — следуем за ним; если он опустел и
+        // исчез, встаём на первый.
+        let new_cur = remap.iter().find(|(old, _)| *old == cur).map(|&(_, n)| n)
+            .unwrap_or(1);
+        // Полки с полосами колонок переезжают вместе с тегами, иначе стол
+        // приехал бы на чужую раскладку. Порядок важен: переносим от начала,
+        // а номера только УМЕНЬШАЮТСЯ (лента схлопывается влево), так что
+        // затирания не будет.
+        for &(old, new) in &remap {
+            self.columns_rekey(old, new);
+        }
+        self.viewport.tagset[self.viewport.seltags] = new_cur;
+        self.refresh_tags();
+        tracing::info!("dawn/columns: лента столов схлопнута, занято {}", occupied.len());
+    }
+
+    // ── Жесты тачпада (niri: view scroll / workspace switch) ─────────────────
+
+    /// Свайп по горизонтали: вид едет за пальцами непрерывно, без анимации —
+    /// колонка «под пальцем» ощущается физически. Прилипание к ближайшей
+    /// колонке делает columns_swipe_end на отпускании.
+    pub fn columns_swipe_scroll(&mut self, dx: f64) {
+        /// Ускорение жеста: за один и тот же ход пальцами вид должен проезжать
+        /// заметно больше, чем прошли пальцы — как в niri.
+        const SWIPE_GAIN: f64 = 1.6;
+        self.camera_anim = None;
+        self.viewport.cam_x -= dx * SWIPE_GAIN;
+        // Влево дальше начала полосы не уезжаем.
+        if self.viewport.cam_x < 0.0 {
+            self.viewport.cam_x = 0.0;
+        }
+        self.viewport.cam_y = self.columns_cur_y();
+        self.apply_camera();
+    }
+
+    /// Свайп по вертикали копит ход и на пороге переключает стол — niri так же
+    /// листает воркспейсы вертикально.
+    pub fn columns_swipe_workspace(&mut self, dy: f64) {
+        /// Сколько пикселей хода нужно на один стол.
+        const WS_THRESHOLD: f64 = 120.0;
+        self.columns_swipe_dy += dy;
+        while self.columns_swipe_dy.abs() >= WS_THRESHOLD {
+            let dir = if self.columns_swipe_dy > 0.0 { 1 } else { -1 };
+            self.columns_swipe_dy -= WS_THRESHOLD * dir as f64;
+            self.workspace_step(dir);
+        }
+    }
+
+    /// Отпустили пальцы: прилипаем к ближайшей колонке и делаем её активной —
+    /// в niri вид всегда стоит на колонке, а не между ними.
+    pub fn columns_swipe_end(&mut self) {
+        self.columns_swipe_dy = 0.0;
+        let geo = match self.primary_output_geo() { Some(g) => g, None => return };
+        if self.columns.columns.is_empty() {
+            return;
+        }
+        let working_w = geo.size.w as f64;
+        let view_x = self.viewport.cam_x;
+        // Ближайшая по левому краю к текущему положению вида.
+        let mut best = 0usize;
+        let mut best_d = f64::MAX;
+        for i in 0..self.columns.columns.len() {
+            let d = (self.columns_column_x(i, working_w) - COL_GAP - view_x).abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        self.columns.active = best;
+        if let Some(w) = self.columns_active_window() {
+            self.columns_give_focus(&w);
+        }
+        self.columns_scroll_to_active();
+    }
+
+    /// niri: `toggle-column-tabbed-display` — переключить показ активной
+    /// колонки между стопкой и вкладками.
+    pub fn columns_toggle_tabbed(&mut self) {
+        self.columns_set_active_to_focus();
+        let a = self.columns.active;
+        let Some(col) = self.columns.columns.get_mut(a) else { return };
+        col.tabbed = !col.tabbed;
+        let tabbed = col.tabbed;
+        self.arrange();
+        if let Some(w) = self.columns_active_window() {
+            self.columns_give_focus(&w);
+        }
+        self.request_redraw();
+        tracing::info!("dawn/columns: колонка {} → {}", a, if tabbed { "вкладки" } else { "стопка" });
+    }
+
+    /// Геометрия полоски вкладок для колонки: (x, y, ширина, высота одной
+    /// вкладки, сколько их, активная). Считается в canvas-координатах, рисуется
+    /// в udev.rs. None — колонка не вкладочная или окон меньше двух.
+    pub fn columns_tab_strip(&self, ci: usize) -> Option<(i32, i32, i32, i32, usize, usize)> {
+        let col = self.columns.columns.get(ci)?;
+        if !col.tabbed || col.windows.len() < 2 {
+            return None;
+        }
+        let geo = self.primary_output_geo()?;
+        let working_w = geo.size.w as f64;
+        let x = self.columns_column_x(ci, working_w);
+        let avail_h = (geo.size.h - GAP_OUTER * 2).max(1);
+        // Полоска живёт в зазоре слева от колонки, как в niri.
+        let strip_w = (COL_GAP as i32 / 2).max(3);
+        let n = col.windows.len();
+        let tab_h = (avail_h / n as i32).max(4);
+        Some((
+            x.round() as i32 - strip_w - 2,
+            GAP_OUTER,
+            strip_w,
+            tab_h,
+            n,
+            col.active_row,
+        ))
     }
 
     fn columns_active_window(&self) -> Option<Window> {
@@ -186,37 +779,20 @@ impl Dawn {
     /// Отдаёт клавиатурный фокус окну и поднимает его (общий хелпер операций
     /// над колонками — повторяет логику tiling.rs::focus_stack).
     fn columns_give_focus(&mut self, window: &Window) {
-        let serial = SERIAL_COUNTER.next_serial();
-        self.space.raise_element(window, true);
-        window.set_activated(true);
-        for w in self.space.elements() {
-            let other = w.toplevel().zip(window.toplevel())
-                .map(|(a, b)| a.wl_surface() != b.wl_surface())
-                .unwrap_or(true);
-            if other {
-                w.set_activated(false);
-                if let Some(t) = w.toplevel() { t.send_pending_configure(); }
-            }
-        }
-        if let Some(t) = window.toplevel() {
-            if let Some(kb) = self.seat.get_keyboard() {
-                kb.set_focus(self, Some(t.wl_surface().clone()), serial);
-            }
-            t.send_pending_configure();
-        }
+        crate::xwin::focus(self, &window.clone());
     }
 
     /// Синхронизирует активную колонку/строку с текущим клавиатурным фокусом
     /// (например после Super+N или sloppy-focus мышью).
     pub fn columns_set_active_to_focus(&mut self) {
         self.columns_reconcile();
-        let focused = match self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
+        let focused = match self.focused_surface() {
             Some(f) => f,
             None => return,
         };
         for (ci, col) in self.columns.columns.iter().enumerate() {
             if let Some(ri) = col.windows.iter().position(|w| {
-                w.toplevel().map(|t| t.wl_surface() == &focused).unwrap_or(false)
+                crate::xwin::is_surface(w, &focused)
             }) {
                 self.columns.active = ci;
                 self.columns.columns[ci].active_row = ri;
@@ -225,10 +801,65 @@ impl Dawn {
         }
     }
 
-    /// Плавно подтягивает камеру так, чтобы активная колонка попала в кадр
-    /// (без центрирования; если колонка шире экрана — выравнивает по левому
-    /// краю). Колонки живут при zoom=1, cam_y=0.
-    pub fn columns_scroll_to_active(&mut self) {
+    /// Левый край колонки `idx` на бесконечной полосе (niri: `column_x`).
+    /// Сумма ширин предыдущих колонок с зазорами; начало полосы смещено на
+    /// COL_GAP, как и в apply_columns_layout.
+    fn columns_column_x(&self, idx: usize, working_w: f64) -> f64 {
+        let mut x = COL_GAP;
+        for col in self.columns.columns.iter().take(idx) {
+            x += col.width_px(working_w) + COL_GAP;
+        }
+        x
+    }
+
+    /// Куда вид едет СЕЙЧАС: цель анимации, если она идёт, иначе текущая
+    /// камера. Важно для серии нажатий подряд — niri считает от цели
+    /// (`target_view_pos`), иначе второе нажатие считает от полпути и вид
+    /// «не доезжает».
+    fn columns_target_view_x(&self) -> f64 {
+        match &self.camera_anim {
+            Some(a) => a.to.x,
+            None => self.viewport.cam_x,
+        }
+    }
+
+    /// Точный перенос niri::compute_new_view_offset.
+    ///
+    /// Возвращает позицию вида (левый край экрана на полосе), при которой
+    /// колонка `col_x..col_x+col_w` показана по правилам niri:
+    ///  · колонка шире экрана — прижимаем к её левому краю;
+    ///  · колонка уже целиком видна (с полем в зазор) — вид НЕ трогаем;
+    ///  · иначе выравниваем по той стороне, до которой ехать ближе.
+    fn columns_fit_view(&self, cur_x: f64, view_w: f64, col_x: f64, col_w: f64) -> f64 {
+        if view_w <= col_w {
+            return col_x;
+        }
+        let padding = ((view_w - col_w) / 2.0).clamp(0.0, COL_GAP);
+        let new_x = col_x - padding;
+        let new_right = col_x + col_w + padding;
+        if cur_x <= new_x && new_right <= cur_x + view_w {
+            return cur_x;
+        }
+        let dist_left = (cur_x - new_x).abs();
+        let dist_right = ((cur_x + view_w) - new_right).abs();
+        if dist_left <= dist_right {
+            new_x
+        } else {
+            new_right - view_w
+        }
+    }
+
+    /// Вид с активной колонкой по центру (niri: compute_new_view_offset_centered).
+    fn columns_center_view(&self, cur_x: f64, view_w: f64, col_x: f64, col_w: f64) -> f64 {
+        if view_w <= col_w {
+            return self.columns_fit_view(cur_x, view_w, col_x, col_w);
+        }
+        col_x - (view_w - col_w) / 2.0
+    }
+
+    /// Подтянуть вид к активной колонке. `prev` — колонка, С КОТОРОЙ уходим:
+    /// она нужна режиму OnOverflow, чтобы понять, влезает ли переход целиком.
+    pub fn columns_scroll_to_active_from(&mut self, prev: Option<usize>) {
         let geo = match self.primary_output_geo() {
             Some(g) => g,
             None => return,
@@ -237,25 +868,79 @@ impl Dawn {
             return;
         }
         let view_w = geo.size.w as f64;
-        let mut left = 0i32;
-        for col in self.columns.columns.iter().take(self.columns.active) {
-            left += (col.width.factor() * geo.size.w as f64).round() as i32;
-        }
-        let active_w = (self.columns.columns[self.columns.active].width.factor()
-            * geo.size.w as f64).round() as i32;
-        let left = left as f64;
-        let right = left + active_w as f64;
+        let working_w = geo.size.w as f64;
+        let idx = self.columns.active;
+        let col_x = self.columns_column_x(idx, working_w);
+        let col_w = self.columns.columns[idx].width_px(working_w);
+        let cur = self.columns_target_view_x();
 
-        let mut cam_x = self.viewport.cam_x;
-        if right > cam_x + view_w { cam_x = right - view_w; }
-        if left < cam_x { cam_x = left; }
-        if cam_x < 0.0 { cam_x = 0.0; }
+        let target = match self.columns.center_focused {
+            CenterFocusedColumn::Always => self.columns_center_view(cur, view_w, col_x, col_w),
+            CenterFocusedColumn::Never => self.columns_fit_view(cur, view_w, col_x, col_w),
+            CenterFocusedColumn::OnOverflow => {
+                // niri: источником берём соседа цели со стороны, откуда пришли,
+                // и если «источник + цель» не влезают в экран разом — центрируем.
+                let src = match prev {
+                    None => return self.columns_scroll_to_active_fit(),
+                    Some(p) if p == idx => return self.columns_scroll_to_active_fit(),
+                    Some(p) if p > idx => (idx + 1).min(self.columns.columns.len() - 1),
+                    Some(_) => idx.saturating_sub(1),
+                };
+                let src_x = self.columns_column_x(src, working_w);
+                let src_w = self.columns.columns[src].width_px(working_w);
+                let total = if src_x < col_x {
+                    col_x - src_x + col_w
+                } else {
+                    src_x - col_x + src_w
+                } + COL_GAP * 2.0;
+                if total <= view_w {
+                    self.columns_fit_view(cur, view_w, col_x, col_w)
+                } else {
+                    self.columns_center_view(cur, view_w, col_x, col_w)
+                }
+            }
+        };
 
+        self.columns_animate_view_to(target);
+    }
+
+    /// Короткая форма: подтянуть вид «как влезет», без учёта откуда пришли.
+    pub fn columns_scroll_to_active(&mut self) {
+        self.columns_scroll_to_active_from(None);
+    }
+
+    fn columns_scroll_to_active_fit(&mut self) {
+        let geo = match self.primary_output_geo() { Some(g) => g, None => return };
+        let view_w = geo.size.w as f64;
+        let idx = self.columns.active;
+        let col_x = self.columns_column_x(idx, view_w);
+        let col_w = self.columns.columns[idx].width_px(view_w);
+        let cur = self.columns_target_view_x();
+        let target = self.columns_fit_view(cur, view_w, col_x, col_w);
+        self.columns_animate_view_to(target);
+    }
+
+    fn columns_animate_view_to(&mut self, target_x: f64) {
         let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
-        let to = Point::from((cam_x, 0.0));
+        let to = Point::from((target_x, self.columns_cur_y()));
         if (to.x - from.x).abs() > 0.5 || (to.y - from.y).abs() > 0.5 {
             self.camera_anim = Some(CameraAnim::new(from, to, Duration::from_millis(220)));
         }
+    }
+
+    /// Super+C (niri: `center-column`) — поставить активную колонку по центру.
+    pub fn columns_center_active(&mut self) {
+        self.columns_set_active_to_focus();
+        let geo = match self.primary_output_geo() { Some(g) => g, None => return };
+        if self.columns.columns.is_empty() { return; }
+        let view_w = geo.size.w as f64;
+        let idx = self.columns.active;
+        let col_x = self.columns_column_x(idx, view_w);
+        let col_w = self.columns.columns[idx].width_px(view_w);
+        let cur = self.columns_target_view_x();
+        let target = self.columns_center_view(cur, view_w, col_x, col_w);
+        self.columns_animate_view_to(target);
+        self.request_redraw();
     }
 
     /// Super+←/→ (dcol), Super+↑/↓ (drow): сдвиг фокуса по колонкам/строкам.
@@ -266,6 +951,9 @@ impl Dawn {
         if self.columns.columns.is_empty() {
             return;
         }
+        // Колонка, С КОТОРОЙ уходим, нужна режиму OnOverflow (см.
+        // columns_scroll_to_active_from) — он по ней решает, влезает ли переход.
+        let prev = self.columns.active;
         if dcol != 0 {
             let n = self.columns.columns.len() as i32;
             self.columns.active = (self.columns.active as i32 + dcol).clamp(0, n - 1) as usize;
@@ -278,7 +966,7 @@ impl Dawn {
         if let Some(w) = self.columns_active_window() {
             self.columns_give_focus(&w);
         }
-        self.columns_scroll_to_active();
+        self.columns_scroll_to_active_from(Some(prev));
     }
 
     /// Super+J/K/Tab в Columns: линейный обход всех окон в порядке
@@ -300,12 +988,13 @@ impl Dawn {
             (cur + flat.len() - 1) % flat.len()
         };
         let (ci, ri) = flat[next];
+        let prev = self.columns.active;
         self.columns.active = ci;
         self.columns.columns[ci].active_row = ri;
         if let Some(w) = self.columns_active_window() {
             self.columns_give_focus(&w);
         }
-        self.columns_scroll_to_active();
+        self.columns_scroll_to_active_from(Some(prev));
     }
 
     /// Super+Ctrl+←/→: переставить активную колонку влево/вправо.
@@ -395,35 +1084,266 @@ impl Dawn {
         self.request_redraw();
     }
 
-    /// Super+R: сменить пресет ширины активной колонки.
-    /// Сбрасывает drag_width (непрерывный ресайз от Super+RMB).
+    /// Super+R (niri: `switch-preset-column-width`): следующий пресет ширины.
+    /// Если ширина была задана вручную (drag или ±%), цикл начинается заново с
+    /// первого пресета — так же ведёт себя niri.
     pub fn columns_cycle_width(&mut self) {
         self.columns_set_active_to_focus();
         if let Some(col) = self.columns.columns.get_mut(self.columns.active) {
             col.drag_width = None;
-            col.width = col.width.next();
+            let next = match col.preset_idx {
+                Some(i) => (i + 1) % PRESET_WIDTHS.len(),
+                None => 0,
+            };
+            col.preset_idx = Some(next);
+            col.width = ColumnWidth::Proportion(PRESET_WIDTHS[next]);
         }
         self.arrange();
         self.columns_scroll_to_active();
         self.request_redraw();
     }
 
-    /// Super+RMB drag (в Columns-режиме): непрерывный ресайз ширины активной
-    /// колонки. delta_px — смещение мыши по X от начала драга (может быть
-    /// отрицательным). Ширина зажимается в [15%, 100%] экрана.
-    pub fn columns_resize_active_width(&mut self, delta_px: f64) {
+    /// niri: `switch-preset-window-height` — следующий пресет высоты активного
+    /// окна внутри колонки. В колонке из одного окна смысла нет (оно и так во
+    /// всю высоту), как и в niri.
+    pub fn columns_cycle_height(&mut self) {
         self.columns_set_active_to_focus();
-        let geo = match self.primary_output_geo() {
-            Some(g) => g,
-            None => return,
+        let a = self.columns.active;
+        let Some(col) = self.columns.columns.get_mut(a) else { return };
+        if col.windows.len() <= 1 {
+            return;
+        }
+        let row = col.active_row;
+        let cur = col.row_fraction(row);
+        // Берём следующий пресет строго больше текущего, иначе первый.
+        let next = PRESET_HEIGHTS.iter().copied()
+            .find(|&p| p > cur + 0.01)
+            .unwrap_or(PRESET_HEIGHTS[0]);
+        col.set_row_fraction(row, next);
+        self.arrange();
+        self.request_redraw();
+    }
+
+    /// niri: `set-column-width "+10%"` / `"-10%"` — подвинуть ширину активной
+    /// колонки на долю экрана. Пресет при этом «слетает»: следующий Super+R
+    /// начнёт цикл сначала.
+    pub fn columns_adjust_width(&mut self, delta_percent: f64) {
+        self.columns_set_active_to_focus();
+        let geo = match self.primary_output_geo() { Some(g) => g, None => return };
+        let working_w = geo.size.w as f64;
+        let a = self.columns.active;
+        let Some(col) = self.columns.columns.get_mut(a) else { return };
+        let cur = match col.drag_width {
+            Some(f) => f,
+            None => col.width.proportion(working_w),
         };
-        if let Some(col) = self.columns.columns.get_mut(self.columns.active) {
-            let current = col.drag_width.unwrap_or_else(|| col.width.factor());
-            let delta = delta_px / geo.size.w as f64;
-            col.drag_width = Some((current + delta).clamp(0.15, 1.0));
+        let next = (cur + delta_percent / 100.0).clamp(0.05, 2.0);
+        col.drag_width = None;
+        col.preset_idx = None;
+        col.width = ColumnWidth::Proportion(next);
+        self.arrange();
+        self.columns_scroll_to_active();
+        self.request_redraw();
+    }
+
+    /// niri: `set-window-height "+10%"` — доля высоты активного окна в колонке.
+    pub fn columns_adjust_height(&mut self, delta_percent: f64) {
+        self.columns_set_active_to_focus();
+        let a = self.columns.active;
+        let Some(col) = self.columns.columns.get_mut(a) else { return };
+        if col.windows.len() <= 1 {
+            return;
+        }
+        let row = col.active_row;
+        let cur = col.row_fraction(row);
+        col.set_row_fraction(row, cur + delta_percent / 100.0);
+        self.arrange();
+        self.request_redraw();
+    }
+
+    /// niri: `reset-window-height` — вернуть окнам колонки равные высоты.
+    pub fn columns_reset_heights(&mut self) {
+        self.columns_set_active_to_focus();
+        let a = self.columns.active;
+        let Some(col) = self.columns.columns.get_mut(a) else { return };
+        col.row_weights.clear();
+        self.arrange();
+        self.request_redraw();
+    }
+
+    /// niri: `maximize-column` — колонка на всю рабочую ширину и обратно к
+    /// половине. Пресет сбрасывается, как и при ручном ресайзе.
+    pub fn columns_maximize(&mut self) {
+        self.columns_set_active_to_focus();
+        let geo = match self.primary_output_geo() { Some(g) => g, None => return };
+        let working_w = geo.size.w as f64;
+        let a = self.columns.active;
+        let Some(col) = self.columns.columns.get_mut(a) else { return };
+        let cur = col.drag_width.unwrap_or_else(|| col.width.proportion(working_w));
+        col.drag_width = None;
+        if cur >= 0.99 {
+            col.preset_idx = Some(1);
+            col.width = ColumnWidth::Proportion(PRESET_WIDTHS[1]);
+        } else {
+            col.preset_idx = None;
+            col.width = ColumnWidth::Proportion(1.0);
         }
         self.arrange();
         self.columns_scroll_to_active();
+        self.request_redraw();
+    }
+
+    /// niri: `focus-column-first` / `focus-column-last`.
+    pub fn columns_focus_edge(&mut self, last: bool) {
+        self.columns_set_active_to_focus();
+        if self.columns.columns.is_empty() {
+            return;
+        }
+        let prev = self.columns.active;
+        self.columns.active = if last { self.columns.columns.len() - 1 } else { 0 };
+        if let Some(w) = self.columns_active_window() {
+            self.columns_give_focus(&w);
+        }
+        self.columns_scroll_to_active_from(Some(prev));
+        self.request_redraw();
+    }
+
+    /// niri: `move-column-to-first` / `move-column-to-last`.
+    pub fn columns_move_to_edge(&mut self, last: bool) {
+        self.columns_set_active_to_focus();
+        let n = self.columns.columns.len();
+        if n < 2 {
+            return;
+        }
+        let a = self.columns.active;
+        let col = self.columns.columns.remove(a);
+        let target = if last { n - 1 } else { 0 };
+        self.columns.columns.insert(target, col);
+        self.columns.active = target;
+        self.arrange();
+        self.columns_scroll_to_active();
+        self.request_redraw();
+    }
+
+    /// niri: `consume-or-expel-window-left/right` — одна клавиша на оба
+    /// действия. Если окно в колонке не одно, оно ВЫТАЛКИВАЕТСЯ в соседнюю
+    /// колонку с этой стороны (создавая её при надобности); если одно — уходит
+    /// в стопку соседней колонки.
+    pub fn columns_consume_or_expel(&mut self, dir: i32) {
+        self.columns_set_active_to_focus();
+        let a = self.columns.active;
+        let n = self.columns.columns.len();
+        let Some(col) = self.columns.columns.get(a) else { return };
+        let single = col.windows.len() <= 1;
+
+        if single {
+            // Уходим целой колонкой в стопку соседа.
+            let target = if dir < 0 {
+                if a == 0 { return; }
+                a - 1
+            } else {
+                if a + 1 >= n { return; }
+                a + 1
+            };
+            let col = self.columns.columns.remove(a);
+            let target = if target > a { target - 1 } else { target };
+            let w = col.windows.into_iter().next();
+            let Some(w) = w else { return };
+            let dst = &mut self.columns.columns[target];
+            if dir < 0 {
+                dst.windows.push(w);
+                dst.active_row = dst.windows.len() - 1;
+            } else {
+                dst.windows.insert(0, w);
+                dst.active_row = 0;
+            }
+            dst.row_weights.clear();
+            self.columns.active = target;
+        } else {
+            // Выталкиваем активное окно в новую колонку с нужной стороны.
+            let width = self.columns.columns[a].width;
+            let preset = self.columns.columns[a].preset_idx;
+            let col = &mut self.columns.columns[a];
+            let row = col.active_row;
+            let w = col.windows.remove(row);
+            col.row_weights.clear();
+            col.clamp_row();
+            let mut newcol = Column::single(w);
+            newcol.width = width;
+            newcol.preset_idx = preset;
+            let at = if dir < 0 { a } else { a + 1 };
+            self.columns.columns.insert(at, newcol);
+            self.columns.active = at;
+        }
+
+        self.arrange();
+        if let Some(w) = self.columns_active_window() {
+            self.columns_give_focus(&w);
+        }
+        self.columns_scroll_to_active();
+        self.request_redraw();
+    }
+
+    /// Устанавливает активную колонку по КОНКРЕТНОМУ окну (а не по фокусу).
+    /// Нужно для Super+RMB-ресайза: граб стартует с focus:None, поэтому активной
+    /// должна стать колонка СХВАЧЕННОГО окна, а не сфокусированного.
+    pub fn columns_set_active_to_window(&mut self, window: &Window) {
+        self.columns_reconcile();
+        for (ci, col) in self.columns.columns.iter().enumerate() {
+            if let Some(ri) = col.windows.iter().position(|w| {
+                w == window
+            }) {
+                self.columns.active = ci;
+                self.columns.columns[ci].active_row = ri;
+                return;
+            }
+        }
+    }
+
+    /// Эффективная ширина (доля экрана) колонки, содержащей `window`: текущий
+    /// drag_width, иначе фактор пресета. None — окна нет в колонках. Нужна как
+    /// база для Super+RMB-ресайза (см. resize_grab.rs).
+    pub fn columns_effective_width_of_window(&mut self, window: &Window) -> Option<f64> {
+        self.columns_reconcile();
+        let working_w = self.primary_output_geo().map(|g| g.size.w as f64).unwrap_or(1920.0);
+        for col in &self.columns.columns {
+            if col.windows.iter().any(|w| {
+                w == window
+            }) {
+                return Some(col.drag_width.unwrap_or_else(|| col.width.proportion(working_w)));
+            }
+        }
+        None
+    }
+
+    /// Эффективная доля высоты (0..1) строки схваченного окна в его колонке.
+    /// None — окна нет в колонках. База для вертикального Super+RMB-ресайза.
+    pub fn columns_effective_row_fraction_of_window(&mut self, window: &Window) -> Option<f64> {
+        self.columns_reconcile();
+        for col in &self.columns.columns {
+            if let Some(ri) = col.windows.iter().position(|w| {
+                w == window
+            }) {
+                return Some(col.row_fraction(ri));
+            }
+        }
+        None
+    }
+
+    /// Super+RMB drag (в Columns-режиме): ставит АБСОЛЮТНУЮ ширину колонки
+    /// (доля экрана) и долю высоты строки схваченного окна. Активной делает эту
+    /// колонку. Раскладывает БЕЗ скролла камеры — во время ресайза камера должна
+    /// стоять, иначе вид дёргается (скролл к активной колонке был причиной
+    /// «не скроллятся нормально»).
+    pub fn columns_resize_of_window(&mut self, window: &Window, width_factor: f64, row_fraction: f64) {
+        self.columns_set_active_to_window(window);
+        let active = self.columns.active;
+        if let Some(col) = self.columns.columns.get_mut(active) {
+            col.drag_width = Some(width_factor.clamp(0.15, 1.0));
+            let row = col.active_row;
+            col.set_row_fraction(row, row_fraction);
+        }
+        self.arrange();
         self.request_redraw();
     }
 
@@ -436,7 +1356,9 @@ impl Dawn {
         }
         self.columns_set_active_to_focus();
         let idx = self.viewport.current_tags().trailing_zeros() as i32 + 1;
-        let new = (idx + dir).clamp(1, 9);
+        // Динамический диапазон: до пустого стола снизу включительно (niri —
+        // перенос вниз на пустой создаёт новый стол, список растёт).
+        let new = (idx + dir).clamp(1, self.niri_ws_count());
         if new == idx {
             return;
         }
@@ -450,17 +1372,22 @@ impl Dawn {
         }
         for w in &wins {
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                tw.window.toplevel().zip(w.toplevel())
-                    .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                    .unwrap_or(false)
+                &tw.window == w
             }) {
                 tw.tags = mask;
             }
         }
-        self.columns.columns.remove(self.columns.active);
+        // Колонка уезжает на соседний стол ЦЕЛИКОМ — со стопкой, шириной и
+        // вкладочностью. Просто отпустить окна было мало: на том столе
+        // reconcile разложил бы их по одной колонке (в niri колонка переезжает
+        // как есть).
+        let moved = self.columns.columns.remove(self.columns.active);
         if self.columns.active >= self.columns.columns.len() {
             self.columns.active = self.columns.columns.len().saturating_sub(1);
         }
+        let dst = self.columns_by_tag.entry(mask).or_default();
+        dst.columns.push(moved);
+        dst.active = dst.columns.len() - 1;
         self.refresh_tags();
         self.arrange();
         if let Some(w) = self.columns_active_window() {

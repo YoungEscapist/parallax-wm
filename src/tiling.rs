@@ -2,11 +2,10 @@ use std::time::Duration;
 
 use smithay::{
     desktop::Window,
-    reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
     utils::{Logical, Point, Rectangle, Size},
 };
 
-use crate::anim::CameraAnim;
+use crate::anim::{CameraAnim, PosAnim};
 use crate::state::Dawn;
 
 /// Псевдослучайный угол из seed (LCG)
@@ -17,7 +16,7 @@ fn lcg_f64(seed: u64) -> f64 {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Layout {
-    Tile,    // dwindle горизонтальный
+    Tile,    // dwindle как в Hyprland: BSP-дерево, см. dwindle.rs
     Float,
     Monocle,
     Columns, // niri-подобные колонки по полэкрана, скролл камерой вправо
@@ -48,7 +47,10 @@ fn inset_rect(rect: Rectangle<i32, Logical>, inset: i32) -> Rectangle<i32, Logic
 }
 
 pub struct TileConfig {
+    /// dwm-наследие: в Tile не используется (в dwindle нет мастер-области),
+    /// осталось для Monocle/Columns.
     pub nmaster:     usize,
+    /// То же: в Tile ширину задают split_ratio узлов дерева, а не общий фактор.
     pub mfact:       f32,
     pub layout:      Layout,
     pub prev_layout: Layout,
@@ -60,7 +62,10 @@ impl Default for TileConfig {
     }
 }
 
-// ── Dwindle: рекурсивный горизонтальный split ─────────────────────────────────
+// ── Dwindle-цепочка: рекурсивный split по счётчику окон ───────────────────────
+// Раскладка Layout::Tile этим БОЛЬШЕ НЕ пользуется — там настоящее BSP-дерево
+// (dwindle.rs). Осталось для обзора столов (overview.rs), где нужна разумная
+// сетка миниатюр для стола, у которого своего дерева ещё нет.
 // n=1: [  A  ]
 // n=2: [ A ][ B ]   ← горизонтальный split (лево/право)
 // n=3: [ A ][ B ]   ← B делится вертикально (верх/низ)
@@ -129,19 +134,34 @@ impl Dawn {
 
     // apply_columns_layout вынесена в columns.rs (полная niri-модель колонок).
 
-    pub fn apply_tile_layout(&mut self) {
-        let output = match self.space.outputs().next() {
-            Some(o) => o.clone(),
-            None => return,
-        };
-        // Раскладку строим от НАЧАЛА ХОЛСТА (0,0), а НЕ от output_geometry.loc
-        // (= позиция камеры). Иначе тайлинг "уезжает" вслед за камерой; при
-        // фиксированном (0,0) камере можно красиво перелетать к нему (set_layout).
-        let geo = match self.space.output_geometry(&output) {
-            Some(g) => Rectangle::new((0, 0).into(), g.size),
-            None => return,
-        };
+    /// Рабочая область тайлинга: экран от НАЧАЛА ХОЛСТА (0,0), а НЕ от
+    /// output_geometry.loc (= позиция камеры). Иначе тайлинг "уезжает" вслед за
+    /// камерой; при фиксированном (0,0) камере можно красиво перелетать к нему
+    /// (см. set_layout). Внешний отступ GAP_OUTER уже вычтен.
+    pub fn tile_work_area(&self) -> Option<Rectangle<i32, Logical>> {
+        let output = self.space.outputs().next()?;
+        let geo = self.space.output_geometry(output)?;
+        Some(inset_rect(Rectangle::new((0, 0).into(), geo.size), GAP_OUTER))
+    }
 
+    /// Окно, за которым сейчас клавиатурный фокус.
+    pub(crate) fn focused_window(&self) -> Option<Window> {
+        let fs = self.focused_surface()?;
+        self.tagged_windows.iter()
+            .find(|tw| crate::xwin::is_surface(&tw.window, &fs))
+            .map(|tw| tw.window.clone())
+    }
+
+    /// Приводит BSP-дерево текущего набора тегов в соответствие со списком
+    /// видимых тайловых окон: исчезнувшие удаляются (их место забирает сосед по
+    /// узлу), новые ВСТАВЛЯЮТСЯ ДЕЛЕНИЕМ слота — как в Hyprland.
+    ///
+    /// Одно новое окно за проход = интерактивное открытие: делим слот
+    /// СФОКУСИРОВАННОГО окна, сторону выбирает курсор. Несколько сразу
+    /// (сборка из Float, возврат на тег) — каждое садится к ближайшему по
+    /// своей текущей позиции соседу, чтобы раскладка примерно повторила то,
+    /// как окна лежали на холсте.
+    fn sync_dwindle_tree(&mut self, area: Rectangle<i32, Logical>) {
         let current_tags = self.viewport.current_tags();
         let visible: Vec<Window> = self.tagged_windows
             .iter()
@@ -149,21 +169,118 @@ impl Dawn {
             .map(|tw| tw.window.clone())
             .collect();
 
-        let n = visible.len();
-        if n == 0 { return; }
+        if visible.is_empty() {
+            self.dwindle_trees.remove(&current_tags);
+            return;
+        }
 
-        // Внешний отступ — от краёв экрана до крайних окон.
-        let geo = inset_rect(geo, GAP_OUTER);
-        // Первый split — горизонтальный (лево/право)
-        let rects = dwindle_rects(geo, n, true);
-        // Внутренний отступ — между соседними окнами (половина зазора с каждой стороны).
-        let rects: Vec<Rectangle<i32, Logical>> = rects.into_iter()
-            .map(|r| inset_rect(r, GAP_INNER / 2))
+        let cfg = self.lua_config.dwindle;
+        let focused = self.focused_window();
+        let mouse = self.pointer_location;
+
+        // Центры окон нужны для «сборки»; берём до захвата дерева (borrowck).
+        let centers: Vec<(Window, Point<f64, Logical>)> = visible.iter()
+            .map(|w| {
+                let c = self.space.element_geometry(w)
+                    .map(|g| Point::from((
+                        g.loc.x as f64 + g.size.w as f64 / 2.0,
+                        g.loc.y as f64 + g.size.h as f64 / 2.0,
+                    )))
+                    .unwrap_or(mouse);
+                (w.clone(), c)
+            })
             .collect();
 
-        for (window, rect) in visible.iter().zip(rects.iter()) {
-            self.resize_window(window, *rect);
+        let tree = self.dwindle_trees.entry(current_tags).or_default();
+
+        for w in tree.windows() {
+            if !visible.iter().any(|v| crate::dwindle::same_window(v, &w)) {
+                tree.remove(&w);
+            }
         }
+
+        let missing: Vec<(Window, Point<f64, Logical>)> = centers.into_iter()
+            .filter(|(w, _)| !tree.contains(w))
+            .collect();
+
+        if missing.len() == 1 {
+            tree.recalc(area, &cfg);
+            let (w, _) = &missing[0];
+            let opening_on = focused
+                .as_ref()
+                .filter(|f| !crate::dwindle::same_window(f, w))
+                .and_then(|f| tree.node_of(f))
+                .or_else(|| tree.closest_node(mouse, Some(w)));
+            tree.insert(w.clone(), opening_on, mouse, area, &cfg, None);
+        } else {
+            for (w, center) in missing {
+                tree.recalc(area, &cfg);
+                let opening_on = tree.closest_node(center, Some(&w));
+                tree.insert(w, opening_on, center, area, &cfg, None);
+            }
+        }
+        tree.recalc(area, &cfg);
+    }
+
+    pub fn apply_tile_layout(&mut self) {
+        self.apply_tile_layout_animated(true);
+    }
+
+    /// `animate = false` — окна встают на место кадром, без 180ms LERP: нужно
+    /// на живом ресайзе (Super+ПКМ), иначе раскладка тянется за курсором.
+    pub fn apply_tile_layout_animated(&mut self, animate: bool) {
+        let area = match self.tile_work_area() {
+            Some(a) => a,
+            None => return,
+        };
+        self.sync_dwindle_tree(area);
+
+        let current_tags = self.viewport.current_tags();
+        let rects = match self.dwindle_trees.get(&current_tags) {
+            // Внутренний отступ — между соседями (половина зазора с каждой стороны).
+            Some(tree) => tree.leaf_rects().into_iter()
+                .map(|(w, r)| (w, inset_rect(r, GAP_INNER / 2)))
+                .collect::<Vec<_>>(),
+            None => return,
+        };
+        for (window, rect) in rects {
+            self.resize_window_animated(&window, rect, animate);
+        }
+    }
+
+    /// Размер, который получит следующее окно в Tile — чтобы отдать его
+    /// клиенту сразу в первом configure и не слать второй после arrange
+    /// (Hyprland: predictSizeForNewTarget). Делим слот того окна, чей слот и
+    /// будет разделён (сфокусированного), по тем же правилам.
+    pub fn predict_tile_size(&self) -> Option<Size<i32, Logical>> {
+        let area = self.tile_work_area()?;
+        let inner = GAP_INNER / 2;
+        let tags = self.viewport.current_tags();
+        let tree = self.dwindle_trees.get(&tags);
+        let cfg = self.lua_config.dwindle;
+
+        let (w, h) = match (tree, self.focused_window()) {
+            (Some(tree), Some(focused)) => tree
+                .predict_split_size(&focused, &cfg)
+                .or_else(|| {
+                    // Фокуса в дереве нет (только что закрыли окно и т.п.) —
+                    // берём любой лист, лишь бы масштаб был правдоподобным.
+                    tree.leaf_rects().first().map(|(_, r)| {
+                        let b = crate::dwindle::FBox::from_rect(*r);
+                        if b.h * cfg.split_width_multiplier as f64 > b.w {
+                            (b.w, b.h / 2.0)
+                        } else {
+                            (b.w / 2.0, b.h)
+                        }
+                    })
+                })
+                .unwrap_or((area.size.w as f64, area.size.h as f64)),
+            _ => (area.size.w as f64, area.size.h as f64),
+        };
+        Some(Size::from((
+            (w.round() as i32 - inner * 2).max(1),
+            (h.round() as i32 - inner * 2).max(1),
+        )))
     }
 
     pub fn apply_monocle_layout(&mut self) {
@@ -189,23 +306,31 @@ impl Dawn {
     }
 
     pub fn resize_window(&mut self, window: &Window, rect: Rectangle<i32, Logical>) {
-        if let Some(toplevel) = window.toplevel() {
-            toplevel.with_pending_state(|state| {
-                state.size = Some(rect.size);
-                state.states.set(xdg_toplevel::State::TiledLeft);
-                state.states.set(xdg_toplevel::State::TiledRight);
-                state.states.set(xdg_toplevel::State::TiledTop);
-                state.states.set(xdg_toplevel::State::TiledBottom);
-            });
-            toplevel.send_pending_configure();
-        }
+        self.resize_window_animated(window, rect, true);
+    }
+
+    pub fn resize_window_animated(
+        &mut self,
+        window: &Window,
+        rect: Rectangle<i32, Logical>,
+        animate: bool,
+    ) {
+        crate::xwin::set_size(window, Some(rect.size), crate::xwin::Tiled::Set);
+        crate::xwin::configure(window);
         // Размер применяется сразу (клиент сам не умеет анимировать resize),
         // а позиция едет плавным LERP — "сборка" в тайлинг (см. anim::tick).
-        self.animate_window_to(window, rect.loc);
+        if animate {
+            self.animate_window_to(window, rect.loc);
+        } else {
+            // Живой ресайз: никакого LERP — снимаем идущую анимацию позиции,
+            // иначе она перебьёт map_element на следующем тике.
+            self.window_pos_anims.retain(|(w, _)| {
+                w != window
+            });
+            self.space.map_element(window.clone(), rect.loc, false);
+        }
         if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-            tw.window.toplevel().zip(window.toplevel())
-                .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                .unwrap_or(false)
+            &tw.window == window
         }) {
             tw.position = rect.loc;
         }
@@ -215,20 +340,50 @@ impl Dawn {
     /// мгновенного space.map_element — используется при разлёте/сборке
     /// tiling/floating. Заменяет уже идущую анимацию этого окна, если была.
     pub(crate) fn animate_window_to_dur(&mut self, window: &Window, target: Point<i32, Logical>, dur: Duration) {
+        let target_f = target.to_f64();
+        if let Some((_, anim)) = self.window_pos_anims.iter_mut()
+            .find(|(w, _)| crate::dwindle::same_window(w, window))
+        {
+            // Окно уже летит — МЕНЯЕМ ЦЕЛЬ, а не заводим анимацию заново.
+            // Раньше здесь была пересборка с нуля, и при частых вызовах
+            // (arrange() на каждый свап во время драга, толчок соседей на
+            // каждый кадр коллизии) ease перезапускался каждые 16мс: окно
+            // теряло скорость, ползло по асимптоте и «не доезжало» — это и
+            // выглядело как баганная анимация переноса.
+            anim.retarget(target_f, dur);
+            return;
+        }
         let from = self.space.element_geometry(window)
             .map(|g| g.loc.to_f64())
-            .unwrap_or(target.to_f64());
-        self.window_pos_anims.retain(|(w, _)| {
-            w.toplevel().zip(window.toplevel())
-                .map(|(a, b)| a.wl_surface() != b.wl_surface())
-                .unwrap_or(true)
-        });
-        // Плавный ease-out-cubic без overshoot: пружина (new_spring) визуально
-        // "подлагивала" в тайлинге из-за лишних кадров перелёта за цель.
+            .unwrap_or(target_f);
+        // Уже на месте — незачем заводить анимацию (и жечь кадры на неё).
+        if (from.x - target_f.x).abs() < 0.5 && (from.y - target_f.y).abs() < 0.5 {
+            return;
+        }
+        self.window_pos_anims.push((window.clone(), PosAnim::new(from, target_f, dur)));
+    }
+
+    /// Инерционный доезд окна после броска мышью: пружина стартует С ТОЙ ЖЕ
+    /// скоростью, что была у курсора, и тормозит экспоненциально. Возвращает
+    /// точку, где окно остановится (её надо записать в float_position).
+    ///
+    /// `omega` — жёсткость торможения (1/сек): путь доезда = |v|/ω.
+    pub(crate) fn fling_window(
+        &mut self,
+        window: &Window,
+        vel: Point<f64, Logical>,
+        omega: f64,
+    ) -> Point<i32, Logical> {
+        let from = self.space.element_geometry(window)
+            .map(|g| g.loc.to_f64())
+            .unwrap_or_default();
+        let target = Point::from((from.x + vel.x / omega, from.y + vel.y / omega));
+        self.window_pos_anims.retain(|(w, _)| !crate::dwindle::same_window(w, window));
         self.window_pos_anims.push((
             window.clone(),
-            CameraAnim::new(from, target.to_f64(), dur),
+            PosAnim::with_velocity(from, target, vel, omega),
         ));
+        target.to_i32_round()
     }
 
     fn animate_window_to(&mut self, window: &Window, target: Point<i32, Logical>) {
@@ -242,8 +397,35 @@ impl Dawn {
         self.tile_config.prev_layout = prev;
         self.tile_config.layout = layout;
         if layout == Layout::Float {
+            // Возврат из тайлинга — камера туда же, где холст был до входа.
+            // Вход в тайлинг насильно ставит камеру в (0,0) при zoom=1 (иначе
+            // разложенные по экрану окна оказались бы за кадром), и без этого
+            // снимка выход во Float каждый раз выбрасывал в начало координат:
+            // окна, к которым пользователь долго ехал по холсту, оставались
+            // где-то далеко, а «привычное место» терялось.
+            if let Some((cam_x, cam_y, zoom)) = self.pre_tiling_view.take() {
+                self.momentum.stop();
+                self.camera_anim = None;
+                self.zoom_anim = None;
+                self.viewport.zoom = zoom;
+                self.viewport.cam_x = cam_x;
+                self.viewport.cam_y = cam_y;
+                self.apply_camera();
+            }
+            // Строго ПОСЛЕ восстановления камеры: разлёт считает кольцо от
+            // центра ЭКРАНА, то есть от текущего положения камеры.
             self.scatter_to_float(prev);
         } else {
+            // Снимок берём только на первом входе Float→tiling: переходы
+            // между тайловыми раскладками (Tile→Columns→Monocle) идут уже с
+            // камерой (0,0) и затёрли бы запомненное место.
+            if prev == Layout::Float {
+                self.pre_tiling_view = Some((
+                    self.viewport.cam_x,
+                    self.viewport.cam_y,
+                    self.viewport.zoom,
+                ));
+            }
             // Любой переход в tiling/columns (Win+D/Win+T/Win+N): камера в (0,0),
             // zoom=1, arrange раскладывает окна. Окна плывут от текущей позиции
             // к тайловой через window_pos_anims (animate_window_to, 180ms).
@@ -336,16 +518,10 @@ impl Dawn {
 
         // Применяем: убираем tiled-состояния, восстанавливаем float_size
         for (window, float_size, pos) in &updates {
-            if let Some(t) = window.toplevel() {
-                t.with_pending_state(|s| {
-                    s.size = *float_size; // None → клиент выбирает сам
-                    s.states.unset(xdg_toplevel::State::TiledLeft);
-                    s.states.unset(xdg_toplevel::State::TiledRight);
-                    s.states.unset(xdg_toplevel::State::TiledTop);
-                    s.states.unset(xdg_toplevel::State::TiledBottom);
-                });
-                t.send_pending_configure();
-            }
+            // float_size = None → размер выбирает клиент (у X11 в этом
+            // случае остаётся текущий).
+            crate::xwin::set_size(window, *float_size, crate::xwin::Tiled::Unset);
+            crate::xwin::configure(window);
             // Плавный "разлёт" в кольцо вместо мгновенного прыжка (см. anim::tick) —
             // подольше и заметнее, чем сборка в тайлинг ("красивая" анимация).
             self.animate_window_to_dur(window, *pos, Duration::from_millis(600));
@@ -354,9 +530,7 @@ impl Dawn {
         // Обновляем tagged_windows
         for (window, _, pos) in &updates {
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                tw.window.toplevel().zip(window.toplevel())
-                    .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                    .unwrap_or(false)
+                &tw.window == window
             }) {
                 tw.float_position = *pos;
                 tw.position = *pos;
@@ -420,15 +594,86 @@ impl Dawn {
     }
 
     pub fn inc_nmaster(&mut self, delta: i32) {
+        // В Tile (dwindle) master-области нет: узлы делятся пополам, а не
+        // "N окон в мастере". Ближайший по смыслу аналог из Hyprland —
+        // togglesplit/swapsplit ближайшего деления (dwindle:layoutmsg).
+        if self.tile_config.layout == Layout::Tile {
+            if delta > 0 { self.toggle_split_focused(); } else { self.swap_split_focused(); }
+            return;
+        }
         let n = self.tile_config.nmaster as i32 + delta;
         self.tile_config.nmaster = n.max(0) as usize;
         self.arrange();
     }
 
     pub fn set_mfact(&mut self, delta: f32) {
+        // Tile (dwindle): двигаем ближайшее деление — hyprctl dispatch
+        // layoutmsg splitratio ±. Глобального mfact в dwindle не существует.
+        if self.tile_config.layout == Layout::Tile {
+            let (Some(window), Some(area)) = (self.focused_window(), self.tile_work_area())
+                else { return };
+            let cfg = self.lua_config.dwindle;
+            let tags = self.viewport.current_tags();
+            if let Some(tree) = self.dwindle_trees.get_mut(&tags) {
+                if tree.split_ratio_delta(&window, delta * 2.0) {
+                    tree.recalc(area, &cfg);
+                }
+            }
+            self.arrange(); // через arrange: он один знает про обзор столов
+            self.request_redraw();
+            return;
+        }
         let new = (self.tile_config.mfact + delta).clamp(0.1, 0.9);
         self.tile_config.mfact = new;
         self.arrange();
+    }
+
+    /// Перевернуть ось ближайшего деления (Hyprland: layoutmsg togglesplit).
+    /// Живёт только при `dwindle{ preserve_split = true }` — иначе следующий
+    /// пересчёт снова возьмёт ось из пропорций слота.
+    pub fn toggle_split_focused(&mut self) {
+        let (Some(window), Some(area)) = (self.focused_window(), self.tile_work_area()) else { return };
+        let cfg = self.lua_config.dwindle;
+        let tags = self.viewport.current_tags();
+        if let Some(tree) = self.dwindle_trees.get_mut(&tags) {
+            if tree.toggle_split(&window) {
+                tree.recalc(area, &cfg);
+            }
+        }
+        self.arrange(); // через arrange: он один знает про обзор столов
+        self.request_redraw();
+    }
+
+    /// Поменять половины деления местами (Hyprland: layoutmsg swapsplit).
+    pub fn swap_split_focused(&mut self) {
+        let (Some(window), Some(area)) = (self.focused_window(), self.tile_work_area()) else { return };
+        let cfg = self.lua_config.dwindle;
+        let tags = self.viewport.current_tags();
+        if let Some(tree) = self.dwindle_trees.get_mut(&tags) {
+            if tree.swap_split(&window) {
+                tree.recalc(area, &cfg);
+            }
+        }
+        self.arrange(); // через arrange: он один знает про обзор столов
+        self.request_redraw();
+    }
+
+    /// Живой ресайз тайлового окна мышью (Super+ПКМ): `delta` — ИНКРЕМЕНТ с
+    /// прошлого события, меняет split_ratio предков (Hyprland smart_resizing).
+    pub fn dwindle_resize_focused(
+        &mut self,
+        window: &Window,
+        delta: Point<f64, Logical>,
+        corner: crate::dwindle::Corner,
+    ) {
+        let Some(area) = self.tile_work_area() else { return };
+        let cfg = self.lua_config.dwindle;
+        let tags = self.viewport.current_tags();
+        if let Some(tree) = self.dwindle_trees.get_mut(&tags) {
+            tree.resize(window, delta, corner, area, &cfg);
+        }
+        self.apply_tile_layout_animated(false);
+        self.request_redraw();
     }
 
     /// Схлопывание группы окон в стопку (2.4): все видимые окна текущего тега
@@ -459,7 +704,7 @@ impl Dawn {
             tracing::info!("dawn: stack unfolded");
         } else {
             const FOLD_OFFSET: i32 = 30;
-            let focused = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+            let focused = self.focused_surface();
 
             let visible_idxs: Vec<usize> = self.tagged_windows.iter().enumerate()
                 .filter(|(_, tw)| tw.tags & current_tags != 0)
@@ -472,7 +717,7 @@ impl Dawn {
             let anchor = focused.as_ref()
                 .and_then(|fs| self.tagged_windows.iter().find(|tw| {
                     tw.tags & current_tags != 0
-                        && tw.window.toplevel().map(|t| t.wl_surface() == fs).unwrap_or(false)
+                        && crate::xwin::is_surface(&tw.window, &fs)
                 }))
                 .or_else(|| self.tagged_windows.get(visible_idxs[0]))
                 .and_then(|tw| self.space.element_geometry(&tw.window).map(|g| g.loc))
@@ -498,11 +743,9 @@ impl Dawn {
     }
 
     pub fn toggle_floating(&mut self) {
-        if let Some(focused) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
+        if let Some(focused) = self.focused_surface() {
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                tw.window.toplevel()
-                    .map(|t| t.wl_surface() == &focused)
-                    .unwrap_or(false)
+                crate::xwin::is_surface(&tw.window, &focused)
             }) {
                 tw.floating = !tw.floating;
             }
@@ -514,7 +757,7 @@ impl Dawn {
     /// dx: -1=влево, +1=вправо; dy: -1=вверх, +1=вниз
     pub fn focus_direction(&mut self, dx: i32, dy: i32) {
         let current_tags = self.viewport.current_tags();
-        let focused_surface = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let focused_surface = self.focused_surface();
 
         struct WinPos { window: Window, cx: f64, cy: f64, focused: bool }
 
@@ -525,8 +768,7 @@ impl Dawn {
                     let cx = g.loc.x as f64 + g.size.w as f64 / 2.0;
                     let cy = g.loc.y as f64 + g.size.h as f64 / 2.0;
                     let focused = focused_surface.as_ref()
-                        .zip(tw.window.toplevel())
-                        .map(|(fs, t)| t.wl_surface() == fs)
+                        .map(|fs| crate::xwin::is_surface(&tw.window, fs))
                         .unwrap_or(false);
                     WinPos { window: tw.window.clone(), cx, cy, focused }
                 })
@@ -560,23 +802,7 @@ impl Dawn {
             None => return, // нет окон в этом направлении
         };
 
-        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        self.space.raise_element(&next, true);
-        next.set_activated(true);
-        for w in self.space.elements() {
-            if w.toplevel().zip(next.toplevel())
-                .map(|(a, b)| a.wl_surface() != b.wl_surface())
-                .unwrap_or(true)
-            {
-                w.set_activated(false);
-                if let Some(t) = w.toplevel() { t.send_pending_configure(); }
-            }
-        }
-        if let Some(t) = next.toplevel() {
-            self.seat.get_keyboard().unwrap()
-                .set_focus(self, Some(t.wl_surface().clone()), serial);
-            t.send_pending_configure();
-        }
+        crate::xwin::focus(self, &next.clone());
 
         // Умное центрирование камеры (1.2)
         self.snap_camera_to_window(&next);
@@ -591,10 +817,10 @@ impl Dawn {
             .collect();
         if visible.is_empty() { return; }
 
-        let focused = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let focused = self.focused_surface();
         let current_idx = focused.as_ref().and_then(|fs| {
             visible.iter().position(|w| {
-                w.toplevel().map(|t| t.wl_surface() == fs).unwrap_or(false)
+                crate::xwin::is_surface(w, &fs)
             })
         });
         let next_idx = match current_idx {
@@ -603,35 +829,36 @@ impl Dawn {
             None => 0,
         };
         let next = &visible[next_idx];
-        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        self.space.raise_element(next, true);
-        next.set_activated(true);
-        for w in self.space.elements() {
-            if w.toplevel().zip(next.toplevel())
-                .map(|(a, b)| a.wl_surface() != b.wl_surface())
-                .unwrap_or(true)
-            {
-                w.set_activated(false);
-                if let Some(t) = w.toplevel() { t.send_pending_configure(); }
-            }
-        }
-        if let Some(t) = next.toplevel() {
-            self.seat.get_keyboard().unwrap()
-                .set_focus(self, Some(t.wl_surface().clone()), serial);
-            t.send_pending_configure();
-        }
+        crate::xwin::focus(self, &next.clone());
 
         // Умное центрирование камеры (1.2)
         self.snap_camera_to_window(next);
     }
 
+    /// dwm-шный zoom. В Tile (dwindle) master-слота нет, поэтому делаем то же,
+    /// что Hyprland'овский `layoutmsg movetoroot`: поднимаем окно на верхний
+    /// уровень дерева — оно занимает половину экрана целиком.
     pub fn zoom(&mut self) {
+        if self.tile_config.layout == Layout::Tile {
+            let (Some(window), Some(area)) = (self.focused_window(), self.tile_work_area())
+                else { return };
+            let cfg = self.lua_config.dwindle;
+            let tags = self.viewport.current_tags();
+            if let Some(tree) = self.dwindle_trees.get_mut(&tags) {
+                if tree.move_to_root(&window, true) {
+                    tree.recalc(area, &cfg);
+                }
+            }
+            self.arrange(); // через arrange: он один знает про обзор столов
+            self.request_redraw();
+            return;
+        }
         let current_tags = self.viewport.current_tags();
-        let focused = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let focused = self.focused_surface();
         if let Some(fs) = focused {
             let idx = self.tagged_windows.iter().position(|tw| {
                 tw.tags & current_tags != 0 && !tw.floating
-                    && tw.window.toplevel().map(|t| t.wl_surface() == &fs).unwrap_or(false)
+                    && crate::xwin::is_surface(&tw.window, &fs)
             });
             if let Some(idx) = idx {
                 if idx != 0 {
@@ -644,10 +871,10 @@ impl Dawn {
 
     /// Переместить сфокусированное окно на (dx, dy) пикселей (Float-режим)
     pub fn move_focused_window(&mut self, dx: i32, dy: i32) {
-        let focused = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let focused = self.focused_surface();
         let fs = match focused { Some(f) => f, None => return };
         let w = match self.space.elements()
-            .find(|w| w.toplevel().map(|t| t.wl_surface() == &fs).unwrap_or(false))
+            .find(|w| crate::xwin::is_surface(w, &fs))
             .cloned()
         {
             Some(w) => w, None => return,
@@ -656,9 +883,7 @@ impl Dawn {
         let new_loc = (loc.x + dx, loc.y + dy).into();
         self.space.map_element(w.clone(), new_loc, false);
         if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-            tw.window.toplevel().zip(w.toplevel())
-                .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                .unwrap_or(false)
+            tw.window == w
         }) {
             tw.position = new_loc;
             tw.float_position = new_loc;
@@ -666,10 +891,90 @@ impl Dawn {
         }
     }
 
-    /// Перемещение окна в тайлинге (Hyprland movewindow): меняет местами
-    /// сфокусированное окно с соседним в порядке dwindle по направлению
-    /// (dx>0/dy>0 → следующее, иначе предыдущее) и перераскладывает.
+    /// Меняет местами два тайловых окна — общая точка для перетаскивания мышью
+    /// (Super+ЛКМ, см. grabs/move_grab.rs).
+    ///
+    /// Раскладку в Tile определяет BSP-дерево (dwindle.rs), в Columns —
+    /// структура колонок (columns.rs); порядок в `tagged_windows` там ни на что
+    /// не влияет. Поэтому свап одного лишь списка (как было раньше) выглядел
+    /// как "перетаскивание не работает": arrange() возвращал окна на прежние
+    /// места. Меняем местами именно в структуре активной раскладки.
+    ///
+    /// Возвращает true, если раскладка изменилась (вызывающему нужен arrange).
+    pub fn swap_tiled_windows(&mut self, a: &Window, b: &Window) -> bool {
+        use crate::dwindle::same_window;
+        if same_window(a, b) {
+            return false;
+        }
+        match self.tile_config.layout {
+            Layout::Float => false,
+            Layout::Tile => {
+                let tags = self.viewport.current_tags();
+                let Some(tree) = self.dwindle_trees.get_mut(&tags) else { return false };
+                if tree.node_of(a).is_none() || tree.node_of(b).is_none() {
+                    return false;
+                }
+                // Геометрию слотов пересчитает arrange (sync_dwindle_tree → recalc).
+                tree.swap(a, b);
+                true
+            }
+            Layout::Columns => {
+                self.columns_reconcile();
+                let pos = |cols: &crate::columns::ColumnLayout, w: &Window| {
+                    cols.columns.iter().enumerate().find_map(|(ci, c)| {
+                        c.windows.iter().position(|x| same_window(x, w)).map(|ri| (ci, ri))
+                    })
+                };
+                let (Some((ca, ra)), Some((cb, rb))) =
+                    (pos(&self.columns, a), pos(&self.columns, b)) else { return false };
+                let wa = self.columns.columns[ca].windows[ra].clone();
+                let wb = self.columns.columns[cb].windows[rb].clone();
+                self.columns.columns[ca].windows[ra] = wb;
+                self.columns.columns[cb].windows[rb] = wa;
+                // Активным делаем слот, в который уехало перетаскиваемое окно —
+                // иначе фокус колонок разъезжается с тем, что видит мышь.
+                self.columns.active = cb;
+                self.columns.columns[cb].active_row = rb;
+                true
+            }
+            Layout::Monocle => {
+                // Монокль: геометрия одна на всех, важен только порядок стопки —
+                // тут свап tagged_windows как раз и есть раскладка.
+                let tags = self.viewport.current_tags();
+                let idx = |data: &Self, w: &Window| {
+                    data.tagged_windows.iter().position(|tw| {
+                        tw.tags & tags != 0 && same_window(&tw.window, w)
+                    })
+                };
+                let (Some(ia), Some(ib)) = (idx(self, a), idx(self, b)) else { return false };
+                self.tagged_windows.swap(ia, ib);
+                true
+            }
+        }
+    }
+
+    /// Перемещение окна в тайлинге (Hyprland movewindow).
+    ///
+    /// Tile: окно ВЫНИМАЕТСЯ из BSP-дерева и вставляется рядом с соседом за
+    /// соответствующим краем — ровно как moveTargetInDirection в Hyprland
+    /// (а не свап по номеру в списке: в дереве "следующего окна" нет).
+    /// Monocle: сохраняем старый свап по порядку — там геометрия одна на всех,
+    /// меняется только порядок в стопке.
     pub fn move_tiled_window(&mut self, dx: i32, dy: i32) {
+        if self.tile_config.layout == Layout::Tile {
+            let (Some(window), Some(area)) = (self.focused_window(), self.tile_work_area())
+                else { return };
+            let cfg = self.lua_config.dwindle;
+            let tags = self.viewport.current_tags();
+            let moved = self.dwindle_trees.get_mut(&tags)
+                .map(|tree| tree.move_in_direction(&window, dx, dy, area, &cfg))
+                .unwrap_or(false);
+            if moved {
+                self.arrange(); // через arrange: он один знает про обзор столов
+                self.request_redraw();
+            }
+            return;
+        }
         let current = self.viewport.current_tags();
         // Индексы видимых тайловых окон в tagged_windows (порядок = dwindle).
         let visible: Vec<usize> = self.tagged_windows.iter().enumerate()
@@ -679,13 +984,12 @@ impl Dawn {
         if visible.len() < 2 {
             return;
         }
-        let focused = match self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
+        let focused = match self.focused_surface() {
             Some(f) => f,
             None => return,
         };
         let cur = match visible.iter().position(|&i| {
-            self.tagged_windows[i].window.toplevel()
-                .map(|t| t.wl_surface() == &focused).unwrap_or(false)
+            crate::xwin::is_surface(&self.tagged_windows[i].window, &focused)
         }) {
             Some(c) => c,
             None => return,
@@ -702,20 +1006,18 @@ impl Dawn {
 
     /// Изменить размер сфокусированного окна на (dw, dh) пикселей (Float-режим)
     pub fn keyboard_resize_focused(&mut self, dw: i32, dh: i32) {
-        let focused = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let focused = self.focused_surface();
         let fs = match focused { Some(f) => f, None => return };
         let w = match self.space.elements()
-            .find(|w| w.toplevel().map(|t| t.wl_surface() == &fs).unwrap_or(false))
+            .find(|w| crate::xwin::is_surface(w, &fs))
             .cloned()
         {
             Some(w) => w, None => return,
         };
-        if let Some(t) = w.toplevel() {
-            let cur = t.with_committed_state(|s| s.and_then(|s| s.size)).unwrap_or((200, 200).into());
-            let new_w = (cur.w + dw).max(50);
-            let new_h = (cur.h + dh).max(50);
-            t.with_pending_state(|s| { s.size = Some((new_w, new_h).into()); });
-            t.send_pending_configure();
-        }
+        let cur = crate::xwin::current_size(&w);
+        let new_w = (cur.w + dw).max(50);
+        let new_h = (cur.h + dh).max(50);
+        crate::xwin::set_size(&w, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
+        crate::xwin::configure(&w);
     }
 }

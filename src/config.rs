@@ -76,6 +76,31 @@ pub enum Action {
     PinBookmarkAtCursor,
     /// Columns (niri): сменить пресет ширины активной колонки (Super+R).
     ColumnWidthCycle,
+    // ── Действия колонок как в niri (см. columns.rs) ──────────────────────
+    /// `switch-preset-window-height`
+    WindowHeightCycle,
+    /// `set-column-width "±N%"`
+    ColumnWidthAdjust(f64),
+    /// `set-window-height "±N%"`
+    WindowHeightAdjust(f64),
+    /// `reset-window-height`
+    WindowHeightReset,
+    /// `maximize-column`
+    ColumnMaximize,
+    /// `center-column`
+    ColumnCenter,
+    /// `focus-column-first` / `focus-column-last`
+    ColumnFocusEdge(bool),
+    /// `move-column-to-first` / `move-column-to-last`
+    ColumnMoveToEdge(bool),
+    /// `consume-or-expel-window-left/right`
+    ColumnConsumeOrExpel(i32),
+    /// `center-focused-column` — режим поведения вида (never/always/on-overflow)
+    ColumnCenterMode(crate::columns::CenterFocusedColumn),
+    /// `toggle-column-tabbed-display`
+    ColumnToggleTabbed,
+    /// `switch-focus-between-floating-and-tiling`
+    ColumnFocusOtherLayer,
     /// niri-воркспейсы: перейти на пред/след воркспейс (dir=-1/+1).
     WorkspaceStep(i32),
     /// niri-воркспейсы: перенести активную колонку на соседний воркспейс (Columns).
@@ -83,6 +108,9 @@ pub enum Action {
     /// Тумблер niri-режим (Columns) ↔ Tile (Win+N): в niri — выход в обычный
     /// tile, не в niri — вход в niri.
     ToggleNiriMode,
+    /// Обзор столов (тап Super): переставить ВЕСЬ стол под курсором в соседнюю
+    /// ячейку сетки — влево/вправо/вверх/вниз относительно других столов.
+    MoveWorkspaceSlot(i32, i32),
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +163,8 @@ pub struct Config {
     /// Trigger key for the Super-held bird's-eye zoom gesture (default: space).
     /// This is a hold-gesture, not a plain keybind, so it's handled separately.
     pub bird_eye_key: u32,
+    /// `dwindle{}` — Hyprland's dwindle:* knobs for Layout::Tile (see dwindle.rs).
+    pub dwindle: crate::dwindle::DwindleConfig,
 }
 
 impl Config {
@@ -172,6 +202,7 @@ impl Default for Config {
             bindings: Vec::new(),
             xkb: XkbSettings::default(),
             bird_eye_key: xkb::keysyms::KEY_space,
+            dwindle: crate::dwindle::DwindleConfig::default(),
         }
     }
 }
@@ -252,9 +283,34 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
         "ungroup_selected" => UngroupSelected,
         "pin_bookmark_at_cursor" => PinBookmarkAtCursor,
         "column_width_cycle" => ColumnWidthCycle,
+        // niri-действия колонок. Проценты — как в niri: set-column-width "+10%".
+        "window_height_cycle" => WindowHeightCycle,
+        "column_width_adjust" => ColumnWidthAdjust(get_f32("percent", 10.0) as f64),
+        "window_height_adjust" => WindowHeightAdjust(get_f32("percent", 10.0) as f64),
+        "window_height_reset" => WindowHeightReset,
+        "column_maximize" => ColumnMaximize,
+        "column_center" => ColumnCenter,
+        "column_focus_first" => ColumnFocusEdge(false),
+        "column_focus_last" => ColumnFocusEdge(true),
+        "column_move_to_first" => ColumnMoveToEdge(false),
+        "column_move_to_last" => ColumnMoveToEdge(true),
+        "consume_or_expel_left" => ColumnConsumeOrExpel(-1),
+        "consume_or_expel_right" => ColumnConsumeOrExpel(1),
+        "column_toggle_tabbed" => ColumnToggleTabbed,
+        "focus_floating_or_tiling" => ColumnFocusOtherLayer,
+        "center_focused_column" => {
+            use crate::columns::CenterFocusedColumn as C;
+            let mode = tbl.get::<String>("mode").unwrap_or_else(|_| "never".into());
+            ColumnCenterMode(match mode.as_str() {
+                "always" => C::Always,
+                "on-overflow" | "on_overflow" => C::OnOverflow,
+                _ => C::Never,
+            })
+        }
         "workspace_step" => WorkspaceStep(get_i32("dir", 1)),
         "move_column_to_workspace" => MoveColumnToWorkspace(get_i32("dir", 1)),
         "toggle_niri_mode" => ToggleNiriMode,
+        "move_workspace_slot" => MoveWorkspaceSlot(get_i32("dx", 0), get_i32("dy", 0)),
         other => {
             tracing::warn!("dawn/config: unknown action '{}'", other);
             return None;
@@ -308,6 +364,8 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let bindings: Rc<RefCell<Vec<KeyBinding>>> = Rc::new(RefCell::new(Vec::new()));
     let xkb_settings: Rc<RefCell<XkbSettings>> = Rc::new(RefCell::new(XkbSettings::default()));
     let bird_eye_key: Rc<RefCell<u32>> = Rc::new(RefCell::new(xkb::keysyms::KEY_space));
+    let dwindle_cfg: Rc<RefCell<crate::dwindle::DwindleConfig>> =
+        Rc::new(RefCell::new(crate::dwindle::DwindleConfig::default()));
 
     {
         let bindings = bindings.clone();
@@ -377,6 +435,27 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         })?;
         lua.globals().set("set", set_fn)?;
     }
+    {
+        // dwindle{} — те же ручки, что dwindle:* в hyprland.conf (см. dwindle.rs).
+        let dwindle_cfg = dwindle_cfg.clone();
+        let dwindle_fn = lua.create_function(move |_, tbl: Table| {
+            let mut d = dwindle_cfg.borrow_mut();
+            if let Ok(v) = tbl.get::<f32>("split_width_multiplier") {
+                d.split_width_multiplier = v.max(0.1);
+            }
+            if let Ok(v) = tbl.get::<bool>("preserve_split") {
+                d.preserve_split = v;
+            }
+            if let Ok(v) = tbl.get::<i32>("force_split") {
+                d.force_split = v.clamp(0, 2) as u8;
+            }
+            if let Ok(v) = tbl.get::<f32>("default_split_ratio") {
+                d.default_split_ratio = v.clamp(0.1, 1.9);
+            }
+            Ok(())
+        })?;
+        lua.globals().set("dwindle", dwindle_fn)?;
+    }
 
     lua.load(source).exec()?;
 
@@ -384,6 +463,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         bindings: bindings.borrow().clone(),
         xkb: xkb_settings.borrow().clone(),
         bird_eye_key: *bird_eye_key.borrow(),
+        dwindle: *dwindle_cfg.borrow(),
     };
     Ok(result)
 }
@@ -411,6 +491,13 @@ impl Dawn {
             //  · выделение = созвездие → расцепить его (разлёт с анимацией);
             //  · иначе выделение      → магнитно стянуть в новое созвездие.
             ToggleLayoutFloatTile => {
+                // В обзоре столов (тап Super) Win+D не работает: обзор сам
+                // раскладывает ленту столов и держит камеру/зум, а смена
+                // layout'а из-под него ломает и то, и другое. Выйти из обзора
+                // можно тапом Super / ПКМ / кликом по столу.
+                if self.overview_active {
+                    return;
+                }
                 self.momentum.stop();
                 self.camera_anim = None;
                 self.zoom_anim = None;
@@ -473,13 +560,22 @@ impl Dawn {
             // Super+1-9 double as camera-bookmark slots while bookmarks_mode
             // is on (Super+B) — same override the old hardcoded handler had.
             ViewTag(mask) => {
-                // Super+1-9 в обзоре столов → выйти из обзора и перейти на воркспейс.
                 if self.overview_active {
+                    // Super+1-9 в обзоре столов → выйти из обзора на воркспейс.
                     self.exit_overview_immediate(Some(mask));
-                }
-                if self.bookmarks_mode {
+                } else if self.bookmarks_mode {
                     self.jump_to_camera_bookmark(mask.trailing_zeros() + 1);
                 } else {
+                    // В Columns Win+цифра — обычный переход по столам, а не
+                    // no-op: лента остаётся лентой (view_tag сам держит Columns
+                    // и зовёт columns_fly_to_workspace). Направление слайда
+                    // задаём по разнице индексов, чтобы стол въезжал вертикально
+                    // так же, как от Super+PageUp/Down.
+                    if self.tile_config.layout == crate::tiling::Layout::Columns {
+                        let cur = self.viewport.current_tags().trailing_zeros() as i32;
+                        let dst = mask.trailing_zeros() as i32;
+                        self.columns_ws_slide = (dst - cur).signum();
+                    }
                     self.view_tag(mask);
                 }
             }
@@ -518,7 +614,34 @@ impl Dawn {
             GroupSelected => self.group_selected_into_constellation(),
             UngroupSelected => self.ungroup_focused_constellation(),
             PinBookmarkAtCursor => self.pin_bookmark_at_cursor(),
+            // Всё, что ниже до ColumnCenterMode, имеет смысл только в Columns:
+            // в Tile/Float/Monocle геометрией распоряжается своя раскладка, и
+            // «сделать колонку шире» там нечего.
+            ColumnWidthCycle | WindowHeightCycle | ColumnWidthAdjust(_)
+            | WindowHeightAdjust(_) | WindowHeightReset | ColumnMaximize
+            | ColumnCenter | ColumnFocusEdge(_) | ColumnMoveToEdge(_)
+            | ColumnConsumeOrExpel(_) | ColumnToggleTabbed | ColumnFocusOtherLayer
+                if self.tile_config.layout != Layout::Columns =>
+            {
+                tracing::debug!("dawn/columns: действие только для режима Columns (Super+N)");
+            }
             ColumnWidthCycle => self.columns_cycle_width(),
+            WindowHeightCycle => self.columns_cycle_height(),
+            ColumnWidthAdjust(p) => self.columns_adjust_width(p),
+            WindowHeightAdjust(p) => self.columns_adjust_height(p),
+            WindowHeightReset => self.columns_reset_heights(),
+            ColumnMaximize => self.columns_maximize(),
+            ColumnCenter => self.columns_center_active(),
+            ColumnFocusEdge(last) => self.columns_focus_edge(last),
+            ColumnMoveToEdge(last) => self.columns_move_to_edge(last),
+            ColumnConsumeOrExpel(dir) => self.columns_consume_or_expel(dir),
+            ColumnToggleTabbed => self.columns_toggle_tabbed(),
+            ColumnFocusOtherLayer => self.columns_focus_other_layer(),
+            ColumnCenterMode(mode) => {
+                self.columns.center_focused = mode;
+                tracing::info!("dawn/columns: center-focused-column = {:?}", mode);
+                self.columns_scroll_to_active();
+            }
             WorkspaceStep(d) => self.workspace_step(d),
             MoveColumnToWorkspace(d) => self.columns_move_to_workspace(d),
             ToggleNiriMode => {
@@ -531,6 +654,7 @@ impl Dawn {
                     self.set_layout(Layout::Columns);
                 }
             }
+            MoveWorkspaceSlot(dx, dy) => self.overview_move_workspace_slot(dx, dy),
         }
     }
 

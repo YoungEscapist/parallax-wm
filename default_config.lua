@@ -17,18 +17,39 @@
 --     (see below). A bind requires an EXACT modifier match — e.g. a
 --     mods="super" bind will NOT fire while shift is also held.
 --
+--   dwindle{ preserve_split = true, force_split = 2 }
+--     Tiling (Super+T) is Hyprland's dwindle: a new window splits the FOCUSED
+--     window's slot in half, so the layout is a BSP tree rather than a fixed
+--     chain — closing a window gives its space to its sibling, not to everyone.
+--     Same knobs as the dwindle:* section of hyprland.conf, same defaults:
+--       split_width_multiplier (1.0) — how much wider than tall a slot must be
+--                                      to split left/right instead of top/bottom
+--       preserve_split (false)       — false: the split axis is recomputed from
+--                                      the slot's proportions on every relayout
+--                                      (windows "flip" as neighbours close);
+--                                      true: a split stays where it was made
+--       force_split (0)              — which half the new window takes:
+--                                      0 = the half the cursor is over,
+--                                      1 = always left/top, 2 = always right/bottom
+--       default_split_ratio (1.0)    — 1.0 = new splits are 50/50
+--
 -- Available actions and their extra fields:
 --   spawn            cmd = "ghostty"
 --   quit             (saves session, stops the compositor)
 --   kill             (closes the focused window)
 --   set_layout       layout = "tile" | "float" | "monocle"
---   toggle_layout    (toggles between Float and Tile)
---   zoom             (swap focused window with master)
+--   toggle_layout    (toggles between Float and Tile; ignored in the Super-tap
+--                     desktop overview, which manages the camera itself)
+--   zoom             (Tile: raise the focused window to the top of the split
+--                     tree — Hyprland's "layoutmsg movetoroot"; other layouts:
+--                     swap it with the first window in the stack)
 --   toggle_floating  (toggle floating for the focused window)
 --   focus_direction  dx = -1|0|1, dy = -1|0|1 (spatial navigation)
 --   focus_stack      dir = 1 | -1 (focus next/prev in stack order)
---   inc_nmaster      n = 1 | -1
---   set_mfact        delta = 0.05 | -0.05
+--   inc_nmaster      n = 1 | -1 (Tile: n>0 flips the nearest split's axis
+--                     [togglesplit], n<0 swaps its two halves [swapsplit])
+--   set_mfact        delta = 0.05 | -0.05 (Tile: moves the nearest split,
+--                     growing the focused window — "layoutmsg splitratio")
 --   move_focused     dx = <px>, dy = <px> (floating window move)
 --   resize_focused    dw = <px>, dh = <px> (floating window resize)
 --   view_tag         tag = 1-9
@@ -89,8 +110,39 @@ bind{ mods = "super", key = "t", action = "set_layout", layout = "tile" }
 bind{ mods = "super", key = "m", action = "set_layout", layout = "monocle" }
 -- niri-подобные колонки (вертикальные стопки, скролл камерой к активной колонке)
 bind{ mods = "super", key = "n", action = "toggle_niri_mode" }
--- Ширина активной колонки в Columns (1/3 → 1/2 → 2/3 → full)
+-- ── Колонки (Columns) — раскладка и биндинги как в niri ──────────────────
+-- Ширина/высота: пресеты niri (⅓ → ½ → ⅔), проценты и сброс.
 bind{ mods = "super", key = "r", action = "column_width_cycle" }
+bind{ mods = "super+shift", key = "r", action = "window_height_cycle" }
+bind{ mods = "super+ctrl", key = "r", action = "window_height_reset" }
+bind{ mods = "super", key = "minus", action = "column_width_adjust", percent = -10 }
+bind{ mods = "super", key = "equal", action = "column_width_adjust", percent = 10 }
+bind{ mods = "super+shift", key = "minus", action = "window_height_adjust", percent = -10 }
+bind{ mods = "super+shift", key = "equal", action = "window_height_adjust", percent = 10 }
+-- Колонка на всю ширину и обратно; колонка по центру экрана.
+bind{ mods = "super", key = "f", action = "column_maximize" }
+bind{ mods = "super", key = "c", action = "column_center" }
+-- Первая/последняя колонка и перенос колонки в начало/конец полосы.
+bind{ mods = "super", key = "Home", action = "column_focus_first" }
+bind{ mods = "super", key = "End",  action = "column_focus_last" }
+bind{ mods = "super+ctrl", key = "Home", action = "column_move_to_first" }
+bind{ mods = "super+ctrl", key = "End",  action = "column_move_to_last" }
+-- Забрать окно в колонку / вытолкнуть из неё одной клавишей (niri:
+-- consume-or-expel-window-left/right).
+bind{ mods = "super", key = "bracketleft",  action = "consume_or_expel_left" }
+bind{ mods = "super", key = "bracketright", action = "consume_or_expel_right" }
+-- Колонка вкладками: видно только активное окно, слева полоска вкладок
+-- (niri: toggle-column-tabbed-display).
+bind{ mods = "super", key = "v", action = "column_toggle_tabbed" }
+-- Фокус между плавающим слоем и полосой колонок
+-- (niri: switch-focus-between-floating-and-tiling). У niri это Mod+Space, но
+-- в dawn Super+Space занят режимом лупы (bird_eye_key, перехватывается раньше
+-- биндингов), поэтому здесь Super+Shift+Space.
+bind{ mods = "super+shift", key = "space", action = "focus_floating_or_tiling" }
+-- Как вести вид за активной колонкой: never (по умолчанию, как в niri),
+-- always, on-overflow. Меняется на лету.
+bind{ mods = "super+alt", key = "c", action = "center_focused_column", mode = "always" }
+bind{ mods = "super+alt+shift", key = "c", action = "center_focused_column", mode = "never" }
 -- niri-воркспейсы: Super+PageUp/Down переключают воркспейс (в Columns остаёмся
 -- в Columns); Super+Ctrl+PageUp/Down переносят активную колонку на соседний.
 bind{ mods = "super", key = "Next",  action = "workspace_step", dir = 1 }
@@ -101,6 +153,20 @@ bind{ mods = "super", key = "comma", action = "inc_nmaster", n = 1 }
 bind{ mods = "super", key = "period", action = "inc_nmaster", n = -1 }
 bind{ mods = "super+shift", key = "h", action = "set_mfact", delta = -0.05 }
 bind{ mods = "super+shift", key = "l", action = "set_mfact", delta = 0.05 }
+
+-- ── Обзор столов (тап Super) ─────────────────────────────────────────────
+-- Столы лежат 2D-сеткой вокруг текущего: новые встают по очереди справа,
+-- снизу, слева, сверху от уже занятых ячеек (и только потом по диагоналям).
+--
+-- Перетащить ВЕСЬ стол по сетке во все четыре стороны можно:
+--   · мышью — Win+Alt+ЛКМ (стол едет за курсором, встаёт в ближайшую ячейку);
+--   · с клавиатуры — Win+Alt+стрелки (биндинги ниже).
+-- Ячейка занята другим столом → столы меняются местами. Расстановка
+-- сохраняется между заходами в обзор.
+bind{ mods = "super+alt", key = "Left",  action = "move_workspace_slot", dx = -1, dy = 0 }
+bind{ mods = "super+alt", key = "Right", action = "move_workspace_slot", dx = 1,  dy = 0 }
+bind{ mods = "super+alt", key = "Up",    action = "move_workspace_slot", dx = 0,  dy = -1 }
+bind{ mods = "super+alt", key = "Down",  action = "move_workspace_slot", dx = 0,  dy = 1 }
 
 -- ── Focus / navigation ───────────────────────────────────────────────────
 bind{ mods = "super", key = "Left",  action = "focus_direction", dx = -1, dy = 0 }

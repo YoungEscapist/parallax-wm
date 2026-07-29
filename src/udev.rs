@@ -17,17 +17,19 @@ use smithay::{
             damage::OutputDamageTracker,
             element::{
                 AsRenderElements,
+                Id,
                 Kind,
                 memory::MemoryRenderBufferRenderElement,
-                solid::{SolidColorBuffer, SolidColorRenderElement},
+                solid::SolidColorRenderElement,
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
             gles::GlesRenderer,
+            utils::CommitCounter,
         },
         session::{libseat::LibSeatSession, Event as SessionEvent, Session},
         udev::{UdevBackend, UdevEvent},
     },
-    desktop::space::SpaceRenderElements,
+    desktop::{Window, space::SpaceRenderElements},
     input::pointer::{CursorImageStatus, CursorImageSurfaceData},
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
@@ -39,7 +41,7 @@ use smithay::{
         input::Libinput,
         rustix::fs::OFlags,
     },
-    utils::{DeviceFd, Transform},
+    utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size, Transform},
     wayland::compositor::with_states,
 };
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
@@ -61,7 +63,8 @@ smithay::backend::renderer::element::render_elements! {
     pub OutputRenderElements<=GlesRenderer>;
     Space = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
     Cursor = WaylandSurfaceRenderElement<GlesRenderer>,
-    DefaultCursor = MemoryRenderBufferRenderElement<GlesRenderer>,
+    // Текстурные элементы: курсор темы и плитки декораций (см. decor.rs).
+    Memory = MemoryRenderBufferRenderElement<GlesRenderer>,
     Solid = SolidColorRenderElement,
 }
 
@@ -76,7 +79,81 @@ pub struct Surface {
     pub output: Output,
     pub compositor: GbmDrmCompositor,
     pub damage_tracker: OutputDamageTracker,
+    /// Кадр уже отдан в `queue_frame` и ждёт своего VBlank.
+    ///
+    /// Без этого флага во время анимации рендер шёл ДВАЖДЫ на каждый показанный
+    /// кадр: один раз из VBlank-хендлера и ещё раз из главного цикла по
+    /// `needs_redraw`, который выставляет 60-герцевый anim-таймер. Второй рендер
+    /// не выбрасывался в никуда молча — `DrmCompositor::queue_frame` кладёт кадр
+    /// в `queued_frame`, а следующий queue_frame ЗАТИРАЕТ его, — то есть половина
+    /// полностью отрисованных 4K-кадров (по 9-17 мс каждый) просто выбрасывалась.
+    /// Бюджет 16.6 мс на кадр от этого удваивался, и анимации ехали ~30 fps
+    /// рывками. Плюс каждый рендер шлёт клиентам frame callback (см. хвост
+    /// render_surface), так что клиенты тоже рисовали вдвое чаще, чем нужно.
+    pub frame_queued: bool,
+    /// Когда флаг выше был выставлен. Страховка от вечной заморозки экрана:
+    /// если VBlank почему-то не пришёл (потеря page flip, гонка при VT-switch),
+    /// через FRAME_QUEUE_STALE_MS флаг игнорируется и рендер идёт как раньше.
+    pub frame_queued_at: std::time::Instant,
 }
+
+/// Посекундная сводка по рендеру — дешёвая замена профайлеру, которого на этой
+/// машине нет. Печатается на уровне `debug!` (штатный RUST_LOG в launch_tty.zsh),
+/// одна строка в секунду, и только когда за секунду был хоть один кадр: на
+/// неподвижном экране лог остаётся пустым, и это само по себе сигнал, что
+/// damage tracking работает.
+#[derive(Debug)]
+pub struct RenderStats {
+    since: std::time::Instant,
+    frames: u32,
+    skipped: u32,
+    total_us: u64,
+    max_us: u64,
+    max_elements: usize,
+}
+
+impl RenderStats {
+    pub fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            frames: 0, skipped: 0, total_us: 0, max_us: 0, max_elements: 0,
+        }
+    }
+
+    fn record(&mut self, us: u64, elements: usize) {
+        self.frames += 1;
+        self.total_us += us;
+        self.max_us = self.max_us.max(us);
+        self.max_elements = self.max_elements.max(elements);
+        self.flush();
+    }
+
+    fn record_skip(&mut self) {
+        self.skipped += 1;
+    }
+
+    fn flush(&mut self) {
+        if self.since.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let secs = self.since.elapsed().as_secs_f64();
+        tracing::debug!(
+            "dawn/render: {:.0} кадр/с, средний {:.1} мс, худший {:.1} мс, \
+             элементов до {}, пропущено (кадр уже в очереди) {}",
+            self.frames as f64 / secs,
+            self.total_us as f64 / self.frames.max(1) as f64 / 1000.0,
+            self.max_us as f64 / 1000.0,
+            self.max_elements,
+            self.skipped,
+        );
+        *self = Self::new();
+    }
+}
+
+/// Через сколько «зависший» `frame_queued` перестаёт блокировать рендер.
+/// Заметно больше кадра (16.6 мс) и заметно меньше 500-мс хартбита, который
+/// в самом плохом случае всё равно перезапустит цепочку.
+const FRAME_QUEUE_STALE_MS: u128 = 100;
 
 pub struct Device {
     pub drm: DrmDevice,
@@ -111,6 +188,7 @@ pub fn init_udev(
         match event {
             SessionEvent::PauseSession => {
                 tracing::info!("dawn/udev: session paused");
+                state.session_active = false;
                 libinput_for_notifier.suspend();
                 // Отдаём DRM master — seatd передаёт его другому compositor'у
                 for device in state.udev_devices.values_mut() {
@@ -119,6 +197,7 @@ pub fn init_udev(
             }
             SessionEvent::ActivateSession => {
                 tracing::info!("dawn/udev: session activated — acquiring DRM master");
+                state.session_active = true;
                 let _ = libinput_for_notifier.resume();
                 // Берём DRM master обратно — теперь мы активный compositor
                 let mut devices = std::mem::take(&mut state.udev_devices);
@@ -132,6 +211,10 @@ pub fn init_udev(
                 for surface in device.surfaces.values_mut() {
                     let _ = surface.compositor.reset_state();
                     let _ = surface.compositor.frame_submitted();
+                    // Кадр, поставленный в очередь до VT-switch, своего VBlank уже
+                    // не дождётся — иначе экран после возврата остался бы мёртвым
+                    // до срабатывания страховки по FRAME_QUEUE_STALE_MS.
+                    surface.frame_queued = false;
                 }
                 // Рендерим все поверхности
                 let crtcs: Vec<_> = device.surfaces.keys().cloned().collect();
@@ -167,7 +250,10 @@ pub fn init_udev(
                 event_loop.handle().insert_source(drm_notifier, move |event, _, state| {
                     match event {
                         DrmEvent::VBlank(crtc) => {
-                            tracing::debug!("dawn/drm: VBlank crtc={:?}", crtc);
+                            // trace!, а не debug!: одна строка на КАЖДЫЙ кадр, а лог
+                            // из launch_tty.zsh пишется через tee синхронно прямо из
+                            // единственного потока рендера (см. queue_frame ниже).
+                            tracing::trace!("dawn/drm: VBlank crtc={:?}", crtc);
                             let mut devices = std::mem::take(&mut state.udev_devices);
                             if let Some(device) = devices.get_mut(&node) {
                                 if let Some(surface) = device.surfaces.get_mut(&crtc) {
@@ -177,6 +263,20 @@ pub fn init_udev(
                                         Ok(_) => {}
                                         Err(e) => tracing::warn!("dawn/drm: frame_submitted: {:?}", e),
                                     }
+                                    // Показанный кадр отпускает «шлагбаум»: следующий
+                                    // рендер разрешён, и делает его прямо этот же
+                                    // VBlank — ровно один рендер на показанный кадр.
+                                    surface.frame_queued = false;
+                                    // Досчитываем анимации ПРЯМО ПЕРЕД кадром:
+                                    // 60Гц-таймер из main.rs тикает независимо
+                                    // от VBlank, и между ними набегала расфазировка
+                                    // до целого кадра — позиция окна на экране
+                                    // отставала/забегала то на кадр, то на ноль,
+                                    // что и читается как «дёрганая» анимация.
+                                    // Тик по времени (Instant), так что лишний
+                                    // вызов ничего не ломает — он просто
+                                    // сэмплирует анимацию в момент отрисовки.
+                                    crate::anim::tick(state);
                                     let gles = &mut device.gles as *mut GlesRenderer;
                                     unsafe { render_surface(surface, &mut *gles, state); }
                                 }
@@ -411,7 +511,11 @@ fn add_surface(
     )?;
 
     let damage_tracker = OutputDamageTracker::from_output(&output);
-    device.surfaces.insert(crtc, Surface { output, compositor, damage_tracker });
+    device.surfaces.insert(crtc, Surface {
+        output, compositor, damage_tracker,
+        frame_queued: false,
+        frame_queued_at: std::time::Instant::now(),
+    });
     tracing::info!("dawn/udev: output '{}' {}x{}@{}Hz",
         output_name, wl_mode.size.w, wl_mode.size.h, wl_mode.refresh/1000);
     Ok(())
@@ -423,22 +527,25 @@ fn add_surface(
 /// Rubber-band рамка выделения (в процессе протяжки) + подсветка уже
 /// выделенных окон (Super+G группирует их в "созвездие") — рисуются поверх
 /// окон полупрозрачными заливками, тем же приёмом, что и Focus Aura/фон портала.
-fn build_selection_elements(state: &Dawn) -> Vec<OutputRenderElements> {
+fn build_selection_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
     let mut elements = Vec::new();
+    if state.selected_windows.is_empty() && state.selection_drag.is_none() {
+        return elements;
+    }
+
     let cam_x = state.viewport.cam_x;
     let cam_y = state.viewport.cam_y;
     let zoom = state.viewport.zoom;
 
+    // Геометрию собираем до заимствования пула: space принадлежит тому же state.
+    let mut rects: Vec<((i32, i32), (i32, i32), [f32; 4])> = Vec::new();
     for window in &state.selected_windows {
         let geo = match state.space.element_geometry(window) { Some(g) => g, None => continue };
         let x = ((geo.loc.x as f64 - cam_x) * zoom).round() as i32;
         let y = ((geo.loc.y as f64 - cam_y) * zoom).round() as i32;
         let w = ((geo.size.w as f64 * zoom).round() as i32).max(1);
         let h = ((geo.size.h as f64 * zoom).round() as i32).max(1);
-        let buf = SolidColorBuffer::new((w, h), [1.0f32, 0.7, 0.2, 0.22]);
-        elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-            &buf, (x, y), 1.0_f64, 1.0, Kind::Unspecified,
-        )));
+        rects.push(((x, y), (w, h), [1.0, 0.7, 0.2, 0.22]));
     }
 
     if let Some(rect) = state.selection_drag {
@@ -446,28 +553,30 @@ fn build_selection_elements(state: &Dawn) -> Vec<OutputRenderElements> {
         let y = ((rect.loc.y as f64 - cam_y) * zoom).round() as i32;
         let w = ((rect.size.w as f64 * zoom).round() as i32).max(1);
         let h = ((rect.size.h as f64 * zoom).round() as i32).max(1);
-        let buf = SolidColorBuffer::new((w, h), [0.35f32, 0.6, 1.0, 0.16]);
-        elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-            &buf, (x, y), 1.0_f64, 1.0, Kind::Unspecified,
-        )));
+        rects.push(((x, y), (w, h), [0.35, 0.6, 1.0, 0.16]));
+    }
+
+    let pool = &mut state.selection_ids;
+    let mut idx = 0usize;
+    for (loc, size, color) in rects {
+        elements.push(pooled_solid(pool, &mut idx, loc, size, color));
     }
 
     elements
 }
 
-fn build_minimap_elements(state: &Dawn, output: &Output) -> Vec<OutputRenderElements> {
+fn build_minimap_elements(state: &mut Dawn, output: &Output) -> Vec<OutputRenderElements> {
     let mut elements = Vec::new();
     let mode = match output.current_mode() { Some(m) => m, None => return elements };
 
     let current_tags = state.viewport.current_tags();
-    let focused = state.seat.get_keyboard().and_then(|kb| kb.current_focus());
+    let focused = state.focused_surface();
     let windows: Vec<(smithay::utils::Point<i32, smithay::utils::Logical>, smithay::utils::Size<i32, smithay::utils::Logical>, bool)> =
         state.tagged_windows.iter()
             .filter(|tw| tw.tags & current_tags != 0)
             .filter_map(|tw| state.space.element_geometry(&tw.window).map(|g| {
                 let is_focused = focused.as_ref()
-                    .zip(tw.window.toplevel())
-                    .map(|(fs, t)| t.wl_surface() == fs)
+                    .map(|fs| crate::xwin::is_surface(&tw.window, fs))
                     .unwrap_or(false);
                 (g.loc, g.size, is_focused)
             }))
@@ -476,23 +585,24 @@ fn build_minimap_elements(state: &Dawn, output: &Output) -> Vec<OutputRenderElem
     let proj = crate::canvas::project_minimap(&windows);
     let origin = crate::canvas::minimap_panel_origin(mode.size);
 
-    let bg = SolidColorBuffer::new(
+    // Закладки камеры читаем до заимствования пула — обе части лежат в state.
+    let bookmarks: Vec<_> = state.camera_bookmarks.values().copied().collect();
+    let pool = &mut state.minimap_ids;
+    let mut idx = 0usize;
+
+    elements.push(pooled_solid(
+        pool, &mut idx, (origin.x, origin.y),
         (crate::canvas::MINIMAP_PANEL_W, crate::canvas::MINIMAP_PANEL_H),
-        [0.05f32, 0.05, 0.08, 0.75],
-    );
-    elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-        &bg, origin, 1.0_f64, 1.0, Kind::Unspecified,
-    )));
+        [0.05, 0.05, 0.08, 0.75],
+    ));
 
     for b in &proj.boxes {
         let color: [f32; 4] = if b.focused { [0.35, 0.55, 0.95, 0.9] } else { [0.6, 0.6, 0.65, 0.75] };
-        let buf = SolidColorBuffer::new((b.size.w, b.size.h), color);
-        let loc = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
-            origin.x + b.loc.x, origin.y + b.loc.y,
+        elements.push(pooled_solid(
+            pool, &mut idx,
+            (origin.x + b.loc.x, origin.y + b.loc.y),
+            (b.size.w, b.size.h), color,
         ));
-        elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-            &buf, loc, 1.0_f64, 1.0, Kind::Unspecified,
-        )));
     }
 
     // Рамку текущего viewport (жёлтый прямоугольник) НЕ рисуем: при отдалении
@@ -505,8 +615,8 @@ fn build_minimap_elements(state: &Dawn, output: &Output) -> Vec<OutputRenderElem
     // двух перекладин. Точки вне панели (сильный зум/далеко) пропускаем.
     const CROSS_ARM: i32 = 5; // длина луча от центра, px
     const CROSS_TH: i32 = 2;  // толщина перекладины, px
-    for anchor in state.camera_bookmarks.values() {
-        let p = crate::canvas::project_point_minimap(*anchor, proj.bbox, proj.scale);
+    for anchor in bookmarks {
+        let p = crate::canvas::project_point_minimap(anchor, proj.bbox, proj.scale);
         if p.x < 0 || p.y < 0
             || p.x >= crate::canvas::MINIMAP_PANEL_W
             || p.y >= crate::canvas::MINIMAP_PANEL_H
@@ -515,21 +625,17 @@ fn build_minimap_elements(state: &Dawn, output: &Output) -> Vec<OutputRenderElem
         }
         let color = [1.0f32, 0.30, 0.45, 0.95];
         // горизонтальная перекладина
-        let hbuf = SolidColorBuffer::new((CROSS_ARM * 2 + 1, CROSS_TH), color);
-        let hloc = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
-            origin.x + p.x - CROSS_ARM, origin.y + p.y - CROSS_TH / 2,
+        elements.push(pooled_solid(
+            pool, &mut idx,
+            (origin.x + p.x - CROSS_ARM, origin.y + p.y - CROSS_TH / 2),
+            (CROSS_ARM * 2 + 1, CROSS_TH), color,
         ));
-        elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-            &hbuf, hloc, 1.0_f64, 1.0, Kind::Unspecified,
-        )));
         // вертикальная перекладина
-        let vbuf = SolidColorBuffer::new((CROSS_TH, CROSS_ARM * 2 + 1), color);
-        let vloc = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
-            origin.x + p.x - CROSS_TH / 2, origin.y + p.y - CROSS_ARM,
+        elements.push(pooled_solid(
+            pool, &mut idx,
+            (origin.x + p.x - CROSS_TH / 2, origin.y + p.y - CROSS_ARM),
+            (CROSS_TH, CROSS_ARM * 2 + 1), color,
         ));
-        elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-            &vbuf, vloc, 1.0_f64, 1.0, Kind::Unspecified,
-        )));
     }
 
     elements
@@ -542,26 +648,54 @@ const PARALLAX_FACTOR: f64 = 0.3;
 const PARALLAX_SPACING_PX: i32 = 160;
 const PARALLAX_DOT_PX: i32 = 3;
 
-fn build_parallax_elements(state: &Dawn, mode: Mode) -> Vec<OutputRenderElements> {
+const PARALLAX_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
+
+/// ВАЖНО про damage tracking: раньше здесь на каждый кадр создавался один
+/// `SolidColorBuffer`, и все ~375 точек сетки (3840x2160 при шаге 160) шли
+/// через `from_buffer`, то есть делили ОДИН Id, у которого вдобавок каждый
+/// кадр было новое значение. Это обе болезни из `pooled_solid` разом, причём
+/// в самом заднем слое, который строится безусловно на каждый кадр: экран
+/// повреждался целиком всегда, `queue_frame` никогда не отдавал `EmptyFrame`,
+/// цепочка VBlank не прерывалась и 4K перерисовывалось ~60 раз в секунду на
+/// неподвижной картинке. Починка теней и масок углов до этого ничего не
+/// меняла, пока параллакс оставался таким.
+fn build_parallax_elements(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    mode: Mode,
+) -> Vec<OutputRenderElements> {
     let mut out = Vec::new();
-    let zoom = state.viewport.zoom;
+    let zoom = state.viewport.zoom.max(0.01);
 
     let shift_x = state.viewport.cam_x * zoom * PARALLAX_FACTOR;
     let shift_y = state.viewport.cam_y * zoom * PARALLAX_FACTOR;
     let offset_x = shift_x.rem_euclid(PARALLAX_SPACING_PX as f64);
     let offset_y = shift_y.rem_euclid(PARALLAX_SPACING_PX as f64);
 
-    let buf = SolidColorBuffer::new((PARALLAX_DOT_PX, PARALLAX_DOT_PX), [1.0f32, 1.0, 1.0, 0.08]);
+    // Один элемент на РЯД сетки вместо точки: точки ряда лежат в одной текстуре
+    // (см. decor.rs). Было ~24×14 ≈ 340 элементов на кадр, стало ~15.
+    let row_w = mode.size.w + PARALLAX_SPACING_PX;
+    // Ширина/высота задаются в логических единицах и умножаются рендером на
+    // zoom, а сетка живёт в экранных пикселях — поэтому делим на zoom заранее.
+    let dst = Size::<i32, Logical>::from((
+        (row_w as f64 / zoom).round().max(1.0) as i32,
+        (PARALLAX_DOT_PX as f64 / zoom).round().max(1.0) as i32,
+    ));
 
+    let mut slot = 0usize;
     let mut y = -(offset_y as i32);
     while y < mode.size.h {
-        let mut x = -(offset_x as i32);
-        while x < mode.size.w {
-            out.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                &buf, (x, y), 1.0_f64, 1.0, Kind::Unspecified,
-            )));
-            x += PARALLAX_SPACING_PX;
+        let buf = state.decor.parallax_row(
+            slot, row_w, PARALLAX_DOT_PX, PARALLAX_SPACING_PX, PARALLAX_COLOR,
+        );
+        let loc = Point::<f64, Physical>::from((-offset_x, y as f64));
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer, loc, buf, None, None, Some(dst), Kind::Unspecified,
+        ) {
+            Ok(el) => out.push(OutputRenderElements::Memory(el)),
+            Err(e) => tracing::warn!("dawn/udev: параллакс: {:?}", e),
         }
+        slot += 1;
         y += PARALLAX_SPACING_PX;
     }
     out
@@ -589,156 +723,320 @@ fn corner_cutout_widths(radius_px: i32) -> Vec<i32> {
     }).collect()
 }
 
-/// Возвращает 1×`width` буфер цвета `CLEAR_COLOR` из `state.corner_mask_cache`,
-/// создавая его при первом обращении. Ширина среза (`corner_cutout_widths`)
-/// принимает не больше 24 разных значений (r_px ∈ [2,24]), так что кэш растёт
-/// до пары десятков записей и никогда не чистится — раньше этот буфер
-/// пересоздавался заново на КАЖДУЮ строку КАЖДОГО угла КАЖДОГО окна КАЖДЫЙ
-/// кадр (до 4*24 аллокаций на окно на кадр), хотя содержимое зависит только
-/// от ширины среза.
-fn cached_corner_buf(cache: &mut HashMap<i32, SolidColorBuffer>, width: i32) -> &SolidColorBuffer {
-    cache.entry(width).or_insert_with(|| SolidColorBuffer::new((width, 1), CLEAR_COLOR))
+/// Слот пула процедурных solid-элементов: стабильный между кадрами `Id` плюс
+/// последний отданный цвет и счётчик коммитов (см. `pooled_solid`).
+#[derive(Debug)]
+pub struct SolidSlot {
+    id: Id,
+    commit: CommitCounter,
+    color: [f32; 4],
 }
 
-fn build_corner_mask_elements(state: &mut Dawn, output: &Output) -> Vec<OutputRenderElements> {
-    let mut elements = Vec::new();
-    if state.tagged_windows.is_empty() {
-        return elements;
+impl SolidSlot {
+    fn new() -> Self {
+        // Цвет-«невозможное значение», чтобы первый же кадр записал настоящий
+        // и не считал совпадение с чёрным прозрачным за «цвет не менялся».
+        Self { id: Id::new(), commit: CommitCounter::default(), color: [f32::NAN; 4] }
     }
+}
+
+/// Выдаёт solid-элемент со стабильным между кадрами `Id` из пула `pool`.
+///
+/// Зачем не `SolidColorBuffer` + `from_buffer`: `SolidColorBuffer::new()` внутри
+/// вызывает `Id::new()`, а `from_buffer` берёт id прямо из буфера. Отсюда две
+/// противоположные болезни, обе ломавшие damage tracking:
+///
+/// * тени (`build_shadow_elements`) и фон обзора собирали НОВЫЙ буфер на каждую
+///   полоску каждый кадр → у сотен элементов на окно каждый кадр новый Id →
+///   damage tracker считал их все новыми и помечал повреждённым весь экран.
+///   В логе на 10 МБ не было ни одного `is_empty=true`: 4K-кадр перерисовывался
+///   целиком по 60 раз в секунду даже на неподвижном экране, а `queue_frame`
+///   никогда не возвращал `EmptyFrame`. Это и есть основной источник лагов;
+/// * маски углов, наоборот, брали ОДИН кэшированный буфер (значит один Id) сразу
+///   на десятки элементов, а damage tracker индексирует состояние по Id и
+///   схлопывает такие элементы в один — повреждения считались неверно.
+///
+/// Пул выдаёт Id по порядковому номеру: постоянный от кадра к кадру и
+/// уникальный внутри кадра. Порядок обхода окон детерминирован, так что
+/// элемент N — это из кадра в кадр одна и та же полоска. Если состав или
+/// геометрия окон меняется, элемент под тем же номером просто получает другую
+/// геометрию, и damage tracker честно повреждает старый и новый прямоугольник.
+///
+/// Цвет слота хранится в пуле и при смене двигает `CommitCounter`: раньше здесь
+/// стоял `CommitCounter::default()` в расчёте на то, что цвет для номера
+/// постоянен (константы слоёв тени / `CLEAR_COLOR` / `BG_COLOR`), но пулом
+/// пользуются и миникарта с выделением, где цвет элемента под тем же номером
+/// зависит от фокуса и состава выделения.
+fn pooled_solid(
+    pool: &mut Vec<SolidSlot>,
+    idx: &mut usize,
+    loc: (i32, i32),
+    size: (i32, i32),
+    color: [f32; 4],
+) -> OutputRenderElements {
+    while pool.len() <= *idx {
+        pool.push(SolidSlot::new());
+    }
+    let slot = &mut pool[*idx];
+    *idx += 1;
+    // Геометрию damage tracker сравнивает сам, а вот содержимое элемента для него
+    // непрозрачно — об изменении цвета при той же геометрии он узнаёт ТОЛЬКО по
+    // счётчику коммитов. Без этого, например, прямоугольник миникапы, потерявший
+    // фокус, остался бы на экране старым цветом до ближайшего чужого повреждения.
+    if slot.color != color {
+        slot.color = color;
+        slot.commit.increment();
+    }
+    let geo: Rectangle<i32, Physical> = Rectangle::new(Point::from(loc), Size::from(size));
+    OutputRenderElements::Solid(SolidColorRenderElement::new(
+        slot.id.clone(), geo, slot.commit, color, Kind::Unspecified,
+    ))
+}
+
+/// Полоска вкладок слева от вкладочной колонки (niri: tab indicator).
+/// Рисуется ТОЛЬКО в режиме Columns — остальные раскладки про вкладки не знают.
+fn build_tab_indicators(state: &mut Dawn) -> Vec<OutputRenderElements> {
+    let mut els = Vec::new();
+    if state.tile_config.layout != crate::tiling::Layout::Columns {
+        return els;
+    }
+    /// Цвет неактивной и активной вкладки.
+    const TAB_IDLE: [f32; 4] = [1.0, 1.0, 1.0, 0.22];
+    const TAB_ACTIVE: [f32; 4] = [0.55, 0.75, 1.0, 0.95];
+
     let zoom = state.viewport.zoom;
     let cam_x = state.viewport.cam_x;
     let cam_y = state.viewport.cam_y;
+    let strips: Vec<(i32, i32, i32, i32, usize, usize)> = (0..state.columns.columns.len())
+        .filter_map(|ci| state.columns_tab_strip(ci))
+        .collect();
+    if strips.is_empty() {
+        return els;
+    }
+    let pool = &mut state.tab_ids;
+    let mut idx = 0usize;
+    for (x, y, w, tab_h, n, active) in strips {
+        for i in 0..n {
+            let color = if i == active { TAB_ACTIVE } else { TAB_IDLE };
+            // Между вкладками — маленький просвет, чтобы читались как отдельные.
+            let top = y + tab_h * i as i32 + 2;
+            let h = (tab_h - 4).max(2);
+            let px = (((x as f64) - cam_x) * zoom).round() as i32;
+            let py = (((top as f64) - cam_y) * zoom).round() as i32;
+            let pw = ((w as f64) * zoom).round().max(1.0) as i32;
+            let ph = ((h as f64) * zoom).round().max(1.0) as i32;
+            els.push(pooled_solid(pool, &mut idx, (px, py), (pw, ph), color));
+        }
+    }
+    els
+}
 
-    let radius_logical = if state.tile_config.layout == crate::tiling::Layout::Tile {
+/// Подсказка вставки при перетаскивании окна в Columns (niri: insert hint) —
+/// показывает шов между колонками или стопку, куда окно встанет на отпускании.
+fn build_insert_hint(state: &mut Dawn) -> Vec<OutputRenderElements> {
+    let mut els = Vec::new();
+    if state.tile_config.layout != crate::tiling::Layout::Columns {
+        return els;
+    }
+    let Some(pos_x) = state.columns_drag_hint else { return els };
+    let Some(rect) = state.columns_insert_hint_rect(pos_x) else { return els };
+    const HINT_COLOR: [f32; 4] = [0.35, 0.6, 1.0, 0.35];
+
+    let zoom = state.viewport.zoom;
+    let x = ((rect.loc.x as f64 - state.viewport.cam_x) * zoom).round() as i32;
+    let y = ((rect.loc.y as f64 - state.viewport.cam_y) * zoom).round() as i32;
+    let w = (rect.size.w as f64 * zoom).round().max(1.0) as i32;
+    let h = (rect.size.h as f64 * zoom).round().max(1.0) as i32;
+    let pool = &mut state.hint_ids;
+    let mut idx = 0usize;
+    els.push(pooled_solid(pool, &mut idx, (x, y), (w, h), HINT_COLOR));
+    els
+}
+
+/// Радиус скругления окон для текущей раскладки (логические px).
+fn corner_radius_logical(state: &Dawn) -> i32 {
+    let r = if state.tile_config.layout == crate::tiling::Layout::Tile {
         CORNER_RADIUS_LOGICAL_TILE
     } else {
         CORNER_RADIUS_LOGICAL
     };
-    let r_px = ((radius_logical * zoom).round() as i32).clamp(2, 32);
-    let widths = corner_cutout_widths(r_px);
+    (r.round() as i32).clamp(2, 32)
+}
+
+/// Геометрия окна на экране: (x0, y0, ширина, высота) в физических пикселях.
+fn window_screen_rect(state: &Dawn, window: &Window) -> Option<(f64, f64, f64, f64)> {
+    let geo = state.space.element_geometry(window)?;
+    let zoom = state.viewport.zoom;
+    Some((
+        (geo.loc.x as f64 - state.viewport.cam_x) * zoom,
+        (geo.loc.y as f64 - state.viewport.cam_y) * zoom,
+        geo.size.w as f64 * zoom,
+        geo.size.h as f64 * zoom,
+    ))
+}
+
+/// Маски скруглённых углов — четыре плитки на окно вместо 4×радиус полосок.
+/// Размер плитки НЕ задаём: буфер сделан в логических пикселях, и рендер сам
+/// умножит его на масштаб выхода (у нас это zoom) — ровно так же, как окна,
+/// поэтому маска не разъезжается с углом при любом зуме.
+fn build_corner_mask_elements(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    let mut elements = Vec::new();
+    if state.tagged_windows.is_empty() {
+        return elements;
+    }
     let _ = output;
+    let zoom = state.viewport.zoom;
+    let radius = corner_radius_logical(state);
+    state.decor.ensure(radius, [CLEAR_COLOR[0], CLEAR_COLOR[1], CLEAR_COLOR[2]]);
+    let r_px = state.decor.mask_px() as f64 * zoom;
 
-    let space = &state.space;
-    let tagged_windows = &state.tagged_windows;
-    let cache = &mut state.corner_mask_cache;
-
-    for tw in tagged_windows {
-        let geo = match space.element_geometry(&tw.window) { Some(g) => g, None => continue };
-        let w_px = (geo.size.w as f64 * zoom).round() as i32;
-        let h_px = (geo.size.h as f64 * zoom).round() as i32;
-        if w_px < r_px * 2 || h_px < r_px * 2 {
+    let windows: Vec<Window> = state.tagged_windows.iter().map(|tw| tw.window.clone()).collect();
+    let mut slot = 0usize;
+    for window in windows {
+        let Some((x0, y0, w, h)) = window_screen_rect(state, &window) else { continue };
+        if w < r_px * 2.0 || h < r_px * 2.0 {
             continue; // окно слишком маленькое для радиуса — не портим его совсем
         }
-        let x0 = ((geo.loc.x as f64 - cam_x) * zoom).round() as i32;
-        let y0 = ((geo.loc.y as f64 - cam_y) * zoom).round() as i32;
-
-        for (row, &cw) in widths.iter().enumerate() {
-            if cw <= 0 {
-                continue;
+        let corners = [
+            (crate::decor::TL, x0, y0),
+            (crate::decor::TR, x0 + w - r_px, y0),
+            (crate::decor::BL, x0, y0 + h - r_px),
+            (crate::decor::BR, x0 + w - r_px, y0 + h - r_px),
+        ];
+        for (corner, x, y) in corners {
+            let buf = state.decor.mask_corner(corner, slot);
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer, Point::<f64, Physical>::from((x, y)), buf,
+                None, None, None, Kind::Unspecified,
+            ) {
+                Ok(el) => elements.push(OutputRenderElements::Memory(el)),
+                Err(e) => tracing::warn!("dawn/udev: маска угла: {:?}", e),
             }
-            let row = row as i32;
-            // top-left / top-right — сверху окна
-            let buf = cached_corner_buf(cache, cw);
-            elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                buf, (x0, y0 + row), 1.0_f64, 1.0, Kind::Unspecified,
-            )));
-            let buf = cached_corner_buf(cache, cw);
-            elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                buf, (x0 + w_px - cw, y0 + row), 1.0_f64, 1.0, Kind::Unspecified,
-            )));
-            // bottom-left / bottom-right — снизу окна
-            let by = y0 + h_px - 1 - row;
-            let buf = cached_corner_buf(cache, cw);
-            elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                buf, (x0, by), 1.0_f64, 1.0, Kind::Unspecified,
-            )));
-            let buf = cached_corner_buf(cache, cw);
-            elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                buf, (x0 + w_px - cw, by), 1.0_f64, 1.0, Kind::Unspecified,
-            )));
         }
+        slot += 1;
     }
 
     elements
 }
 
-/// Мягкая нейтральная тень-«гало» позади каждого окна — НЕСКОЛЬКО слоёв разного
-/// размера и убывающей прозрачности дают перо/растушёвку (эффект «блюра фона»),
-/// а не резкий контур. Нейтральный чёрный (НЕ голубой). Скругление — строками
-/// (corner_cutout_widths), но строки рисуют чёрным (углы тени прозрачны).
-fn build_shadow_elements(state: &Dawn) -> Vec<OutputRenderElements> {
-    // Многослойная растушёвка: 5 слоёв от плотного ядра до широкого ореола
-    // с низкой альфой — имитация размытия как "замазали в фотошопе".
-    const LAYERS: [(i32, f32); 5] = [(2, 0.09), (5, 0.06), (9, 0.035), (14, 0.02), (20, 0.01)];
-    const DROP: i32 = 4;
+/// Мягкая нейтральная тень-«гало» позади каждого окна.
+///
+/// Девятипатчевая раскладка (см. decor.rs): 4 угловые плитки + 4 кромки,
+/// растянутые вдоль сторон, + однотонная середина тремя прямоугольниками.
+/// 11 элементов на окно вместо ~225 построчных полосок, вид тот же — форма и
+/// альфы слоёв запечены в плитки по той же формуле.
+///
+/// Части НЕ перекрываются: полупрозрачные куски, наложившись, дали бы двойное
+/// затемнение по швам.
+fn build_shadow_elements(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
     if state.tagged_windows.is_empty() {
         return els;
     }
     let zoom = state.viewport.zoom;
-    let cam_x = state.viewport.cam_x;
-    let cam_y = state.viewport.cam_y;
-    let radius_logical = if state.tile_config.layout == crate::tiling::Layout::Tile {
-        CORNER_RADIUS_LOGICAL_TILE
-    } else {
-        CORNER_RADIUS_LOGICAL
+    let radius = corner_radius_logical(state);
+    state.decor.ensure(radius, [CLEAR_COLOR[0], CLEAR_COLOR[1], CLEAR_COLOR[2]]);
+
+    // Всё в физических пикселях экрана; плитки заданы в логических и
+    // домножаются рендером на zoom — поэтому и здесь масштабируем на него.
+    let s = crate::decor::SPREAD as f64 * zoom;       // ширина кромки
+    let r = radius as f64 * zoom;                     // радиус скругления
+
+    let drop = crate::decor::DROP as f64 * zoom;      // сдвиг тени вниз
+    let center = {
+        let a = crate::decor::center_alpha();
+        [0.0f32, 0.0, 0.0, a]
     };
-    let r_px_base = (radius_logical * zoom).round() as i32;
-    for tw in &state.tagged_windows {
-        let geo = match state.space.element_geometry(&tw.window) { Some(g) => g, None => continue };
-        let w_px = (geo.size.w as f64 * zoom).round() as i32;
-        let h_px = (geo.size.h as f64 * zoom).round() as i32;
-        if w_px < 8 || h_px < 8 {
+
+    let windows: Vec<Window> = state.tagged_windows.iter().map(|tw| tw.window.clone()).collect();
+    let mut slot = 0usize;
+    for window in windows {
+        let Some((x0, y0raw, w, h)) = window_screen_rect(state, &window) else { continue };
+        if w < 8.0 || h < 8.0 || w < 2.0 * r || h < 2.0 * r {
             continue;
         }
-        let x0 = ((geo.loc.x as f64 - cam_x) * zoom).round() as i32;
-        let y0 = ((geo.loc.y as f64 - cam_y) * zoom).round() as i32;
+        let y0 = y0raw + drop;
 
-        for (spread, alpha) in LAYERS {
-            let color = [0.0f32, 0.0, 0.0, alpha];
-            let sx = x0 - spread;
-            let sy = y0 - spread + DROP;
-            let sw = w_px + 2 * spread;
-            let sh = h_px + 2 * spread;
-            let r_sh = (r_px_base + spread).clamp(2, sw.min(sh) / 2);
-            let widths = corner_cutout_widths(r_sh);
-            let rr = widths.len() as i32;
-            if sh <= 2 * rr || sw <= 2 * rr {
-                let buf = SolidColorBuffer::new((sw.max(1), sh.max(1)), color);
-                els.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                    &buf, (sx, sy), 1.0_f64, 1.0, Kind::Unspecified,
-                )));
-                continue;
-            }
-            for (i, &cw) in widths.iter().enumerate() {
-                let rw = sw - 2 * cw;
-                if rw <= 0 { continue; }
-                let i = i as i32;
-                let buf = SolidColorBuffer::new((rw, 1), color);
-                els.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                    &buf, (sx + cw, sy + i), 1.0_f64, 1.0, Kind::Unspecified,
-                )));
-                let by = sy + sh - 1 - i;
-                let buf = SolidColorBuffer::new((rw, 1), color);
-                els.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                    &buf, (sx + cw, by), 1.0_f64, 1.0, Kind::Unspecified,
-                )));
-            }
-            let midh = sh - 2 * rr;
-            if midh > 0 {
-                let buf = SolidColorBuffer::new((sw, midh), color);
-                els.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                    &buf, (sx, sy + rr), 1.0_f64, 1.0, Kind::Unspecified,
-                )));
+        // ── Углы ─────────────────────────────────────────────────────────────
+        let corners = [
+            (crate::decor::TL, x0 - s,     y0 - s),
+            (crate::decor::TR, x0 + w - r, y0 - s),
+            (crate::decor::BL, x0 - s,     y0 + h - r),
+            (crate::decor::BR, x0 + w - r, y0 + h - r),
+        ];
+        for (corner, x, y) in corners {
+            let buf = state.decor.shadow_corner(corner, slot);
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer, Point::<f64, Physical>::from((x, y)), buf,
+                None, None, None, Kind::Unspecified,
+            ) {
+                Ok(el) => els.push(OutputRenderElements::Memory(el)),
+                Err(e) => tracing::warn!("dawn/udev: угол тени: {:?}", e),
             }
         }
+
+
+        // ── Кромки ───────────────────────────────────────────────────────────
+        // Текстура толщиной в пиксель растягивается вдоль стороны через dst:
+        // альфа вдоль стороны постоянна, так что растяжение точное.
+        let side_w = ((w - 2.0 * r) / zoom).round().max(1.0) as i32;
+        let side_h = ((h - 2.0 * r) / zoom).round().max(1.0) as i32;
+        let edges = [
+            (crate::decor::TOP,    x0 + r,     y0 - s,     side_w, crate::decor::SPREAD),
+            (crate::decor::BOTTOM, x0 + r,     y0 + h,     side_w, crate::decor::SPREAD),
+            (crate::decor::LEFT,   x0 - s,     y0 + r,     crate::decor::SPREAD, side_h),
+            (crate::decor::RIGHT,  x0 + w,     y0 + r,     crate::decor::SPREAD, side_h),
+        ];
+        for (edge, x, y, dw, dh) in edges {
+            let buf = state.decor.shadow_edge(edge, slot);
+            let dst = Size::<i32, Logical>::from((dw, dh));
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer, Point::<f64, Physical>::from((x, y)), buf,
+                None, None, Some(dst), Kind::Unspecified,
+            ) {
+                Ok(el) => els.push(OutputRenderElements::Memory(el)),
+                Err(e) => tracing::warn!("dawn/udev: кромка тени: {:?}", e),
+            }
+        }
+
+        // ── Середина ─────────────────────────────────────────────────────────
+        // Три непересекающихся прямоугольника: широкий по центру и две вставки
+        // между угловыми плитками по бокам.
+        let pool = &mut state.shadow_ids;
+        let mut idx = slot * 3;
+        let mid_x = (x0 + r).round() as i32;
+        let mid_w = (w - 2.0 * r).round() as i32;
+        if mid_w > 0 {
+            els.push(pooled_solid(
+                pool, &mut idx, (mid_x, y0.round() as i32), (mid_w, h.round() as i32), center,
+            ));
+        }
+        let side_hh = (h - 2.0 * r).round() as i32;
+        if side_hh > 0 && r >= 1.0 {
+            let y = (y0 + r).round() as i32;
+            els.push(pooled_solid(
+                pool, &mut idx, (x0.round() as i32, y), (r.round() as i32, side_hh), center,
+            ));
+            els.push(pooled_solid(
+                pool, &mut idx, ((x0 + w - r).round() as i32, y), (r.round() as i32, side_hh), center,
+            ));
+        }
+
+        slot += 1;
     }
     els
 }
 
 /// Полупрозрачный «заметный» фон + тень под каждым воркспейсом — ТОЛЬКО в обзоре
 /// (тап Super), чтобы столы визуально читались как отдельные карточки.
-fn build_overview_bg_elements(state: &Dawn) -> Vec<OutputRenderElements> {
+fn build_overview_bg_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
     if !state.overview_active {
         return els;
@@ -751,7 +1049,12 @@ fn build_overview_bg_elements(state: &Dawn) -> Vec<OutputRenderElements> {
     let zoom = state.viewport.zoom;
     let cam_x = state.viewport.cam_x;
     let cam_y = state.viewport.cam_y;
-    for r in state.overview_band_rects() {
+    // Собираем прямоугольники до взятия &mut на пул: overview_band_rects()
+    // читает state целиком, а пул живёт в нём же.
+    let bands: Vec<_> = state.overview_band_rects().into_iter().collect();
+    let pool = &mut state.overview_bg_ids;
+    let mut idx = 0usize;
+    for r in bands {
         let sx = ((r.loc.x as f64 - cam_x) * zoom).round() as i32;
         let sy = ((r.loc.y as f64 - cam_y) * zoom).round() as i32;
         let sw = (r.size.w as f64 * zoom).round() as i32;
@@ -767,10 +1070,9 @@ fn build_overview_bg_elements(state: &Dawn) -> Vec<OutputRenderElements> {
             let sw_sh = sw + 2 * spread;
             let sh_sh = sh + 2 * spread;
             let color = [0.0f32, 0.0, 0.0, alpha];
-            let buf = SolidColorBuffer::new((sw_sh.max(1), sh_sh.max(1)), color);
-            els.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                &buf, (sx_sh, sy_sh), 1.0_f64, 1.0, Kind::Unspecified,
-            )));
+            els.push(pooled_solid(
+                pool, &mut idx, (sx_sh, sy_sh), (sw_sh.max(1), sh_sh.max(1)), color,
+            ));
         }
 
         // ── Фон бэнда (скруглённый) ──
@@ -778,25 +1080,50 @@ fn build_overview_bg_elements(state: &Dawn) -> Vec<OutputRenderElements> {
         let widths = corner_cutout_widths(r_px);
         let rr = widths.len() as i32;
         if sh <= 2 * rr || sw <= 2 * rr {
-            let buf = SolidColorBuffer::new((sw.max(1), sh.max(1)), BG_COLOR);
-            els.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                &buf, (sx, sy), 1.0_f64, 1.0, Kind::Unspecified,
-            )));
+            els.push(pooled_solid(pool, &mut idx, (sx, sy), (sw.max(1), sh.max(1)), BG_COLOR));
             continue;
         }
         for (i, &cw) in widths.iter().enumerate() {
             let rw = sw - 2 * cw;
             if rw <= 0 { continue; }
-            let buf = SolidColorBuffer::new((rw, sh - 2 * (i as i32)), BG_COLOR);
-            els.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                &buf, (sx + cw, sy + i as i32), 1.0_f64, 1.0, Kind::Unspecified,
-            )));
+            let i = i as i32;
+            els.push(pooled_solid(pool, &mut idx, (sx + cw, sy + i), (rw, sh - 2 * i), BG_COLOR));
         }
     }
     els
 }
 
 pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state: &mut Dawn) {
+    // Курсор сводим с камерой ЗДЕСЬ — в самой нижней точке, через которую
+    // проходят ВСЕ пути отрисовки. Раньше вызов стоял в render_all, но
+    // VBlank-хендлер (см. init_udev) зовёт anim::tick и render_surface напрямую,
+    // мимо него — то есть каждый кадр анимации (зум, обзор, перелёт, инерция)
+    // рисовался с курсором от предыдущего положения камеры. Стрелку тащило
+    // вместе с холстом, а главный цикл возвращал её назад уже после показа:
+    // в логе это «СИНХ КУРСОР ... снос=(-30.0,-38.0)» — 30-38 px за один
+    // отрисованный кадр.
+    state.sync_pointer_to_camera();
+
+    // Не рисуем чаще, чем экран показывает: пока предыдущий кадр ждёт VBlank,
+    // рисовать второй бессмысленно — queue_frame его же и затрёт (см. поле
+    // Surface::frame_queued). Запрос на перерисовку не теряем: возвращаем
+    // needs_redraw, и кадр будет отрисован либо ближайшим VBlank (он всё равно
+    // зовёт render_surface), либо следующим проходом главного цикла.
+    if surface.frame_queued {
+        if surface.frame_queued_at.elapsed().as_millis() < FRAME_QUEUE_STALE_MS {
+            state.needs_redraw = true;
+            state.render_stats.record_skip();
+            return;
+        }
+        // Страховка: VBlank не пришёл слишком долго — считаем цепочку порванной
+        // и рисуем, иначе экран замёрзнет навсегда.
+        tracing::debug!("dawn/udev: frame_queued завис на {:?}, рисуем принудительно",
+            surface.frame_queued_at.elapsed());
+        surface.frame_queued = false;
+    }
+
+    let render_started = std::time::Instant::now();
+
     // Сбрасываем plane-кэш только когда окна реально поменялись (тайлинг/
     // создание/уничтожение/переключение тега) — несколько кадров подряд
     // (см. request_plane_reset), не постоянно: полный редрав каждый кадр
@@ -820,6 +1147,28 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
         output_local.to_physical(state.viewport.zoom).to_i32_round()
     };
 
+    // Решающий замер по жалобе «курсор тянется за паном»: печатаем то, что
+    // РЕАЛЬНО уходит в кадр — экранную точку курсора и точку привязки окон
+    // (output_geo.loc, от неё smithay раскладывает все окна). Если при пане
+    // стрелка стоит, а привязка едет — курсор от содержимого не отстаёт и
+    // причина где-то ещё. Если едут обе — курсор тащит вместе с холстом.
+    // Не чаще 4 строк в секунду и только когда камера шевелится.
+    {
+        let cam = (state.viewport.cam_x, state.viewport.cam_y);
+        let moving = (cam.0 - state.render_cam_logged.0).abs() > 0.01
+            || (cam.1 - state.render_cam_logged.1).abs() > 0.01;
+        if moving && state.render_cursor_logged.elapsed().as_millis() >= 250 {
+            state.render_cursor_logged = std::time::Instant::now();
+            let anchor = state.space.output_geometry(&surface.output).map(|g| g.loc);
+            tracing::debug!(
+                "КАДР: курсор_экран=({},{}) привязка_окон={:?} камера=({:.1},{:.1}) zoom={:.2}",
+                cursor_pos_physical.x, cursor_pos_physical.y, anchor, cam.0, cam.1,
+                state.viewport.zoom,
+            );
+        }
+        state.render_cam_logged = cam;
+    }
+
     match &state.cursor_status {
         CursorImageStatus::Surface(ref cursor_surface) => {
             let hotspot = with_states(cursor_surface, |states| {
@@ -827,12 +1176,23 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
                     .map(|d| d.lock().unwrap().hotspot)
                     .unwrap_or_default()
             });
-            let p = state.pointer_location - hotspot.to_f64();
+            // Хотспот вычитается в ФИЗИЧЕСКИХ пикселях, уже ПОСЛЕ умножения на
+            // zoom: поверхность курсора рисуется 1:1 (scale = 1.0 ниже), зум её
+            // не масштабирует. Раньше вычитание шло в canvas-координатах, до
+            // зума, то есть фактически вычитался hotspot*zoom — остриё уезжало
+            // от точки попадания на hotspot*(zoom-1). В обзоре (zoom 0.5) клик
+            // из-за этого уходил не туда, куда показывает стрелка.
+            // Курсор из темы (ветка Named) — наоборот, масштабируется вместе с
+            // зумом через dst, там hotspot*zoom и есть правильное смещение.
             let output_local = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
-                p.x - state.viewport.cam_x,
-                p.y - state.viewport.cam_y,
+                state.pointer_location.x - state.viewport.cam_x,
+                state.pointer_location.y - state.viewport.cam_y,
             ));
-            let pos = output_local.to_physical(state.viewport.zoom).to_i32_round();
+            let p = output_local.to_physical(state.viewport.zoom);
+            let pos = smithay::utils::Point::<f64, smithay::utils::Physical>::from((
+                p.x - hotspot.x as f64,
+                p.y - hotspot.y as f64,
+            )).to_i32_round();
             let cursor_els: Vec<OutputRenderElements> =
                 render_elements_from_surface_tree(
                     renderer, cursor_surface, pos, 1.0, 1.0, Kind::Cursor,
@@ -849,13 +1209,17 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
                 match MemoryRenderBufferRenderElement::from_buffer(
                     renderer, cursor_pos_physical, buf, None, None, Some(dst), Kind::Cursor,
                 ) {
-                    Ok(el) => elements.push(OutputRenderElements::DefaultCursor(el)),
+                    Ok(el) => elements.push(OutputRenderElements::Memory(el)),
                     Err(e) => tracing::warn!("dawn/udev: cursor render element: {:?}", e),
                 }
             }
         }
         CursorImageStatus::Hidden => {}
     }
+
+    // Всё, что добавлено выше, рисует курсор — screencopy отбрасывает ровно эти
+    // элементы, когда сессия просит кадр без курсора (см. serve_pending).
+    let cursor_elements = elements.len();
 
     // ── Миникарта (3.1, поверх окон, под курсором) ───────────────────────────
     // Не показываем во время обзора столов (перекрывает ленту).
@@ -866,7 +1230,7 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     // ── Оконный портал (4.4): живая копия удалённого окна в фикс. точке экрана ─
     if let Some(portal) = &state.portal {
         if let Some(window) = state.tagged_windows.iter()
-            .find(|tw| tw.window.toplevel().map(|t| t.wl_surface() == &portal.surface).unwrap_or(false))
+            .find(|tw| crate::xwin::is_surface(&tw.window, &portal.surface))
             .map(|tw| tw.window.clone())
         {
             if let Some(geo) = state.space.element_geometry(&window) {
@@ -874,10 +1238,13 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
                 let scale_y = portal.box_size.h as f64 / geo.size.h.max(1) as f64;
                 let scale = scale_x.min(scale_y);
 
-                let bg = SolidColorBuffer::new((portal.box_size.w, portal.box_size.h), [0.0f32, 0.0, 0.0, 0.85]);
-                elements.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
-                    &bg, portal.screen_pos, 1.0_f64, 1.0, Kind::Unspecified,
-                )));
+                let mut idx = 0usize;
+                elements.push(pooled_solid(
+                    &mut state.portal_ids, &mut idx,
+                    (portal.screen_pos.x, portal.screen_pos.y),
+                    (portal.box_size.w, portal.box_size.h),
+                    [0.0, 0.0, 0.0, 0.85],
+                ));
 
                 let els: Vec<OutputRenderElements> = window.render_elements(
                     renderer, portal.screen_pos, smithay::utils::Scale::from(scale), 1.0f32,
@@ -893,7 +1260,11 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     // угла окна, по строкам, ширина строки — из уравнения окружности. Красят
     // всегда цветом clear color компоситора, а не тем, что реально позади —
     // упрощение, приемлемое пока под углом обычно просто холст/фон.
-    elements.extend(build_corner_mask_elements(state, &surface.output));
+    elements.extend(build_corner_mask_elements(state, renderer, &surface.output));
+
+    // ── Полоски вкладок и подсказка вставки (только Columns/niri) ────────────
+    elements.extend(build_tab_indicators(state));
+    elements.extend(build_insert_hint(state));
 
     // ── Мультивыделение (rubber-band + подсветка "созвездий") ───────────────
     elements.extend(build_selection_elements(state));
@@ -911,10 +1282,10 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     }
 
     // ── Тени окон (полупрозрачные, скруглённые), сразу ПОЗАДИ окон ──────────
-    // Не рендерим в обзоре — при zoom=0.5 тени незаметны, но много элементов.
-    if !state.overview_active {
-        elements.extend(build_shadow_elements(state));
-    }
+    // В обзоре тоже рисуем: раньше их там отключали из-за цены (225 элементов
+    // на окно), но после перехода на плитки это 11 элементов, и в обзоре тень
+    // как раз нужна — она отделяет окна от фона стола.
+    elements.extend(build_shadow_elements(state, renderer));
 
     // Focus Aura (голубое свечение) УБРАНА — её принимали за "голубую тень".
     // Глубину теперь даёт нейтральная мягкая build_shadow_elements выше.
@@ -924,23 +1295,44 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
 
     // ── Параллакс-фон (5.1) — самый задний слой, сдвигается медленнее окон ──
     if let Some(mode) = surface.output.current_mode() {
-        elements.extend(build_parallax_elements(state, mode));
+        elements.extend(build_parallax_elements(state, renderer, mode));
     }
 
+    let element_count = elements.len();
     let output_name = surface.output.name();
     match surface.compositor.render_frame(
         renderer, &elements, [0.1f32, 0.1, 0.1, 1.0], FrameFlags::empty()
     ) {
         Ok(res) => {
-            tracing::debug!("dawn/udev: render_frame[{}]: is_empty={}", output_name, res.is_empty);
+            // trace!, а не debug!: это две строки на КАЖДЫЙ кадр (при 60 Гц —
+            // ~50 КБ/с), а лог из launch_tty.zsh идёт через tee синхронной
+            // записью на диск прямо из потока рендера, который у dawn один.
+            tracing::trace!("dawn/udev: render_frame[{}]: is_empty={}", output_name, res.is_empty);
             match surface.compositor.queue_frame(()) {
-                Ok(()) => tracing::debug!("dawn/udev: queue_frame[{}]: committed", output_name),
-                Err(FrameError::EmptyFrame) => tracing::debug!("dawn/udev: queue_frame[{}]: EmptyFrame", output_name),
+                Ok(()) => {
+                    // Кадр ушёл на показ — до его VBlank новые рендеры не нужны.
+                    surface.frame_queued = true;
+                    surface.frame_queued_at = std::time::Instant::now();
+                    tracing::trace!("dawn/udev: queue_frame[{}]: committed", output_name);
+                }
+                // EmptyFrame — на экране ничего не изменилось, VBlank НЕ придёт;
+                // шлагбаум обязан остаться открытым, иначе следующее изменение
+                // упрётся в него и будет ждать страховочные 100 мс.
+                Err(FrameError::EmptyFrame) => tracing::trace!("dawn/udev: queue_frame[{}]: EmptyFrame", output_name),
                 Err(e) => tracing::warn!("dawn/udev: queue_frame[{}]: {:?}", output_name, e),
             }
         }
         Err(e) => tracing::warn!("dawn/udev: render_frame[{}]: {:?}", output_name, e),
     }
+
+    state.render_stats.record(render_started.elapsed().as_micros() as u64, element_count);
+
+    // ── Захват экрана ────────────────────────────────────────────────────────
+    // Строго ПОСЛЕ render_frame и теми же элементами: демонстрация экрана
+    // обязана показывать ровно то, что ушло на монитор. См. screencopy.rs.
+    crate::screencopy::serve_pending(
+        state, &surface.output.clone(), renderer, &elements, cursor_elements,
+    );
 
     // Eco-mode (4.2): окна дальше 2 экранов от текущего viewport не получают
     // frame callback — клиент (браузер/плеер) перестаёт рендерить кадры и
@@ -987,6 +1379,14 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
 /// окно, движение курсора) обязан сам дёрнуть рендер через эту функцию —
 /// иначе изменение останется в state, но никогда не попадёт на экран.
 pub fn render_all(state: &mut Dawn) {
+    // Пока сессия не активна (VT-переключение, DRM master у другого
+    // compositor'а), PrepareFrame гарантированно вернёт DrmError(DeviceInactive) —
+    // не тратим кадры и не спамим лог, просто ждём ActivateSession.
+    if !state.session_active {
+        return;
+    }
+    // Синхронизация курсора живёт в render_surface — она общая для всех путей
+    // отрисовки, включая VBlank-хендлер, который сюда не заходит.
     let mut devices = std::mem::take(&mut state.udev_devices);
     for device in devices.values_mut() {
         let crtcs: Vec<_> = device.surfaces.keys().cloned().collect();

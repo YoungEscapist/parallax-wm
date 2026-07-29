@@ -14,6 +14,7 @@ use smithay::{
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         shm::{ShmHandler, ShmState},
     },
+    xwayland::XWaylandClientData,
 };
 
 use crate::{
@@ -30,6 +31,12 @@ impl CompositorHandler for Dawn {
         &self,
         client: &'a smithay::reexports::wayland_server::Client,
     ) -> &'a CompositorClientState {
+        // У клиента XWayland своя структура данных (её создаёт сам smithay при
+        // спавне сервера), а не наш ClientState — раньше тут был просто
+        // unwrap(), то есть паника на первом же коммите X11-клиента.
+        if let Some(state) = client.get_data::<XWaylandClientData>() {
+            return &state.compositor_state;
+        }
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
@@ -39,18 +46,16 @@ impl CompositorHandler for Dawn {
         if let Some(window) = self
             .space
             .elements()
-            .find(|w| {
-                w.toplevel()
-                    .map(|t| t.wl_surface() == surface)
-                    .unwrap_or(false)
-            })
+            .find(|w| crate::xwin::is_surface(w, surface))
             .cloned()
         {
             window.on_commit();
-            tracing::debug!("dawn: commit for mapped window");
+            // trace!: срабатывает на каждый commit каждого клиента — у
+            // анимированного окна это десятки строк в секунду в горячем пути.
+            tracing::trace!("dawn: commit for mapped window");
         }
 
-        handle_commit(&mut self.space, surface);
+        handle_commit(&mut self.space, surface, !self.overview_active);
         self.popups.commit(surface);
 
         // Без этого новый буфер клиента (например, первый кадр kitty/foot)

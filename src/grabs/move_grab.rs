@@ -11,11 +11,68 @@ use smithay::{
         PointerInnerHandle, RelativeMotionEvent,
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Point, Rectangle},
+    utils::{Logical, Point, Rectangle, Size},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const PUSH_ANIM_DURATION: Duration = Duration::from_millis(120);
+const PUSH_ANIM_DURATION: Duration = Duration::from_millis(140);
+
+/// Минимальная пауза между двумя свапами тайловых окон в одном драге.
+/// Без неё свап срабатывал на КАЖДОМ motion-событии, пока курсор висит над
+/// соседом (сотни раз в секунду): раскладка пересобиралась быстрее, чем окна
+/// успевали доехать, и картинка дрожала.
+const SWAP_COOLDOWN: Duration = Duration::from_millis(160);
+
+/// Отступ от края окна-цели (доля размера), внутри которого свап НЕ считается.
+/// Курсор должен зайти в «ядро» соседа, а не задеть его границу — иначе на
+/// стыке двух окон свапы туда-сюда пингпонгуют от дрожания мыши.
+const SWAP_INSET: f64 = 0.18;
+
+/// Торможение инерции после броска (1/сек): путь доезда = |v|/ω.
+const GLIDE_OMEGA: f64 = 8.0;
+/// Потолок пути доезда (px), чтобы резкий флик не зашвыривал окно за горизонт.
+const MAX_GLIDE: f64 = 420.0;
+
+/// Прямоугольник, В КОТОРОМ окно ОКАЖЕТСЯ: если оно сейчас летит (свап,
+/// толчок), берём цель анимации, а не текущий кадр полёта. Все решения драга
+/// (что толкать, с чем свапаться) должны считаться от покоя — иначе они
+/// зависят от фазы анимации и сами себя подхлёстывают.
+fn resting_rect(data: &Dawn, window: &Window) -> Option<Rectangle<i32, Logical>> {
+    let geo = data.space.element_geometry(window)?;
+    let loc = data.window_anim_target(window).unwrap_or(geo.loc);
+    Some(Rectangle::new(loc, geo.size))
+}
+
+/// Тайловое окно текущего тега, в «ядро» которого попал курсор (см. SWAP_INSET).
+/// Считается по покоящимся слотам, а не по space.element_under: во время
+/// перелёта окон hit-test по живой геометрии ловил случайных соседей.
+fn tiled_swap_target(data: &Dawn, dragged: &Window, cursor: Point<f64, Logical>) -> Option<Window> {
+    // В монокле у всех окон стопки ОДИН И ТОТ ЖЕ прямоугольник во весь экран:
+    // «окно под курсором» там не определено, и свап по позиции просто
+    // перемешивал бы стопку каждые SWAP_COOLDOWN. Порядок стопки меняется
+    // клавишами, не мышью.
+    if data.tile_config.layout == Layout::Monocle {
+        return None;
+    }
+    let tags = data.viewport.current_tags();
+    data.tagged_windows.iter()
+        .filter(|tw| {
+            tw.tags & tags != 0
+                && !tw.floating
+                && !crate::dwindle::same_window(&tw.window, dragged)
+        })
+        .find_map(|tw| {
+            let r = resting_rect(data, &tw.window)?;
+            let ix = (r.size.w as f64 * SWAP_INSET).round() as i32;
+            let iy = (r.size.h as f64 * SWAP_INSET).round() as i32;
+            let core = Rectangle::new(
+                Point::from((r.loc.x + ix, r.loc.y + iy)),
+                Size::from((r.size.w - 2 * ix, r.size.h - 2 * iy)),
+            );
+            (core.size.w > 0 && core.size.h > 0 && core.to_f64().contains(cursor))
+                .then(|| tw.window.clone())
+        })
+}
 
 /// Порог примагничивания (2.1): при отпускании кнопки край окна подравнивается
 /// к соседнему, если оказался в пределах этой дистанции.
@@ -37,6 +94,9 @@ pub struct MoveSurfaceGrab {
     velocity: VelocityTracker,
     /// Последняя позиция окна во время драга (для проекции инерции).
     last_loc: Point<i32, Logical>,
+    /// Когда в этом драге в последний раз произошёл свап тайловых окон —
+    /// см. SWAP_COOLDOWN.
+    last_swap: Option<Instant>,
 }
 
 impl MoveSurfaceGrab {
@@ -54,6 +114,7 @@ impl MoveSurfaceGrab {
             group_initial,
             velocity: VelocityTracker::new(),
             last_loc: initial_window_location,
+            last_swap: None,
         }
     }
 }
@@ -72,17 +133,17 @@ fn stitch_ribbon_gap(
     dragged_width: i32,
 ) {
     let row_y = dragged_initial_loc.y;
+    // По покоящимся прямоугольникам: окно, которое ещё летит от толчка, иначе
+    // попадало/не попадало в ленту в зависимости от фазы своей анимации.
     let to_shift: Vec<(Window, Point<i32, Logical>)> = data.space.elements()
         .filter(|w| {
-            w.toplevel().zip(dragged.toplevel())
-                .map(|(a, b)| a.wl_surface() != b.wl_surface())
-                .unwrap_or(true)
+            *w != dragged
         })
-        .filter_map(|w| data.space.element_geometry(w).map(|g| (w.clone(), g)))
-        .filter(|(_, g)| {
-            (g.loc.y - row_y).abs() <= RIBBON_ROW_TOLERANCE && g.loc.x > dragged_initial_loc.x
+        .filter_map(|w| resting_rect(data, w).map(|r| (w.clone(), r)))
+        .filter(|(_, r)| {
+            (r.loc.y - row_y).abs() <= RIBBON_ROW_TOLERANCE && r.loc.x > dragged_initial_loc.x
         })
-        .map(|(w, g)| (w, Point::from((g.loc.x - dragged_width, g.loc.y))))
+        .map(|(w, r)| (w, Point::from((r.loc.x - dragged_width, r.loc.y))))
         .collect();
 
     if to_shift.is_empty() {
@@ -90,11 +151,11 @@ fn stitch_ribbon_gap(
     }
 
     for (w, new_loc) in &to_shift {
-        data.space.map_element(w.clone(), *new_loc, false);
+        // Не телепорт, а тот же пружинный доезд, что и у остальных сдвигов —
+        // «сшивание» ленты рывком выбивалось из общего ощущения.
+        data.animate_window_to_dur(w, *new_loc, Duration::from_millis(220));
         if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-            tw.window.toplevel().zip(w.toplevel())
-                .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                .unwrap_or(false)
+            &tw.window == w
         }) {
             tw.float_position = *new_loc;
             tw.position = *new_loc;
@@ -119,9 +180,7 @@ fn find_snap_target(
     let mut best_y: Option<(i32, i32)> = None;
 
     for other in data.space.elements() {
-        let is_self = other.toplevel().zip(window.toplevel())
-            .map(|(a, b)| a.wl_surface() == b.wl_surface())
-            .unwrap_or(false);
+        let is_self = other == window;
         if is_self { continue; }
         let og = match data.space.element_geometry(other) { Some(g) => g, None => continue };
 
@@ -167,18 +226,26 @@ fn push_colliding_windows(data: &mut Dawn, dragged: &Window, dragged_loc: Point<
     let dcx = dragged_loc.x + size.w / 2;
     let dcy = dragged_loc.y + size.h / 2;
 
+    // Геометрия соседей берётся ПОКОЯЩАЯСЯ (цель анимации), а не текущая:
+    // толкнутое окно летит несколько кадров, и если каждый кадр пересчитывать
+    // перекрытие по его живой позиции, оно толкается снова и снова (цель
+    // убегает вместе с ним) — окно уползало рывками, пока курсор рядом.
     let others: Vec<(Window, Rectangle<i32, Logical>)> = data.space.elements()
         .filter(|w| {
-            w.toplevel().zip(dragged.toplevel())
-                .map(|(a, b)| a.wl_surface() != b.wl_surface())
-                .unwrap_or(true)
+            *w != dragged
         })
-        .filter_map(|w| data.space.element_geometry(w).map(|g| (w.clone(), g)))
+        .filter_map(|w| {
+            let size = data.space.element_geometry(w)?.size;
+            let loc = data.window_anim_target(w)
+                .or_else(|| data.space.element_geometry(w).map(|g| g.loc))?;
+            Some((w.clone(), Rectangle::new(loc, size)))
+        })
         .collect();
 
     for (other, geo) in others {
         let overlap = match dragged_rect.intersection(geo) { Some(o) => o, None => continue };
-        if overlap.size.w <= 0 || overlap.size.h <= 0 { continue; }
+        // Перекрытие в пару пикселей — шум округления, толкать нечего.
+        if overlap.size.w <= 2 || overlap.size.h <= 2 { continue; }
 
         let ocx = geo.loc.x + geo.size.w / 2;
         let ocy = geo.loc.y + geo.size.h / 2;
@@ -194,9 +261,7 @@ fn push_colliding_windows(data: &mut Dawn, dragged: &Window, dragged_loc: Point<
         // (переанимируется на каждый кадр, пока коллизия продолжается).
         data.animate_window_to_dur(&other, new_loc, PUSH_ANIM_DURATION);
         if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-            tw.window.toplevel().zip(other.toplevel())
-                .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                .unwrap_or(false)
+            tw.window == other
         }) {
             tw.float_position = new_loc;
             tw.position = new_loc;
@@ -214,52 +279,45 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
     ) {
         handle.motion(data, None, event);
 
+        // В обзоре столов раскладку держит overview.rs (arrange там выходит
+        // сразу), поэтому окно там всегда таскается свободно — как в Float,
+        // с переносом на стол под курсором на отпускании.
         let is_tiled = data.tile_config.layout != Layout::Float
+            && !data.overview_active
             && data.tagged_windows.iter().any(|tw| {
                 !tw.floating
-                    && tw.window.toplevel().zip(self.window.toplevel())
-                        .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                        .unwrap_or(false)
+                    && tw.window == self.window
             });
 
+        // ── Columns/niri: тащим окно свободно и показываем, куда оно встанет ──
+        // В niri перетаскивание не меняет соседей местами: окно «вынимается» из
+        // полосы, а подсказка показывает шов между колонками или стопку, куда
+        // оно попадёт на отпускании (см. columns_insert_hint_rect и button()).
+        // Остальные тайловые раскладки продолжают работать свапами — их не
+        // трогаем.
+        if is_tiled && data.tile_config.layout == Layout::Columns {
+            data.columns_drag_hint = Some(event.location.x);
+            let delta = event.location - self.start_data.location;
+            let loc = (self.initial_window_location.to_f64() + delta).to_i32_round();
+            data.space.map_element(self.window.clone(), loc, true);
+            data.request_redraw();
+            return;
+        }
+
         if is_tiled {
-            // Ищем окно под курсором (не то которое тащим)
-            let cursor = event.location;
-            let target = data.space
-                .element_under(cursor)
-                .and_then(|(w, _)| {
-                    // не само себя
-                    let is_self = w.toplevel().zip(self.window.toplevel())
-                        .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                        .unwrap_or(false);
-                    if is_self { None } else { Some(w.clone()) }
-                });
-
-            if let Some(target_window) = target {
-                // Находим индексы обоих окон в tagged_windows
-                let current_tags = data.viewport.current_tags();
-
-                let self_idx = data.tagged_windows.iter().position(|tw| {
-                    tw.tags & current_tags != 0
-                        && tw.window.toplevel().zip(self.window.toplevel())
-                            .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                            .unwrap_or(false)
-                });
-
-                let target_idx = data.tagged_windows.iter().position(|tw| {
-                    tw.tags & current_tags != 0
-                        && tw.window.toplevel().zip(target_window.toplevel())
-                            .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                            .unwrap_or(false)
-                });
-
-                if let (Some(si), Some(ti)) = (self_idx, target_idx) {
-                    if si != ti {
-                        // Swap окон в списке
-                        data.tagged_windows.swap(si, ti);
-                        // Пересчитываем тайлинг
+            // Свап только когда курсор зашёл в «ядро» покоящегося слота соседа
+            // и с прошлого свапа прошёл SWAP_COOLDOWN — раскладка успевает
+            // доехать между перестановками, а на стыке окон нет пинг-понга.
+            let ready = self.last_swap.is_none_or(|t| t.elapsed() >= SWAP_COOLDOWN);
+            if ready {
+                if let Some(target_window) = tiled_swap_target(data, &self.window, event.location) {
+                    // Свап в структуре АКТИВНОЙ раскладки (BSP-дерево / колонки /
+                    // стопка монокля) — только он и переживает arrange.
+                    if data.swap_tiled_windows(&self.window, &target_window) {
+                        self.last_swap = Some(Instant::now());
                         data.arrange();
-                        tracing::debug!("dawn: swap {} ↔ {}", si, ti);
+                        data.request_redraw();
+                        tracing::debug!("dawn: tiled drag swap");
                     }
                 }
             }
@@ -271,9 +329,29 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
             let delta = event.location - self.start_data.location;
             let mut free_loc = (self.initial_window_location.to_f64() + delta).to_i32_round();
 
+            // ── Обзор столов: окно ходит ТОЛЬКО внутри рабочих столов ──
+            // Целевой стол — БЛИЖАЙШИЙ к курсору, поэтому окно можно перетащить
+            // на другой стол, но не за рамки столов: позиция зажимается в
+            // прямоугольник целевого стола. Строгое попадание в прямоугольник
+            // тут не годится: в зазоре между столами окно замирало бы, и
+            // перенос срабатывал «через раз».
+            //
+            // Тег окна во время драга НЕ меняем (это делает overview_reassign на
+            // отпускании): ему нужно знать, с какого стола окно уехало, чтобы
+            // вынуть его из BSP-дерева стола-донора.
+            if data.overview_active {
+                if let Some(mask) = data.overview_nearest_workspace(event.location) {
+                    if let Some(size) = data.space.element_geometry(&self.window).map(|g| g.size) {
+                        free_loc = data.overview_clamp_loc(mask, free_loc, size);
+                    }
+                }
+            }
+
             // Разрыв ленты (2.5): вертикальный вылет за высоту окна — тащим
             // окно из его горизонтальной ленты, соседи справа сшиваются один раз.
-            if !self.torn_from_ribbon {
+            // В обзоре не трогаем: «сшивание» двигает чужие окна, и они уехали
+            // бы за рамку своего стола.
+            if !self.torn_from_ribbon && !data.overview_active {
                 if let Some(win_size) = data.space.element_geometry(&self.window).map(|g| g.size) {
                     let win_size: smithay::utils::Size<i32, Logical> = win_size;
                     let dy: i32 = free_loc.y - self.initial_window_location.y;
@@ -292,71 +370,46 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
             self.velocity.push(event.time, step);
             self.last_loc = free_loc;
 
-            // ── Overview mode: clamp to workspace + live tag switch ──
-            let mut should_move = true;
-            if data.overview_active {
-                if let Some(mask) = data.overview_workspace_at(event.location) {
-                    // Сменить тег окна, если курсор на другом столе
-                    if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                        tw.window.toplevel().zip(self.window.toplevel())
-                            .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                            .unwrap_or(false)
-                    }) {
-                        if tw.tags != mask {
-                            tw.tags = mask;
-                        }
-                    }
-                    // Зажать окно в границы стола под курсором
-                    if let Some((bw, bh)) = data.overview_band_size() {
-                        let margin = crate::tiling::GAP_OUTER;
-                        let slot = *data.overview_slots.get(&mask).unwrap_or(&(0, 0));
-                        let band_gap = 140i32;
-                        let stride_x = bw + band_gap;
-                        let stride_y = bh + band_gap;
-                        let brect_loc_x = slot.0 * stride_x;
-                        let brect_loc_y = slot.1 * stride_y;
-                        if let Some(size) = data.space.element_geometry(&self.window).map(|g| g.size) {
-                            free_loc.x = free_loc.x.clamp(
-                                brect_loc_x + margin,
-                                brect_loc_x + bw - size.w - margin,
-                            );
-                            free_loc.y = free_loc.y.clamp(
-                                brect_loc_y + margin,
-                                brect_loc_y + bh - size.h - margin,
-                            );
-                        }
-                    }
-                } else {
-                    // Курсор вне всех столов — не обновляем позицию окна
-                    should_move = false;
-                }
-            }
-
-            if should_move {
+            {
                 data.space.map_element(self.window.clone(), free_loc, true);
-                if data.is_snapping_enabled {
+                // Расталкивание соседей (Super+S) — тоже только вне обзора:
+                // толкнутый сосед уехал бы за рамку своего стола.
+                if data.is_snapping_enabled && !data.overview_active {
                     push_colliding_windows(data, &self.window, free_loc);
                 }
-                // Сохраняем float-позицию и помечаем как вручную размещённое
-                if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                    tw.window.toplevel().zip(self.window.toplevel())
-                        .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                        .unwrap_or(false)
-                }) {
-                    tw.float_position = free_loc;
-                    tw.float_position_set = true;
+                // Сохраняем float-позицию и помечаем как вручную размещённое.
+                // В обзоре — не сохраняем: там координаты обзорные (ячейка стола
+                // в сетке), и записать их во float_position значило бы, что
+                // после выхода окно «разлетится» куда-то в сетку обзора.
+                if !data.overview_active {
+                    if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
+                        tw.window == self.window
+                    }) {
+                        tw.float_position = free_loc;
+                        tw.float_position_set = true;
+                    }
                 }
 
                 // "Созвездие" (Super+G): остальные окна группы едут той же дельтой,
                 // что и перетаскиваемое — группа двигается как единое целое.
                 if !self.group_initial.is_empty() {
                     for (member, init_loc) in &self.group_initial {
-                        let member_loc = (init_loc.to_f64() + delta).to_i32_round();
+                        let mut member_loc = (init_loc.to_f64() + delta).to_i32_round();
+                        // В обзоре каждый член группы остаётся в рамке СВОЕГО стола.
+                        if data.overview_active {
+                            if let (Some(mask), Some(size)) = (
+                                data.overview_mask_of_window(member),
+                                data.space.element_geometry(member).map(|g| g.size),
+                            ) {
+                                member_loc = data.overview_clamp_loc(mask, member_loc, size);
+                            }
+                        }
                         data.space.map_element(member.clone(), member_loc, false);
+                        if data.overview_active {
+                            continue; // обзорные координаты во float не пишем
+                        }
                         if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                            tw.window.toplevel().zip(member.toplevel())
-                                .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                                .unwrap_or(false)
+                            &tw.window == member
                         }) {
                             tw.float_position = member_loc;
                             tw.position = member_loc;
@@ -397,6 +450,33 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
                 return;
             }
 
+            let is_tiled_win = data.tile_config.layout != Layout::Float
+                && data.tagged_windows.iter().any(|tw| {
+                    !tw.floating
+                        && tw.window == self.window
+                });
+
+            // Columns/niri: вставляем окно туда, куда показывала подсказка.
+            if is_tiled_win && data.tile_config.layout == Layout::Columns {
+                let x = data.columns_drag_hint.take().unwrap_or(data.pointer_location.x);
+                data.columns_drop_window(&self.window, x);
+                data.request_plane_reset();
+                handle.frame(data);
+                return;
+            }
+            data.columns_drag_hint = None;
+
+            // Тайловое окно: свапы уже применены в motion, осталось только
+            // дать раскладке доехать. Магнитирование и инерция — это про
+            // свободный холст, тайловое окно они сдвинули бы со слота.
+            if is_tiled_win {
+                data.arrange();
+                data.request_plane_reset();
+                data.request_redraw();
+                handle.frame(data);
+                return;
+            }
+
             // Магнитирование (2.1): один раз при отпускании подравниваем край
             // к ближайшему соседу в пределах SNAP_DISTANCE, если коллизия включена.
             let mut snapped_applied = false;
@@ -405,9 +485,7 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
                     if let Some(snapped) = find_snap_target(data, &self.window, loc) {
                         data.space.map_element(self.window.clone(), snapped, true);
                         if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                            tw.window.toplevel().zip(self.window.toplevel())
-                                .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                                .unwrap_or(false)
+                            tw.window == self.window
                         }) {
                             tw.float_position = snapped;
                         }
@@ -419,31 +497,22 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
             // Инерция перетаскивания: окно доезжает по инерции после отпускания
             // (не применяется, если сработало магнитирование — там нужна
             // точная посадка на край соседа).
-            let is_tiled_win = data.tile_config.layout != Layout::Float
-                && data.tagged_windows.iter().any(|tw| {
-                    !tw.floating
-                        && tw.window.toplevel().zip(self.window.toplevel())
-                            .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                            .unwrap_or(false)
-                });
-            if !snapped_applied && !is_tiled_win {
+            if !snapped_applied {
                 let v = self.velocity.launch_velocity(); // px/сек в canvas
                 let speed = (v.x * v.x + v.y * v.y).sqrt();
                 const MIN_FLING: f64 = 120.0;  // ниже — считаем что окно просто положили
-                const GLIDE_SECS: f64 = 0.16;  // сколько "проекции" скорости пролетит окно
                 if speed > MIN_FLING {
-                    let target = Point::from((
-                        self.last_loc.x + (v.x * GLIDE_SECS).round() as i32,
-                        self.last_loc.y + (v.y * GLIDE_SECS).round() as i32,
-                    ));
-                    // Длительность масштабируем со скоростью (быстрее бросок —
-                    // дольше катится), но с потолком.
-                    let dur_ms = (200.0 + speed * 0.12).min(500.0) as u64;
-                    data.animate_window_to_dur(&self.window, target, std::time::Duration::from_millis(dur_ms));
+                    // Пружина стартует ровно с той скоростью, с какой курсор
+                    // отпустил окно, и тормозит экспоненциально. Раньше тут был
+                    // ease-out на фиксированную дистанцию: его стартовая
+                    // скорость (3·d/dur) не совпадала со скоростью драга, и в
+                    // момент отпускания окно заметно «дёргалось» вперёд.
+                    // ω поднимаем на быстрых бросках, чтобы путь доезда
+                    // (|v|/ω) не превышал MAX_GLIDE.
+                    let omega = GLIDE_OMEGA.max(speed / MAX_GLIDE);
+                    let target = data.fling_window(&self.window, v, omega);
                     if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                        tw.window.toplevel().zip(self.window.toplevel())
-                            .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                            .unwrap_or(false)
+                        tw.window == self.window
                     }) {
                         tw.float_position = target;
                         tw.position = target;

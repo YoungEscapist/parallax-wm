@@ -9,8 +9,7 @@ use smithay::{
         keyboard::{FilterResult, keysyms},
         pointer::{AxisFrame, ButtonEvent, Focus, GrabStartData, MotionEvent},
     },
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Rectangle, SERIAL_COUNTER},
+    utils::{Point, Rectangle, SERIAL_COUNTER},
 };
 
 use crate::{
@@ -24,12 +23,12 @@ const BTN_RIGHT: u32 = 0x111;
 
 impl Dawn {
     pub(crate) fn kill_focused(&mut self) {
-        if let Some(surface) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
+        if let Some(surface) = self.focused_surface() {
             if let Some(w) = self.space.elements()
-                .find(|w| w.toplevel().map(|t| t.wl_surface() == &surface).unwrap_or(false))
+                .find(|w| crate::xwin::is_surface(w, &surface))
                 .cloned()
             {
-                w.toplevel().unwrap().send_close();
+                crate::xwin::close(&w);
                 tracing::info!("dawn: kill focused");
             }
         }
@@ -64,11 +63,30 @@ impl Dawn {
                             if pressed {
                                 // Кандидат на тап — сбросится любым другим вводом.
                                 state.super_tap = true;
+                                state.super_tap_shift = modifiers.shift;
                             } else {
                                 if state.super_tap {
-                                    state.toggle_overview(); // чистый тап Super
+                                    // Обзор открывает чистый тап Super в ЛЮБОЙ
+                                    // раскладке. В Columns дополнительно
+                                    // работает и Shift+Super — тап с Shift тоже
+                                    // считается тапом (см. ветку Shift ниже),
+                                    // так что обе комбинации ведут в обзор.
+                                    state.toggle_overview();
                                 }
                                 state.super_tap = false;
+                                state.super_tap_shift = false;
+                            }
+                            return FilterResult::Forward;
+                        }
+
+                        // Shift, нажатый ВО ВРЕМЯ удержания Super, тап не
+                        // отменяет — он его модификатор (Shift+Super в
+                        // Columns). Любая другая клавиша отменяет как раньше.
+                        const SHIFT_L: u32 = keysyms::KEY_Shift_L;
+                        const SHIFT_R: u32 = keysyms::KEY_Shift_R;
+                        if raw == SHIFT_L || raw == SHIFT_R {
+                            if pressed && state.super_tap {
+                                state.super_tap_shift = true;
                             }
                             return FilterResult::Forward;
                         }
@@ -152,14 +170,22 @@ impl Dawn {
                tracing::trace!("PTR MOTION: delta=({:.2},{:.2})", delta.x, delta.y);
                let zoom = self.viewport.zoom;
 
-               // В обзоре: Super+ЛКМ драг стола — двигаем окна стола, не камеру
+               // В обзоре: Win+Alt+ЛКМ драг стола — стол переезжает по ячейкам
+               // сетки вслед за курсором (камеру не трогаем). Двигать при этом
+               // окна внутри его рамки бессмысленно: рамка рисуется по ячейке,
+               // так что стол при этом визуально стоял бы на месте.
                if self.overview_active {
                    if let Some(mask) = self.overview_drag_ws {
-                       let dcam_x = delta.x / zoom;
-                       let dcam_y = delta.y / zoom;
-                       self.pointer_location.x += dcam_x;
-                       self.pointer_location.y += dcam_y;
-                       self.overview_move_workspace_windows(mask, dcam_x, dcam_y);
+                       // Через warp_pointer, а не записью в pointer_location:
+                       // без motion smithay-указатель остался бы там, где драг
+                       // начался, и следующий клик ушёл бы в старую точку.
+                       let pos = Point::from((
+                           self.pointer_location.x + delta.x / zoom,
+                           self.pointer_location.y + delta.y / zoom,
+                       ));
+                       self.warp_pointer(pos);
+                       let pos = self.pointer_location;
+                       self.overview_drag_workspace_to(mask, pos);
                        return;
                    }
                }
@@ -179,6 +205,18 @@ impl Dawn {
                        event.time_msec(),
                    );
                    self.apply_camera();
+                   // Замер строго на ЭТОМ жесте (Alt+ЛКМ): печатаем экранную
+                   // точку стрелки на каждом событии пана, не чаще 60 строк за
+                   // жест. Если тут число стоит, а стрелку видно едущей —
+                   // причина не в позиции курсора.
+                   if self.pan_log_left > 0 {
+                       self.pan_log_left -= 1;
+                       let s = self.pointer_screen_physical();
+                       tracing::debug!(
+                           "ПАН Alt+ЛКМ: курсор_экран=({:.1},{:.1}) камера=({:.1},{:.1}) дельта=({:.1},{:.1})",
+                           s.x, s.y, self.viewport.cam_x, self.viewport.cam_y, delta.x, delta.y,
+                       );
+                   }
                    self.request_redraw();
                    return;
                }
@@ -227,20 +265,24 @@ impl Dawn {
                let pointer = self.seat.get_pointer().unwrap();
                let under = self.surface_under(pos);
 
-               if let Some((surface, _)) = &under {
-                   let keyboard = self.seat.get_keyboard().unwrap();
-                   let same = keyboard.current_focus()
-                       .map(|f| f == *surface).unwrap_or(false);
-                   if !same {
-                       if let Some((window, _)) = self.space
-                           .element_under(pos).map(|(w, l)| (w.clone(), l))
-                       {
-                           self.space.elements().for_each(|w| { w.set_activated(false); });
-                           window.set_activated(true);
-                           keyboard.set_focus(self, Some(surface.clone()), serial);
-                           self.space.elements().for_each(|w| {
-                               w.toplevel().unwrap().send_pending_configure();
-                           });
+               // Sloppy focus — но НЕ в Columns: там вид ездит по полосе от
+               // клавиш и жестов, курсор при этом стоит на месте экрана (это
+               // видно в логе: «КАДР: курсор_экран» неизменен, пока привязка
+               // окон уезжает), и под стрелкой оказывается чужая колонка. С
+               // sloppy focus первое же шевеление мыши перебрасывало фокус
+               // туда, куда пользователь не смотрел. У niri focus-follows-mouse
+               // по той же причине выключен по умолчанию; остальные раскладки
+               // dawn работают как раньше.
+               let sloppy = self.tile_config.layout != Layout::Columns;
+               if sloppy {
+                   if let Some((surface, _)) = &under {
+                       let same = self.focused_surface().as_ref() == Some(surface);
+                       if !same {
+                           if let Some((window, _)) = self.space
+                               .element_under(pos).map(|(w, l)| (w.clone(), l))
+                           {
+                               crate::xwin::focus(self, &window);
+                           }
                        }
                    }
                }
@@ -248,6 +290,11 @@ impl Dawn {
                    location: pos, serial, time: event.time_msec(),
                });
                pointer.frame(self);
+               // Это движение — от настоящей мыши, и оно уже разослано. Фиксируем
+               // новую экранную позицию как эталонную, иначе sync_pointer_to_camera
+               // в конце итерации сочтёт сдвиг камеры от "перелива" у края (выше)
+               // самовольным и оттащит стрелку обратно — курсор резинил бы у края.
+               self.pointer_warped();
                // Курсор client-side — его позицию перерисовывает только сам
                // рендер; без явного пинка тут курсор будет виден в последнем
                // отрендеренном кадре, а не там, где мышь реально находится.
@@ -272,29 +319,21 @@ impl Dawn {
                 let pointer = self.seat.get_pointer().unwrap();
                 let under = self.surface_under(pos);
 
-                // sloppyfocus: focus follows cursor (как в dwl sloppyfocus=1)
-                if let Some((surface, _)) = &under {
-                    let keyboard = self.seat.get_keyboard().unwrap();
-                    let current_focus = keyboard.current_focus();
-                    let same = current_focus.as_ref()
-                        .map(|f| f == surface)
-                        .unwrap_or(false);
+                // sloppyfocus: focus follows cursor (как в dwl sloppyfocus=1).
+                // В Columns выключен — см. подробный комментарий в ветке
+                // PointerMotion выше.
+                if self.tile_config.layout != Layout::Columns {
+                    if let Some((surface, _)) = &under {
+                    let same = self.focused_surface().as_ref() == Some(surface);
                     if !same {
                         // Найти окно под курсором и активировать
                         if let Some((window, _)) = self.space
                             .element_under(pos)
                             .map(|(w, l)| (w.clone(), l))
                         {
-                            // Деактивируем остальные
-                            self.space.elements().for_each(|w| {
-                                w.set_activated(false);
-                            });
-                            window.set_activated(true);
-                            keyboard.set_focus(self, Some(surface.clone()), serial);
-                            self.space.elements().for_each(|w| {
-                                w.toplevel().unwrap().send_pending_configure();
-                            });
+                            crate::xwin::focus(self, &window);
                         }
+                    }
                     }
                 }
 
@@ -302,6 +341,9 @@ impl Dawn {
                     location: pos, serial, time: event.time_msec(),
                 });
                 pointer.frame(self);
+                // Абсолютный ввод (планшет/VM) задаёт позицию курсора прямо в
+                // экранных координатах — она и есть эталон для синхронизации.
+                self.pointer_warped();
                 self.request_redraw();
             }
 
@@ -338,9 +380,23 @@ impl Dawn {
                 //  · ЛКМ → фокус на окне (основной хендлер), потом exit на стол
                 //  · Alt+ЛКМ → pan ленты
                 //  · Super+ЛКМ → драг окна (move_grab → overview_reassign)
-                //  · Super+Alt+ЛКМ по пустому → драг стола (snap на отпускании).
+                //  · Super+Alt+ЛКМ → драг ВСЕГО стола по сетке (snap на отпускании).
                 if self.overview_active {
                     if button == BTN_LEFT {
+                        // Win+Alt+ЛКМ → тащим весь стол под курсором. Проверяем
+                        // ДО Alt-пана и до Super+ЛКМ-драга окна: иначе Alt уводил
+                        // бы в пан холста (из-за чего драг стола был вообще
+                        // недостижим), а клик по окну — в move_grab.
+                        if self.logo_held && alt_held {
+                            if ButtonState::Pressed == btn_state {
+                                self.overview_drag_ws = self
+                                    .overview_workspace_at(self.pointer_location)
+                                    .or_else(|| self.overview_nearest_workspace(self.pointer_location));
+                                tracing::debug!("dawn: overview workspace drag start");
+                                return;
+                            }
+                            // Отпускание падает ниже — там снап в ячейку сетки.
+                        }
                         if alt_held {
                             // Alt+ЛКМ → pan (без grab, флаг)
                             self.pan_button_held = ButtonState::Pressed == btn_state;
@@ -354,7 +410,11 @@ impl Dawn {
                             // После него выйдем из обзора (см. ниже).
                         }
                     }
-                    if ButtonState::Pressed == btn_state && button == BTN_RIGHT {
+                    // ПКМ без Super → выход на стол под курсором.
+                    // Super+ПКМ → падаем в основной хендлер (resize окна в обзоре).
+                    if ButtonState::Pressed == btn_state && button == BTN_RIGHT
+                        && !self.logo_held
+                    {
                         self.exit_overview_to_cursor();
                         return;
                     }
@@ -366,6 +426,8 @@ impl Dawn {
                     && self.tile_config.layout == Layout::Float
                 {
                     self.pan_button_held = true;
+                    // Новый жест — новая порция строк замера.
+                    self.pan_log_left = 60;
                     tracing::debug!("dawn/canvas: pan started");
                     return;
                 }
@@ -383,7 +445,26 @@ impl Dawn {
                 }
 
                 if ButtonState::Pressed == btn_state && !pointer.is_grabbed() {
-                    let pos = pointer.current_location();
+                    // Берём НАШУ позицию курсора — ту же, по которой рисуется
+                    // стрелка. current_location() внутри smithay обновляется
+                    // только из pointer.motion; пока курсор двигали записью в
+                    // pointer_location, две позиции расходились, и клик уходил
+                    // не туда, куда показывает стрелка. Теперь все переносы идут
+                    // через warp_pointer (motion рассылается), так что значения
+                    // совпадают — а если разъедутся, это видно в логе ниже.
+                    let pos = self.pointer_location;
+                    if cfg!(debug_assertions) || tracing::enabled!(tracing::Level::DEBUG) {
+                        let smithay_pos = pointer.current_location();
+                        let hit = self.space.element_under(pos)
+                            .and_then(|(w, _)| self.space.element_geometry(w));
+                        tracing::debug!(
+                            "PTR HIT: курсор=({:.1},{:.1}) smithay=({:.1},{:.1}) \
+                             расхождение=({:.1},{:.1}) камера=({:.1},{:.1}) zoom={:.2} окно={:?}",
+                            pos.x, pos.y, smithay_pos.x, smithay_pos.y,
+                            pos.x - smithay_pos.x, pos.y - smithay_pos.y,
+                            self.viewport.cam_x, self.viewport.cam_y, self.viewport.zoom, hit,
+                        );
+                    }
 
                     if let Some((window, window_loc)) = self
                         .space.element_under(pos)
@@ -405,13 +486,22 @@ impl Dawn {
                         // Super+ЛКМ → перемещение окна
                         if kb_mods.logo && button == BTN_LEFT {
                             let initial_window_location = window_loc;
-                            let focus = window.toplevel()
-                                .map(|t| (t.wl_surface().clone(), window_loc.to_f64()));
-                            // "Созвездие" (Super+G): остальные окна группы едут вместе.
-                            let group_initial = self.constellation_members_excluding(&window)
+                            let focus = crate::xwin::surface(&window)
+                                .map(|s| (s, window_loc.to_f64()));
+                            // Вместе едет ВЫДЕЛЕНИЕ (если окно в него входит), а не
+                            // созвездие: тянешь одно окно созвездия — едет только оно.
+                            let group_initial = self.group_drag_members_excluding(&window)
                                 .into_iter()
                                 .filter_map(|w| self.space.element_location(&w).map(|l| (w, l)))
                                 .collect::<Vec<_>>();
+                            // Окно (и члены созвездия) могли ещё лететь после
+                            // прошлой анимации — снимаем её, иначе она каждый
+                            // тик тянула бы окно на свою траекторию и оно
+                            // «резинилось» бы под курсором во время драга.
+                            self.freeze_window_anim(&window);
+                            for (w, _) in &group_initial {
+                                self.freeze_window_anim(w);
+                            }
                             let grab = MoveSurfaceGrab::new(
                                 GrabStartData { focus, button, location: pos },
                                 window.clone(),
@@ -424,10 +514,12 @@ impl Dawn {
                             return;
                         }
 
-                        // Super+ПКМ → resize (только в Float)
-                        if kb_mods.logo && button == BTN_RIGHT
-                            && self.tile_config.layout == Layout::Float
-                        {
+                        // Super+ПКМ → resize. Float: свободный ресайз. Tile:
+                        // тянем деления BSP-дерева (Hyprland smart_resizing,
+                        // см. dwindle.rs). Columns: ширину активной
+                        // колонки. Обзор: свободный ресайз миниатюры (см.
+                        // resize_grab.rs, ветка overview_active). Monocle: no-op.
+                        if kb_mods.logo && button == BTN_RIGHT {
                             tracing::debug!("dawn: resize grab start");
                             let geo = self.space.element_geometry(&window)
                                 .unwrap_or(Rectangle::new(window_loc, (100, 100).into()));
@@ -441,45 +533,38 @@ impl Dawn {
                                 (true,  false) => ResizeEdge::BOTTOM_LEFT,
                                 (false, false) => ResizeEdge::BOTTOM_RIGHT,
                             };
-                            // "Созвездие": остальные окна группы масштабируются вместе.
-                            let group_initial = self.constellation_members_excluding(&window)
+                            // Вместе масштабируется ВЫДЕЛЕНИЕ (см. move-грab выше).
+                            let group_initial = self.group_drag_members_excluding(&window)
                                 .into_iter()
                                 .filter_map(|w| self.space.element_geometry(&w).map(|g| (w, g)))
                                 .collect::<Vec<_>>();
+                            // Ресайз двигает окно напрямую (LEFT/TOP-края) —
+                            // недолетевшая анимация позиции дралась бы с ним.
+                            self.freeze_window_anim(&window);
+                            for (w, _) in &group_initial {
+                                self.freeze_window_anim(w);
+                            }
                             let grab = ResizeSurfaceGrab::start(
                                 GrabStartData { focus: None, button, location: pos },
                                 window, edge, geo, group_initial,
-                                self.tile_config.mfact,
                             );
                             pointer.set_grab(self, grab, serial, Focus::Keep);
                             return;
                         }
 
                         // Клик → focus
-                        self.space.raise_element(&window, true);
-                        window.set_activated(true);
-                        keyboard.set_focus(
-                            self,
-                            Some(window.toplevel().unwrap().wl_surface().clone()),
-                            serial,
-                        );
-                        self.space.elements().for_each(|w| {
-                            w.toplevel().unwrap().send_pending_configure();
-                        });
+                        crate::xwin::focus(self, &window);
                     } else {
-                        self.space.elements().for_each(|w| {
+                        let all: Vec<_> = self.space.elements().cloned().collect();
+                        for w in all {
                             w.set_activated(false);
-                            w.toplevel().unwrap().send_pending_configure();
-                        });
-                        keyboard.set_focus(self, Option::<WlSurface>::None, serial);
-
-                        // Super+Alt+ЛКМ по пустому в обзоре → начать драг стола
-                        if self.overview_active && self.logo_held && alt_held && button == BTN_LEFT {
-                            if let Some(mask) = self.overview_workspace_at(pos) {
-                                self.overview_drag_ws = Some(mask);
-                                return;
-                            }
+                            crate::xwin::configure(&w);
                         }
+                        keyboard.set_focus(self, None, serial);
+
+                        // (Win+Alt+ЛКМ → драг стола перехватывается выше, до
+                        // hit-теста по окнам: стол тащится и когда курсор стоит
+                        // на окне, а не только по пустому месту.)
 
                         // ЛКМ по пустому холсту в Float → rubber-band мультивыделение
                         // (протяжка выделяет пересекающиеся окна, клик без протяжки —
@@ -502,7 +587,9 @@ impl Dawn {
                     && ButtonState::Pressed == btn_state && button == BTN_LEFT
                     && !alt_held && !self.logo_held
                 {
-                    let pos = pointer.current_location();
+                    // Наша позиция курсора — та же, по которой рисуется стрелка
+                    // (см. комментарий выше о расхождении с smithay).
+                    let pos = self.pointer_location;
                     let clicked_window = self.space.element_under(pos).map(|(w, _)| w.clone());
                     if let Some(window) = clicked_window {
                         self.exit_overview_to_window(&window);
@@ -569,15 +656,23 @@ impl Dawn {
                         }
                         return;
                     }
-                    // Латчим окно на первом кадре жеста: курсор стоит, а окно
-                    // едет и может "выскользнуть" из-под него — поэтому двигаем
-                    // именно залатченное окно, пока пальцы не отпущены.
+                    // Латчим окно на первом кадре жеста: даже с курсором,
+                    // который едет следом (ниже), у края экрана он упирается в
+                    // границу и окно из-под него всё равно выскользнуло бы —
+                    // поэтому двигаем именно залатченное окно, пока пальцы не
+                    // отпущены.
                     let window = match self.touchpad_move_window.clone() {
                         Some(w) => Some(w),
                         None => {
                             let w = self.space.element_under(self.pointer_location)
                                 .map(|(w, _)| w.clone());
                             self.touchpad_move_window = w.clone();
+                            tracing::debug!(
+                                "ЖЕСТ: Super+2пальца → перенос окна, окно под курсором={} \
+                                 выделено={}",
+                                w.is_some(),
+                                w.as_ref().map(|w| self.is_selected(w)).unwrap_or(false),
+                            );
                             w
                         }
                     };
@@ -589,15 +684,34 @@ impl Dawn {
                             let new_loc = smithay::utils::Point::from((geo.loc.x + dx, geo.loc.y + dy));
                             self.space.map_element(window.clone(), new_loc, true);
                             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                                tw.window.toplevel().zip(window.toplevel())
-                                    .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                                    .unwrap_or(false)
+                                tw.window == window
                             }) {
                                 tw.float_position = new_loc;
                                 tw.position = new_loc;
                                 tw.float_position_set = true;
                                 tw.floating = true; // вытащили из тайлинга — теперь плавающее
                             }
+                            // Выделение едет вместе с окном — тем же смещением
+                            // (см. group_drag_members_excluding).
+                            for w in self.group_drag_members_excluding(&window) {
+                                let Some(g) = self.space.element_geometry(&w) else { continue };
+                                let loc = smithay::utils::Point::from((g.loc.x + dx, g.loc.y + dy));
+                                self.space.map_element(w.clone(), loc, false);
+                                if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| tw.window == w) {
+                                    tw.float_position = loc;
+                                    tw.position = loc;
+                                    tw.float_position_set = true;
+                                    tw.floating = true;
+                                }
+                            }
+                            // Курсор едет ЗА окном: жест таскает окно, и стрелка
+                            // должна оставаться в той же его точке, как при
+                            // обычном драге мышью. Иначе окно уезжает из-под
+                            // курсора, а следующий клик/жест цепляет уже не его.
+                            self.warp_pointer(Point::from((
+                                self.pointer_location.x + dx as f64,
+                                self.pointer_location.y + dy as f64,
+                            )));
                             // Режим коллизии (Super+S): расталкиваем задетые окна.
                             self.push_colliding_windows(&window);
                             self.request_redraw();
@@ -610,7 +724,13 @@ impl Dawn {
                 // Отличаем от колеса мыши по source=Finger, поэтому Alt+колесо
                 // по-прежнему зумит как раньше (ветка ниже) — старое поведение
                 // не тронуто, это отдельная ветка только для тачпада.
-                if alt_held && source == AxisSource::Finger {
+                // В ленте (Columns) свободного пана НЕТ — это не бесконечный
+                // холст, а полоса колонок: вид ходит только по ней (свайп без
+                // модификаторов) и по вертикали между столами. Пан здесь ломал
+                // саму модель — можно было уехать в пустоту мимо колонок.
+                if alt_held && source == AxisSource::Finger
+                    && self.tile_config.layout != Layout::Columns
+                {
                     // Скролл-единицы тачпада заметно мельче, чем raw pixel delta
                     // мыши при Alt+ЛКМ — усиливаем, чтобы скорость ощущалась так же.
                     const TOUCHPAD_PAN_SPEED: f64 = 2.5;
@@ -625,19 +745,28 @@ impl Dawn {
                             event.time_msec(),
                         );
                         self.apply_camera();
+                        if self.pan_log_left > 0 {
+                            self.pan_log_left -= 1;
+                            let s = self.pointer_screen_physical();
+                            tracing::debug!(
+                                "ПАН Alt+2пальца: курсор_экран=({:.1},{:.1}) камера=({:.1},{:.1}) дельта=({:.1},{:.1})",
+                                s.x, s.y, self.viewport.cam_x, self.viewport.cam_y, h, v,
+                            );
+                        }
                         self.request_redraw();
                     } else {
                         // libinput шлёт финальный кадр с амплитудой 0, когда пальцы
                         // отпущены — это сигнал "стоп", запускаем инерцию отсюда.
+                        tracing::debug!("ЖЕСТ: Alt+2пальца → пан холста завершён, инерция");
                         self.momentum.launch();
+                        self.pan_log_left = 60;
                     }
                     return;
                 }
 
                 // В обзоре столов колесо мыши ЗУМИТ (в обычном tiling zoom нельзя).
                 if self.overview_active && v != 0.0 && source != AxisSource::Finger {
-                    let pointer = self.seat.get_pointer().unwrap();
-                    let cursor_canvas = pointer.current_location();
+                    let cursor_canvas = self.pointer_location;
                     let old_zoom = self.viewport.zoom;
                     let screen_x = (cursor_canvas.x - self.viewport.cam_x) * old_zoom;
                     let screen_y = (cursor_canvas.y - self.viewport.cam_y) * old_zoom;
@@ -666,8 +795,7 @@ impl Dawn {
 
                 // Alt+Scroll (колесо мыши) → zoom (только в Float режиме)
                 if alt_held && v != 0.0 && self.tile_config.layout == Layout::Float {
-                    let pointer = self.seat.get_pointer().unwrap();
-                    let cursor_canvas = pointer.current_location();
+                    let cursor_canvas = self.pointer_location;
 
                     let old_zoom = self.viewport.zoom;
 
@@ -703,6 +831,7 @@ impl Dawn {
 
             // ── Pinch → zoom canvas ──────────────────────────────────────
             InputEvent::GesturePinchBegin { .. } => {
+                tracing::debug!("ЖЕСТ: pinch начат, logo_held={}", self.logo_held);
                 self.pinch_last_scale = 1.0;
                 // Super+2-пальца pinch → resize окна под курсором (в любом режиме;
                 // вытаскиваем из тайлинга во floating, иначе arrange его сожмёт).
@@ -711,12 +840,18 @@ impl Dawn {
                     self.gesture_resize_window = self.space.element_under(pos).map(|(w, _)| w.clone());
                     if let Some(window) = self.gesture_resize_window.clone() {
                         if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                            tw.window.toplevel().zip(window.toplevel())
-                                .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                                .unwrap_or(false)
+                            tw.window == window
                         }) {
                             tw.floating = true;
                         }
+                        // Опорные размеры на весь жест — от них считаем
+                        // абсолютный scale (см. gesture_resize_group). Вместе с
+                        // окном ресайзится выделение, если окно в нём состоит.
+                        let mut group = vec![window.clone()];
+                        group.extend(self.group_drag_members_excluding(&window));
+                        self.gesture_resize_group = group.into_iter()
+                            .map(|w| { let s = crate::xwin::current_size(&w); (w, s) })
+                            .collect();
                     }
                 }
             }
@@ -726,14 +861,22 @@ impl Dawn {
                 if scale <= 0.0 { return; }
 
                 if let Some(window) = self.gesture_resize_window.clone() {
-                    let factor = scale / self.pinch_last_scale;
+                    // Размеры считаются от опорных по АБСОЛЮТНОМУ scale жеста
+                    // (см. Dawn::gesture_resize_group), а показатель PINCH_GAIN
+                    // усиливает жест: пальцы на тачпаде разводятся максимум
+                    // раза в полтора, а окно должно успевать вырасти вдвое.
+                    const PINCH_GAIN: f64 = 3.0;
                     self.pinch_last_scale = scale;
-                    if let Some(t) = window.toplevel() {
-                        let cur = t.with_committed_state(|s| s.and_then(|s| s.size)).unwrap_or((200, 200).into());
-                        let new_w = (cur.w as f64 * factor).round().max(50.0) as i32;
-                        let new_h = (cur.h as f64 * factor).round().max(50.0) as i32;
-                        t.with_pending_state(|s| { s.size = Some((new_w, new_h).into()); });
-                        t.send_pending_configure();
+                    if self.gesture_resize_group.is_empty() {
+                        let s = crate::xwin::current_size(&window);
+                        self.gesture_resize_group = vec![(window.clone(), s)];
+                    }
+                    let factor = scale.powf(PINCH_GAIN).clamp(0.05, 20.0);
+                    for (w, base) in self.gesture_resize_group.clone() {
+                        let new_w = (base.w as f64 * factor).round().clamp(50.0, 20000.0) as i32;
+                        let new_h = (base.h as f64 * factor).round().clamp(50.0, 20000.0) as i32;
+                        crate::xwin::set_size(&w, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
+                        crate::xwin::configure(&w);
                     }
                     self.request_redraw();
                     return;
@@ -746,8 +889,7 @@ impl Dawn {
                 let factor = scale / self.pinch_last_scale;
                 self.pinch_last_scale = scale;
 
-                let pointer = self.seat.get_pointer().unwrap();
-                let cursor = pointer.current_location();
+                let cursor = self.pointer_location;
 
                 let old_zoom = self.viewport.zoom;
                 let new_zoom = (old_zoom * factor).clamp(0.05, 5.0);
@@ -766,16 +908,16 @@ impl Dawn {
 
             InputEvent::GesturePinchEnd { .. } => {
                 self.pinch_last_scale = 1.0;
-                if let Some(window) = self.gesture_resize_window.take() {
-                    if let Some(t) = window.toplevel() {
-                        let size = t.with_committed_state(|s| s.and_then(|s| s.size)).unwrap_or((200, 200).into());
-                        if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                            tw.window.toplevel().zip(window.toplevel())
-                                .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                                .unwrap_or(false)
-                        }) {
-                            tw.float_size = Some(size);
-                        }
+                let group = std::mem::take(&mut self.gesture_resize_group);
+                tracing::debug!("ЖЕСТ: pinch закончен, окон в группе={}", group.len());
+                self.gesture_resize_window = None;
+                // Запоминаем итоговый размер КАЖДОМУ окну группы — иначе
+                // следующий переход Float→tiling→Float вернул бы соседям
+                // выделения их доресайзные размеры.
+                for (w, _) in group {
+                    let size = crate::xwin::current_size(&w);
+                    if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| tw.window == w) {
+                        tw.float_size = Some(size);
                     }
                 }
             }
@@ -801,14 +943,27 @@ impl Dawn {
                         ));
                         self.space.map_element(window.clone(), new_loc, true);
                         if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                            tw.window.toplevel().zip(window.toplevel())
-                                .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                                .unwrap_or(false)
+                            tw.window == window
                         }) {
                             tw.float_position = new_loc;
                             tw.position = new_loc;
                             tw.float_position_set = true;
                         }
+                    }
+                    self.request_redraw();
+                    return;
+                }
+
+                // ── Columns/niri: голый свайп 3+ пальцами листает полосу ─────
+                // Горизонталь — прокрутка вида по колонкам (на отпускании
+                // прилипаем к ближайшей, см. GestureSwipeEnd), вертикаль —
+                // переход по столам. Только в Columns: в остальных раскладках
+                // жест остаётся прежним (Alt+пан ниже), их не трогаем.
+                if self.tile_config.layout == Layout::Columns && !self.logo_held {
+                    if delta.x.abs() >= delta.y.abs() {
+                        self.columns_swipe_scroll(delta.x);
+                    } else {
+                        self.columns_swipe_workspace(delta.y);
                     }
                     self.request_redraw();
                     return;
@@ -824,9 +979,11 @@ impl Dawn {
                 let dcam_y = delta.y / zoom;
                 self.viewport.cam_x -= dcam_x;
                 self.viewport.cam_y -= dcam_y;
-                // Курсор остаётся на той же screen-позиции: ptr -= dcam
-                self.pointer_location.x -= dcam_x;
-                self.pointer_location.y -= dcam_y;
+                // Курсор остаётся на той же screen-позиции — но подтягивает его
+                // общая синхронизация в конце итерации цикла
+                // (Dawn::sync_pointer_to_camera). Делать это здесь вручную мало:
+                // canvas-точка под курсором меняется, а pointer.motion не
+                // отправляется, и фокус/hit-test остаются от старого места.
                 // Кинетический скролл (1.1): копим дельту для инерции на конец жеста
                 self.momentum.accumulate(
                     smithay::utils::Point::from((-dcam_x, -dcam_y)),
@@ -839,6 +996,15 @@ impl Dawn {
 
             InputEvent::GestureSwipeEnd { .. } => {
                 if self.gesture_move_window.take().is_some() {
+                    return;
+                }
+                // В Columns свайп заканчивается «прилипанием» к ближайшей
+                // колонке — как в niri, где вид всегда стоит на колонке, а не
+                // между ними. Инерцию тут не запускаем: она возит камеру по
+                // холсту и мимо модели колонок.
+                if self.tile_config.layout == Layout::Columns {
+                    self.columns_swipe_end();
+                    self.request_redraw();
                     return;
                 }
                 self.momentum.launch();

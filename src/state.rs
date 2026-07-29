@@ -27,7 +27,11 @@ use smithay::{
         shell::xdg::XdgShellState,
         shm::ShmState,
         socket::ListeningSocketSource,
+        xwayland_shell::XWaylandShellState,
+        image_capture_source::{ImageCaptureSourceState, OutputCaptureSourceState},
+        image_copy_capture::{ImageCopyCaptureState, Session},
     },
+    xwayland::X11Wm,
 };
 
 // ── Viewport ─────────────────────────────────────────────────────────────────
@@ -101,12 +105,34 @@ pub struct Dawn {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Dawn>,
     pub data_device_state: DataDeviceState,
+    /// Протокол xwayland_shell — по нему XWayland связывает свои wl_surface с
+    /// X11-окнами (см. xwayland.rs).
+    pub xwayland_shell_state: XWaylandShellState,
+    /// Оконный менеджер X11. None пока Xwayland не поднялся (или если он
+    /// отвалился) — тогда dawn просто чисто wayland-компоситор.
+    pub xwm: Option<X11Wm>,
+    /// Номер X-дисплея (`DISPLAY=:N`) поднятого Xwayland.
+    pub xdisplay: Option<u32>,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
     // dawn state
     pub viewport: Viewport,
     pub cursor_mode: CursorMode,
     pub pointer_location: Point<f64, Logical>,
+    /// Экранная (физическая) позиция курсора — то, где пользователь видит
+    /// стрелку. Ведущая величина при движении камеры: canvas-позиция
+    /// пересчитывается из неё, а не наоборот. См. sync_pointer_to_camera.
+    pub pointer_screen: Point<f64, Physical>,
+    /// Камера (cam_x, cam_y, zoom), при которой pointer_screen был посчитан.
+    /// Расхождение с текущей = камера уехала сама, без мыши.
+    pub pointer_cam_ref: (f64, f64, f64),
+    /// Когда последний раз писали диагностику синхронизации курсора (троттлинг:
+    /// иначе это 60 строк в секунду на всю длину любой анимации камеры).
+    pub pointer_sync_logged: std::time::Instant,
+    /// То же для покадровой диагностики курсора в render_surface, плюс камера
+    /// прошлого кадра — по ней видно, шевелится ли она вообще.
+    pub render_cursor_logged: std::time::Instant,
+    pub render_cam_logged: (f64, f64),
     pub cursor_status: CursorImageStatus,
     pub tagged_windows: Vec<TaggedWindow>,
     pub libinput_handle: Option<smithay::reexports::input::Libinput>,
@@ -119,6 +145,10 @@ pub struct Dawn {
     pub cursor_default_hotspot: Point<i32, Logical>,
     pub cursor_default_size: Size<i32, Logical>,
     pub session: Option<LibSeatSession>,
+    /// false между SessionEvent::PauseSession и ActivateSession — рендер-хартбит
+    /// и VBlank-хендлер в udev.rs должны пропускать render_all()/render_surface()
+    /// пока это так, иначе PrepareFrame бесполезно долбится в DrmError(DeviceInactive).
+    pub session_active: bool,
     /// Сколько ещё кадров подряд форсировать reset_buffer_ages() после
     /// структурного изменения (смена тега, arrange, начало/конец драга и
     /// т.п.). Один сброс покрывает только ОДИН буфер из DRM swap chain — при
@@ -158,31 +188,93 @@ pub struct Dawn {
     /// Позиция камеры для каждого воркспейса (тега) — восстанавливается при
     /// переключении на него, сохраняется при уходе (см. view_tag).
     pub tag_cameras: HashMap<u32, (f64, f64)>,
+    /// Раскладка (Tile/Float/Monocle/Columns) КАЖДОГО стола по отдельности:
+    /// уходя со стола, запоминаем его layout, приходя — восстанавливаем. Так
+    /// стол 1 может быть тайловым, а стол 2 плавающим, и переключение столов
+    /// переключает и режим. Новый (ещё не посещённый) стол всегда открывается
+    /// в Tile — см. view_tag.
+    pub tag_layouts: HashMap<u32, crate::tiling::Layout>,
     // ── Module 5 ──────────────────────────────────────────────────────────
     /// Focus Aura (5.3): последняя цель (позиция, размер) — для детекта смены фокуса.
     pub focus_aura_target: Option<(Point<f64, Logical>, (f64, f64))>,
     /// Focus Aura: текущая интерполированная (позиция, размер) для отрисовки.
     pub focus_aura_current: Option<(Point<f64, Logical>, (f64, f64))>,
     pub focus_aura_anim: Option<crate::anim::RectAnim>,
-    /// Анимации позиций окон при переходах tiling/floating (разлёт/сборка) —
-    /// (окно, LERP из старой позиции в новую).
-    pub window_pos_anims: Vec<(Window, CameraAnim)>,
+    /// Анимации позиций окон (разлёт/сборка tiling↔floating, свапы при драге,
+    /// толчок соседей, инерция броска) — (окно, пружина к целевой позиции).
+    /// Пружина, а не LERP с длительностью: цель здесь меняется на лету, и
+    /// только пружина умеет перенацелиться без разрыва скорости (см. PosAnim).
+    pub window_pos_anims: Vec<(Window, crate::anim::PosAnim)>,
+    /// Момент прошлого anim::tick — источник реального dt (тик зовут и таймер,
+    /// и VBlank, интервал плавает).
+    pub anim_last_tick: Option<std::time::Instant>,
     /// Анимации появления новых окон "с ростом" (Float-режим).
     pub window_open_anims: Vec<(Window, crate::anim::OpenAnim)>,
+    /// Плитки декораций (тень окна, маска угла, полоса параллакса) и пулы их
+    /// буферов — см. decor.rs.
+    pub decor: crate::decor::DecorCache,
+    /// Камера (cam_x, cam_y, zoom) на момент входа Float→тайлинг. Выход обратно
+    /// во Float возвращает холст сюда — см. Dawn::set_layout.
+    pub pre_tiling_view: Option<(f64, f64, f64)>,
     /// Super+2-палец swipe → перемещение окна (новый жест, под курсором на начале).
     pub gesture_move_window: Option<Window>,
     /// Super+pinch → resize окна (новый жест, под курсором на начале).
     pub gesture_resize_window: Option<Window>,
+    /// Размеры окон на НАЧАЛО pinch-жеста: само окно под курсором плюс всё
+    /// выделение, если оно в него входит (выделенные окна ресайзятся вместе).
+    /// Размер считается от этого снимка по абсолютному scale жеста (libinput
+    /// отдаёт scale относительно начала), а не накоплением шагов от текущего
+    /// размера: клиент применяет configure с задержкой, и несколько кадров
+    /// жеста подряд читали один и тот же старый размер — множители терялись,
+    /// ресайз выходил вялым и «залипал».
+    pub gesture_resize_group: Vec<(Window, Size<i32, Logical>)>,
     /// Копится вместо немедленного render_all() на каждый чих (клавиша,
     /// motion, commit) — фактический рендер выполняется один раз после
     /// event_loop.dispatch() в main.rs, схлопывая пачку событий одного тика
     /// в один проход по CRTC вместо N (см. request_redraw()).
     pub needs_redraw: bool,
+    /// Счётчик кадров: раз в секунду печатает, сколько кадров реально ушло на
+    /// экран, сколько это стоило по времени и из скольких элементов кадр собран.
+    /// Нужен, чтобы «лагает» можно было проверить числом, а не глазом.
+    pub render_stats: crate::udev::RenderStats,
     pub lua_config: crate::config::Config,
-    /// Кэш 1×N буферов для скруглённых углов (см. build_corner_mask_elements
-    /// в udev.rs), ключ — ширина среза в физических пикселях. Не больше ~24
-    /// записей (радиус clamp(2,24)), никогда не очищается.
-    pub corner_mask_cache: HashMap<i32, smithay::backend::renderer::element::solid::SolidColorBuffer>,
+    /// Пулы стабильных `Id` для процедурных solid-элементов: маски скруглённых
+    /// углов, тени окон, фон обзора, параллакс-фон, миникарта, выделение, портал.
+    /// Id выдаётся по порядковому номеру элемента в кадре — подробно про то,
+    /// почему без этого damage tracking не работал вовсе, см. `pooled_solid` в
+    /// udev.rs. Растут до максимума, достигнутого за сессию, и не очищаются:
+    /// Id — это просто счётчик, память копеечная.
+    ///
+    /// Отдельный пул на каждый слой обязателен: номер элемента уникален только
+    /// внутри своего пула, а два элемента с одним Id в кадре damage tracker
+    /// схлопывает в один.
+    pub shadow_ids: Vec<crate::udev::SolidSlot>,
+    /// Был ли зажат Shift во время текущего «тапа» Super — в Columns обзор
+    /// открывает Shift+Super, а не чистый Super (см. input.rs).
+    pub super_tap_shift: bool,
+    /// Сколько строк замера пана осталось напечатать (обнуляется, чтобы лог
+    /// не рос: 60 строк на жест хватает, чтобы увидеть, стоит ли курсор).
+    pub pan_log_left: u32,
+    /// Направление начатого перехода по столам в Columns (-1 вверх, +1 вниз,
+    /// 0 нет) — по нему columns_slide_in_workspace делает вертикальный въезд.
+    pub columns_ws_slide: i32,
+    /// Камера, под которую уже подвинуты плавающие окна ленты
+    /// (см. columns_pin_floating).
+    pub columns_float_cam: (f64, f64),
+    /// Пока тащат окно в Columns — canvas-x курсора, по нему рисуется
+    /// подсказка вставки (niri insert hint). None — драга нет.
+    pub columns_drag_hint: Option<f64>,
+    /// Накопленный вертикальный ход свайпа в Columns — по нему листаются
+    /// столы (см. columns_swipe_workspace).
+    pub columns_swipe_dy: f64,
+    /// Пул под полоски вкладок Columns (niri tab indicator).
+    pub tab_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул под подсказку вставки при драге в Columns.
+    pub hint_ids: Vec<crate::udev::SolidSlot>,
+    pub overview_bg_ids: Vec<crate::udev::SolidSlot>,
+    pub minimap_ids: Vec<crate::udev::SolidSlot>,
+    pub selection_ids: Vec<crate::udev::SolidSlot>,
+    pub portal_ids: Vec<crate::udev::SolidSlot>,
     // ── Мультивыделение / "созвездия" ────────────────────────────────────────
     /// Рамка rubber-band выделения в процессе протяжки (canvas-координаты) —
     /// см. grabs/select_grab.rs.
@@ -194,6 +286,13 @@ pub struct Dawn {
     pub constellations: Vec<Vec<Window>>,
     /// niri-подобная модель колонок для Layout::Columns (см. columns.rs).
     pub columns: crate::columns::ColumnLayout,
+    /// Полосы колонок ОСТАЛЬНЫХ столов (текущая лежит в `columns`). У niri
+    /// каждый воркспейс держит свои колонки — см. columns_save_for/load_for.
+    pub columns_by_tag: HashMap<u32, crate::columns::ColumnLayout>,
+    /// BSP-деревья dwindle для Layout::Tile — по одному на набор видимых тегов
+    /// (ключ = viewport.current_tags()), чтобы у каждого воркспейса своя
+    /// раскладка переживала переключение тегов. См. dwindle.rs.
+    pub dwindle_trees: std::collections::HashMap<u32, crate::dwindle::DwindleTree>,
     /// Обзор рабочих столов активен (тап Super, см. overview.rs).
     pub overview_active: bool,
     /// Кандидат на "тап Super": true с нажатия Super, сбрасывается любым другим
@@ -208,6 +307,12 @@ pub struct Dawn {
     pub overview_slots: std::collections::HashMap<u32, (i32, i32)>,
     /// Стол, который сейчас тащим мышью в обзоре (ЛКМ по столу).
     pub overview_drag_ws: Option<u32>,
+    /// Позиции и размеры окон ДО входа в обзор — обзор сжимает окна в миниатюры
+    /// и раскладывает их по сетке столов, а refresh_tags на выходе сохраняет
+    /// эти обзорные координаты в tw.position. Для тайловых столов их чинит
+    /// arrange(), а для плавающих чинить нечем — поэтому снимок делается на
+    /// входе и накатывается обратно на выходе (см. restore_pre_overview_geometry).
+    pub overview_saved_geo: Vec<(Window, Point<i32, Logical>, Size<i32, Logical>)>,
     /// Плавный выход из обзора: true → анимация запущена, после завершения
     /// (camera_anim+zoom_anim оба None) anim::tick финализирует (restore layout).
     pub overview_exit_pending: bool,
@@ -220,6 +325,16 @@ pub struct Dawn {
     /// Layout до входа в niri-режим (Columns). При повторном Win+N восстановить
     /// его, а не всегда Tile.
     pub prev_layout_before_niri: crate::tiling::Layout,
+    // ── Захват экрана (screencast, см. screencopy.rs) ─────────────────────────
+    pub image_capture_source_state: ImageCaptureSourceState,
+    pub output_capture_source_state: OutputCaptureSourceState,
+    pub image_copy_capture_state: ImageCopyCaptureState,
+    /// Живые сессии захвата. Держим владение: Session при Drop шлёт клиенту
+    /// `stopped`, и демонстрация экрана у него обрывается.
+    pub capture_sessions: Vec<Session>,
+    /// Запрошенные, но ещё не снятые кадры — обслуживаются в udev::render_surface
+    /// сразу после отрисовки обычного кадра (см. screencopy::serve_pending).
+    pub pending_frames: Vec<crate::screencopy::PendingFrame>,
 }
 
 fn load_default_cursor() -> (Option<MemoryRenderBuffer>, Point<i32, Logical>, Size<i32, Logical>) {
@@ -266,6 +381,13 @@ impl Dawn {
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
+        // Захват экрана (ext-image-copy-capture): без этих глобалов
+        // xdg-desktop-portal-wlr не видит у компоситора способа снять картинку,
+        // и демонстрация экрана в Discord/OBS остаётся чёрной. См. screencopy.rs.
+        let image_capture_source_state = ImageCaptureSourceState::new();
+        let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
+        let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
         let lua_config = crate::config::Config::load();
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "dawn");
@@ -288,11 +410,19 @@ impl Dawn {
             output_manager_state,
             seat_state,
             data_device_state,
+            xwayland_shell_state,
+            xwm: None,
+            xdisplay: None,
             popups: PopupManager::default(),
             seat,
             viewport: Viewport::default(),
             cursor_mode: CursorMode::Normal,
             pointer_location: Point::from((0.0, 0.0)),
+            pointer_screen: Point::from((0.0, 0.0)),
+            pointer_cam_ref: (0.0, 0.0, 1.0),
+            pointer_sync_logged: std::time::Instant::now(),
+            render_cursor_logged: std::time::Instant::now(),
+            render_cam_logged: (0.0, 0.0),
             cursor_status: CursorImageStatus::default_named(),
             tagged_windows: Vec::new(),
             libinput_handle: None,
@@ -305,6 +435,7 @@ impl Dawn {
             cursor_default_hotspot,
             cursor_default_size,
             session: None,
+            session_active: true,
             plane_reset_frames: 0,
             momentum: crate::canvas::MomentumState::new(0.5),
             camera_anim: None,
@@ -321,30 +452,56 @@ impl Dawn {
             pending_session: crate::session::load(),
             portal: None,
             tag_cameras: HashMap::new(),
+            tag_layouts: HashMap::new(),
             focus_aura_target: None,
             focus_aura_current: None,
             focus_aura_anim: None,
             window_pos_anims: Vec::new(),
+            anim_last_tick: None,
             window_open_anims: Vec::new(),
+            decor: crate::decor::DecorCache::new(),
+            pre_tiling_view: None,
             gesture_move_window: None,
             gesture_resize_window: None,
+            gesture_resize_group: Vec::new(),
             needs_redraw: true,
+            render_stats: crate::udev::RenderStats::new(),
             lua_config,
             selection_drag: None,
             selected_windows: Vec::new(),
             constellations: Vec::new(),
             columns: crate::columns::ColumnLayout::default(),
+            columns_by_tag: HashMap::new(),
+            dwindle_trees: HashMap::new(),
             overview_active: false,
             super_tap: false,
             overview_prev: None,
             overview_order: Vec::new(),
             overview_slots: HashMap::new(),
             overview_drag_ws: None,
+            overview_saved_geo: Vec::new(),
             overview_exit_pending: false,
             overview_exit_target_ws: None,
             touchpad_move_window: None,
             prev_layout_before_niri: crate::tiling::Layout::Tile,
-            corner_mask_cache: HashMap::new(),
+            shadow_ids: Vec::new(),
+            super_tap_shift: false,
+            pan_log_left: 60,
+            columns_ws_slide: 0,
+            columns_float_cam: (0.0, 0.0),
+            columns_drag_hint: None,
+            columns_swipe_dy: 0.0,
+            tab_ids: Vec::new(),
+            hint_ids: Vec::new(),
+            overview_bg_ids: Vec::new(),
+            minimap_ids: Vec::new(),
+            selection_ids: Vec::new(),
+            portal_ids: Vec::new(),
+            image_capture_source_state,
+            output_capture_source_state,
+            image_copy_capture_state,
+            capture_sessions: Vec::new(),
+            pending_frames: Vec::new(),
         }
     }
 
@@ -378,11 +535,29 @@ impl Dawn {
     /// иначе anim::tick() продолжит слать configure/map_element мёртвому окну.
     pub fn cancel_window_anims(&mut self, surface: &WlSurface) {
         self.window_pos_anims.retain(|(w, _)| {
-            w.toplevel().map(|t| t.wl_surface() != surface).unwrap_or(true)
+            !crate::xwin::is_surface(w, &surface)
         });
         self.window_open_anims.retain(|(w, _)| {
-            w.toplevel().map(|t| t.wl_surface() != surface).unwrap_or(true)
+            !crate::xwin::is_surface(w, &surface)
         });
+    }
+
+    /// Позиция, В КОТОРОЙ окно окажется, когда доедет текущая анимация (если
+    /// анимация идёт). Коллизии и свапы при драге должны считаться именно от
+    /// неё: от текущего кадра полёта решение зависело бы от фазы анимации —
+    /// сосед, которого уже толкнули, толкался бы снова и снова, пока летит.
+    pub fn window_anim_target(&self, window: &Window) -> Option<Point<i32, Logical>> {
+        self.window_pos_anims.iter()
+            .find(|(w, _)| crate::dwindle::same_window(w, window))
+            .map(|(_, anim)| anim.target.to_i32_round())
+    }
+
+    /// Снять анимацию позиции с окна, оставив его там, где оно сейчас.
+    /// Нужно перед тем, как окно начнут двигать напрямую (драг мышью, ресайз):
+    /// иначе каждый тик анимация возвращала бы окно на свою траекторию и оно
+    /// «резинилось» под курсором.
+    pub fn freeze_window_anim(&mut self, window: &Window) {
+        self.window_pos_anims.retain(|(w, _)| !crate::dwindle::same_window(w, window));
     }
 
     /// Запросить принудительный полный редрав на несколько следующих кадров
@@ -396,20 +571,159 @@ impl Dawn {
     /// Применяем camera к output — ВСЯ магия infinite canvas
     /// space.map_output(&output, camera) двигает весь viewport
     pub fn apply_camera(&mut self) {
+        // Плавающие окна ленты держатся экрана — двигаем их на ту же дельту,
+        // что и камеру (только в Columns, см. columns_pin_floating).
+        self.columns_pin_floating();
         let cam_x = self.viewport.cam_x.round() as i32;
         let cam_y = self.viewport.cam_y.round() as i32;
         let zoom = self.viewport.zoom;
         let output = self.space.outputs().next().cloned();
         if let Some(output) = output {
-            // Zoom через fractional scale — правильный способ
-            output.change_current_state(
-                None,
-                None,
-                Some(smithay::output::Scale::Fractional(zoom)),
-                None,
-            );
-            self.space.map_output(&output, (cam_x, cam_y));
+            // Zoom через fractional scale — правильный способ.
+            //
+            // ВАЖНО: только когда zoom РЕАЛЬНО изменился. change_current_state()
+            // в smithay ничего не сравнивает: он всегда рассылает wl_output.scale
+            // + wl_output.done() КАЖДОМУ клиенту на каждый вызов. А зовётся он
+            // отсюда из anim::tick — то есть 60 раз в секунду на всём протяжении
+            // любой анимации камеры и инерции, где zoom вообще не меняется. Клиенты
+            // (ghostty/GTK) на каждый done() пересчитывают масштаб и перерисовываются,
+            // их коммиты повреждают экран и заставляют компоситор рисовать ещё —
+            // самоподдерживающаяся нагрузка ровно во время анимаций.
+            if (output.current_scale().fractional_scale() - zoom).abs() > f64::EPSILON {
+                output.change_current_state(
+                    None,
+                    None,
+                    Some(smithay::output::Scale::Fractional(zoom)),
+                    None,
+                );
+            }
+            // map_output дешевле, но тоже незачем звать, когда камера стоит
+            // на месте (в тике она округляется до целых пикселей).
+            let mapped = self.space.output_geometry(&output).map(|g| g.loc);
+            if mapped != Some(Point::from((cam_x, cam_y))) {
+                self.space.map_output(&output, (cam_x, cam_y));
+            }
         }
+    }
+
+    /// Позиция курсора в ФИЗИЧЕСКИХ пикселях монитора — то, куда реально
+    /// смотрит пользователь (камера и зум уже применены).
+    pub fn pointer_screen_physical(&self) -> Point<f64, Physical> {
+        let zoom = self.viewport.zoom;
+        Point::from((
+            (self.pointer_location.x - self.viewport.cam_x) * zoom,
+            (self.pointer_location.y - self.viewport.cam_y) * zoom,
+        ))
+    }
+
+    /// Вернуть курсор в ту же точку ЭКРАНА после того, как камера/зум уехали
+    /// сами, и пересчитать, что теперь под ним.
+    ///
+    /// Мышь — устройство экрана, а не холста. Когда камера едет без участия
+    /// мыши (перелёт к столу, вход/выход из обзора, инерция, зум), стрелка
+    /// обязана остаться там же на мониторе. Раньше pointer_location при этом
+    /// не трогали, и получалось худшее из двух: стрелку утаскивало вместе с
+    /// холстом (при длинном перелёте — вообще за край экрана), а pointer.motion
+    /// никто не слал, так что под курсором оставалась СТАРАЯ поверхность.
+    /// Клик после этого уходил не туда, куда показывает стрелка — это и есть
+    /// «странный хитбокс».
+    pub fn repin_pointer_to_screen(&mut self, screen: Point<f64, Physical>) {
+        let zoom = self.viewport.zoom.max(0.01);
+        let pos = Point::from((
+            screen.x / zoom + self.viewport.cam_x,
+            screen.y / zoom + self.viewport.cam_y,
+        ));
+        self.set_pointer_canvas(pos);
+    }
+
+    /// Переставить курсор в canvas-точку НАМЕРЕННО (телепорт по миникарте,
+    /// курсор едет за окном в жесте, драг стола в обзоре) — с рассылкой motion
+    /// и фиксацией новой экранной позиции как эталонной.
+    ///
+    /// Единственный законный способ двигать курсор не по вводу мыши. Прямая
+    /// запись в `pointer_location` разводит два курсора: стрелка рисуется по
+    /// `pointer_location`, а клики, захваты и якорь зума идут по
+    /// `pointer.current_location()` внутри smithay, которая обновляется ТОЛЬКО
+    /// из `pointer.motion`. Разъехавшись, они дают ровно тот «странный
+    /// хитбокс»: видно одно, нажимается другое.
+    pub fn warp_pointer(&mut self, pos: Point<f64, Logical>) {
+        self.set_pointer_canvas(pos);
+        self.pointer_warped();
+    }
+
+    /// Общая часть: зажать точку экраном, записать её и разослать motion.
+    fn set_pointer_canvas(&mut self, mut pos: Point<f64, Logical>) {
+        // За пределы монитора курсор не выпускаем — там его не видно, а клики
+        // всё равно уходили бы в окна, которых на экране нет.
+        let out_geo = self.space.outputs().next().cloned()
+            .and_then(|o| self.space.output_geometry(&o));
+        if let Some(g) = out_geo {
+            pos.x = pos.x.clamp(g.loc.x as f64, (g.loc.x + g.size.w) as f64);
+            pos.y = pos.y.clamp(g.loc.y as f64, (g.loc.y + g.size.h) as f64);
+        }
+        if pos == self.pointer_location {
+            return;
+        }
+        self.pointer_location = pos;
+
+        let under = self.surface_under(pos);
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let time = self.start_time.elapsed().as_millis() as u32;
+        let pointer = match self.seat.get_pointer() { Some(p) => p, None => return };
+        pointer.motion(self, under, &smithay::input::pointer::MotionEvent {
+            location: pos, serial, time,
+        });
+        pointer.frame(self);
+    }
+
+    /// Принять текущую позицию курсора как намеренную: запомнить её экранную
+    /// проекцию вместе с текущей камерой. Нужно там, где курсор переносят
+    /// СПЕЦИАЛЬНО одновременно со сменой камеры (телепорт по миникарте) —
+    /// иначе sync_pointer_to_camera примет это за уехавшую камеру и вернёт
+    /// стрелку на прежнее место экрана.
+    pub fn pointer_warped(&mut self) {
+        self.pointer_cam_ref = (self.viewport.cam_x, self.viewport.cam_y, self.viewport.zoom);
+        self.pointer_screen = self.pointer_screen_physical();
+    }
+
+    /// Свести курсор с камерой — один раз за итерацию главного цикла, ПОСЛЕ
+    /// того как отработали ввод и анимации (см. main.rs).
+    ///
+    /// Две ситуации, и различаются они только тем, шевелилась ли камера:
+    /// * камера стоит — курсор двигался (или нет) сам, его экранная позиция
+    ///   просто пересчитывается из canvas-позиции и запоминается;
+    /// * камера уехала — значит уехала БЕЗ мыши (анимация перелёта, инерция,
+    ///   зум, вход/выход из обзора, переключение стола). Тогда ведущей
+    ///   становится запомненная экранная позиция: стрелка обязана остаться в
+    ///   той же точке монитора, а под неё подставляется новая canvas-точка.
+    ///
+    /// Одна точка вызова вместо правки полутора десятков мест, где меняется
+    /// камера: любое движение камеры, откуда бы оно ни пришло, здесь будет
+    /// замечено сравнением с pointer_cam_ref.
+    pub fn sync_pointer_to_camera(&mut self) {
+        let cam = (self.viewport.cam_x, self.viewport.cam_y, self.viewport.zoom);
+        if cam == self.pointer_cam_ref {
+            self.pointer_screen = self.pointer_screen_physical();
+            return;
+        }
+        self.pointer_cam_ref = cam;
+        let screen = self.pointer_screen;
+        // Диагностика «курсор ездит при пане»: не чаще 4 строк в секунду,
+        // и только пока камера реально движется. Если стрелку сносит, здесь
+        // будет видно расхождение «хотели / получилось» в экранных пикселях.
+        if self.pointer_sync_logged.elapsed().as_millis() >= 250 {
+            self.pointer_sync_logged = std::time::Instant::now();
+            let got = self.pointer_screen_physical();
+            tracing::debug!(
+                "СИНХ КУРСОР: держим экран=({:.0},{:.0}) было=({:.0},{:.0}) снос=({:.1},{:.1}) камера=({:.0},{:.0}) zoom={:.2}",
+                screen.x, screen.y, got.x, got.y, got.x - screen.x, got.y - screen.y,
+                cam.0, cam.1, cam.2,
+            );
+        }
+        self.repin_pointer_to_screen(screen);
+        // repin зажимает курсор краем монитора, так что фактическая экранная
+        // позиция могла и сдвинуться — перечитываем её, а не верим желаемой.
+        self.pointer_screen = self.pointer_screen_physical();
     }
 
     pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
@@ -446,7 +760,7 @@ impl Dawn {
         }
 
         let window = self.tagged_windows.iter()
-            .find(|tw| tw.window.toplevel().map(|t| t.wl_surface() == &portal.surface).unwrap_or(false))
+            .find(|tw| crate::xwin::is_surface(&tw.window, &portal.surface))
             .map(|tw| &tw.window)?;
         let geo = self.space.element_geometry(window)?;
 
@@ -468,7 +782,7 @@ impl Dawn {
             self.request_redraw();
             return;
         }
-        let focused = match self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
+        let focused = match self.focused_surface() {
             Some(f) => f,
             None => return,
         };
@@ -500,9 +814,7 @@ impl Dawn {
         };
         let current = self.viewport.current_tags();
         let same = |a: &Window, b: &Window| {
-            a.toplevel().zip(b.toplevel())
-                .map(|(x, y)| x.wl_surface() == y.wl_surface())
-                .unwrap_or(false)
+            a == b
         };
         let others: Vec<Window> = self.tagged_windows.iter()
             .filter(|tw| tw.tags & current != 0)
@@ -553,34 +865,88 @@ impl Dawn {
 
     /// Переключиться на тег (Super+N)
     pub fn view_tag(&mut self, tag: u32) {
-        // У каждого воркспейса своя позиция камеры — запоминаем текущую перед
-        // уходом и восстанавливаем сохранённую (если была) для нового тега.
+        use crate::tiling::Layout;
+        // Из обзора столов переход по столам = ВЫХОД из обзора на этот стол.
+        // Guard стоит здесь, а не в dispatch_action, потому что сюда приходят и
+        // другие бинды: workspace_step (Super+PageUp/Down),
+        // move_column_to_workspace. Раньше они меняли теги и дёргали
+        // set_layout/arrange, пока обзор ещё активен, а его снимок геометрии
+        // (overview_prev/overview_saved_geo) оставался от прежнего стола — на
+        // выходе окна восстанавливались не туда, и «бинды столов ломались».
+        // Рекурсии нет: exit_overview_immediate зовёт view_tag уже с
+        // overview_active = false.
+        if self.overview_active {
+            self.exit_overview_immediate(Some(tag));
+            return;
+        }
+        // У каждого воркспейса своя позиция камеры И своя раскладка — запоминаем
+        // текущие перед уходом, восстанавливаем сохранённые для нового тега.
         let old_tag = self.viewport.current_tags();
         self.tag_cameras.insert(old_tag, (self.viewport.cam_x, self.viewport.cam_y));
+        self.tag_layouts.insert(old_tag, self.tile_config.layout);
+
+        // Полоса колонок у каждого стола своя: прячем текущую на полку
+        // покидаемого тега и достаём полосу нового (см. columns.rs). Вне
+        // Columns полосы просто лежат нетронутыми.
+        if self.tile_config.layout == Layout::Columns {
+            self.columns_save_for(old_tag);
+            self.columns_load_for(tag);
+        }
 
         self.viewport.tagset[self.viewport.seltags] = tag;
         self.refresh_tags();
 
         // НОВЫЙ (ещё не посещённый) воркспейс → включаем tiling и раскладываем
-        // от (0,0). Повторные заходы layout/камеру не трогают (восстанавливаем
-        // сохранённую позицию камеры ниже).
+        // от (0,0). Повторные заходы восстанавливают запомненный за этим столом
+        // layout и позицию камеры.
         let is_new = !self.visited_tags.contains(&tag);
         self.visited_tags.insert(tag);
+        let target_layout = if is_new {
+            // Новый стол наследует режим ТОЛЬКО из Columns: свежий стол,
+            // на который скроллятся из ленты, обязан остаться лентой. Из
+            // остальных раскладок новый стол по-прежнему открывается в Tile —
+            // это их давнее поведение, и его не трогаем.
+            if self.tile_config.layout == Layout::Columns {
+                Layout::Columns
+            } else {
+                Layout::Tile
+            }
+        } else {
+            *self.tag_layouts.get(&tag).unwrap_or(&Layout::Tile)
+        };
 
-        // niri-режим (Columns): воркспейс меняется, но layout остаётся Columns —
-        // перекладываем колонки под новый тег и подъезжаем к активной колонке.
-        if self.tile_config.layout == crate::tiling::Layout::Columns {
+        // Режим — свойство СТОЛА, а не глобальный тумблер: уходя с ленты на
+        // стол, который помнит себя тайловым, выходим из Columns (ниже общей
+        // веткой через set_layout). Раньше здесь стояло «текущий Columns ИЛИ
+        // целевой Columns», из-за чего лента прилипала ко всем столам подряд.
+        if target_layout == Layout::Columns {
+            self.tile_config.layout = Layout::Columns;
             self.arrange();
             self.columns_set_active_to_focus();
             self.columns_scroll_to_active();
+            // Перелёт на этаж нового стола (вертикальная лента). Строго ПОСЛЕ
+            // scroll_to_active и arrange: окна нового стола уже разложены на
+            // своём этаже, и камера летит к готовой картинке.
+            self.columns_fly_to_workspace(tag);
             tracing::info!("dawn: view_tag → {:#b} (columns workspace)", tag);
             return;
         }
 
         if is_new {
-            self.set_layout(crate::tiling::Layout::Tile); // сам обнуляет камеру
+            self.set_layout(Layout::Tile); // сам обнуляет камеру
             tracing::info!("dawn: view_tag → {:#b} (new workspace → tiling)", tag);
             return;
+        }
+
+        // Стол помнит свой режим: если он отличается от текущего — переключаем.
+        // set_layout сам ставит камеру (тайлинг — в (0,0)) и раскладывает окна,
+        // поэтому для тайловых столов восстанавливать камеру уже не нужно.
+        if target_layout != self.tile_config.layout {
+            self.set_layout(target_layout);
+            tracing::info!("dawn: view_tag → {:#b} (layout {})", tag, target_layout.symbol());
+            if target_layout != Layout::Float {
+                return;
+            }
         }
 
         // Плавный "перелёт" камеры между воркспейсами вместо мгновенного прыжка.
@@ -598,12 +964,36 @@ impl Dawn {
         tracing::info!("dawn: view_tag → {:#b}", tag);
     }
 
-    /// niri-воркспейсы: перейти на пред/след воркспейс (тег idx±1, clamp 1-9).
-    /// Работает в любом режиме; в Columns остаётся Columns (см. view_tag).
+    /// Число активных воркспейсов в niri-модели: индекс последнего занятого
+    /// стола + 1 (всегда один пустой снизу). Кэп 9 (ограничение битовой маски
+    /// тегов). Учитывает и текущий стол, даже если он пуст, чтобы навигация не
+    /// «схлопывалась» при переходе на свежесозданный пустой.
+    pub fn niri_ws_count(&self) -> i32 {
+        let mut highest = self.viewport.current_tags().trailing_zeros() as i32 + 1;
+        for tw in &self.tagged_windows {
+            if !tw.floating && tw.tags != 0 {
+                let idx = tw.tags.trailing_zeros() as i32 + 1;
+                if idx > highest { highest = idx; }
+            }
+        }
+        (highest + 1).min(9)
+    }
+
+    /// niri-воркспейсы: перейти на пред/след воркспейс. В Columns диапазон
+    /// ДИНАМИЧЕСКИЙ [1, niri_ws_count] (последний занятый + пустой снизу);
+    /// в остальных режимах — фиксированные 1-9.
     pub fn workspace_step(&mut self, dir: i32) {
         let idx = self.viewport.current_tags().trailing_zeros() as i32 + 1;
-        let new = (idx + dir).clamp(1, 9);
+        let max = if self.tile_config.layout == crate::tiling::Layout::Columns {
+            self.niri_ws_count()
+        } else {
+            9
+        };
+        let new = (idx + dir).clamp(1, max);
         if new == idx { return; }
+        // Направление перехода — для вертикального въезда нового стола
+        // (см. columns_slide_in_workspace); view_tag сам его подхватит.
+        self.columns_ws_slide = dir.signum();
         self.view_tag(1u32 << (new - 1));
     }
 
@@ -617,6 +1007,11 @@ impl Dawn {
 
     /// Toggle тег в текущем представлении (Super+Ctrl+N)
     pub fn toggle_view(&mut self, tag: u32) {
+        // Смена набора видимых тегов на живом обзоре ломает его сетку (она
+        // построена по столам на момент входа) — сперва выходим, см. view_tag.
+        if self.overview_active {
+            self.exit_overview_immediate(None);
+        }
         let new = self.viewport.current_tags() ^ tag;
         if new != 0 {
             self.viewport.tagset[self.viewport.seltags] = new;
@@ -627,11 +1022,16 @@ impl Dawn {
 
     /// Назначить тег focused окну (Super+Shift+N)
     pub fn tag_window(&mut self, tag: u32) {
+        // Переезд окна на другой стол прямо в обзоре оставил бы его миниатюру
+        // в чужой ячейке, а снимок геометрии — от старого стола: выходим,
+        // потом переносим (см. view_tag). Перетаскивание мышью в обзоре — это
+        // отдельный путь (overview_reassign), он сетку обновляет сам.
+        if self.overview_active {
+            self.exit_overview_immediate(None);
+        }
         if let Some(focused) = self.focused_window_surface() {
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                tw.window.toplevel()
-                    .map(|t| t.wl_surface() == &focused)
-                    .unwrap_or(false)
+                crate::xwin::is_surface(&tw.window, &focused)
             }) {
                 tw.tags = tag;
                 tracing::info!("dawn: tag_window → {:#b}", tag);
@@ -642,11 +1042,12 @@ impl Dawn {
 
     /// Toggle тег на focused окне (Super+Ctrl+Shift+N)
     pub fn toggle_tag(&mut self, tag: u32) {
+        if self.overview_active {
+            self.exit_overview_immediate(None);
+        }
         if let Some(focused) = self.focused_window_surface() {
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                tw.window.toplevel()
-                    .map(|t| t.wl_surface() == &focused)
-                    .unwrap_or(false)
+                crate::xwin::is_surface(&tw.window, &focused)
             }) {
                 let new = tw.tags ^ tag;
                 if new != 0 {
@@ -674,11 +1075,22 @@ impl Dawn {
             self.space.unmap_elem(&tw.window);
         }
 
-        // Добавляем только видимые
-        for tw in &self.tagged_windows {
-            if tw.tags & current != 0 {
-                self.space.map_element(tw.window.clone(), tw.position, false);
-            }
+        // Добавляем видимые. В ленте (Columns) видимы окна ВСЕХ ленточных
+        // столов: столы там не подменяют друг друга, а лежат этажами одной
+        // вертикальной ленты (стол N на высоте N × экран, см. columns.rs), и
+        // соседние этажи обязаны существовать — иначе переход между столами
+        // показывал бы пустоту, а не уезжающий стол. За кадром они ничего не
+        // стоят: damage tracking и eco-mode отсекают всё вне вида.
+        let strip = self.tile_config.layout == crate::tiling::Layout::Columns;
+        let visible: Vec<(Window, Point<i32, Logical>)> = self.tagged_windows.iter()
+            .filter(|tw| {
+                tw.tags & current != 0
+                    || (strip && tw.tags != 0 && self.columns_is_strip_tag(tw.tags))
+            })
+            .map(|tw| (tw.window.clone(), tw.position))
+            .collect();
+        for (w, pos) in visible {
+            self.space.map_element(w, pos, false);
         }
 
         // Без этого при переключении тега на экране остаётся "тень" —
@@ -862,7 +1274,11 @@ impl Dawn {
         self.viewport.cam_x = cam_target.x;
         self.viewport.cam_y = cam_target.y;
         self.apply_camera();
-        self.pointer_location = target_point;
+        // Курсор здесь переносится НАМЕРЕННО (вместе с камерой): warp_pointer
+        // разошлёт motion и зафиксирует новую экранную позицию, иначе
+        // sync_pointer_to_camera увидит уехавшую камеру и вернёт стрелку туда,
+        // где она была на панели миникарты.
+        self.warp_pointer(target_point);
         self.request_redraw();
         tracing::info!("dawn: minimap click → teleport to ({:.0},{:.0})", target_point.x, target_point.y);
         true
@@ -920,9 +1336,7 @@ impl Dawn {
 
     /// Получить focused surface (для tag_window/close)
     fn focused_window_surface(&self) -> Option<WlSurface> {
-        self.seat
-            .get_keyboard()
-            .and_then(|kb| kb.current_focus())
+        self.focused_surface()
     }
 }
 

@@ -14,7 +14,7 @@ use smithay::{
         wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{Logical, Point, Rectangle, Size},
-    wayland::{compositor, shell::xdg::SurfaceCachedState},
+    wayland::compositor,
 };
 use std::cell::RefCell;
 
@@ -48,9 +48,16 @@ pub struct ResizeSurfaceGrab {
     /// начала ресайза — на отпускании масштабируются вокруг общего опорного
     /// угла на тот же коэффициент, что и перетаскиваемое окно (см. button()).
     group_initial: Vec<(Window, Rectangle<i32, Logical>)>,
-    /// Начальный mfact при старте ресайза (Tile mode) — чтобы delta.x
-    /// правильно менял master-фактор относительно исходного значения.
-    initial_mfact: f32,
+    /// Суммарная дельта курсора, уже отданная dwindle-ресайзу (Tile mode):
+    /// дереву нужен ИНКРЕМЕНТ с прошлого события, а не путь от старта.
+    tile_last_delta: Point<f64, Logical>,
+    /// Эффективная ширина колонки схваченного окна на старте ресайза (Columns
+    /// mode), захватывается на ПЕРВОМ motion. Нужна, чтобы ширину считать как
+    /// base + total_delta, а не накапливать (иначе колонка «разгоняется»).
+    col_resize_base: Option<f64>,
+    /// То же для доли высоты строки схваченного окна (вертикальный ресайз в
+    /// Columns): доля = base + total_delta_y/avail_h.
+    row_resize_base: Option<f64>,
 }
 
 impl ResizeSurfaceGrab {
@@ -60,15 +67,19 @@ impl ResizeSurfaceGrab {
         edges: ResizeEdge,
         initial_window_rect: Rectangle<i32, Logical>,
         group_initial: Vec<(Window, Rectangle<i32, Logical>)>,
-        initial_mfact: f32,
     ) -> Self {
-        ResizeSurfaceState::with(window.toplevel().unwrap().wl_surface(), |state| {
-            *state = ResizeSurfaceState::Resizing {
-                edges,
-                initial_rect: initial_window_rect,
-                last_rect: initial_window_rect,
-            };
-        });
+        // У X11-окна поверхности может ещё не быть — ResizeSurfaceState живёт
+        // в её данных, но для X11 он и не нужен: позицию при ресайзе от
+        // LEFT/TOP там правим сами, не дожидаясь коммита (см. motion).
+        if let Some(surface) = crate::xwin::surface(&window) {
+            ResizeSurfaceState::with(&surface, |state| {
+                *state = ResizeSurfaceState::Resizing {
+                    edges,
+                    initial_rect: initial_window_rect,
+                    last_rect: initial_window_rect,
+                };
+            });
+        }
         Self {
             start_data,
             window,
@@ -76,7 +87,9 @@ impl ResizeSurfaceGrab {
             initial_rect: initial_window_rect,
             last_window_size: initial_window_rect.size,
             group_initial,
-            initial_mfact,
+            tile_last_delta: Point::from((0.0, 0.0)),
+            col_resize_base: None,
+            row_resize_base: None,
         }
     }
 }
@@ -91,31 +104,61 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
     ) {
         handle.motion(data, None, event);
 
-        // Проверяем — окно в тайлинге?
-        let is_tiled = data.tile_config.layout != Layout::Float
+        // Проверяем — окно в тайлинге? В обзоре столов тайлинг НЕ активен
+        // (arrange отключён), поэтому там ресайз свободный, как во Float.
+        let is_tiled = !data.overview_active
+            && data.tile_config.layout != Layout::Float
             && data.tagged_windows.iter().any(|tw| {
                 !tw.floating
-                    && tw.window.toplevel().zip(self.window.toplevel())
-                        .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                        .unwrap_or(false)
+                    && tw.window == self.window
             });
 
         if is_tiled {
             let delta = event.location - self.start_data.location;
             if data.tile_config.layout == Layout::Tile {
-                // Tile: горизонтальный drag меняет mfact (master-фактор).
-                let out_w = data.space.outputs().next()
-                    .and_then(|o| data.space.output_geometry(o))
-                    .map(|g| g.size.w as f64)
-                    .unwrap_or(1920.0);
-                let delta_mfact = (delta.x / out_w) as f32;
-                data.tile_config.mfact = (self.initial_mfact + delta_mfact).clamp(0.1, 0.9);
-                data.arrange();
-                data.request_redraw();
+                // Tile: тянем деления BSP-дерева (Hyprland resizeTarget,
+                // smart_resizing). Дереву отдаём ИНКРЕМЕНТ с прошлого события —
+                // оно двигает split_ratio, а не пересчитывает от старта.
+                let step = delta - self.tile_last_delta;
+                self.tile_last_delta = delta;
+                let corner = crate::dwindle::Corner {
+                    left: self.edges.intersects(ResizeEdge::LEFT),
+                    top: self.edges.intersects(ResizeEdge::TOP),
+                    right: self.edges.intersects(ResizeEdge::RIGHT),
+                    bottom: self.edges.intersects(ResizeEdge::BOTTOM),
+                };
+                let win = self.window.clone();
+                data.dwindle_resize_focused(&win, step, corner);
             } else if data.tile_config.layout == Layout::Columns {
-                // Columns: горизонтальный drag меняет ширину активной колонки
-                // непрерывно (drag_width от 15% до 100% экрана).
-                data.columns_resize_active_width(delta.x);
+                // Columns: drag по X — ширина колонки, по Y — доля высоты строки
+                // СХВАЧЕННОГО окна. Обе оси считаются как base + total_delta от
+                // старта (база захватывается на первом motion) — без накопления
+                // и без скролла камеры (иначе «разгон» и дёрганье вида).
+                let win = self.window.clone();
+                let (out_w, out_h) = data.space.outputs().next()
+                    .and_then(|o| data.space.output_geometry(o))
+                    .map(|g| (g.size.w as f64, g.size.h as f64))
+                    .unwrap_or((1920.0, 1080.0));
+                let avail_h = (out_h - (crate::tiling::GAP_OUTER * 2) as f64).max(1.0);
+                let base_w = match self.col_resize_base {
+                    Some(b) => b,
+                    None => {
+                        let b = data.columns_effective_width_of_window(&win).unwrap_or(0.5);
+                        self.col_resize_base = Some(b);
+                        b
+                    }
+                };
+                let base_h = match self.row_resize_base {
+                    Some(b) => b,
+                    None => {
+                        let b = data.columns_effective_row_fraction_of_window(&win).unwrap_or(0.5);
+                        self.row_resize_base = Some(b);
+                        b
+                    }
+                };
+                let width_factor = (base_w + delta.x / out_w).clamp(0.15, 1.0);
+                let row_fraction = base_h + delta.y / avail_h; // клампится в set_row_fraction
+                data.columns_resize_of_window(&win, width_factor, row_fraction);
             }
             // Monocle: не поддерживается.
             return;
@@ -135,29 +178,59 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
             new_h = (self.initial_rect.size.h as f64 + delta.y) as i32;
         }
 
-        let (min_size, max_size) =
-            compositor::with_states(self.window.toplevel().unwrap().wl_surface(), |states| {
-                let mut guard = states.cached_state.get::<SurfaceCachedState>();
-                let data = guard.current();
-                (data.min_size, data.max_size)
-            });
+        let (min_size, max_size) = crate::xwin::size_constraints(&self.window);
 
         let min_w = min_size.w.max(1);
         let min_h = min_size.h.max(1);
-        let max_w = if max_size.w == 0 { i32::MAX } else { max_size.w };
-        let max_h = if max_size.h == 0 { i32::MAX } else { max_size.h };
+        let mut max_w = if max_size.w == 0 { i32::MAX } else { max_size.w };
+        let mut max_h = if max_size.h == 0 { i32::MAX } else { max_size.h };
+
+        // В обзоре рамка стола — такой же ограничитель, как max_size клиента:
+        // окно ресайзится в пределах своего стола и не «выталкивается» за него.
+        // Считаем от неподвижного края (тянем за LEFT/TOP — двигается левый/
+        // верхний край, значит упираемся в левую/верхнюю границу стола).
+        if data.overview_active {
+            if let Some(area) = data.overview_mask_of_window(&self.window)
+                .and_then(|m| data.overview_window_area(m))
+            {
+                let limit_w = if self.edges.intersects(ResizeEdge::LEFT) {
+                    self.initial_rect.loc.x + self.initial_rect.size.w - area.loc.x
+                } else {
+                    area.loc.x + area.size.w - self.initial_rect.loc.x
+                };
+                let limit_h = if self.edges.intersects(ResizeEdge::TOP) {
+                    self.initial_rect.loc.y + self.initial_rect.size.h - area.loc.y
+                } else {
+                    area.loc.y + area.size.h - self.initial_rect.loc.y
+                };
+                max_w = max_w.min(limit_w.max(1));
+                max_h = max_h.min(limit_h.max(1));
+            }
+        }
 
         self.last_window_size = Size::from((
-            new_w.max(min_w).min(max_w),
-            new_h.max(min_h).min(max_h),
+            new_w.min(max_w).max(min_w),
+            new_h.min(max_h).max(min_h),
         ));
 
-        let xdg = self.window.toplevel().unwrap();
-        xdg.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Resizing);
-            state.size = Some(self.last_window_size);
-        });
-        xdg.send_pending_configure();
+        crate::xwin::set_resizing(&self.window, true);
+        crate::xwin::set_size(&self.window, Some(self.last_window_size), crate::xwin::Tiled::Keep);
+        crate::xwin::configure(&self.window);
+
+        // Тянем за левый/верхний край → окно должно ещё и ехать. У wayland-окна
+        // это делает handle_commit по факту применения нового размера клиентом;
+        // X11-клиент нового размера не «подтверждает» — двигаем сами и сразу,
+        // иначе окно растёт только вправо/вниз.
+        if self.window.is_x11() {
+            let mut loc = self.initial_rect.loc;
+            if self.edges.intersects(ResizeEdge::LEFT) {
+                loc.x += self.initial_rect.size.w - self.last_window_size.w;
+            }
+            if self.edges.intersects(ResizeEdge::TOP) {
+                loc.y += self.initial_rect.size.h - self.last_window_size.h;
+            }
+            data.space.map_element(self.window.clone(), loc, false);
+        }
 
         // "Созвездие": остальные окна группы масштабируются ЖИВО вместе с
         // перетаскиваемым (раньше это делалось только на отпускании — соседи
@@ -180,10 +253,8 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
                 let new_h = ((geo.size.h as f64) * scale_y).round().max(50.0) as i32;
                 let new_x = (anchor_x as f64 + (geo.loc.x - anchor_x) as f64 * scale_x).round() as i32;
                 let new_y = (anchor_y as f64 + (geo.loc.y - anchor_y) as f64 * scale_y).round() as i32;
-                if let Some(t) = member.toplevel() {
-                    t.with_pending_state(|s| { s.size = Some((new_w, new_h).into()); });
-                    t.send_pending_configure();
-                }
+                crate::xwin::set_size(&member, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
+                crate::xwin::configure(&member);
                 let new_loc: Point<i32, Logical> = (new_x, new_y).into();
                 data.space.map_element(member.clone(), new_loc, false);
             }
@@ -212,46 +283,47 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
         if !handle.current_pressed().contains(&BTN_RIGHT) {
             handle.unset_grab(self, data, event.serial, event.time, true);
 
-            // Только для floating — финализируем resize.
+            // Только для floating (и обзора) — финализируем resize.
             // В tiling/columns: сбрасываем ResizeSurfaceState (commit-хендлер
             // не должен корректировать позицию — ей управляет layout).
-            let is_tiled = data.tile_config.layout != Layout::Float
+            let is_tiled = !data.overview_active
+                && data.tile_config.layout != Layout::Float
                 && data.tagged_windows.iter().any(|tw| {
                     !tw.floating
-                        && tw.window.toplevel().zip(self.window.toplevel())
-                            .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                            .unwrap_or(false)
+                        && tw.window == self.window
                 });
 
             if is_tiled {
-                if let Some(t) = self.window.toplevel() {
-                    ResizeSurfaceState::with(t.wl_surface(), |state| {
+                if let Some(surface) = crate::xwin::surface(&self.window) {
+                    ResizeSurfaceState::with(&surface, |state| {
                         *state = ResizeSurfaceState::Idle;
                     });
                 }
             } else {
-                let xdg = self.window.toplevel().unwrap();
-                xdg.with_pending_state(|state| {
-                    state.states.unset(xdg_toplevel::State::Resizing);
-                    state.size = Some(self.last_window_size);
-                });
-                xdg.send_pending_configure();
+                crate::xwin::set_resizing(&self.window, false);
+                crate::xwin::set_size(&self.window, Some(self.last_window_size), crate::xwin::Tiled::Keep);
+                crate::xwin::configure(&self.window);
 
                 // Сохраняем float_size
                 if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                    tw.window.toplevel().zip(self.window.toplevel())
-                        .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                        .unwrap_or(false)
+                    tw.window == self.window
                 }) {
                     tw.float_size = Some(self.last_window_size);
                 }
+                // В обзоре ресайз должен пережить выход — правим и снимок
+                // до-обзорной геометрии (иначе он вернёт прежний размер).
+                if data.overview_active {
+                    data.overview_note_resize(&self.window, self.last_window_size);
+                }
 
-                ResizeSurfaceState::with(xdg.wl_surface(), |state| {
-                    *state = ResizeSurfaceState::WaitingForLastCommit {
-                        edges: self.edges,
-                        initial_rect: self.initial_rect,
-                    };
-                });
+                if let Some(surface) = crate::xwin::surface(&self.window) {
+                    ResizeSurfaceState::with(&surface, |state| {
+                        *state = ResizeSurfaceState::WaitingForLastCommit {
+                            edges: self.edges,
+                            initial_rect: self.initial_rect,
+                        };
+                    });
+                }
 
                 // "Созвездие" (Super+G): остальные окна группы масштабируются
                 // вокруг общего неподвижного угла на тот же коэффициент.
@@ -273,15 +345,11 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
                         let new_h = ((geo.size.h as f64) * scale_y).round().max(50.0) as i32;
                         let new_x = (anchor_x as f64 + (geo.loc.x - anchor_x) as f64 * scale_x).round() as i32;
                         let new_y = (anchor_y as f64 + (geo.loc.y - anchor_y) as f64 * scale_y).round() as i32;
-                        if let Some(t) = member.toplevel() {
-                            t.with_pending_state(|s| { s.size = Some((new_w, new_h).into()); });
-                            t.send_pending_configure();
-                        }
+                        crate::xwin::set_size(&member, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
+                        crate::xwin::configure(&member);
                         data.animate_window_to_dur(&member, (new_x, new_y).into(), std::time::Duration::from_millis(180));
                         if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                            tw.window.toplevel().zip(member.toplevel())
-                                .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                                .unwrap_or(false)
+                            tw.window == member
                         }) {
                             tw.float_size = Some((new_w, new_h).into());
                             tw.float_position = (new_x, new_y).into();
@@ -416,10 +484,7 @@ fn elastic_displace(
     let others: Vec<(Window, Rectangle<i32, Logical>)> = space
         .elements()
         .filter(|w| {
-            w.toplevel()
-                .zip(resized.toplevel())
-                .map(|(a, b)| a.wl_surface() != b.wl_surface())
-                .unwrap_or(true)
+            *w != resized
         })
         .filter_map(|w| space.element_geometry(w).map(|g| (w.clone(), g)))
         .collect();
@@ -453,10 +518,13 @@ fn elastic_displace(
     }
 }
 
-pub fn handle_commit(space: &mut Space<Window>, surface: &WlSurface) -> Option<()> {
+/// `elastic` — расталкивать ли соседей примыкающими краями (2.3). В обзоре
+/// столов выключено: миниатюры стоят в зазоре GAP_INNER друг от друга, то есть
+/// все соседи «примыкающие», и любой ресайз выдавливал бы их за рамку стола.
+pub fn handle_commit(space: &mut Space<Window>, surface: &WlSurface, elastic: bool) -> Option<()> {
     let window = space
         .elements()
-        .find(|w| w.toplevel().unwrap().wl_surface() == surface)
+        .find(|w| crate::xwin::is_surface(w, surface))
         .cloned()?;
 
     let mut window_loc = space.element_location(&window)?;
@@ -485,7 +553,7 @@ pub fn handle_commit(space: &mut Space<Window>, surface: &WlSurface) -> Option<(
     // коммитах активного resize, не на финальном после отпускания кнопки.
     let new_rect = Rectangle::new(window_loc, geometry.size);
     let old_rect = ResizeSurfaceState::with(surface, |state| state.take_last_rect_for_elastic(new_rect));
-    if let Some(old_rect) = old_rect {
+    if let (Some(old_rect), true) = (old_rect, elastic) {
         elastic_displace(space, &window, old_rect, new_rect);
     }
 

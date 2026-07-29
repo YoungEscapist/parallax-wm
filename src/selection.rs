@@ -9,9 +9,7 @@ use crate::state::Dawn;
 use crate::tiling::Layout;
 
 fn same_window(a: &Window, b: &Window) -> bool {
-    a.toplevel().zip(b.toplevel())
-        .map(|(x, y)| x.wl_surface() == y.wl_surface())
-        .unwrap_or(false)
+    a == b
 }
 
 impl Dawn {
@@ -53,9 +51,28 @@ impl Dawn {
         self.constellations.iter().position(|g| g.iter().any(|w| same_window(w, window)))
     }
 
-    /// Остальные окна из "созвездия" данного окна (без самого `window`) —
-    /// используется грабами перемещения/ресайза, чтобы тащить/масштабировать
-    /// группу как единое целое.
+    /// Кого тащить и масштабировать ВМЕСТЕ с `window` — это ВЫДЕЛЕНИЕ, а не
+    /// созвездие.
+    ///
+    /// Созвездие (Super+G) больше не двигается целиком: оно фиксирует взаимное
+    /// расположение окон, но хвататься за одно окно и утаскивать всю группу
+    /// оказалось неожиданно — тянешь одно, едут пять. Групповой драг/ресайз
+    /// теперь ровно там, где его просят явно: если окно входит в выделение
+    /// (рамкой по Super+ЛКМ), едет всё выделение; если нет — едет только оно.
+    pub fn group_drag_members_excluding(&self, window: &Window) -> Vec<Window> {
+        if !self.is_selected(window) {
+            return Vec::new();
+        }
+        self.selected_windows.iter()
+            .filter(|w| !same_window(w, window))
+            .cloned()
+            .collect()
+    }
+
+    /// Остальные окна из "созвездия" данного окна (без самого `window`).
+    /// Грабами больше НЕ используется (см. group_drag_members_excluding),
+    /// оставлено для операций над самим созвездием.
+    #[allow(dead_code)]
     pub fn constellation_members_excluding(&self, window: &Window) -> Vec<Window> {
         self.constellation_index_of(window)
             .map(|i| self.constellations[i].iter()
@@ -156,9 +173,7 @@ impl Dawn {
         for (w, pos) in &targets {
             self.animate_window_to_dur(w, *pos, std::time::Duration::from_millis(260));
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                tw.window.toplevel().zip(w.toplevel())
-                    .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                    .unwrap_or(false)
+                &tw.window == w
             }) {
                 tw.floating = true;
                 tw.float_position = *pos;
@@ -270,9 +285,7 @@ impl Dawn {
             ));
             self.animate_window_to_dur(w, pos, Duration::from_millis(320));
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                tw.window.toplevel().zip(w.toplevel())
-                    .map(|(a, b)| a.wl_surface() == b.wl_surface())
-                    .unwrap_or(false)
+                &tw.window == w
             }) {
                 tw.floating = true;
                 tw.float_position = pos;
@@ -290,12 +303,12 @@ impl Dawn {
 
     /// Super+Shift+G: разбить созвездие, в котором состоит сфокусированное окно.
     pub fn ungroup_focused_constellation(&mut self) {
-        let focused = match self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
+        let focused = match self.focused_surface() {
             Some(f) => f,
             None => return,
         };
         let window = match self.tagged_windows.iter()
-            .find(|tw| tw.window.toplevel().map(|t| t.wl_surface() == &focused).unwrap_or(false))
+            .find(|tw| crate::xwin::is_surface(&tw.window, &focused))
             .map(|tw| tw.window.clone())
         {
             Some(w) => w,
@@ -313,9 +326,7 @@ impl Dawn {
         if !self.selected_windows.is_empty() {
             let n = self.selected_windows.len();
             for w in self.selected_windows.clone() {
-                if let Some(t) = w.toplevel() {
-                    t.send_close();
-                }
+                crate::xwin::close(&w);
             }
             tracing::info!("dawn: killed {} selected windows", n);
             self.clear_selection();
