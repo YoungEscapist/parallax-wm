@@ -24,13 +24,31 @@ const BTN_RIGHT: u32 = 0x111;
 impl Dawn {
     pub(crate) fn kill_focused(&mut self) {
         if let Some(surface) = self.focused_surface() {
-            if let Some(w) = self.space.elements()
+            // Ищем сперва в space, потом в собственном списке окон.
+            //
+            // space держит только то, что сейчас РИСУЕТСЯ: скрытые вкладки
+            // Columns с него сняты, окна чужих раскладок и чужих тегов тоже.
+            // Фокус же спокойно оказывается на таком окне (после закрытия
+            // соседа, после переключения вкладки), и Win+Q молча не делал
+            // ничего — в логе 20260729_190042 это 28 промахов на 27 попаданий,
+            // причём промах всегда стоит вплотную перед повторным нажатием.
+            // Закрытие окна не должно зависеть от того, видно его сейчас или нет.
+            let w = self.space.elements()
                 .find(|w| crate::xwin::is_surface(w, &surface))
                 .cloned()
-            {
+                .or_else(|| self.tagged_windows.iter()
+                    .find(|tw| crate::xwin::is_surface(&tw.window, &surface))
+                    .map(|tw| tw.window.clone()));
+            if let Some(w) = w {
                 crate::xwin::close(&w);
                 tracing::info!("dawn: kill focused");
+            } else {
+                tracing::info!("dawn: kill — фокусная поверхность есть, но окна для неё нет ни в space, ни в списке");
             }
+        } else {
+            // Win+q молча ничего не делает ровно здесь: клавиатурный фокус снят
+            // (например, кликом по пустому холсту, см. ниже set_focus(None)).
+            tracing::info!("dawn: kill — фокуса нет, закрывать нечего");
         }
     }
 
@@ -170,26 +188,6 @@ impl Dawn {
                tracing::trace!("PTR MOTION: delta=({:.2},{:.2})", delta.x, delta.y);
                let zoom = self.viewport.zoom;
 
-               // В обзоре: Win+Alt+ЛКМ драг стола — стол переезжает по ячейкам
-               // сетки вслед за курсором (камеру не трогаем). Двигать при этом
-               // окна внутри его рамки бессмысленно: рамка рисуется по ячейке,
-               // так что стол при этом визуально стоял бы на месте.
-               if self.overview_active {
-                   if let Some(mask) = self.overview_drag_ws {
-                       // Через warp_pointer, а не записью в pointer_location:
-                       // без motion smithay-указатель остался бы там, где драг
-                       // начался, и следующий клик ушёл бы в старую точку.
-                       let pos = Point::from((
-                           self.pointer_location.x + delta.x / zoom,
-                           self.pointer_location.y + delta.y / zoom,
-                       ));
-                       self.warp_pointer(pos);
-                       let pos = self.pointer_location;
-                       self.overview_drag_workspace_to(mask, pos);
-                       return;
-                   }
-               }
-
                // Alt+LMB pan (Float) / ЛКМ-пан в обзоре столов: курсор стоит,
                // холст движется в сторону drag.
                if self.pan_button_held
@@ -197,14 +195,14 @@ impl Dawn {
                {
                    let dcam_x = delta.x / zoom;
                    let dcam_y = delta.y / zoom;
-                   self.viewport.cam_x -= dcam_x;
-                   self.viewport.cam_y -= dcam_y;
+                   // Камера + курсор одним шагом: стрелка обязана остаться в
+                   // той же точке экрана уже в ЭТОМ кадре (см. pan_camera_by).
+                   self.pan_camera_by(dcam_x, dcam_y);
                    // Кинетический скролл (1.1): копим дельту для инерции на отпускание
                    self.momentum.accumulate(
                        smithay::utils::Point::from((-dcam_x, -dcam_y)),
                        event.time_msec(),
                    );
-                   self.apply_camera();
                    // Замер строго на ЭТОМ жесте (Alt+ЛКМ): печатаем экранную
                    // точку стрелки на каждом событии пана, не чаще 60 строк за
                    // жест. Если тут число стоит, а стрелку видно едущей —
@@ -286,6 +284,10 @@ impl Dawn {
                        }
                    }
                }
+               // Surface-local всегда в логическом пространстве — клиент сам
+               // умножает на scale (wl_output.scale / wp_fractional_scale),
+               // чтобы получить пиксель буфера. zoom_adjusted_location_motion
+               // дважды применял scale — surface-local уходил сжатым.
                pointer.motion(self, under, &MotionEvent {
                    location: pos, serial, time: event.time_msec(),
                });
@@ -380,23 +382,10 @@ impl Dawn {
                 //  · ЛКМ → фокус на окне (основной хендлер), потом exit на стол
                 //  · Alt+ЛКМ → pan ленты
                 //  · Super+ЛКМ → драг окна (move_grab → overview_reassign)
-                //  · Super+Alt+ЛКМ → драг ВСЕГО стола по сетке (snap на отпускании).
+                // Сами столы в обзоре НЕ двигаются: их порядок задаёт обзор
+                // (ячейки выдаются кольцами вокруг текущего, см. overview.rs).
                 if self.overview_active {
                     if button == BTN_LEFT {
-                        // Win+Alt+ЛКМ → тащим весь стол под курсором. Проверяем
-                        // ДО Alt-пана и до Super+ЛКМ-драга окна: иначе Alt уводил
-                        // бы в пан холста (из-за чего драг стола был вообще
-                        // недостижим), а клик по окну — в move_grab.
-                        if self.logo_held && alt_held {
-                            if ButtonState::Pressed == btn_state {
-                                self.overview_drag_ws = self
-                                    .overview_workspace_at(self.pointer_location)
-                                    .or_else(|| self.overview_nearest_workspace(self.pointer_location));
-                                tracing::debug!("dawn: overview workspace drag start");
-                                return;
-                            }
-                            // Отпускание падает ниже — там снап в ячейку сетки.
-                        }
                         if alt_held {
                             // Alt+ЛКМ → pan (без grab, флаг)
                             self.pan_button_held = ButtonState::Pressed == btn_state;
@@ -428,20 +417,33 @@ impl Dawn {
                     self.pan_button_held = true;
                     // Новый жест — новая порция строк замера.
                     self.pan_log_left = 60;
+                    self.pan_start_screen = Some(self.pointer_screen_physical());
                     tracing::debug!("dawn/canvas: pan started");
                     return;
                 }
                 // Любое отпускание ЛКМ → завершаем pan, запускаем инерцию (1.1)
                 if ButtonState::Released == btn_state && button == BTN_LEFT {
-                    // Перетаскивание стола в обзоре: snap в ближайшую ячейку сетки
-                    if let Some(from) = self.overview_drag_ws.take() {
-                        self.overview_snap_workspace(from, self.pointer_location);
-                        return;
-                    }
                     if self.pan_button_held {
                         self.momentum.launch();
+                        // Итог жеста: где стрелка была в начале и где оказалась.
+                        // Ненулевая разница здесь — это и есть «уезжает и
+                        // остаётся смещённой» (в отличие от дрожи, у которой
+                        // итог около нуля).
+                        if let Some(start) = self.pan_start_screen.take() {
+                            let now = self.pointer_screen_physical();
+                            tracing::debug!(
+                                "ИТОГ ПАН: старт=({:.1},{:.1}) конец=({:.1},{:.1}) смещение=({:.1},{:.1})",
+                                start.x, start.y, now.x, now.y, now.x - start.x, now.y - start.y,
+                            );
+                        }
                     }
                     self.pan_button_held = false;
+                }
+
+                // Висящий pointer-grab съедает Win+ЛКМ/Win+ПКМ целиком: ветка
+                // ниже под него не заходит, и клик выглядит "не работает".
+                if ButtonState::Pressed == btn_state && pointer.is_grabbed() {
+                    tracing::debug!("PTR: клик мимо биндов — активен pointer grab");
                 }
 
                 if ButtonState::Pressed == btn_state && !pointer.is_grabbed() {
@@ -464,6 +466,15 @@ impl Dawn {
                             pos.x - smithay_pos.x, pos.y - smithay_pos.y,
                             self.viewport.cam_x, self.viewport.cam_y, self.viewport.zoom, hit,
                         );
+                        // Промах ВНУТРИ окна (окно то, а кнопка нажимается со
+                        // сдвигом) виден только здесь: печатаем точку, которую
+                        // клиент получает в СВОИХ координатах, рядом с тем,
+                        // какого размера мы это окно считаем и какого размера
+                        // поверхность клиент реально закоммитил. Если
+                        // локальная точка и размеры сходятся, а промах есть —
+                        // мажет клиент (наш zoom он видит как wl_output.scale),
+                        // и лечить надо не хит-тест.
+                        self.log_pointer_local(pos);
                     }
 
                     if let Some((window, window_loc)) = self
@@ -555,16 +566,20 @@ impl Dawn {
                         // Клик → focus
                         crate::xwin::focus(self, &window);
                     } else {
+                        if kb_mods.logo {
+                            // Win+ЛКМ/Win+ПКМ пришли по пустому месту: под нашей
+                            // точкой курсора окна нет (хотя стрелка может рисоваться
+                            // поверх окна — тогда разъехались координаты).
+                            tracing::debug!(
+                                "PTR: Win+клик без окна под курсором ({:.1},{:.1})", pos.x, pos.y
+                            );
+                        }
                         let all: Vec<_> = self.space.elements().cloned().collect();
                         for w in all {
                             w.set_activated(false);
                             crate::xwin::configure(&w);
                         }
                         keyboard.set_focus(self, None, serial);
-
-                        // (Win+Alt+ЛКМ → драг стола перехватывается выше, до
-                        // hit-теста по окнам: стол тащится и когда курсор стоит
-                        // на окне, а не только по пустому месту.)
 
                         // ЛКМ по пустому холсту в Float → rubber-band мультивыделение
                         // (протяжка выделяет пересекающиеся окна, клик без протяжки —
@@ -639,9 +654,9 @@ impl Dawn {
                     // по столам), а не двигают окно.
                     if self.overview_active {
                         let zoom = self.viewport.zoom;
-                        self.viewport.cam_x -= h * 2.5 / zoom;
-                        self.viewport.cam_y -= v * 2.5 / zoom;
-                        self.apply_camera();
+                        // Тот же класс, что Alt+ЛКМ: пан рукой обязан удержать
+                        // стрелку на экране в этом же кадре (см. pan_camera_by).
+                        self.pan_camera_by(h * 2.5 / zoom, v * 2.5 / zoom);
                         self.request_redraw();
                         return;
                     }
@@ -720,6 +735,32 @@ impl Dawn {
                     return;
                 }
 
+                // Alt + 2-палец тачпад-скролл в ленте (Columns/niri) → прокрутка
+                // самой полосы: горизонталь везёт вид по колонкам, вертикаль
+                // листает столы — ровно то же, что делает голый свайп 3+
+                // пальцами (см. GestureSwipeUpdate). Свободного пана в ленте нет
+                // (ветка ниже её и исключает), а без модификатора 2 пальца
+                // обязаны уходить в приложение — поэтому жест повешен на Alt.
+                if alt_held && source == AxisSource::Finger
+                    && self.tile_config.layout == Layout::Columns
+                    && !self.overview_active
+                {
+                    // Единицы скролла тачпада мельче пиксельной дельты свайпа —
+                    // тот же коэффициент, что у Alt+пана ниже.
+                    const TOUCHPAD_PAN_SPEED: f64 = 2.5;
+                    if h == 0.0 && v == 0.0 {
+                        // Финальный кадр амплитуды 0 = пальцы отпущены →
+                        // прилипаем к ближайшей колонке, как в niri.
+                        self.columns_swipe_end();
+                    } else if h.abs() >= v.abs() {
+                        self.columns_swipe_scroll(h * TOUCHPAD_PAN_SPEED);
+                    } else {
+                        self.columns_swipe_workspace(v * TOUCHPAD_PAN_SPEED);
+                    }
+                    self.request_redraw();
+                    return;
+                }
+
                 // Alt + 2-палец тачпад-скролл → pan холста (новое, как Alt+ЛКМ).
                 // Отличаем от колеса мыши по source=Finger, поэтому Alt+колесо
                 // по-прежнему зумит как раньше (ветка ниже) — старое поведение
@@ -728,8 +769,10 @@ impl Dawn {
                 // холст, а полоса колонок: вид ходит только по ней (свайп без
                 // модификаторов) и по вертикали между столами. Пан здесь ломал
                 // саму модель — можно было уехать в пустоту мимо колонок.
+                // В обзоре ленты пан РАЗРЕШЁН: там камера уже отъехала от полосы
+                // и ходит по кадру обзора свободно.
                 if alt_held && source == AxisSource::Finger
-                    && self.tile_config.layout != Layout::Columns
+                    && (self.tile_config.layout != Layout::Columns || self.overview_active)
                 {
                     // Скролл-единицы тачпада заметно мельче, чем raw pixel delta
                     // мыши при Alt+ЛКМ — усиливаем, чтобы скорость ощущалась так же.
@@ -738,13 +781,11 @@ impl Dawn {
                         let zoom = self.viewport.zoom;
                         let dcam_x = h * TOUCHPAD_PAN_SPEED / zoom;
                         let dcam_y = v * TOUCHPAD_PAN_SPEED / zoom;
-                        self.viewport.cam_x -= dcam_x;
-                        self.viewport.cam_y -= dcam_y;
+                        self.pan_camera_by(dcam_x, dcam_y);
                         self.momentum.accumulate(
                             smithay::utils::Point::from((-dcam_x, -dcam_y)),
                             event.time_msec(),
                         );
-                        self.apply_camera();
                         if self.pan_log_left > 0 {
                             self.pan_log_left -= 1;
                             let s = self.pointer_screen_physical();
@@ -776,6 +817,11 @@ impl Dawn {
                     self.viewport.cam_x = cursor_canvas.x - screen_x / new_zoom;
                     self.viewport.cam_y = cursor_canvas.y - screen_y / new_zoom;
                     self.apply_camera();
+                    // Камера пересчитана ОТ курсора — его экранная точка не
+                    // изменилась по построению. Помечаем как намеренную, иначе
+                    // sync_pointer_to_camera увидит уехавшую камеру и на каждый
+                    // щелчок колеса пошлёт клиенту лишний motion.
+                    self.pointer_warped();
                     self.request_redraw();
                     return;
                 }
@@ -977,19 +1023,17 @@ impl Dawn {
                 let zoom = self.viewport.zoom;
                 let dcam_x = delta.x / zoom;
                 let dcam_y = delta.y / zoom;
-                self.viewport.cam_x -= dcam_x;
-                self.viewport.cam_y -= dcam_y;
-                // Курсор остаётся на той же screen-позиции — но подтягивает его
-                // общая синхронизация в конце итерации цикла
-                // (Dawn::sync_pointer_to_camera). Делать это здесь вручную мало:
-                // canvas-точка под курсором меняется, а pointer.motion не
-                // отправляется, и фокус/hit-test остаются от старого места.
+                // Курсор держим на той же screen-позиции ЗДЕСЬ же: отложенная
+                // sync_pointer_to_camera отставала на кадр и давала дрожь
+                // (см. pan_camera_by). Hit-test при этом не портится — repin
+                // шлёт pointer.motion, чего не делала прежняя ручная правка
+                // pointer_location, из-за которой этот путь и был отложенным.
+                self.pan_camera_by(dcam_x, dcam_y);
                 // Кинетический скролл (1.1): копим дельту для инерции на конец жеста
                 self.momentum.accumulate(
                     smithay::utils::Point::from((-dcam_x, -dcam_y)),
                     event.time_msec(),
                 );
-                self.apply_camera();
                 self.request_redraw();
                 tracing::debug!("swipe pan: cam=({:.1},{:.1})", self.viewport.cam_x, self.viewport.cam_y);
             }

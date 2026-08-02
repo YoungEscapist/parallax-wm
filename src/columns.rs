@@ -194,6 +194,62 @@ impl Dawn {
         self.space.output_geometry(&o)
     }
 
+    /// Экран для арифметики ленты. В обзоре у output'а масштаб = зум, поэтому
+    /// его ЛОГИЧЕСКАЯ геометрия «шире» настоящей — а этажи ленты разложены по
+    /// НАСТОЯЩЕМУ размеру экрана. Берём режим вывода, чтобы ресайз колонки в
+    /// обзоре считал ту же ширину, что и вне его.
+    fn columns_screen_geo(&self) -> Option<Rectangle<i32, Logical>> {
+        if self.overview_active {
+            let mode = self.space.outputs().next()?.current_mode()?;
+            return Some(Rectangle::new((0, 0).into(), (mode.size.w, mode.size.h).into()));
+        }
+        self.primary_output_geo()
+    }
+
+    /// Этаж (тег), на полосе которого лежит `window`.
+    fn columns_tag_of_window(&self, window: &Window) -> Option<u32> {
+        self.tagged_windows.iter()
+            .find(|tw| same_window(&tw.window, window))
+            .map(|tw| tw.tags)
+    }
+
+    /// Полоса этажа `tag`: текущий стол живёт в `self.columns`, чужие — в
+    /// `columns_by_tag`. Нужно обзору ленты — там видны все этажи сразу, и
+    /// Super+ПКМ может схватить окно чужого стола.
+    fn columns_layout_of_tag_mut(&mut self, tag: u32) -> Option<&mut ColumnLayout> {
+        if tag == self.viewport.current_tags() {
+            self.columns_reconcile();
+            Some(&mut self.columns)
+        } else {
+            self.columns_by_tag.get_mut(&tag)
+        }
+    }
+
+    /// Разложить полосу этажа `tag` на месте. В обзоре идём мимо arrange: тот
+    /// в обзоре ничего не делает (раскладку держит overview.rs), а лента там
+    /// лежит на холсте по-настоящему и обязана пересобраться сразу.
+    fn columns_relayout_floor(&mut self, tag: u32) {
+        let cur = self.viewport.current_tags();
+        if tag == cur && !self.overview_active {
+            self.arrange();
+            return;
+        }
+        let Some(geo) = self.columns_screen_geo() else { return };
+        let floor_y = self.columns_ws_y(tag).round() as i32;
+        let plan = if tag == cur {
+            plan_columns(&self.columns, geo, floor_y)
+        } else {
+            // Полосу вынимаем из полки на время планирования (заимствование).
+            let Some(layout) = self.columns_by_tag.remove(&tag) else { return };
+            let plan = plan_columns(&layout, geo, floor_y);
+            self.columns_by_tag.insert(tag, layout);
+            plan
+        };
+        for (w, rect) in plan {
+            self.resize_window(&w, rect);
+        }
+    }
+
     /// Приводит `self.columns` в соответствие с реальным набором видимых
     /// не-плавающих окон текущего тега: выкидывает исчезнувшие, дописывает
     /// новые как отдельные колонки в конец. Сохраняет существующие стопки и
@@ -236,20 +292,56 @@ impl Dawn {
         if self.columns.columns.is_empty() {
             return;
         }
-
-        let avail_h = (geo.size.h - GAP_OUTER * 2).max(1);
-        let working_w = geo.size.w as f64;
         // Этаж текущего стола в вертикальной ленте: вся раскладка ниже
         // считается от него, а не от нуля холста.
         let floor_y = self.columns_cur_y().round() as i32;
+        let plan = plan_columns(&self.columns, geo, floor_y);
+        for (w, rect) in plan {
+            self.resize_window(&w, rect);
+        }
+        self.columns_apply_tabbed_visibility();
+    }
 
-        // Собираем план, чтобы не держать &self.columns во время resize_window (&mut self).
-        let mut plan: Vec<(Window, Rectangle<i32, Logical>)> = Vec::new();
+    /// Разложить полосу ЧУЖОГО стола прямо на его этаже, не переключаясь на
+    /// него. Нужно niri-обзору: туда можно бросить окно на соседний этаж, и та
+    /// полоса обязана пересобраться сразу — иначе брошенное окно так и висело
+    /// бы в точке отпускания до следующего захода на этот стол.
+    pub fn columns_layout_tag(&mut self, tag: u32) {
+        if tag == self.viewport.current_tags() {
+            self.arrange();
+            return;
+        }
+        let Some(geo) = self.primary_output_geo() else { return };
+        // Полосу вынимаем из полки на время планирования (заимствование), затем
+        // кладём обратно ровно там же.
+        let Some(layout) = self.columns_by_tag.remove(&tag) else { return };
+        let floor_y = self.columns_ws_y(tag).round() as i32;
+        let plan = plan_columns(&layout, geo, floor_y);
+        self.columns_by_tag.insert(tag, layout);
+        for (w, rect) in plan {
+            self.resize_window(&w, rect);
+        }
+    }
+}
+
+/// План раскладки полосы `layout` на этаже `floor_y`: слева направо, каждая
+/// колонка своей ширины, окна внутри делят высоту по весам строк. Вынесено из
+/// [`Dawn::apply_columns_layout`] отдельной функцией, чтобы ту же геометрию
+/// можно было посчитать и для полосы НЕ текущего стола (см. columns_layout_tag).
+fn plan_columns(
+    layout: &ColumnLayout,
+    geo: Rectangle<i32, Logical>,
+    floor_y: i32,
+) -> Vec<(Window, Rectangle<i32, Logical>)> {
+    let mut plan: Vec<(Window, Rectangle<i32, Logical>)> = Vec::new();
+    {
+        let avail_h = (geo.size.h - GAP_OUTER * 2).max(1);
+        let working_w = geo.size.w as f64;
         // Первая колонка стоит на COL_GAP от начала полосы — в niri это поле
         // даёт view_offset, но dawn возит камеру по холсту, поэтому проще
         // заложить его прямо в координаты.
         let mut x = COL_GAP as i32;
-        for col in &self.columns.columns {
+        for col in &layout.columns {
             let win_w = col.width_px(working_w).round().max(1.0) as i32;
             let col_full_w = win_w + COL_GAP as i32;
             let n = col.windows.len();
@@ -295,13 +387,56 @@ impl Dawn {
             }
             x += col_full_w;
         }
-
-        for (w, rect) in plan {
-            self.resize_window(&w, rect);
-        }
-        self.columns_apply_tabbed_visibility();
     }
+    plan
+}
 
+/// Вынуть окно из полосы, схлопнув опустевшие колонки.
+fn remove_window_from(layout: &mut ColumnLayout, window: &Window) {
+    for col in &mut layout.columns {
+        col.windows.retain(|w| !same_window(w, window));
+        col.row_weights.clear();
+        col.clamp_row();
+    }
+    layout.columns.retain(|c| !c.windows.is_empty());
+    layout.clamp_active();
+}
+
+/// Левый край колонки `idx` в полосе `layout` (сумма ширин предыдущих с зазорами).
+fn column_x_in(layout: &ColumnLayout, idx: usize, working_w: f64) -> f64 {
+    let mut x = COL_GAP;
+    for col in layout.columns.iter().take(idx) {
+        x += col.width_px(working_w) + COL_GAP;
+    }
+    x
+}
+
+/// Куда встанет окно, брошенное на X = `pos_x` в полосе `layout`: номер колонки
+/// и «в стопку ли». Вынесено из [`Dawn::columns_insert_target`], чтобы то же
+/// решение можно было принять и для полосы не текущего стола.
+fn insert_target_in(layout: &ColumnLayout, working_w: f64, pos_x: f64) -> (usize, bool) {
+    for i in 0..layout.columns.len() {
+        let x = column_x_in(layout, i, working_w);
+        let w = layout.columns[i].width_px(working_w);
+        if pos_x < x - COL_GAP / 2.0 {
+            return (i, false);
+        }
+        if pos_x < x + w {
+            // Внутри колонки: треть слева/справа — вставка рядом, середина —
+            // в стопку.
+            let rel = (pos_x - x) / w.max(1.0);
+            if rel < 0.25 {
+                return (i, false);
+            } else if rel > 0.75 {
+                return (i + 1, false);
+            }
+            return (i, true);
+        }
+    }
+    (layout.columns.len(), false)
+}
+
+impl Dawn {
     /// Во вкладочных колонках на экране остаётся только активное окно.
     ///
     /// Скрываем снятием со `space` — тогда окно не рисуется, не получает frame
@@ -361,6 +496,13 @@ impl Dawn {
     /// раскладках плавающее окно, наоборот, ОБЯЗАНО стоять на холсте (там
     /// камера и есть способ до него доехать).
     pub fn columns_pin_floating(&mut self) {
+        // В обзоре камера отъезжает на всю ленту — плавающие окна при этом
+        // обязаны остаться на своих местах холста, иначе они уплывали бы за
+        // кадр вместе с зумом и возвращались бы уже не туда.
+        if self.overview_active {
+            self.columns_float_cam = (self.viewport.cam_x, self.viewport.cam_y);
+            return;
+        }
         if self.tile_config.layout != Layout::Columns {
             // Запоминаем текущую камеру, чтобы при возврате в Columns не
             // «догонять» накопленную за это время разницу одним рывком.
@@ -407,15 +549,94 @@ impl Dawn {
     // столов остаются на space (см. refresh_tags) и полосы соседей
     // действительно существуют: до них можно доехать и видно, как они уезжают.
 
-    /// Номер стола в ленте (0-based) по маске тега.
+    /// Номер бита тега (0-based). НЕ номер этажа: между своими столами могут
+    /// лежать чужие, для этажа есть columns_floor_index.
     pub fn columns_ws_index(tag: u32) -> i32 {
         tag.trailing_zeros() as i32
     }
 
-    /// Сдвиг этажа стола по Y на холсте.
+    /// Чужой ли стол для ленты: он уже ПОСЕЩЁН и помнит НЕ ленточную раскладку
+    /// (Tile/Dwindle/Float/Monocle). Непосещённый стол чужим не считается —
+    /// зайдя на него из ленты, он станет ленточным (см. view_tag), именно так
+    /// в niri заводят новый стол.
+    ///
+    /// Это граница изоляции: лента не видит чужие столы, не листается на них,
+    /// не нумерует их этажами и не трогает их окна при схлопывании.
+    pub fn columns_tag_foreign(&self, tag: u32) -> bool {
+        // Все столы живут по одному правилу: visited + layout решают,
+        // чужой ли это стол для ленты. Никаких закреплённых номеров.
+        self.visited_tags.contains(&tag) && !self.columns_is_strip_tag(tag)
+    }
+
+    /// Этажи ленты по порядку: все теги 1..9, кроме чужих.
+    pub fn columns_strip_order(&self) -> Vec<u32> {
+        (0..9u32)
+            .map(|i| 1u32 << i)
+            .filter(|&m| !self.columns_tag_foreign(m))
+            .collect()
+    }
+
+    /// Номер ЭТАЖА стола в ленте (0-based) — позиция среди своих тегов, а не
+    /// номер бита. Иначе чужой стол в середине оставлял бы в ленте дыру в целый
+    /// экран: камера перелетала бы через пустоту к следующему своему столу.
+    /// Для чужого тега возвращает индекс, который он бы занял (в ленте он не
+    /// рисуется, значение не используется).
+    pub fn columns_floor_index(&self, tag: u32) -> i32 {
+        let mut idx = 0;
+        for i in 0..9u32 {
+            let m = 1u32 << i;
+            if m == tag {
+                return idx;
+            }
+            if !self.columns_tag_foreign(m) {
+                idx += 1;
+            }
+        }
+        idx
+    }
+
+    /// Сосед по ленте в направлении `dir` — следующий СВОЙ стол, чужие
+    /// пропускаются целиком. None, если лента в эту сторону кончилась (вверх —
+    /// первый этаж, вниз — пустой этаж за последним занятым, см. niri_ws_count).
+    pub fn columns_strip_neighbor(&self, tag: u32, dir: i32) -> Option<u32> {
+        let order = self.columns_strip_order();
+        let pos = order.iter().position(|&m| m == tag)? as i32;
+        let limit = (self.niri_ws_count() as usize).min(order.len()) as i32;
+        let new = pos + dir.signum();
+        if new < 0 || new >= limit {
+            return None;
+        }
+        order.get(new as usize).copied()
+    }
+
+    // isolation_order/tag_for_digit (относительная нумерация столов «внутри
+    // своей изоляции») удалены: Super+цифра адресует стол ГЛОБАЛЬНЫМ битом
+    // тега, а режим записан в tag_layouts для каждого стола отдельно.
+    // Изоляция при этом жива и работает как прежде для навигации ЛЕНТОЙ
+    // (columns_strip_order, columns_strip_neighbor, workspace_step).
+
+    /// Высота ЭТАЖА ленты в canvas-единицах — всегда «экран при zoom 1».
+    ///
+    /// ВАЖНО: не primary_output_geo. Та меряет output в ЛОГИЧЕСКИХ единицах, а
+    /// apply_camera выставляет output'у scale = текущий зум камеры, так что при
+    /// отъезде (обзор ленты — zoom ≈ 0.37, лупа) логическая высота вырастает во
+    /// столько же раз. Шаг этажей от неё «разъезжался» ровно тогда, когда он
+    /// нужнее всего: в обзоре хит-тест стола под курсором (overview_workspace_at
+    /// меряет этажи ростом в mode.size.h) промахивался мимо всех этажей, маска
+    /// выходила None — и повторный тап Super просто закрывал обзор на прежнем
+    /// столе вместо стола под курсором.
+    pub fn columns_floor_h(&self) -> f64 {
+        self.space.outputs().next()
+            .and_then(|o| o.current_mode())
+            .map(|m| m.size.h as f64)
+            .unwrap_or(1080.0)
+    }
+
+    /// Сдвиг этажа стола по Y на холсте. Считаем по НОМЕРУ ЭТАЖА (позиции среди
+    /// своих столов), а не по номеру бита: чужие столы в ленте не существуют и
+    /// места в ней не занимают.
     pub fn columns_ws_y(&self, tag: u32) -> f64 {
-        let h = self.primary_output_geo().map(|g| g.size.h as f64).unwrap_or(1080.0);
-        Self::columns_ws_index(tag) as f64 * h
+        self.columns_floor_index(tag) as f64 * self.columns_floor_h()
     }
 
     /// Y текущего стола — база для горизонтальной прокрутки.
@@ -423,13 +644,27 @@ impl Dawn {
         self.columns_ws_y(self.viewport.current_tags())
     }
 
-    /// Ленточный ли стол (его раскладка — Columns). Текущий считаем по живому
-    /// layout, остальные — по запомненному в tag_layouts.
+    /// Ленточный ли стол (его раскладка — Columns) — граница между двумя
+    /// изоляциями: лента и всё остальное (tiling/floating).
+    ///
+    /// Источник правды ОДИН — `tag_layouts`: раскладка это свойство СТОЛА, и
+    /// set_layout записывает её туда сразу же, как только стол сменил режим.
+    /// Раньше текущий стол считался по живому `tile_config.layout`, и в
+    /// середине view_tag (тег уже новый, layout ещё старый) изоляция врала:
+    /// refresh_tags принимал тайловый стол за ленточный и оставлял на экране
+    /// окна чужих этажей.
+    ///
+    /// Живой layout остаётся запасным ответом только для текущего стола, о
+    /// котором tag_layouts ещё ничего не знает (самый первый кадр).
     pub fn columns_is_strip_tag(&self, tag: u32) -> bool {
-        if tag == self.viewport.current_tags() {
-            self.tile_config.layout == Layout::Columns
-        } else {
-            *self.tag_layouts.get(&tag).unwrap_or(&Layout::Tile) == Layout::Columns
+        // Все столы по единому правилу: стол — лента, если tag_layouts
+        // говорит Columns. Для текущего стола источник — живая раскладка.
+        match self.tag_layouts.get(&tag) {
+            Some(l) => *l == Layout::Columns,
+            None if tag == self.viewport.current_tags() => {
+                self.tile_config.layout == Layout::Columns
+            }
+            None => false,
         }
     }
 
@@ -456,13 +691,47 @@ impl Dawn {
         self.request_redraw();
     }
 
-    /// Убрать текущую полосу на полку тега `tag`.
+    /// Убрать текущую полосу на полку тега `tag`. Текущая полоса после этого
+    /// ПУСТА — значит стол, уходящий в другую изоляцию (tiling/floating), не
+    /// утащит свои колонки за собой и не отдаст их следующему ленточному столу.
+    /// Настройка вида (center-focused-column) общая на композитор и остаётся.
     pub fn columns_save_for(&mut self, tag: u32) {
         let layout = std::mem::take(&mut self.columns);
+        self.columns.center_focused = layout.center_focused;
         if layout.columns.is_empty() {
             self.columns_by_tag.remove(&tag);
         } else {
             self.columns_by_tag.insert(tag, layout);
+        }
+    }
+
+    /// Пересобрать ГЕОМЕТРИЮ всех этажей ленты на их нынешних местах.
+    ///
+    /// Y этажа считается по его НОМЕРУ В ЛЕНТЕ (columns_floor_index), а не по
+    /// биту тега, поэтому стоит одному столу войти в ленту или выйти из неё
+    /// (Win+N, схлопывание при закрытии окна) — все этажи ниже него уезжают на
+    /// экран вверх или вниз. Обычный arrange раскладывает только ТЕКУЩИЙ стол,
+    /// так что соседние этажи оставались на старых Y: переключение стола
+    /// приводило на пустое место, а окна прежнего жильца висели этажом выше.
+    /// Пересобираем только те этажи, которые СЪЕХАЛИ со своего Y: окно ленты
+    /// всегда лежит внутри полосы своего этажа, так что достаточно проверить,
+    /// попадают ли окна в неё. Иначе каждый переход между столами гонял бы
+    /// анимацию позиции у всех окон ленты ради той же самой геометрии.
+    pub fn columns_relayout_strip(&mut self) {
+        let cur = self.viewport.current_tags();
+        let h = self.columns_floor_h();
+        let stale: Vec<u32> = self.columns_strip_order().into_iter()
+            .filter(|&tag| tag != cur && self.columns_by_tag.contains_key(&tag))
+            .filter(|&tag| {
+                let y = self.columns_ws_y(tag);
+                self.tagged_windows.iter().any(|tw| {
+                    tw.tags == tag && !tw.floating
+                        && ((tw.position.y as f64) < y || (tw.position.y as f64) >= y + h)
+                })
+            })
+            .collect();
+        for tag in stale {
+            self.columns_relayout_floor(tag);
         }
     }
 
@@ -475,13 +744,26 @@ impl Dawn {
         self.columns = layout;
     }
 
-    /// Перенести полосу с тега `from` на тег `to` (при схлопывании ленты).
+    /// Перенести стол с тега `from` на тег `to` (при схлопывании ленты):
+    /// полосу колонок И всю память стола — запомненную раскладку, камеру и факт
+    /// посещения. Без последнего схлопывание оставляло бы за собой «чужие»
+    /// этажи: тег, с которого стол уехал, так и помнил бы Columns, а тег, на
+    /// который он приехал, — чужую раскладку от прошлого жильца.
     fn columns_rekey(&mut self, from: u32, to: u32) {
         if from == to {
             return;
         }
         if let Some(l) = self.columns_by_tag.remove(&from) {
             self.columns_by_tag.insert(to, l);
+        }
+        if let Some(l) = self.tag_layouts.remove(&from) {
+            self.tag_layouts.insert(to, l);
+        }
+        if let Some(c) = self.tag_cameras.remove(&from) {
+            self.tag_cameras.insert(to, c);
+        }
+        if self.visited_tags.remove(&from) {
+            self.visited_tags.insert(to);
         }
     }
 
@@ -529,25 +811,21 @@ impl Dawn {
     /// колонки — в её стопку.
     pub fn columns_insert_target(&self, pos_x: f64) -> (usize, bool) {
         let working_w = self.primary_output_geo().map(|g| g.size.w as f64).unwrap_or(1920.0);
-        for i in 0..self.columns.columns.len() {
-            let x = self.columns_column_x(i, working_w);
-            let w = self.columns.columns[i].width_px(working_w);
-            if pos_x < x - COL_GAP / 2.0 {
-                return (i, false);
-            }
-            if pos_x < x + w {
-                // Внутри колонки: треть слева/справа — вставка рядом, середина —
-                // в стопку.
-                let rel = (pos_x - x) / w.max(1.0);
-                if rel < 0.25 {
-                    return (i, false);
-                } else if rel > 0.75 {
-                    return (i + 1, false);
-                }
-                return (i, true);
-            }
+        insert_target_in(&self.columns, working_w, pos_x)
+    }
+
+    /// То же, но для полосы ЧУЖОГО стола (niri-обзор: окно бросают на соседний
+    /// этаж). Полоса текущего стола лежит в `self.columns`, остальные — в
+    /// `columns_by_tag`; пустой этаж принимает окно первой колонкой.
+    pub fn columns_insert_target_for(&self, tag: u32, pos_x: f64) -> (usize, bool) {
+        let working_w = self.primary_output_geo().map(|g| g.size.w as f64).unwrap_or(1920.0);
+        if tag == self.viewport.current_tags() {
+            return insert_target_in(&self.columns, working_w, pos_x);
         }
-        (self.columns.columns.len(), false)
+        match self.columns_by_tag.get(&tag) {
+            Some(l) => insert_target_in(l, working_w, pos_x),
+            None => (0, false),
+        }
     }
 
     /// Прямоугольник подсказки вставки (canvas-координаты) для текущей позиции
@@ -610,6 +888,160 @@ impl Dawn {
         self.request_redraw();
     }
 
+    /// Бросили окно в полосу СОСЕДНЕГО этажа (niri-обзор): окно меняет стол и
+    /// встаёт в полосу того стола туда, куда показывал курсор по X. Тот же
+    /// contract, что у [`Dawn::columns_drop_window`], только приёмник — не
+    /// обязательно текущий стол.
+    pub fn columns_drop_window_on_ws(&mut self, window: &Window, tag: u32, pos_x: f64) {
+        if self.tile_config.layout != Layout::Columns {
+            return;
+        }
+        if tag == self.viewport.current_tags() {
+            self.columns_drop_window(window, pos_x);
+            return;
+        }
+        // Куда встанет — считаем ДО того, как окно вынуто из полос: полоса
+        // приёмника от этого не меняется, а порядок вычислений так очевиднее.
+        let (idx, into_stack) = self.columns_insert_target_for(tag, pos_x);
+        // Этаж-донор нужно будет пересобрать: окно могли тащить и с НЕ текущего
+        // стола (в обзоре ленты видны все этажи сразу).
+        let old_tag = self.tagged_windows.iter()
+            .find(|tw| &tw.window == window)
+            .map(|tw| tw.tags);
+
+        // Вынимаем окно из полосы-донора (текущей или чужой — окно могло
+        // приехать с третьего этажа).
+        remove_window_from(&mut self.columns, window);
+        for l in self.columns_by_tag.values_mut() {
+            remove_window_from(l, window);
+        }
+
+        let Some(tw) = self.tagged_windows.iter_mut().find(|tw| &tw.window == window) else {
+            return;
+        };
+        tw.tags = tag;
+        // Окно вернулось в полосу — оно больше не плавающее (как в drop_window).
+        tw.floating = false;
+
+        let dst = self.columns_by_tag.entry(tag).or_default();
+        let idx = idx.min(dst.columns.len());
+        if into_stack && idx < dst.columns.len() {
+            let col = &mut dst.columns[idx];
+            col.windows.push(window.clone());
+            col.active_row = col.windows.len() - 1;
+        } else {
+            dst.columns.insert(idx, Column::single(window.clone()));
+        }
+        dst.active = idx.min(dst.columns.len().saturating_sub(1));
+
+        self.refresh_tags();
+        // Обе полосы пересобираются прямо на своих этажах — переключаться на
+        // них не надо (см. columns_layout_tag; текущий стол уходит в arrange).
+        self.arrange();
+        if let Some(old) = old_tag.filter(|&t| t != tag) {
+            self.columns_layout_tag(old);
+        }
+        self.columns_layout_tag(tag);
+        self.request_plane_reset();
+        self.request_redraw();
+        tracing::info!("dawn/columns: окно брошено на стол {:#b} (колонка {})", tag, idx);
+    }
+
+    /// Отдать окно полосе стола `tag` — программный аналог броска мышью
+    /// ([`Dawn::columns_drop_window_on_ws`]), только место в полосе выбирает не
+    /// курсор, а правило niri: НОВАЯ КОЛОНКА сразу справа от активной.
+    ///
+    /// В отличие от drop-версии работает из ЛЮБОЙ раскладки: сюда приходит
+    /// Win+Shift+2 с тайлового стола, где `self.columns` пуста, а полоса
+    /// приёмника лежит на полке `columns_by_tag`. Без этого окно попадало в
+    /// ленту вслепую — только сменой тега, а колонку ему заводил ленивый
+    /// `columns_reconcile` при следующем заходе на стол, всегда в КОНЕЦ полосы
+    /// и мимо активной колонки.
+    ///
+    /// Возвращает false, если окна нет в `tagged_windows` (вызывающий тогда
+    /// ничего не менял).
+    pub fn columns_adopt_window(&mut self, window: &Window, tag: u32) -> bool {
+        let cur = self.viewport.current_tags();
+        let old_tag = self.tagged_windows.iter()
+            .find(|tw| same_window(&tw.window, window))
+            .map(|tw| tw.tags);
+
+        // Вынимаем из полосы-донора: текущей или лежащей на полке. Окно могло
+        // не быть ни в одной (пришло из тайлинга) — тогда это no-op.
+        remove_window_from(&mut self.columns, window);
+        for l in self.columns_by_tag.values_mut() {
+            remove_window_from(l, window);
+        }
+
+        let Some(tw) = self.tagged_windows.iter_mut()
+            .find(|tw| same_window(&tw.window, window))
+        else {
+            return false;
+        };
+        tw.tags = tag;
+        // Окно встало в полосу — оно больше не плавающее (как в drop_window).
+        tw.floating = false;
+
+        // Живая полоса текущего стола лежит в self.columns, полосы остальных —
+        // на полке. Пишем ровно в ту, которой стол пользуется, иначе колонка
+        // потерялась бы на ближайшем columns_save_for.
+        let dst = if tag == cur && self.tile_config.layout == Layout::Columns {
+            &mut self.columns
+        } else {
+            self.columns_by_tag.entry(tag).or_default()
+        };
+        let idx = (dst.active + 1).min(dst.columns.len());
+        dst.columns.insert(idx, Column::single(window.clone()));
+        dst.active = idx;
+
+        self.refresh_tags();
+        self.arrange();
+        // Этаж-приёмник пересобираем на месте, только если он СЕЙЧАС на холсте:
+        // в ленте видны все её этажи сразу (см. refresh_tags). Вне ленты чужой
+        // стол не смаплен, и раскладывать его нечего — полосу он соберёт при
+        // заходе (columns_load_for + arrange), уже с готовой колонкой.
+        if self.tile_config.layout == Layout::Columns {
+            if let Some(old) = old_tag.filter(|&t| t != tag && self.columns_is_strip_tag(t)) {
+                self.columns_layout_tag(old);
+            }
+            self.columns_layout_tag(tag);
+        }
+        self.request_plane_reset();
+        self.request_redraw();
+        tracing::info!("dawn/columns: окно принято столом {:#b} (колонка {})", tag, idx);
+        true
+    }
+
+    /// Габариты ВСЕЙ ленты на холсте: этажи всех ленточных столов вместе с их
+    /// колонками. Это кадр, который niri-обзор вписывает в экран.
+    pub fn columns_strip_bbox(&self) -> Option<Rectangle<i32, Logical>> {
+        let geo = self.primary_output_geo()?;
+        let (mut min_x, mut min_y) = (0, i32::MAX);
+        let (mut max_x, mut max_y) = (geo.size.w, i32::MIN);
+        for tw in &self.tagged_windows {
+            if tw.tags == 0 || !self.columns_is_strip_tag(tw.tags) {
+                continue;
+            }
+            let floor_y = self.columns_ws_y(tw.tags).round() as i32;
+            min_y = min_y.min(floor_y);
+            max_y = max_y.max(floor_y + geo.size.h);
+            if let Some(g) = self.space.element_geometry(&tw.window) {
+                min_x = min_x.min(g.loc.x);
+                max_x = max_x.max(g.loc.x + g.size.w + COL_GAP as i32);
+            }
+        }
+        // Ни одного окна в ленте — показываем хотя бы текущий этаж.
+        if min_y > max_y {
+            let y = self.columns_cur_y().round() as i32;
+            min_y = y;
+            max_y = y + geo.size.h;
+        }
+        Some(Rectangle::new(
+            (min_x, min_y).into(),
+            ((max_x - min_x).max(1), (max_y - min_y).max(1)).into(),
+        ))
+    }
+
     /// Схлопнуть дыры в ленте столов — niri-модель динамических воркспейсов:
     /// пустой стол в СЕРЕДИНЕ не живёт, лента всегда плотная, а пустой ровно
     /// один и всегда последний.
@@ -624,22 +1056,34 @@ impl Dawn {
         if self.tile_config.layout != Layout::Columns {
             return;
         }
-        // Занятые теги по порядку.
+        // Занятые СВОИ теги по порядку. Чужие столы лента не трогает: их окна
+        // ей не принадлежат, а перенумеровав их, она затащила бы тайловый стол
+        // внутрь ленты (ровно то, от чего изоляция и защищает).
+        let cur = self.viewport.current_tags();
         let mut occupied: Vec<u32> = Vec::new();
         for tw in &self.tagged_windows {
-            if tw.tags != 0 && !occupied.contains(&tw.tags) {
+            if tw.tags != 0 && !self.columns_tag_foreign(tw.tags) && !occupied.contains(&tw.tags) {
                 occupied.push(tw.tags);
             }
         }
-        occupied.sort_unstable();
-        if occupied.is_empty() {
-            return;
+        // Текущий стол держит свой этаж, даже если опустел (в niri пустой
+        // текущий воркспейс живёт, пока с него не ушли). Без этого содержимое
+        // следующего стола переехало бы прямо под курсор.
+        if !occupied.contains(&cur) {
+            occupied.push(cur);
         }
-        // Куда переезжает каждый занятый тег: первый → 1, второй → 2, ...
+        occupied.sort_unstable();
+        // Куда переезжает каждый занятый тег: в СВОИ биты по порядку (первый
+        // свободный от чужих, второй, ...), а не в 1,2,3 подряд — иначе стол
+        // ленты сел бы на бит чужого.
+        let slots = self.columns_strip_order();
         let mut moved = false;
         let mut remap: Vec<(u32, u32)> = Vec::new();
         for (i, &old) in occupied.iter().enumerate() {
-            let new = 1u32 << i;
+            let new = match slots.get(i) {
+                Some(&m) => m,
+                None => break,
+            };
             if new != old {
                 moved = true;
             }
@@ -648,25 +1092,29 @@ impl Dawn {
         if !moved {
             return;
         }
-        let cur = self.viewport.current_tags();
         for tw in &mut self.tagged_windows {
             if let Some(&(_, new)) = remap.iter().find(|(old, _)| *old == tw.tags) {
                 tw.tags = new;
             }
         }
-        // Текущий стол мог переехать — следуем за ним; если он опустел и
-        // исчез, встаём на первый.
+        // Текущий стол переезжает вместе со своим содержимым (он есть в remap
+        // всегда — его добавили выше).
         let new_cur = remap.iter().find(|(old, _)| *old == cur).map(|&(_, n)| n)
-            .unwrap_or(1);
-        // Полки с полосами колонок переезжают вместе с тегами, иначе стол
-        // приехал бы на чужую раскладку. Порядок важен: переносим от начала,
-        // а номера только УМЕНЬШАЮТСЯ (лента схлопывается влево), так что
-        // затирания не будет.
+            .unwrap_or(cur);
+        // Полки с полосами колонок и ПАМЯТЬ СТОЛА (раскладка, камера, факт
+        // посещения) переезжают вместе с тегами, иначе стол приехал бы на чужую
+        // раскладку и лента на следующем же переходе решила бы, что этот этаж
+        // чужой. Порядок важен: переносим от начала, а номера только
+        // УМЕНЬШАЮТСЯ (лента схлопывается вверх), так что затирания не будет.
         for &(old, new) in &remap {
             self.columns_rekey(old, new);
         }
         self.viewport.tagset[self.viewport.seltags] = new_cur;
         self.refresh_tags();
+        // Этажи переехали — их окна обязаны переехать вместе с ними. Без этого
+        // схлопывание двигало только теги, а геометрия соседних этажей
+        // оставалась на прежних Y (см. columns_relayout_strip).
+        self.columns_relayout_strip();
         tracing::info!("dawn/columns: лента столов схлопнута, занято {}", occupied.len());
     }
 
@@ -680,6 +1128,10 @@ impl Dawn {
         /// заметно больше, чем прошли пальцы — как в niri.
         const SWIPE_GAIN: f64 = 1.6;
         self.camera_anim = None;
+        // Экранную точку стрелки запоминаем ДО сдвига вида: свайп — это пан
+        // рукой, и курсор обязан остаться на месте монитора уже в этом кадре,
+        // а не после отложенной sync_pointer_to_camera (см. pan_camera_by).
+        let screen = self.pointer_screen_physical();
         self.viewport.cam_x -= dx * SWIPE_GAIN;
         // Влево дальше начала полосы не уезжаем.
         if self.viewport.cam_x < 0.0 {
@@ -687,6 +1139,7 @@ impl Dawn {
         }
         self.viewport.cam_y = self.columns_cur_y();
         self.apply_camera();
+        self.pin_pointer_after_camera(screen);
     }
 
     /// Свайп по вертикали копит ход и на пороге переключает стол — niri так же
@@ -1304,9 +1757,10 @@ impl Dawn {
     /// drag_width, иначе фактор пресета. None — окна нет в колонках. Нужна как
     /// база для Super+RMB-ресайза (см. resize_grab.rs).
     pub fn columns_effective_width_of_window(&mut self, window: &Window) -> Option<f64> {
-        self.columns_reconcile();
-        let working_w = self.primary_output_geo().map(|g| g.size.w as f64).unwrap_or(1920.0);
-        for col in &self.columns.columns {
+        let tag = self.columns_tag_of_window(window)?;
+        let working_w = self.columns_screen_geo().map(|g| g.size.w as f64).unwrap_or(1920.0);
+        let layout = self.columns_layout_of_tag_mut(tag)?;
+        for col in &layout.columns {
             if col.windows.iter().any(|w| {
                 w == window
             }) {
@@ -1319,8 +1773,9 @@ impl Dawn {
     /// Эффективная доля высоты (0..1) строки схваченного окна в его колонке.
     /// None — окна нет в колонках. База для вертикального Super+RMB-ресайза.
     pub fn columns_effective_row_fraction_of_window(&mut self, window: &Window) -> Option<f64> {
-        self.columns_reconcile();
-        for col in &self.columns.columns {
+        let tag = self.columns_tag_of_window(window)?;
+        let layout = self.columns_layout_of_tag_mut(tag)?;
+        for col in &layout.columns {
             if let Some(ri) = col.windows.iter().position(|w| {
                 w == window
             }) {
@@ -1335,15 +1790,26 @@ impl Dawn {
     /// колонку. Раскладывает БЕЗ скролла камеры — во время ресайза камера должна
     /// стоять, иначе вид дёргается (скролл к активной колонке был причиной
     /// «не скроллятся нормально»).
+    /// В обзоре ленты правит полосу ТОГО этажа, где лежит окно (там видны все
+    /// этажи, и схватить можно окно чужого стола).
     pub fn columns_resize_of_window(&mut self, window: &Window, width_factor: f64, row_fraction: f64) {
-        self.columns_set_active_to_window(window);
-        let active = self.columns.active;
-        if let Some(col) = self.columns.columns.get_mut(active) {
-            col.drag_width = Some(width_factor.clamp(0.15, 1.0));
-            let row = col.active_row;
-            col.set_row_fraction(row, row_fraction);
+        let Some(tag) = self.columns_tag_of_window(window) else { return };
+        if tag == self.viewport.current_tags() {
+            self.columns_set_active_to_window(window);
         }
-        self.arrange();
+        let Some(layout) = self.columns_layout_of_tag_mut(tag) else { return };
+        let Some(ci) = layout.columns.iter()
+            .position(|c| c.windows.iter().any(|w| same_window(w, window)))
+        else {
+            return;
+        };
+        let col = &mut layout.columns[ci];
+        let row = col.windows.iter()
+            .position(|w| same_window(w, window))
+            .unwrap_or(col.active_row);
+        col.drag_width = Some(width_factor.clamp(0.15, 1.0));
+        col.set_row_fraction(row, row_fraction);
+        self.columns_relayout_floor(tag);
         self.request_redraw();
     }
 
@@ -1355,14 +1821,15 @@ impl Dawn {
             return;
         }
         self.columns_set_active_to_focus();
-        let idx = self.viewport.current_tags().trailing_zeros() as i32 + 1;
-        // Динамический диапазон: до пустого стола снизу включительно (niri —
-        // перенос вниз на пустой создаёт новый стол, список растёт).
-        let new = (idx + dir).clamp(1, self.niri_ws_count());
-        if new == idx {
-            return;
-        }
-        let mask = 1u32 << (new - 1);
+        // Соседний СВОЙ этаж: диапазон динамический — до пустого стола снизу
+        // включительно (niri: перенос вниз на пустой создаёт новый стол), а
+        // чужие столы пропускаются, колонка из ленты в них не уезжает.
+        let cur = self.viewport.current_tags();
+        let mask = match self.columns_strip_neighbor(cur, dir) {
+            Some(m) => m,
+            None => return,
+        };
+        let new = Self::columns_ws_index(mask) + 1;
         let wins: Vec<Window> = match self.columns.columns.get(self.columns.active) {
             Some(c) => c.windows.clone(),
             None => return,

@@ -17,6 +17,11 @@
 --     (see below). A bind requires an EXACT modifier match — e.g. a
 --     mods="super" bind will NOT fire while shift is also held.
 --
+--   set{ bird_eye_key = "space" }
+--     Клавиша режима лупы (zoom-nav): Super+<эта клавиша> — тумблер увеличенного
+--     вида, где голые стрелки панорамируют холст. Перехватывается ДО биндов,
+--     поэтому комбинация Super+<bird_eye_key> для bind{} недоступна.
+--
 --   dwindle{ preserve_split = true, force_split = 2 }
 --     Tiling (Super+T) is Hyprland's dwindle: a new window splits the FOCUSED
 --     window's slot in half, so the layout is a BSP tree rather than a fixed
@@ -37,7 +42,7 @@
 --   spawn            cmd = "ghostty"
 --   quit             (saves session, stops the compositor)
 --   kill             (closes the focused window)
---   set_layout       layout = "tile" | "float" | "monocle"
+--   set_layout       layout = "tile" | "float" | "monocle" | "columns"
 --   toggle_layout    (toggles between Float and Tile; ignored in the Super-tap
 --                     desktop overview, which manages the camera itself)
 --   zoom             (Tile: raise the focused window to the top of the split
@@ -70,6 +75,24 @@
 --   pin_bookmark_at_cursor  (Alt+B: pin a camera bookmark at the cursor into the
 --                        lowest free slot 1-9; jump to it in bookmarks mode with Super+N)
 --   column_width_cycle  (Columns/niri mode: cycle active column width 1/3→1/2→2/3→full)
+--   toggle_niri_mode    (тумблер Columns ↔ Tile)
+--
+-- Действия колонок (Columns/niri), все — с теми же именами, что команды niri:
+--   window_height_cycle     (switch-preset-window-height)
+--   window_height_reset     (reset-window-height)
+--   column_width_adjust     percent = ±N   (set-column-width "±N%")
+--   window_height_adjust    percent = ±N   (set-window-height "±N%")
+--   column_maximize         (maximize-column)
+--   column_center           (center-column)
+--   column_focus_first / column_focus_last     (focus-column-first/last)
+--   column_move_to_first / column_move_to_last (move-column-to-first/last)
+--   consume_or_expel_left / consume_or_expel_right
+--                           (consume-or-expel-window-left/right)
+--   column_toggle_tabbed    (toggle-column-tabbed-display)
+--   focus_floating_or_tiling (switch-focus-between-floating-and-tiling)
+--   center_focused_column   mode = "never" | "always" | "on-overflow"
+--   workspace_step          dir = 1 | -1   (пред/след воркспейс)
+--   move_column_to_workspace dir = 1 | -1  (перенести колонку на соседний)
 --
 -- niri-подобный режим Columns (Super+N): колонки — вертикальные стопки окон,
 -- холст скроллится по горизонтали к активной колонке. В этом режиме те же
@@ -85,6 +108,9 @@
 -- к нему.
 
 xkb{ layout = "us,ru", variant = "", options = "grp:alt_shift_toggle" }
+
+-- Клавиша режима лупы (Super+Space по умолчанию).
+set{ bird_eye_key = "space" }
 
 -- ── VT switching ─────────────────────────────────────────────────────────
 for i = 1, 12 do
@@ -102,14 +128,16 @@ bind{ mods = "super", key = "g", action = "group_selected" }
 bind{ mods = "super+shift", key = "g", action = "ungroup_selected" }
 bind{ mods = "super", key = "Return", action = "spawn", cmd = "ghostty" }
 bind{ mods = "super+shift", key = "Return", action = "zoom" }
-bind{ mods = "super", key = "w", action = "toggle_floating" }
 
 -- ── Layouts ───────────────────────────────────────────────────────────────
 bind{ mods = "super", key = "d", action = "toggle_layout" }
+bind{ mods = "super+shift", key = "d", action = "set_layout", layout = "float" }
 bind{ mods = "super", key = "t", action = "set_layout", layout = "tile" }
 bind{ mods = "super", key = "m", action = "set_layout", layout = "monocle" }
 -- niri-подобные колонки (вертикальные стопки, скролл камерой к активной колонке)
 bind{ mods = "super", key = "n", action = "toggle_niri_mode" }
+-- Тот же Columns, но без тумблера — включить принудительно.
+bind{ mods = "super+shift", key = "n", action = "set_layout", layout = "columns" }
 -- ── Колонки (Columns) — раскладка и биндинги как в niri ──────────────────
 -- Ширина/высота: пресеты niri (⅓ → ½ → ⅔), проценты и сброс.
 bind{ mods = "super", key = "r", action = "column_width_cycle" }
@@ -157,16 +185,8 @@ bind{ mods = "super+shift", key = "l", action = "set_mfact", delta = 0.05 }
 -- ── Обзор столов (тап Super) ─────────────────────────────────────────────
 -- Столы лежат 2D-сеткой вокруг текущего: новые встают по очереди справа,
 -- снизу, слева, сверху от уже занятых ячеек (и только потом по диагоналям).
---
--- Перетащить ВЕСЬ стол по сетке во все четыре стороны можно:
---   · мышью — Win+Alt+ЛКМ (стол едет за курсором, встаёт в ближайшую ячейку);
---   · с клавиатуры — Win+Alt+стрелки (биндинги ниже).
--- Ячейка занята другим столом → столы меняются местами. Расстановка
--- сохраняется между заходами в обзор.
-bind{ mods = "super+alt", key = "Left",  action = "move_workspace_slot", dx = -1, dy = 0 }
-bind{ mods = "super+alt", key = "Right", action = "move_workspace_slot", dx = 1,  dy = 0 }
-bind{ mods = "super+alt", key = "Up",    action = "move_workspace_slot", dx = 0,  dy = -1 }
-bind{ mods = "super+alt", key = "Down",  action = "move_workspace_slot", dx = 0,  dy = 1 }
+-- Сами столы не перетаскиваются — расстановку задаёт обзор и сохраняет её
+-- между заходами.
 
 -- ── Focus / navigation ───────────────────────────────────────────────────
 bind{ mods = "super", key = "Left",  action = "focus_direction", dx = -1, dy = 0 }
@@ -201,9 +221,14 @@ bind{ mods = "super+shift", key = "Right", action = "resize_focused", dw = 30, d
 -- ── Tags / workspaces (Super+1-9 view, Super+Shift+1-9 assign) ───────────
 -- When bookmarks_mode is on (Super+B), these instead jump to / save camera
 -- bookmarks in the same numbered slots.
+-- Super+Ctrl+N добавляет/убирает тег из ТЕКУЩЕГО вида (несколько столов на
+-- экране разом), Super+Ctrl+Shift+N — из набора тегов сфокусированного окна
+-- (окно видно сразу на нескольких столах). Как toggleview/toggletag в dwm.
 for i = 1, 9 do
   bind{ mods = "super", key = tostring(i), action = "view_tag", tag = i }
   bind{ mods = "super+shift", key = tostring(i), action = "tag_window", tag = i }
+  bind{ mods = "super+ctrl", key = tostring(i), action = "toggle_view", tag = i }
+  bind{ mods = "super+ctrl+shift", key = tostring(i), action = "toggle_tag", tag = i }
 end
 
 -- ── Toggles ───────────────────────────────────────────────────────────────

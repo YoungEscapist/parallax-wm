@@ -7,7 +7,7 @@ use smithay::{
         renderer::element::memory::MemoryRenderBuffer,
         session::libseat::LibSeatSession,
     },
-    desktop::{PopupManager, Space, Window, WindowSurfaceType},
+    desktop::{PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output},
     input::{Seat, SeatState},
     reexports::{
         calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic},
@@ -18,13 +18,15 @@ use smithay::{
         },
     },
     input::pointer::CursorImageStatus,
-    utils::{Logical, Physical, Point, Size, Transform},
+    utils::{Logical, Physical, Point, Rectangle, Size, Transform},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::xdg::XdgShellState,
+        shell::wlr_layer::WlrLayerShellState,
+        shell::wlr_layer::Layer as WlrLayer,
         shm::ShmState,
         socket::ListeningSocketSource,
         xwayland_shell::XWaylandShellState,
@@ -205,6 +207,10 @@ pub struct Dawn {
     /// Пружина, а не LERP с длительностью: цель здесь меняется на лету, и
     /// только пружина умеет перенацелиться без разрыва скорости (см. PosAnim).
     pub window_pos_anims: Vec<(Window, crate::anim::PosAnim)>,
+    /// Окно, которое ПРЯМО СЕЙЧАС таскают мышью (MoveSurfaceGrab). Его позицию
+    /// каждый motion задаёт курсор, поэтому анимации его не трогают: толчок от
+    /// прилетевшего соседа дрался бы с мышью, и окно дрожало бы под курсором.
+    pub dragged_window: Option<Window>,
     /// Момент прошлого anim::tick — источник реального dt (тик зовут и таймер,
     /// и VBlank, интервал плавает).
     pub anim_last_tick: Option<std::time::Instant>,
@@ -255,6 +261,11 @@ pub struct Dawn {
     /// Сколько строк замера пана осталось напечатать (обнуляется, чтобы лог
     /// не рос: 60 строк на жест хватает, чтобы увидеть, стоит ли курсор).
     pub pan_log_left: u32,
+    /// Экранная точка курсора в момент НАЧАЛА пана Alt+ЛКМ. Нужна ровно для
+    /// одного вопроса: за жест стрелка вернулась на место или осталась
+    /// смещённой? Построчный замер этого не отвечает — он печатает ту же
+    /// величину, которую сам пан и удерживает.
+    pub pan_start_screen: Option<Point<f64, Physical>>,
     /// Направление начатого перехода по столам в Columns (-1 вверх, +1 вниз,
     /// 0 нет) — по нему columns_slide_in_workspace делает вертикальный въезд.
     pub columns_ws_slide: i32,
@@ -275,6 +286,8 @@ pub struct Dawn {
     pub minimap_ids: Vec<crate::udev::SolidSlot>,
     pub selection_ids: Vec<crate::udev::SolidSlot>,
     pub portal_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул под панель рабочих столов (бар снизу).
+    pub bar_ids: Vec<crate::udev::SolidSlot>,
     // ── Мультивыделение / "созвездия" ────────────────────────────────────────
     /// Рамка rubber-band выделения в процессе протяжки (canvas-координаты) —
     /// см. grabs/select_grab.rs.
@@ -295,6 +308,10 @@ pub struct Dawn {
     pub dwindle_trees: std::collections::HashMap<u32, crate::dwindle::DwindleTree>,
     /// Обзор рабочих столов активен (тап Super, см. overview.rs).
     pub overview_active: bool,
+    /// Обзор открыт в ленточном (niri) режиме: окна НЕ перекладываются в сетку
+    /// миниатюр, камера просто отъезжает и показывает ленту как она есть — как
+    /// Super+Space, только с вписыванием всех этажей и обзорными кликами/драгом.
+    pub overview_strip: bool,
     /// Кандидат на "тап Super": true с нажатия Super, сбрасывается любым другим
     /// вводом; если дожил до отпускания Super — это тап → toggle_overview.
     pub super_tap: bool,
@@ -305,8 +322,6 @@ pub struct Dawn {
     /// Позиции столов в 2D-сетке обзора: маска тега → (col, row) относительно
     /// центрального (0,0). Сбрасывается при каждом входе в обзор.
     pub overview_slots: std::collections::HashMap<u32, (i32, i32)>,
-    /// Стол, который сейчас тащим мышью в обзоре (ЛКМ по столу).
-    pub overview_drag_ws: Option<u32>,
     /// Позиции и размеры окон ДО входа в обзор — обзор сжимает окна в миниатюры
     /// и раскладывает их по сетке столов, а refresh_tags на выходе сохраняет
     /// эти обзорные координаты в tw.position. Для тайловых столов их чинит
@@ -335,6 +350,9 @@ pub struct Dawn {
     /// Запрошенные, но ещё не снятые кадры — обслуживаются в udev::render_surface
     /// сразу после отрисовки обычного кадра (см. screencopy::serve_pending).
     pub pending_frames: Vec<crate::screencopy::PendingFrame>,
+    // ── wlr-layer-shell ──────────────────────────────────────────────────────
+    /// Состояние протокола wlr-layer-shell (фоновые обои, панели и т.п.).
+    pub layer_shell_state: WlrLayerShellState,
 }
 
 fn load_default_cursor() -> (Option<MemoryRenderBuffer>, Point<i32, Logical>, Size<i32, Logical>) {
@@ -382,6 +400,7 @@ impl Dawn {
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
+        let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         // Захват экрана (ext-image-copy-capture): без этих глобалов
         // xdg-desktop-portal-wlr не видит у компоситора способа снять картинку,
         // и демонстрация экрана в Discord/OBS остаётся чёрной. См. screencopy.rs.
@@ -457,6 +476,7 @@ impl Dawn {
             focus_aura_current: None,
             focus_aura_anim: None,
             window_pos_anims: Vec::new(),
+            dragged_window: None,
             anim_last_tick: None,
             window_open_anims: Vec::new(),
             decor: crate::decor::DecorCache::new(),
@@ -474,11 +494,11 @@ impl Dawn {
             columns_by_tag: HashMap::new(),
             dwindle_trees: HashMap::new(),
             overview_active: false,
+            overview_strip: false,
             super_tap: false,
             overview_prev: None,
             overview_order: Vec::new(),
             overview_slots: HashMap::new(),
-            overview_drag_ws: None,
             overview_saved_geo: Vec::new(),
             overview_exit_pending: false,
             overview_exit_target_ws: None,
@@ -487,6 +507,7 @@ impl Dawn {
             shadow_ids: Vec::new(),
             super_tap_shift: false,
             pan_log_left: 60,
+            pan_start_screen: None,
             columns_ws_slide: 0,
             columns_float_cam: (0.0, 0.0),
             columns_drag_hint: None,
@@ -497,11 +518,13 @@ impl Dawn {
             minimap_ids: Vec::new(),
             selection_ids: Vec::new(),
             portal_ids: Vec::new(),
+            bar_ids: Vec::new(),
             image_capture_source_state,
             output_capture_source_state,
             image_copy_capture_state,
             capture_sessions: Vec::new(),
             pending_frames: Vec::new(),
+            layer_shell_state,
         }
     }
 
@@ -604,6 +627,57 @@ impl Dawn {
                 self.space.map_output(&output, (cam_x, cam_y));
             }
         }
+    }
+
+    /// Сдвинуть камеру рукой (пан мышью/тачпадом) так, чтобы под остриём
+    /// осталась та же ТОЧКА ХОЛСТА — «схватил и потащил карту».
+    ///
+    /// Раньше здесь было обратное: стрелка прибивалась к точке ЭКРАНА, весь ход
+    /// мыши уходил в камеру, содержимое ехало из-под неподвижного острия. Замеры
+    /// подтверждали, что это работает (`ИТОГ ПАН` = 0, `КАДР: курсор_экран`
+    /// неизменен весь жест) — но пользователю нужно ровно противоположное
+    /// поведение, поэтому пиннинг снят. Теперь `pointer_location` (canvas) не
+    /// трогаем вовсе: экранная позиция стрелки = (ptr − cam)·zoom сдвигается
+    /// ровно на ход мыши, то есть стрелка едет по монитору вместе с холстом.
+    ///
+    /// `warp_pointer` тут нужен ради двух вещей: зажать стрелку краем монитора
+    /// (иначе при упоре мыши в край она уехала бы за видимую область — у точки
+    /// холста такого ограничения нет) и вызвать `pointer_warped`, который
+    /// сообщает `sync_pointer_to_camera`, что камера уехала НАМЕРЕННО. Без
+    /// этого отложенная синхронизация вернула бы стрелку в старую точку экрана
+    /// и вернула бы старое поведение. Поверхность под курсором не меняется
+    /// (canvas-точка та же), так что лишних motion не будет — `set_pointer_canvas`
+    /// выходит сразу, когда позиция не изменилась.
+    ///
+    /// Раньше ветки пана двигали только камеру и полагались на отложенную
+    /// `sync_pointer_to_camera`. Между этими двумя моментами помещается целый
+    /// кадр: на 4K он длится 16-45 мс, а события мыши приходят каждые ~7 мс,
+    /// то есть к моменту отрисовки накапливалось 2-6 необработанных дельт по
+    /// 15-20 px. Стрелка успевала уехать с холстом на десятки пикселей, кадр
+    /// рисовался уже с уехавшей стрелкой, и следующая синхронизация дёргала её
+    /// назад. Это и есть «курсор ездит при пане»: не снос (за жест он около
+    /// нуля), а дрожь. В логе 20260729_190042 видно ровно это — путь стрелки
+    /// 100-670 px за жест при итоговом смещении в единицы пикселей.
+    ///
+    /// `repin_pointer_to_screen` рассылает `pointer.motion`, поэтому hit-test и
+    /// фокус тоже правильные (прежний комментарий в input.rs утверждал
+    /// обратное — он старше `repin`/`warp_pointer`). `pointer_warped` в конце
+    /// сообщает синхронизации, что камера уехала НАМЕРЕННО и курсор уже
+    /// приведён в порядок — иначе она повторит ту же работу.
+    pub fn pan_camera_by(&mut self, dcam_x: f64, dcam_y: f64) {
+        self.viewport.cam_x -= dcam_x;
+        self.viewport.cam_y -= dcam_y;
+        self.apply_camera();
+        let pos = self.pointer_location;
+        self.warp_pointer(pos);
+    }
+
+    /// Вторая половина `pan_camera_by` для тех мест, где камера считается не
+    /// дельтой (прокрутка ленты зажимает cam_x нулём и берёт cam_y от этажа).
+    /// Порядок обязателен: сначала `apply_camera`, потом это.
+    pub fn pin_pointer_after_camera(&mut self, screen: Point<f64, Physical>) {
+        self.repin_pointer_to_screen(screen);
+        self.pointer_warped();
     }
 
     /// Позиция курсора в ФИЗИЧЕСКИХ пикселях монитора — то, куда реально
@@ -732,10 +806,84 @@ impl Dawn {
                 return Some(hit);
             }
         }
+        // Overlay/Top — НАД окнами, поэтому спрашиваем их первыми. Background и
+        // Bottom намеренно не опрашиваем: в dawn пустой холст — это орган
+        // управления (пан, жесты, рамка выделения), и обои, растянутые на весь
+        // выход, съедали бы каждый такой клик.
+        if let Some(hit) = self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top]) {
+            return Some(hit);
+        }
         self.space.element_under(pos).and_then(|(window, location)| {
             window.surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                 .map(|(s, p)| (s, (p + location).to_f64()))
         })
+    }
+
+    /// Попадание курсора в layer-поверхность (wlr-layer-shell).
+    ///
+    /// Layer-поверхности приколоты к ЭКРАНУ, а не к холсту: рендер кладёт их по
+    /// `layer_geometry` без камеры и зума (см. build_layer_elements в udev.rs).
+    /// Значит и хит-тест обязан идти в экранных координатах — иначе панель
+    /// нажималась бы там, где её нарисовали бы при zoom=1 и камере в нуле.
+    ///
+    /// Возвращает (surface, «виртуальный origin») с тем же контрактом, что и
+    /// обычная ветка surface_under: `pos - origin` даёт surface-локальную точку.
+    fn layer_surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+        layers: &[WlrLayer],
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let output = self.space.outputs().next()?;
+        let map = layer_map_for_output(output);
+        let zoom = self.viewport.zoom;
+        let screen = Point::<f64, Logical>::from((
+            (pos.x - self.viewport.cam_x) * zoom,
+            (pos.y - self.viewport.cam_y) * zoom,
+        ));
+        for &layer in layers {
+            let Some(surface) = map.layer_under(layer, screen) else { continue };
+            let Some(geo) = map.layer_geometry(surface) else { continue };
+            let surface_local = screen - geo.loc.to_f64();
+            // surface_under уважает input region клиента: поверхность, которая
+            // отказалась от ввода, вернёт None, и клик уйдёт ниже — к окнам.
+            if let Some((wl, offset)) = surface.surface_under(surface_local, WindowSurfaceType::ALL) {
+                let local = surface_local - offset.to_f64();
+                return Some((wl, pos - local));
+            }
+        }
+        None
+    }
+
+    /// Замер «промаха ВНУТРИ окна»: окно под курсором то самое, но нажимается
+    /// точка со сдвигом. Печатает всё, что участвует в переводе canvas-точки в
+    /// координаты клиента:
+    ///  · `локальная` — ровно та точка, которую клиент получит в wl_pointer;
+    ///  · `окно` — размер, который МЫ считаем размером окна (по нему строится
+    ///    раскладка и обзор);
+    ///  · `поверхность` — размер, который клиент реально закоммитил.
+    ///
+    /// Читается так: `локальная` вне `поверхность` или `окно ≠ поверхность` —
+    /// виноват композитор (шлём координаты не в тот кадр). Всё сходится, а
+    /// промах есть — координаты доходят верные, и мажет уже клиент, который
+    /// видит наш зум как `wl_output.scale`.
+    pub fn log_pointer_local(&self, pos: Point<f64, Logical>) {
+        let Some((surface, origin)) = self.surface_under(pos) else {
+            tracing::debug!("PTR ЛОКАЛЬ: под курсором нет поверхности");
+            return;
+        };
+        let local = pos - origin;
+        let win_geo = self.space.element_under(pos)
+            .and_then(|(w, _)| self.space.element_geometry(w))
+            .map(|g| g.size);
+        let surf_size = smithay::backend::renderer::utils::with_renderer_surface_state(
+            &surface, |s| s.surface_size(),
+        ).flatten();
+        tracing::debug!(
+            "PTR ЛОКАЛЬ: локальная=({:.1},{:.1}) начало=({:.1},{:.1}) окно={:?} \
+             поверхность={:?} zoom={:.2} обзор={}",
+            local.x, local.y, origin.x, origin.y, win_geo, surf_size,
+            self.viewport.zoom, self.overview_active,
+        );
     }
 
     /// Проверяет попадание курсора в рамку портала (4.4) и, если попал,
@@ -802,8 +950,10 @@ impl Dawn {
 
     /// Режим коллизии (Super+S, is_snapping_enabled): расталкивает окна,
     /// которые перекрываются с только что сдвинутым `mover`. Толкаем по оси
-    /// наименьшего перекрытия, в сторону от центра mover'а, с зазором. Один
-    /// проход (без каскада) — визуально достаточно для "толкания".
+    /// наименьшего перекрытия, в сторону от центра mover'а, с зазором.
+    /// Реакция ЦЕПНАЯ: отодвинутое окно само толкает своих соседей (BFS), иначе
+    /// оно просто накрывало бы того, кто стоял за ним. Каждое окно волна двигает
+    /// не более одного раза — этим цепочка и завершается.
     pub fn push_colliding_windows(&mut self, mover: &Window) {
         if !self.is_snapping_enabled {
             return;
@@ -816,41 +966,55 @@ impl Dawn {
         let same = |a: &Window, b: &Window| {
             a == b
         };
-        let others: Vec<Window> = self.tagged_windows.iter()
+        let mut others: Vec<(Window, Rectangle<i32, Logical>)> = self.tagged_windows.iter()
             .filter(|tw| tw.tags & current != 0)
             .map(|tw| tw.window.clone())
             .filter(|w| !same(w, mover))
+            .filter_map(|w| self.space.element_geometry(&w).map(|g| (w, g)))
             .collect();
 
         const MARGIN: i32 = 8;
-        let mcx = mover_geo.loc.x + mover_geo.size.w / 2;
-        let mcy = mover_geo.loc.y + mover_geo.size.h / 2;
-        for w in others {
-            let g = match self.space.element_geometry(&w) {
-                Some(g) => g,
-                None => continue,
-            };
-            let inter = match mover_geo.intersection(g) {
-                Some(i) => i,
-                None => continue,
-            };
-            // Толкаем по оси наименьшего перекрытия — так окно "выскальзывает"
-            // в ближайшую свободную сторону.
-            let (mut nx, mut ny) = (g.loc.x, g.loc.y);
-            if inter.size.w <= inter.size.h {
-                nx = if g.loc.x + g.size.w / 2 >= mcx {
-                    mover_geo.loc.x + mover_geo.size.w + MARGIN
-                } else {
-                    mover_geo.loc.x - g.size.w - MARGIN
+        let mut moved = vec![false; others.len()];
+        let mut queue: std::collections::VecDeque<Rectangle<i32, Logical>> =
+            std::collections::VecDeque::new();
+        queue.push_back(mover_geo);
+
+        while let Some(m) = queue.pop_front() {
+            let mcx = m.loc.x + m.size.w / 2;
+            let mcy = m.loc.y + m.size.h / 2;
+            for i in 0..others.len() {
+                if moved[i] { continue; }
+                let g = others[i].1;
+                let inter = match m.intersection(g) {
+                    Some(i) => i,
+                    None => continue,
                 };
-            } else {
-                ny = if g.loc.y + g.size.h / 2 >= mcy {
-                    mover_geo.loc.y + mover_geo.size.h + MARGIN
+                // Толкаем по оси наименьшего перекрытия — так окно "выскальзывает"
+                // в ближайшую свободную сторону.
+                let (mut nx, mut ny) = (g.loc.x, g.loc.y);
+                if inter.size.w <= inter.size.h {
+                    nx = if g.loc.x + g.size.w / 2 >= mcx {
+                        m.loc.x + m.size.w + MARGIN
+                    } else {
+                        m.loc.x - g.size.w - MARGIN
+                    };
                 } else {
-                    mover_geo.loc.y - g.size.h - MARGIN
-                };
+                    ny = if g.loc.y + g.size.h / 2 >= mcy {
+                        m.loc.y + m.size.h + MARGIN
+                    } else {
+                        m.loc.y - g.size.h - MARGIN
+                    };
+                }
+                let new_geo = Rectangle::new(Point::from((nx, ny)), g.size);
+                others[i].1 = new_geo;
+                moved[i] = true;
+                queue.push_back(new_geo);
             }
-            let new_loc = Point::from((nx, ny));
+        }
+
+        for (i, (w, g)) in others.into_iter().enumerate() {
+            if !moved[i] { continue; }
+            let new_loc = g.loc;
             self.space.map_element(w.clone(), new_loc, false);
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| same(&tw.window, &w)) {
                 tw.float_position = new_loc;
@@ -885,35 +1049,39 @@ impl Dawn {
         self.tag_cameras.insert(old_tag, (self.viewport.cam_x, self.viewport.cam_y));
         self.tag_layouts.insert(old_tag, self.tile_config.layout);
 
-        // Полоса колонок у каждого стола своя: прячем текущую на полку
-        // покидаемого тега и достаём полосу нового (см. columns.rs). Вне
-        // Columns полосы просто лежат нетронутыми.
-        if self.tile_config.layout == Layout::Columns {
-            self.columns_save_for(old_tag);
-            self.columns_load_for(tag);
-        }
-
-        self.viewport.tagset[self.viewport.seltags] = tag;
-        self.refresh_tags();
-
         // НОВЫЙ (ещё не посещённый) воркспейс → включаем tiling и раскладываем
         // от (0,0). Повторные заходы восстанавливают запомненный за этим столом
-        // layout и позицию камеры.
+        // layout и позицию камеры. Считаем ДО всех изменений: от этого зависит,
+        // в какую изоляцию мы едем.
         let is_new = !self.visited_tags.contains(&tag);
-        self.visited_tags.insert(tag);
         let target_layout = if is_new {
-            // Новый стол наследует режим ТОЛЬКО из Columns: свежий стол,
-            // на который скроллятся из ленты, обязан остаться лентой. Из
-            // остальных раскладок новый стол по-прежнему открывается в Tile —
-            // это их давнее поведение, и его не трогаем.
-            if self.tile_config.layout == Layout::Columns {
-                Layout::Columns
-            } else {
-                Layout::Tile
-            }
+            // Новые столы всегда открываются в Tile.
+            Layout::Tile
         } else {
             *self.tag_layouts.get(&tag).unwrap_or(&Layout::Tile)
         };
+
+        // Полоса колонок у каждого стола СВОЯ, и переезд между изоляциями её не
+        // тащит: полосу покидаемого стола прячем на его полку (текущая после
+        // этого пуста), полосу нового достаём — но только если новый стол
+        // ленточный. Раньше и то и другое делалось лишь когда ЛЕНТОЙ БЫЛ
+        // ПОКИДАЕМЫЙ стол, поэтому вход в ленту с тайлового стола отдавал ей
+        // чужую полосу: колонки, стопки и вкладки нового стола пересобирались
+        // из остатков предыдущего.
+        if self.tile_config.layout == Layout::Columns {
+            self.columns_save_for(old_tag);
+        }
+        if target_layout == Layout::Columns {
+            self.columns_load_for(tag);
+        }
+
+        // Стол переходит в свою группу ДО refresh_tags: видимость окон (лента
+        // показывает все свои этажи, tiling/floating — только свой стол)
+        // считается по tag_layouts, см. columns_is_strip_tag.
+        self.visited_tags.insert(tag);
+        self.tag_layouts.insert(tag, target_layout);
+        self.viewport.tagset[self.viewport.seltags] = tag;
+        self.refresh_tags();
 
         // Режим — свойство СТОЛА, а не глобальный тумблер: уходя с ленты на
         // стол, который помнит себя тайловым, выходим из Columns (ниже общей
@@ -922,6 +1090,11 @@ impl Dawn {
         if target_layout == Layout::Columns {
             self.tile_config.layout = Layout::Columns;
             self.arrange();
+            // Пока нас не было, состав ленты мог смениться (стол вышел из неё
+            // через Win+N, новый стол занял бит в середине) — этажи ниже
+            // съехали. Правим их ДО перелёта, чтобы камера приезжала на готовый
+            // стол, а не на пустое место.
+            self.columns_relayout_strip();
             self.columns_set_active_to_focus();
             self.columns_scroll_to_active();
             // Перелёт на этаж нового стола (вертикальная лента). Строго ПОСЛЕ
@@ -933,8 +1106,8 @@ impl Dawn {
         }
 
         if is_new {
-            self.set_layout(Layout::Tile); // сам обнуляет камеру
-            tracing::info!("dawn: view_tag → {:#b} (new workspace → tiling)", tag);
+            self.set_layout(target_layout); // сам обнуляет камеру
+            tracing::info!("dawn: view_tag → {:#b} (new workspace → {})", tag, target_layout.symbol());
             return;
         }
 
@@ -969,32 +1142,85 @@ impl Dawn {
     /// тегов). Учитывает и текущий стол, даже если он пуст, чтобы навигация не
     /// «схлопывалась» при переходе на свежесозданный пустой.
     pub fn niri_ws_count(&self) -> i32 {
-        let mut highest = self.viewport.current_tags().trailing_zeros() as i32 + 1;
+        // Считаем ЭТАЖИ ленты, а не биты тегов, и только по своим столам:
+        // чужой (тайловый) стол в середине не должен ни занимать этаж, ни
+        // удлинять ленту (см. columns_tag_foreign).
+        let mut highest = self.columns_floor_index(self.viewport.current_tags()) + 1;
         for tw in &self.tagged_windows {
-            if !tw.floating && tw.tags != 0 {
-                let idx = tw.tags.trailing_zeros() as i32 + 1;
+            if !tw.floating && tw.tags != 0 && !self.columns_tag_foreign(tw.tags) {
+                let idx = self.columns_floor_index(tw.tags) + 1;
                 if idx > highest { highest = idx; }
             }
         }
         (highest + 1).min(9)
     }
 
-    /// niri-воркспейсы: перейти на пред/след воркспейс. В Columns диапазон
-    /// ДИНАМИЧЕСКИЙ [1, niri_ws_count] (последний занятый + пустой снизу);
-    /// в остальных режимах — фиксированные 1-9.
+    /// Число доступных НЕ-ленточных воркспейсов: позиция последнего занятого
+    /// среди неленточных тегов (по порядку 1..9) + 2 (сам стол + один пустой
+    /// снизу). Используется как верхний лимит для workspace_step вне Columns,
+    /// аналогично niri_ws_count для ленты. Текущий стол всегда учитывается —
+    /// навигация не «схлопывается» при переходе на свежесозданный пустой.
+    pub fn tiling_ws_count(&self) -> usize {
+        let tiling_tags: Vec<u32> = (0..9u32)
+            .map(|i| 1u32 << i)
+            .filter(|&m| !self.columns_is_strip_tag(m))
+            .collect();
+        if tiling_tags.is_empty() { return 0; }
+        let cur = self.viewport.current_tags();
+        let mut highest = tiling_tags.iter()
+            .position(|&m| m == cur)
+            .unwrap_or(0);
+        for tw in &self.tagged_windows {
+            if tw.tags == 0 || self.columns_is_strip_tag(tw.tags) { continue; }
+            if let Some(idx) = tiling_tags.iter().position(|&m| m == tw.tags) {
+                if idx > highest { highest = idx; }
+            }
+        }
+        // Пустой стол снизу, но не дальше доступной линейки.
+        (highest + 2).min(tiling_tags.len())
+    }
+
+    /// niri-воркспейсы: перейти на пред/след воркспейс.
+    ///
+    /// Лента ИЗОЛИРОВАНА от остальных столов, и изоляция двусторонняя: в
+    /// Columns шаг идёт по своим этажам (диапазон динамический — последний
+    /// занятый + пустой снизу), чужие столы пропускаются целиком; вне Columns
+    /// пропускаются, наоборот, ленточные — иначе PageUp/PageDown с тайлового
+    /// стола втягивал бы в niri-режим, пересобирая окна чужой раскладкой.
     pub fn workspace_step(&mut self, dir: i32) {
-        let idx = self.viewport.current_tags().trailing_zeros() as i32 + 1;
-        let max = if self.tile_config.layout == crate::tiling::Layout::Columns {
-            self.niri_ws_count()
-        } else {
-            9
-        };
-        let new = (idx + dir).clamp(1, max);
-        if new == idx { return; }
-        // Направление перехода — для вертикального въезда нового стола
-        // (см. columns_slide_in_workspace); view_tag сам его подхватит.
-        self.columns_ws_slide = dir.signum();
-        self.view_tag(1u32 << (new - 1));
+        use crate::tiling::Layout;
+        if dir == 0 { return; }
+        if self.tile_config.layout == Layout::Columns {
+            let target = match self.columns_strip_neighbor(self.viewport.current_tags(), dir) {
+                Some(t) => t,
+                None => return,
+            };
+            // Направление перехода — для вертикального въезда нового стола
+            // (см. columns_slide_in_workspace); view_tag сам его подхватит.
+            self.columns_ws_slide = dir.signum();
+            self.view_tag(target);
+            return;
+        }
+        // Вне ленты столы тоже динамические: шаг ходит по неленточным тегам, но
+        // не дальше «последний занятый + один пустой». Раньше PageDown уводил на
+        // любой из 9 тегов подряд — с тайлового стола 1 можно было уехать на
+        // пустой стол 7, минуя пять таких же пустых, и обратной дороги по
+        // столам с окнами не было.
+        let tiling_tags: Vec<u32> = (0..9u32)
+            .map(|i| 1u32 << i)
+            .filter(|&m| !self.columns_is_strip_tag(m))
+            .collect();
+        let cur = self.viewport.current_tags();
+        let Some(pos) = tiling_tags.iter().position(|&m| m == cur) else { return };
+        let step = dir.signum();
+        let limit = self.tiling_ws_count() as i32;
+        let new = pos as i32 + step;
+        if new < 0 || new >= limit {
+            return;
+        }
+        let Some(&m) = tiling_tags.get(new as usize) else { return };
+        self.columns_ws_slide = step;
+        self.view_tag(m);
     }
 
     /// Показать все теги (Super+0)
@@ -1029,15 +1255,46 @@ impl Dawn {
         if self.overview_active {
             self.exit_overview_immediate(None);
         }
-        if let Some(focused) = self.focused_window_surface() {
-            if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                crate::xwin::is_surface(&tw.window, &focused)
-            }) {
-                tw.tags = tag;
-                tracing::info!("dawn: tag_window → {:#b}", tag);
+        let Some(focused) = self.focused_window_surface() else {
+            self.refresh_tags();
+            return;
+        };
+        let Some((window, floating, old_tag)) = self.tagged_windows.iter()
+            .find(|tw| crate::xwin::is_surface(&tw.window, &focused))
+            .map(|tw| (tw.window.clone(), tw.floating, tw.tags))
+        else {
+            self.refresh_tags();
+            return;
+        };
+        if old_tag == tag {
+            return;
+        }
+
+        // Стол-приёмник — лента: окно обязано войти в её МОДЕЛЬ КОЛОНОК, а не
+        // просто сменить тег. Иначе полосе о нём известно только через ленивый
+        // columns_reconcile, который допишет его колонкой в самый конец при
+        // следующем заходе на стол. Плавающие окна не трогаем: в ленте они
+        // остаются плавающими поверх полосы (см. columns_pin_floating).
+        if !floating && self.columns_is_strip_tag(tag) {
+            if self.columns_adopt_window(&window, tag) {
+                tracing::info!("dawn: tag_window → {:#b} (в ленту)", tag);
+                return;
             }
         }
+
+        if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
+            crate::xwin::is_surface(&tw.window, &focused)
+        }) {
+            tw.tags = tag;
+            tracing::info!("dawn: tag_window → {:#b}", tag);
+        }
+        // Окно ушло со СВОЕГО стола — донор обязан сомкнуться сразу. Полоса
+        // держит его в колонке, дерево dwindle — в листе, и вычищают их только
+        // columns_reconcile / sync_dwindle_tree, то есть arrange. Без него на
+        // месте уехавшего окна оставалась дыра до следующей операции с
+        // раскладкой: refresh_tags лишь снимает окно с холста.
         self.refresh_tags();
+        self.arrange();
     }
 
     /// Toggle тег на focused окне (Super+Ctrl+Shift+N)
@@ -1081,7 +1338,11 @@ impl Dawn {
         // соседние этажи обязаны существовать — иначе переход между столами
         // показывал бы пустоту, а не уезжающий стол. За кадром они ничего не
         // стоят: damage tracking и eco-mode отсекают всё вне вида.
-        let strip = self.tile_config.layout == crate::tiling::Layout::Columns;
+        // Лента ли ТЕКУЩИЙ стол — спрашиваем у него самого, а не у глобального
+        // тумблера: view_tag меняет тег раньше, чем layout, и по тумблеру
+        // тайловый стол на миг считался ленточным — окна соседних этажей
+        // оставались на экране поверх него (нулевой этаж лежит ровно на нём).
+        let strip = self.columns_is_strip_tag(current);
         let visible: Vec<(Window, Point<i32, Logical>)> = self.tagged_windows.iter()
             .filter(|tw| {
                 tw.tags & current != 0
@@ -1338,7 +1599,8 @@ impl Dawn {
     fn focused_window_surface(&self) -> Option<WlSurface> {
         self.focused_surface()
     }
-}
+
+	}
 
 // ── ClientState ──────────────────────────────────────────────────────────────
 

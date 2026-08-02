@@ -9,15 +9,18 @@ pub const MIN_ZOOM_FLOOR: f64 = 0.001;
 /// Maximum zoom level (100% — native resolution, no magnification).
 pub const MAX_ZOOM: f64 = 1.0;
 
+#[cfg(test)]
 /// A position in screen-local coordinates (0,0 = top-left of the output).
 #[derive(Debug, Clone, Copy)]
 pub struct ScreenPos(pub Point<f64, Logical>);
 
+#[cfg(test)]
 /// A position in infinite canvas coordinates (absolute world position).
 #[derive(Debug, Clone, Copy)]
 pub struct CanvasPos(pub Point<f64, Logical>);
 
 /// screen_pos = (canvas_pos - camera) * zoom  ⟹  canvas = screen / zoom + camera
+#[cfg(test)]
 #[inline]
 pub fn screen_to_canvas(screen: ScreenPos, camera: Point<f64, Logical>, zoom: f64) -> CanvasPos {
     CanvasPos(Point::from((
@@ -27,6 +30,7 @@ pub fn screen_to_canvas(screen: ScreenPos, camera: Point<f64, Logical>, zoom: f6
 }
 
 /// canvas_pos → screen_pos = (canvas - camera) * zoom
+#[cfg(test)]
 #[inline]
 pub fn canvas_to_screen(canvas: CanvasPos, camera: Point<f64, Logical>, zoom: f64) -> ScreenPos {
     ScreenPos(Point::from((
@@ -35,32 +39,9 @@ pub fn canvas_to_screen(canvas: CanvasPos, camera: Point<f64, Logical>, zoom: f6
     )))
 }
 
-/// Focus location for a screen-space surface (wlr layer, screen-pinned window):
-/// smithay derives surface-local coords as `location - focus_loc` with the
-/// pointer/touch location in canvas coords, so the surface's screen origin is
-/// shifted by (canvas - screen) to make the subtraction come out in screen space.
-#[inline]
-pub fn screen_space_focus_loc(
-    origin: ScreenPos,
-    canvas: CanvasPos,
-    screen: ScreenPos,
-) -> Point<f64, Logical> {
-    origin.0 + (canvas.0 - screen.0)
-}
-
-/// Inverse of [`screen_space_focus_loc`]: recover the surface's screen origin
-/// from an adjusted focus location.
-#[inline]
-pub fn screen_space_origin(
-    focus_loc: Point<f64, Logical>,
-    canvas: CanvasPos,
-    screen: ScreenPos,
-) -> ScreenPos {
-    ScreenPos(focus_loc - (canvas.0 - screen.0))
-}
-
 /// Convert internal canvas coords (top-left origin, Y-down) to the user-facing
 /// window-rule convention (center, Y-up) used by config rules, the state file, and IPC.
+#[cfg(test)]
 #[inline]
 pub fn internal_to_rule(loc: Point<i32, Logical>, size: Size<i32, Logical>) -> (i32, i32) {
     (loc.x + size.w / 2, -(loc.y + size.h / 2))
@@ -69,6 +50,7 @@ pub fn internal_to_rule(loc: Point<i32, Logical>, size: Size<i32, Logical>) -> (
 /// Inverse of [`internal_to_rule`]: window-rule coords (center, Y-up) back to
 /// internal top-left, Y-down canvas coords.
 #[inline]
+#[cfg(test)]
 pub fn rule_to_internal(x: i32, y: i32, size: Size<i32, Logical>) -> Point<i32, Logical> {
     Point::from((x - size.w / 2, -y - size.h / 2))
 }
@@ -78,6 +60,7 @@ pub fn rule_to_internal(x: i32, y: i32, size: Size<i32, Logical>) -> Point<i32, 
 /// output-center origin, Y-up — on an output of `output_size`. Callers clamp the
 /// result into the output. Inverse of [`screen_top_left_to_rule`].
 #[inline]
+#[cfg(test)]
 pub fn rule_to_screen_top_left(
     x: i32,
     y: i32,
@@ -96,6 +79,7 @@ pub fn rule_to_screen_top_left(
 /// origin, Y-up) — the numbers a `pinned_to_screen` rule's `position` takes, so
 /// `driftwm msg state` values paste straight into a rule.
 #[inline]
+#[cfg(test)]
 pub fn screen_top_left_to_rule(
     screen_pos: Point<i32, Logical>,
     size: Size<i32, Logical>,
@@ -112,6 +96,7 @@ pub fn screen_top_left_to_rule(
 /// Shared by the state file and IPC so they can't drift. Inverse of
 /// [`camera_for_center`].
 #[inline]
+#[cfg(test)]
 pub fn viewport_center(
     camera: Point<f64, Logical>,
     zoom: f64,
@@ -126,6 +111,7 @@ pub fn viewport_center(
 /// The camera (internal top-left, Y-down) that centers the viewport on the Y-up
 /// point `(x, y)`. Inverse of [`viewport_center`].
 #[inline]
+#[cfg(test)]
 pub fn camera_for_center(
     x: f64,
     y: f64,
@@ -141,6 +127,7 @@ pub fn camera_for_center(
 /// Compute the camera position that centers a window at `screen_center` on screen.
 /// `screen_center` is the screen-space point where the window center should appear
 /// (typically the usable area center, accounting for panel exclusive zones).
+#[cfg(test)]
 pub fn camera_to_center_window(
     window_loc: Point<i32, Logical>,
     window_size: Size<i32, Logical>,
@@ -159,6 +146,7 @@ pub fn camera_to_center_window(
 
 /// Fraction of a rectangle's area visible in the current viewport (0.0–1.0).
 /// Returns 0.0 for zero-area rectangles.
+#[cfg(test)]
 pub fn visible_fraction(
     rect_loc: Point<i32, Logical>,
     rect_size: Size<i32, Logical>,
@@ -183,18 +171,6 @@ pub fn visible_fraction(
     let ih = (iy_max - iy_min).max(0.0);
 
     (iw * ih) / area
-}
-
-/// Check whether the canvas origin (0, 0) is visible in the current viewport.
-/// At zoom < 1.0, the visible area is larger: viewport_size / zoom.
-pub fn is_origin_visible(
-    camera: Point<f64, Logical>,
-    viewport_size: Size<i32, Logical>,
-    zoom: f64,
-) -> bool {
-    let visible_w = viewport_size.w as f64 / zoom;
-    let visible_h = viewport_size.h as f64 / zoom;
-    camera.x <= 0.0 && 0.0 <= camera.x + visible_w && camera.y <= 0.0 && 0.0 <= camera.y + visible_h
 }
 
 /// The canvas rectangle visible at the current camera + zoom.
@@ -257,21 +233,6 @@ pub fn zoom_to_fit(
     zoom_x.min(zoom_y).clamp(MIN_ZOOM_FLOOR, MAX_ZOOM)
 }
 
-/// Dynamic minimum zoom based on the current window layout.
-/// Uses a virtual 5x5 window at the origin as baseline when no windows exist,
-/// so the limit stays consistent as the first window appears.
-pub fn dynamic_min_zoom(
-    windows: impl Iterator<Item = (Point<i32, Logical>, Size<i32, Logical>)>,
-    viewport_size: Size<i32, Logical>,
-    padding: f64,
-) -> f64 {
-    let bbox =
-        all_windows_bbox(windows).unwrap_or_else(|| Rectangle::new((-2, -2).into(), (5, 5).into()));
-    // Allow zooming out to 50% beyond the fit zoom for breathing room
-    let fit = zoom_to_fit(bbox, viewport_size, padding);
-    (fit * 0.5).max(MIN_ZOOM_FLOOR)
-}
-
 /// Camera position that keeps `anchor_canvas` at `anchor_screen` after a zoom change.
 /// Derived from: screen = (canvas - camera) * zoom  ⟹  camera = canvas - screen / zoom.
 pub fn zoom_anchor_camera(
@@ -284,26 +245,6 @@ pub fn zoom_anchor_camera(
         anchor_canvas.y - anchor_screen.y / new_zoom,
     ))
 }
-
-/// Snap zoom to 1.0 if within ±0.05 dead zone (avoids stuck-near-1.0 feel).
-pub fn snap_zoom(z: f64) -> f64 {
-    if (z - 1.0).abs() < 0.05 { 1.0 } else { z }
-}
-
-/// Closest point on an axis-aligned rect to `origin`.
-/// If origin is inside the rect, returns origin itself (distance 0).
-pub fn closest_point_on_rect(
-    origin: Point<f64, Logical>,
-    loc: Point<i32, Logical>,
-    size: Size<i32, Logical>,
-) -> Point<f64, Logical> {
-    Point::from((
-        origin.x.clamp(loc.x as f64, (loc.x + size.w) as f64),
-        origin.y.clamp(loc.y as f64, (loc.y + size.h) as f64),
-    ))
-}
-
-
 
 /// Sliding-window velocity tracker for scroll/gesture input.
 /// Computes launch velocity from recent displacement over a fixed time window,
@@ -487,7 +428,6 @@ pub struct MinimapBox {
 
 pub struct MinimapProjection {
     pub boxes: Vec<MinimapBox>,
-    pub viewport_box: MinimapBox,
     /// Для обратного клика (3.3)
     pub bbox: Rectangle<i32, Logical>,
     pub scale: f64,
@@ -542,7 +482,6 @@ pub fn project_minimap(
 
     MinimapProjection {
         boxes,
-        viewport_box: MinimapBox { loc: (0, 0).into(), size: (0, 0).into(), focused: false },
         bbox,
         scale,
     }

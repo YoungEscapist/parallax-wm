@@ -108,9 +108,6 @@ pub enum Action {
     /// Тумблер niri-режим (Columns) ↔ Tile (Win+N): в niri — выход в обычный
     /// tile, не в niri — вход в niri.
     ToggleNiriMode,
-    /// Обзор столов (тап Super): переставить ВЕСЬ стол под курсором в соседнюю
-    /// ячейку сетки — влево/вправо/вверх/вниз относительно других столов.
-    MoveWorkspaceSlot(i32, i32),
 }
 
 #[derive(Clone, Debug)]
@@ -310,7 +307,6 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
         "workspace_step" => WorkspaceStep(get_i32("dir", 1)),
         "move_column_to_workspace" => MoveColumnToWorkspace(get_i32("dir", 1)),
         "toggle_niri_mode" => ToggleNiriMode,
-        "move_workspace_slot" => MoveWorkspaceSlot(get_i32("dx", 0), get_i32("dy", 0)),
         other => {
             tracing::warn!("dawn/config: unknown action '{}'", other);
             return None;
@@ -560,20 +556,28 @@ impl Dawn {
             // Super+1-9 double as camera-bookmark slots while bookmarks_mode
             // is on (Super+B) — same override the old hardcoded handler had.
             ViewTag(mask) => {
+                // Цифра = бит тега напрямую: нумерация столов ОДНА на весь
+                // композитор. Раньше она была относительной («N-й стол своей
+                // изоляции»), и из-за этого Win+1 из ленты вёл на первый этаж
+                // ленты, а не в тайлинг. Теперь режим задаёт сам стол:
+                // 1 — Tile, 2 — Columns (niri), 3 — Float, см.
                 if self.overview_active {
                     // Super+1-9 в обзоре столов → выйти из обзора на воркспейс.
                     self.exit_overview_immediate(Some(mask));
                 } else if self.bookmarks_mode {
                     self.jump_to_camera_bookmark(mask.trailing_zeros() + 1);
                 } else {
-                    // В Columns Win+цифра — обычный переход по столам, а не
-                    // no-op: лента остаётся лентой (view_tag сам держит Columns
-                    // и зовёт columns_fly_to_workspace). Направление слайда
-                    // задаём по разнице индексов, чтобы стол въезжал вертикально
-                    // так же, как от Super+PageUp/Down.
-                    if self.tile_config.layout == crate::tiling::Layout::Columns {
-                        let cur = self.viewport.current_tags().trailing_zeros() as i32;
-                        let dst = mask.trailing_zeros() as i32;
+                    // Внутри ленты Win+цифра остаётся её собственным переходом
+                    // по этажам: направление слайда задаём по разнице этажей,
+                    // чтобы стол въезжал вертикально так же, как от
+                    // Super+PageUp/Down. Для столов ВНЕ ленты (Win+1, Win+3)
+                    // этажа нет — там обычный выход в чужой режим, слайд не
+                    // нужен и считался бы по несуществующей позиции.
+                    if self.tile_config.layout == Layout::Columns
+                        && !self.columns_tag_foreign(mask)
+                    {
+                        let cur = self.columns_floor_index(self.viewport.current_tags());
+                        let dst = self.columns_floor_index(mask);
                         self.columns_ws_slide = (dst - cur).signum();
                     }
                     self.view_tag(mask);
@@ -583,8 +587,20 @@ impl Dawn {
                 if self.bookmarks_mode {
                     self.save_camera_bookmark(mask.trailing_zeros() + 1);
                 } else {
+                    // Нумерация та же, что у Win+цифра — глобальная. Окно можно
+                    // отправить и в чужой режим (Win+Shift+2 кладёт его в
+                    // ленту): полоса колонок подберёт его при первом же заходе
+                    // на стол, см. columns_reconcile.
                     self.tag_window(mask);
                 }
+            }
+            // Смешанный набор видимых тегов (Win+Ctrl+цифра) ленту ломает: она
+            // считает текущий тег ОДНИМ столом-этажом (columns_floor_index,
+            // columns_ws_y, полка полосы в columns_by_tag), а с двумя битами в
+            // маске «этаж» перестаёт существовать. В niri-режиме эти действия
+            // просто не работают — столы там изолированы друг от друга.
+            ToggleView(_) | ToggleTag(_) if self.tile_config.layout == Layout::Columns => {
+                tracing::debug!("dawn/columns: смешивать столы в ленте нельзя (Win+Ctrl+цифра)");
             }
             ToggleView(mask) => self.toggle_view(mask),
             ToggleTag(mask) => self.toggle_tag(mask),
@@ -654,7 +670,6 @@ impl Dawn {
                     self.set_layout(Layout::Columns);
                 }
             }
-            MoveWorkspaceSlot(dx, dy) => self.overview_move_workspace_slot(dx, dy),
         }
     }
 

@@ -33,6 +33,7 @@ impl Layout {
     }
 }
 
+
 /// Отступ между окнами в Tile (логические пиксели; итоговый зазор между
 /// соседними окнами = GAP_INNER, т.к. каждое окно ужимается на GAP_INNER/2).
 pub const GAP_INNER: i32 = 16;
@@ -386,6 +387,49 @@ impl Dawn {
         target.to_i32_round()
     }
 
+    /// Толчок окна «по инерции»: добавляет скорость к тому движению, что у окна
+    /// уже есть, и пересчитывает точку остановки (путь доезда = |v|/ω). Окно,
+    /// которое стояло, начинает лететь; окно, которое уже летело, ускоряется —
+    /// поэтому цепочка толчков складывается, а не перезапускается с нуля.
+    /// Возвращает точку остановки (она же пишется во float-позицию).
+    pub(crate) fn impulse_window(
+        &mut self,
+        window: &Window,
+        vel: Point<f64, Logical>,
+        omega: f64,
+    ) -> Point<i32, Logical> {
+        let target = match self.window_pos_anims.iter_mut()
+            .find(|(w, _)| crate::dwindle::same_window(w, window))
+        {
+            Some((_, anim)) => {
+                let sum = Point::from((anim.vel.x + vel.x, anim.vel.y + vel.y));
+                let speed = (sum.x * sum.x + sum.y * sum.y).sqrt();
+                anim.coast(sum, crate::anim::glide_omega(speed).max(omega));
+                anim.target
+            }
+            None => {
+                let from = self.space.element_geometry(window)
+                    .map(|g| g.loc.to_f64())
+                    .unwrap_or_default();
+                let target = Point::from((from.x + vel.x / omega, from.y + vel.y / omega));
+                self.window_pos_anims.push((
+                    window.clone(),
+                    PosAnim::with_velocity(from, target, vel, omega),
+                ));
+                target
+            }
+        };
+        let target = target.to_i32_round();
+        if let Some(tw) = self.tagged_windows.iter_mut()
+            .find(|tw| crate::dwindle::same_window(&tw.window, window))
+        {
+            tw.float_position = target;
+            tw.position = target;
+            tw.float_position_set = true;
+        }
+        target
+    }
+
     fn animate_window_to(&mut self, window: &Window, target: Point<i32, Logical>) {
         // Сокращено с 240ms→180ms — snappy, без ощущения "подлагивания"
         // при сборке/разлёте окон. Ещё короче — будет заметно глазу.
@@ -396,6 +440,39 @@ impl Dawn {
         let prev = self.tile_config.layout;
         self.tile_config.prev_layout = prev;
         self.tile_config.layout = layout;
+
+        // ── Изоляция столов ──────────────────────────────────────────────────
+        // Раскладка — свойство СТОЛА, и tag_layouts единственное место, где оно
+        // записано (по нему считается граница изоляции, см.
+        // columns_is_strip_tag). Пишем СРАЗУ: всё, что ниже (refresh_tags,
+        // arrange, геометрия этажей) уже должно видеть стол в его новой группе.
+        let cur = self.viewport.current_tags();
+        let already_known = self.tag_layouts.get(&cur) == Some(&layout);
+        self.tag_layouts.insert(cur, layout);
+        self.visited_tags.insert(cur);
+        if (prev == Layout::Columns) != (layout == Layout::Columns) {
+            // Стол ПЕРЕСЁК границу: вышел из ленты в tiling/floating или вошёл
+            // в неё. Полосу колонок он забирает с собой на полку (и получает
+            // обратно, вернувшись) — но только если сюда пришли не из view_tag:
+            // там полки уже разложены по столам, а `cur` — это УЖЕ новый стол
+            // (его раскладку view_tag записал в tag_layouts до вызова, отсюда
+            // и признак already_known).
+            if !already_known {
+                if prev == Layout::Columns {
+                    self.columns_save_for(cur);
+                } else {
+                    self.columns_load_for(cur);
+                }
+            }
+            // Видимость: в ленте на холсте лежат окна ВСЕХ ленточных столов, вне
+            // её — только свои. Без этого выход из ленты оставлял окна соседних
+            // этажей поверх тайлового стола (нулевой этаж стоит ровно на экране).
+            self.refresh_tags();
+            // Стол покинул ленту (или вошёл в неё) — этажи ниже сдвинулись на
+            // экран, их геометрию надо пересчитать.
+            self.columns_relayout_strip();
+        }
+
         if layout == Layout::Float {
             // Возврат из тайлинга — камера туда же, где холст был до входа.
             // Вход в тайлинг насильно ставит камеру в (0,0) при zoom=1 (иначе
@@ -435,7 +512,16 @@ impl Dawn {
             self.zoom_anim = None;
             self.viewport.zoom = 1.0;
             self.viewport.cam_x = 0.0;
-            self.viewport.cam_y = 0.0;
+            // В ленте начало холста — не (0,0), а ЭТАЖ этого стола: столы там
+            // стоят друг под другом (стол N на высоте N × экран). Камера в
+            // нулевую точку показала бы первый этаж ленты вместо того стола, на
+            // котором её включили.
+            self.viewport.cam_y = if layout == Layout::Columns {
+                self.columns_cur_y()
+            } else {
+                0.0
+            };
+            self.columns_float_cam = (self.viewport.cam_x, self.viewport.cam_y);
             self.apply_camera();
             if layout == Layout::Columns {
                 self.columns_set_active_to_focus();
@@ -666,6 +752,24 @@ impl Dawn {
         delta: Point<f64, Logical>,
         corner: crate::dwindle::Corner,
     ) {
+        // В обзоре столов дерево окна живёт в рамке СВОЕГО стола (ячейка
+        // сетки), а не в рабочей области экрана, и накатывает его
+        // overview_layout: обычные tile_work_area/apply_tile_layout там
+        // разложили бы стол поверх соседей.
+        if self.overview_active {
+            let Some(mask) = self.overview_mask_of_window(window) else { return };
+            let Some(area) = self.overview_window_area(mask) else { return };
+            let cfg = self.lua_config.dwindle;
+            if let Some(tree) = self.dwindle_trees.get_mut(&mask) {
+                tree.resize(window, delta, corner, area, &cfg);
+            }
+            if let Some((w, h)) = self.overview_band_size() {
+                self.overview_layout(w, h);
+            }
+            self.request_plane_reset();
+            self.request_redraw();
+            return;
+        }
         let Some(area) = self.tile_work_area() else { return };
         let cfg = self.lua_config.dwindle;
         let tags = self.viewport.current_tags();

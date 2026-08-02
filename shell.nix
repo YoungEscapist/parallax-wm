@@ -26,5 +26,9 @@ pkgs.mkShell {
     libGL
     libdrm
     libgbm
+    libdisplay-info
+    seatd
+    udev
+    libinput
   ];
 }

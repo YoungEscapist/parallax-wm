@@ -1,10 +1,23 @@
 use std::time::{Duration, Instant};
 
-use smithay::utils::{Logical, Point};
+use smithay::desktop::Window;
+use smithay::utils::{Logical, Point, Rectangle};
 
 use crate::canvas::zoom_anchor_camera;
 use crate::state::Dawn;
 use crate::tiling::Layout;
+
+/// Торможение свободного полёта (1/сек): путь доезда = |v|/ω.
+pub const GLIDE_OMEGA: f64 = 8.0;
+/// Потолок пути доезда (px), чтобы резкий флик/толчок не зашвыривал окно за
+/// горизонт: на быстрых бросках ω поднимается ровно настолько, чтобы |v|/ω
+/// уложилось в этот предел.
+pub const MAX_GLIDE: f64 = 420.0;
+
+/// ω для полёта с заданной стартовой скоростью (px/сек).
+pub fn glide_omega(speed: f64) -> f64 {
+    GLIDE_OMEGA.max(speed / MAX_GLIDE)
+}
 
 #[inline]
 pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
@@ -94,6 +107,11 @@ pub struct PosAnim {
     pub target: Point<f64, Logical>,
     /// Частота пружины (1/сек): больше — резче. См. omega_for.
     omega: f64,
+    /// Окно летит СВОБОДНО по инерции (бросок мышью, полученный толчок), а не
+    /// едет в слот раскладки. Только такие окна участвуют в столкновениях на
+    /// лету (см. resolve_fling_collisions) — иначе сборка тайлинга начала бы
+    /// расталкивать всё вокруг.
+    pub fling: bool,
     last: Instant,
     done: bool,
 }
@@ -123,6 +141,7 @@ impl PosAnim {
             vel: Point::from((0.0, 0.0)),
             target,
             omega: omega_for(dur),
+            fling: false,
             last: Instant::now(),
             done: false,
         }
@@ -139,7 +158,19 @@ impl PosAnim {
         vel: Point<f64, Logical>,
         omega: f64,
     ) -> Self {
-        Self { pos: from, vel, target, omega, last: Instant::now(), done: false }
+        Self { pos: from, vel, target, omega, fling: true, last: Instant::now(), done: false }
+    }
+
+    /// Продолжить свободный полёт с НОВОЙ скоростью из текущей точки: цель
+    /// пересчитывается как `pos + vel/ω`, то есть решение снова вырождается в
+    /// чистое e^{-ωt} — ни рывка, ни перелёта. Это и есть «удар»: столкновение
+    /// меняет скорость, а точка остановки следует из неё, а не наоборот.
+    pub fn coast(&mut self, vel: Point<f64, Logical>, omega: f64) {
+        self.vel = vel;
+        self.omega = omega;
+        self.target = Point::from((self.pos.x + vel.x / omega, self.pos.y + vel.y / omega));
+        self.fling = true;
+        self.done = false;
     }
 
     /// Сменить цель, сохранив скорость. Та же цель (в пределах полпикселя) —
@@ -188,6 +219,11 @@ pub struct ZoomAnim {
     pub to_zoom: f64,
     pub start: Instant,
     pub duration: Duration,
+    /// Если Some — камера едет ЛИНЕЙНО из первой точки во вторую, а якорь не
+    /// используется. Нужно, когда конечный кадр задан целиком (niri-обзор
+    /// вписывает всю ленту): с якорным пересчётом камера прыгала бы на первом
+    /// же кадре, чтобы прижать якорь к точке экрана.
+    cam: Option<(Point<f64, Logical>, Point<f64, Logical>)>,
 }
 
 impl ZoomAnim {
@@ -198,7 +234,31 @@ impl ZoomAnim {
         to_zoom: f64,
         duration: Duration,
     ) -> Self {
-        Self { anchor_canvas, anchor_screen, from_zoom, to_zoom, start: Instant::now(), duration }
+        Self {
+            anchor_canvas, anchor_screen, from_zoom, to_zoom,
+            start: Instant::now(), duration, cam: None,
+        }
+    }
+
+    /// Зум + перелёт камеры одной анимацией: и зум, и камера линейно едут к
+    /// заданному кадру. В отличие от `new` конечная камера задана явно, поэтому
+    /// кадр в конце ровно тот, что просили (см. обзор ленты в overview.rs).
+    pub fn new_pan(
+        from_cam: Point<f64, Logical>,
+        to_cam: Point<f64, Logical>,
+        from_zoom: f64,
+        to_zoom: f64,
+        duration: Duration,
+    ) -> Self {
+        Self {
+            anchor_canvas: from_cam,
+            anchor_screen: Point::from((0.0, 0.0)),
+            from_zoom,
+            to_zoom,
+            start: Instant::now(),
+            duration,
+            cam: Some((from_cam, to_cam)),
+        }
     }
 
     fn t(&self) -> f64 {
@@ -215,7 +275,10 @@ impl ZoomAnim {
     pub fn current(&self) -> (f64, Point<f64, Logical>) {
         let t = self.t();
         let zoom = lerp(self.from_zoom, self.to_zoom, t);
-        let cam = zoom_anchor_camera(self.anchor_canvas, self.anchor_screen, zoom);
+        let cam = match self.cam {
+            Some((from, to)) => Point::from((lerp(from.x, to.x, t), lerp(from.y, to.y, t))),
+            None => zoom_anchor_camera(self.anchor_canvas, self.anchor_screen, zoom),
+        };
         (zoom, cam)
     }
 }
@@ -301,6 +364,146 @@ impl OpenAnim {
     }
 }
 
+// ── Столкновения на лету (режим коллизии, Super+S) ───────────────────────────
+
+/// Доля скорости вдоль оси удара, которая уходит тому, кого ударили.
+const IMPULSE_TRANSFER: f64 = 0.72;
+/// Сколько скорости вдоль оси удара остаётся у ударившего (остальное гасится
+/// «на удар»). Сумма с TRANSFER меньше 1 — столкновение неупругое, куча окон
+/// не разгоняет сама себя.
+const IMPULSE_KEEP: f64 = 0.22;
+/// Минимальный и максимальный толчок (px/сек): совсем вялый контакт всё равно
+/// должен заметно отодвинуть соседа, а очень резкий — не улететь за горизонт.
+pub(crate) const IMPULSE_MIN: f64 = 240.0;
+pub(crate) const IMPULSE_MAX: f64 = 2200.0;
+/// Перекрытие меньше этого (px) — шум округления, столкновения нет.
+const COLLIDE_EPS: i32 = 2;
+/// Скорость сближения (px/сек), ниже которой удар не считается: без этого
+/// порога уже разъезжающиеся, но ещё перекрытые окна били бы друг друга каждый
+/// кадр и дрожали на месте.
+const APPROACH_EPS: f64 = 30.0;
+
+/// Позиция и скорость окна ПРЯМО СЕЙЧАС (кадр полёта, если оно летит).
+/// В отличие от `window_anim_target` здесь нужна именно живая геометрия:
+/// столкновение происходит там, где окна находятся, а не там, где они
+/// когда-нибудь остановятся.
+fn live_motion(state: &Dawn, window: &Window) -> Option<(Point<f64, Logical>, Point<f64, Logical>)> {
+    if let Some((_, anim)) = state.window_pos_anims.iter()
+        .find(|(w, _)| crate::dwindle::same_window(w, window))
+    {
+        return Some((anim.pos, anim.vel));
+    }
+    let loc = state.space.element_geometry(window)?.loc;
+    Some((loc.to_f64(), Point::from((0.0, 0.0))))
+}
+
+/// Окна, летящие по инерции, не проходят сквозь соседей: на контакте окно
+/// отдаёт часть импульса тому, в кого врезалось (тот сам уезжает по инерции и
+/// толкает дальше — цепочка получается сама собой, каждый толкнутый становится
+/// летящим), гасит свою скорость вдоль оси удара и выходит из соседа, чтобы за
+/// кадр полёта не «залететь» внутрь него.
+///
+/// Зовётся каждый кадр из tick() ПОСЛЕ интегрирования пружин.
+fn resolve_fling_collisions(state: &mut Dawn) {
+    // Коллизия — режим свободного холста: в тайлинге позиции держит раскладка,
+    // а в обзоре столов окно не должно вылетать за рамку своего стола.
+    if !state.is_snapping_enabled || state.overview_active
+        || state.tile_config.layout != Layout::Float
+    {
+        return;
+    }
+
+    let fliers: Vec<Window> = state.window_pos_anims.iter()
+        .filter(|(_, anim)| anim.fling && !anim.is_done())
+        .map(|(w, _)| w.clone())
+        .collect();
+    if fliers.is_empty() {
+        return;
+    }
+
+    let tags = state.viewport.current_tags();
+    // Схлопнутая стопка (2.4) перекрывается сама с собой намеренно — её не
+    // расталкиваем. Окно под курсором в драге тоже не трогаем: его позицию
+    // каждый motion задаёт мышь, и анимация дралась бы с ней.
+    let candidates: Vec<Window> = state.tagged_windows.iter()
+        .filter(|tw| tw.tags & tags != 0 && !tw.folded)
+        .map(|tw| tw.window.clone())
+        .filter(|w| state.dragged_window.as_ref().is_none_or(|d| !crate::dwindle::same_window(d, w)))
+        .collect();
+
+    for flier in &fliers {
+        let (fpos, fvel) = match state.window_pos_anims.iter()
+            .find(|(w, _)| crate::dwindle::same_window(w, flier))
+        {
+            Some((_, a)) if a.fling && !a.is_done() => (a.pos, a.vel),
+            _ => continue,
+        };
+        let fsize = match state.space.element_geometry(flier) { Some(g) => g.size, None => continue };
+        let frect = Rectangle::new(fpos.to_i32_round(), fsize);
+
+        for other in &candidates {
+            if crate::dwindle::same_window(other, flier) { continue; }
+            let osize = match state.space.element_geometry(other) { Some(g) => g.size, None => continue };
+            let (opos, ovel) = match live_motion(state, other) { Some(m) => m, None => continue };
+            let orect = Rectangle::new(opos.to_i32_round(), osize);
+            let inter = match frect.intersection(orect) { Some(i) => i, None => continue };
+            if inter.size.w <= COLLIDE_EPS || inter.size.h <= COLLIDE_EPS { continue; }
+
+            // Нормаль удара — ось наименьшего перекрытия, направление «от
+            // бьющего к битому» (minimum translation vector).
+            let (nx, ny, depth) = if inter.size.w < inter.size.h {
+                let dir = if opos.x + osize.w as f64 / 2.0 >= fpos.x + fsize.w as f64 / 2.0 { 1.0 } else { -1.0 };
+                (dir, 0.0, inter.size.w as f64)
+            } else {
+                let dir = if opos.y + osize.h as f64 / 2.0 >= fpos.y + fsize.h as f64 / 2.0 { 1.0 } else { -1.0 };
+                (0.0, dir, inter.size.h as f64)
+            };
+
+            // Уже разъезжаются (толчок применён кадр назад, битый едет быстрее
+            // бьющего) — второй раз бить не за что.
+            let approach = (fvel.x - ovel.x) * nx + (fvel.y - ovel.y) * ny;
+            if approach <= APPROACH_EPS { continue; }
+
+            // Толчок битому: он летит той же инерционной пружиной, значит сам
+            // становится «бьющим» на следующем кадре — волна идёт дальше.
+            // Пола у толчка здесь НЕТ (в отличие от драга, где энергию
+            // подводит рука): иначе вялый контакт в 31 px/сек порождал бы
+            // толчок в 240, куча окон разгоняла бы сама себя и дрожала бы без
+            // остановки. Слабый удар — слабый толчок; из соседа бьющий всё
+            // равно выталкивается позиционно, ниже.
+            let transfer = (approach * IMPULSE_TRANSFER).min(IMPULSE_MAX);
+            state.impulse_window(other, Point::from((nx * transfer, ny * transfer)), glide_omega(transfer));
+
+            // Бьющий: гасим скорость вдоль оси удара и ВЫТАЛКИВАЕМ его из
+            // соседа на глубину проникновения. Без этой поправки окно за один
+            // кадр полёта (v·dt — десятки пикселей) въезжает внутрь соседа и
+            // так и остаётся там висеть — это и есть «залетают друг в друга».
+            let lost = approach * (1.0 - IMPULSE_KEEP);
+            let new_vel = Point::from((fvel.x - nx * lost, fvel.y - ny * lost));
+            let new_pos = Point::from((fpos.x - nx * depth, fpos.y - ny * depth));
+            let speed = (new_vel.x * new_vel.x + new_vel.y * new_vel.y).sqrt();
+            if let Some((_, anim)) = state.window_pos_anims.iter_mut()
+                .find(|(w, _)| crate::dwindle::same_window(w, flier))
+            {
+                anim.pos = new_pos;
+                anim.coast(new_vel, glide_omega(speed));
+                let target = anim.target.to_i32_round();
+                state.space.map_element(flier.clone(), new_pos.to_i32_round(), false);
+                if let Some(tw) = state.tagged_windows.iter_mut()
+                    .find(|tw| crate::dwindle::same_window(&tw.window, flier))
+                {
+                    tw.float_position = target;
+                    tw.position = target;
+                    tw.float_position_set = true;
+                }
+            }
+            // Один удар на кадр: окно, зажатое между двумя соседями, иначе
+            // получало бы две поправки позиции подряд и дёргалось.
+            break;
+        }
+    }
+}
+
 /// Запасной шаг, если тик зовут первый раз (реального dt ещё нет).
 const FRAME_DT: Duration = Duration::from_millis(16);
 /// Потолок шага: после паузы (VT-switch, зависший кадр) инерция не должна
@@ -331,17 +534,23 @@ pub fn tick(state: &mut Dawn) {
     // поздний momentum.launch() (напр. финальный кадр тачпад-жеста, пришедший
     // уже ПОСЛЕ Win+D) иначе "доезжал" и утаскивал разложенные окна за кадр
     // ("окна уезжают после Win+D").
+    // Экранная точка курсора, которую обязана удержать инерция (см. ниже).
+    let mut pin_after_camera = None;
+
     if state.tile_config.layout == Layout::Float
         && state.camera_anim.is_none() && state.zoom_anim.is_none()
     {
         if let Some(delta) = state.momentum.tick(dt) {
+            // Инерция — продолжение пана, и курсор в ней обязан стоять на месте
+            // экрана ровно так же, как в самом пане (Dawn::pan_camera_by).
+            // Полагаться тут на отложенную sync_pointer_to_camera нельзя: она
+            // ловит уже уехавшую стрелку и дёргает её назад — в логе
+            // 20260729_204021 это `СИНХ КУРСОР ... снос=(17.6,30.0)` сразу
+            // после отпускания ЛКМ. Точку берём ДО сдвига камеры, ставим —
+            // ПОСЛЕ apply_camera (порядок обязателен, см. pin_pointer_after_camera).
+            pin_after_camera = Some(state.pointer_screen_physical());
             state.viewport.cam_x += delta.x;
             state.viewport.cam_y += delta.y;
-            // Курсор здесь НЕ трогаем: его тянет за камерой общая
-            // синхронизация в конце итерации цикла (Dawn::sync_pointer_to_camera).
-            // Раньше сдвиг делался прямо тут — экранная позиция сохранялась, но
-            // pointer.motion никто не слал, и под курсором оставалась старая
-            // поверхность.
             dirty = true;
         }
     }
@@ -400,6 +609,9 @@ pub fn tick(state: &mut Dawn) {
             anim.advance(now);
             state.space.map_element(window.clone(), anim.pos.to_i32_round(), false);
         }
+        // Столкновения считаем ПОСЛЕ шага пружин и по живым позициям: удар
+        // происходит там, где окна оказались в этом кадре.
+        resolve_fling_collisions(state);
         state.window_pos_anims.retain(|(_, anim)| !anim.is_done());
         // ВАЖНО: не сбрасывать needs_plane_reset здесь каждый тик — это
         // форсирует полный редрав экрана (reset_buffer_ages) на КАЖДЫЙ кадр
@@ -461,6 +673,9 @@ pub fn tick(state: &mut Dawn) {
 
     if dirty {
         state.apply_camera();
+        if let Some(screen) = pin_after_camera {
+            state.pin_pointer_after_camera(screen);
+        }
         state.request_redraw();
     }
 }

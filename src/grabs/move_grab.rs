@@ -28,10 +28,6 @@ const SWAP_COOLDOWN: Duration = Duration::from_millis(160);
 /// стыке двух окон свапы туда-сюда пингпонгуют от дрожания мыши.
 const SWAP_INSET: f64 = 0.18;
 
-/// Торможение инерции после броска (1/сек): путь доезда = |v|/ω.
-const GLIDE_OMEGA: f64 = 8.0;
-/// Потолок пути доезда (px), чтобы резкий флик не зашвыривал окно за горизонт.
-const MAX_GLIDE: f64 = 420.0;
 
 /// Прямоугольник, В КОТОРОМ окно ОКАЖЕТСЯ: если оно сейчас летит (свап,
 /// толчок), берём цель анимации, а не текущий кадр полёта. Все решения драга
@@ -220,17 +216,30 @@ fn find_snap_target(
 /// зажата — магнитирование отдельно, на отпускании). Каждый пересекающийся
 /// сосед сдвигается по оси наименьшего перекрытия на величину перекрытия —
 /// стандартная эвристика minimum-translation-vector, ощущается как толчок.
-fn push_colliding_windows(data: &mut Dawn, dragged: &Window, dragged_loc: Point<i32, Logical>) {
+///
+/// Толчок ЦЕПНОЙ: сдвинутое окно само становится толкателем для своих соседей,
+/// те — для своих, и так волной по всей куче (BFS). Без каскада окно, стоящее
+/// вплотную за толкнутым, просто оказывалось накрыто им.
+///
+/// `drag_vel` — текущая скорость перетаскивания (px/сек): окно, которого
+/// коснулись первый раз (оно ещё стоит), получает не только сдвиг из-под
+/// курсора, но и ИМПУЛЬС — уезжает по инерции и сам расталкивает дальше
+/// (см. Dawn::impulse_window и resolve_fling_collisions). Раньше сосед просто
+/// доезжал ровно до края и вставал — «пинка» не чувствовалось.
+fn push_colliding_windows(
+    data: &mut Dawn,
+    dragged: &Window,
+    dragged_loc: Point<i32, Logical>,
+    drag_vel: Point<f64, Logical>,
+) {
     let size = match data.space.element_geometry(dragged) { Some(g) => g.size, None => return };
     let dragged_rect = Rectangle::new(dragged_loc, size);
-    let dcx = dragged_loc.x + size.w / 2;
-    let dcy = dragged_loc.y + size.h / 2;
 
     // Геометрия соседей берётся ПОКОЯЩАЯСЯ (цель анимации), а не текущая:
     // толкнутое окно летит несколько кадров, и если каждый кадр пересчитывать
     // перекрытие по его живой позиции, оно толкается снова и снова (цель
     // убегает вместе с ним) — окно уползало рывками, пока курсор рядом.
-    let others: Vec<(Window, Rectangle<i32, Logical>)> = data.space.elements()
+    let mut others: Vec<(Window, Rectangle<i32, Logical>)> = data.space.elements()
         .filter(|w| {
             *w != dragged
         })
@@ -242,29 +251,82 @@ fn push_colliding_windows(data: &mut Dawn, dragged: &Window, dragged_loc: Point<
         })
         .collect();
 
-    for (other, geo) in others {
-        let overlap = match dragged_rect.intersection(geo) { Some(o) => o, None => continue };
-        // Перекрытие в пару пикселей — шум округления, толкать нечего.
-        if overlap.size.w <= 2 || overlap.size.h <= 2 { continue; }
+    // Каждое окно волна двигает не больше одного раза — этим цепочка и
+    // завершается (и не возникает пинг-понга «А толкнул Б, Б толкнул А»).
+    let mut moved = vec![false; others.len()];
+    // Нормаль толчка для каждого сдвинутого окна — по ней даётся импульс.
+    let mut push_dir = vec![(0.0f64, 0.0f64); others.len()];
+    let mut queue: std::collections::VecDeque<Rectangle<i32, Logical>> =
+        std::collections::VecDeque::new();
+    queue.push_back(dragged_rect);
 
-        let ocx = geo.loc.x + geo.size.w / 2;
-        let ocy = geo.loc.y + geo.size.h / 2;
+    while let Some(mover) = queue.pop_front() {
+        let mcx = mover.loc.x + mover.size.w / 2;
+        let mcy = mover.loc.y + mover.size.h / 2;
+        for i in 0..others.len() {
+            if moved[i] { continue; }
+            let geo = others[i].1;
+            let overlap = match mover.intersection(geo) { Some(o) => o, None => continue };
+            // Перекрытие в пару пикселей — шум округления, толкать нечего.
+            if overlap.size.w <= 2 || overlap.size.h <= 2 { continue; }
 
-        let (push_x, push_y) = if overlap.size.w < overlap.size.h {
-            (if ocx >= dcx { overlap.size.w } else { -overlap.size.w }, 0)
-        } else {
-            (0, if ocy >= dcy { overlap.size.h } else { -overlap.size.h })
-        };
+            let ocx = geo.loc.x + geo.size.w / 2;
+            let ocy = geo.loc.y + geo.size.h / 2;
 
-        let new_loc = Point::from((geo.loc.x + push_x, geo.loc.y + push_y));
+            let (push_x, push_y) = if overlap.size.w < overlap.size.h {
+                (if ocx >= mcx { overlap.size.w } else { -overlap.size.w }, 0)
+            } else {
+                (0, if ocy >= mcy { overlap.size.h } else { -overlap.size.h })
+            };
+
+            let new_geo = Rectangle::new(
+                Point::from((geo.loc.x + push_x, geo.loc.y + push_y)),
+                geo.size,
+            );
+            others[i].1 = new_geo;
+            moved[i] = true;
+            // signum() у 0.0 равен 1.0, поэтому нулевую ось задаём явно.
+            push_dir[i] = if push_x != 0 {
+                ((push_x as f64).signum(), 0.0)
+            } else {
+                (0.0, (push_y as f64).signum())
+            };
+            // Отъехавшее окно теперь само толкает тех, на кого наехало.
+            queue.push_back(new_geo);
+        }
+    }
+
+    for (i, (other, geo)) in others.into_iter().enumerate() {
+        if !moved[i] { continue; }
+        // Окно ещё стоит (анимации нет) — это ПЕРВОЕ касание в этой волне:
+        // отдаём ему часть скорости драга вдоль оси толчка, и дальше оно едет
+        // само, по инерции, толкая своих соседей. Пока оно уже летит, только
+        // подправляем цель — доливать импульс каждый кадр значило бы
+        // разгонять его без предела, пока курсор стоит рядом.
+        let resting = data.window_anim_target(&other).is_none();
+        let (nx, ny) = push_dir[i];
+        let along = drag_vel.x * nx + drag_vel.y * ny;
+        if resting && along > 0.0 {
+            let speed = (along * 0.72).clamp(crate::anim::IMPULSE_MIN, crate::anim::IMPULSE_MAX);
+            let stop = data.impulse_window(
+                &other,
+                Point::from((nx * speed, ny * speed)),
+                crate::anim::glide_omega(speed),
+            );
+            // Инерционного доезда может не хватить, чтобы окно вылезло
+            // из-под курсора — тогда добираем до расчётной MTV-позиции.
+            if (geo.loc.x - stop.x) as f64 * nx + (geo.loc.y - stop.y) as f64 * ny <= 0.0 {
+                continue;
+            }
+        }
         // Плавный LERP вместо телепорта — ощущается как инерция толчка
         // (переанимируется на каждый кадр, пока коллизия продолжается).
-        data.animate_window_to_dur(&other, new_loc, PUSH_ANIM_DURATION);
+        data.animate_window_to_dur(&other, geo.loc, PUSH_ANIM_DURATION);
         if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
             tw.window == other
         }) {
-            tw.float_position = new_loc;
-            tw.position = new_loc;
+            tw.float_position = geo.loc;
+            tw.position = geo.loc;
         }
     }
 }
@@ -278,6 +340,10 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
         event: &MotionEvent,
     ) {
         handle.motion(data, None, event);
+
+        // Пока идёт драг, окно принадлежит мыши: анимации (в т.ч. толчок от
+        // прилетевшего по инерции соседа) его не двигают — см. Dawn::dragged_window.
+        data.dragged_window = Some(self.window.clone());
 
         // В обзоре столов раскладку держит overview.rs (arrange там выходит
         // сразу), поэтому окно там всегда таскается свободно — как в Float,
@@ -375,7 +441,7 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
                 // Расталкивание соседей (Super+S) — тоже только вне обзора:
                 // толкнутый сосед уехал бы за рамку своего стола.
                 if data.is_snapping_enabled && !data.overview_active {
-                    push_colliding_windows(data, &self.window, free_loc);
+                    push_colliding_windows(data, &self.window, free_loc, self.velocity.launch_velocity());
                 }
                 // Сохраняем float-позицию и помечаем как вручную размещённое.
                 // В обзоре — не сохраняем: там координаты обзорные (ячейка стола
@@ -509,7 +575,7 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
                     // момент отпускания окно заметно «дёргалось» вперёд.
                     // ω поднимаем на быстрых бросках, чтобы путь доезда
                     // (|v|/ω) не превышал MAX_GLIDE.
-                    let omega = GLIDE_OMEGA.max(speed / MAX_GLIDE);
+                    let omega = crate::anim::glide_omega(speed);
                     let target = data.fling_window(&self.window, v, omega);
                     if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
                         tw.window == self.window
@@ -561,5 +627,7 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
     fn start_data(&self) -> &PointerGrabStartData<Dawn> {
         &self.start_data
     }
-    fn unset(&mut self, _data: &mut Dawn) {}
+    fn unset(&mut self, data: &mut Dawn) {
+        data.dragged_window = None;
+    }
 }

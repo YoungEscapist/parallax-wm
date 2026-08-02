@@ -55,7 +55,13 @@ impl CompositorHandler for Dawn {
             tracing::trace!("dawn: commit for mapped window");
         }
 
-        handle_commit(&mut self.space, surface, !self.overview_active);
+        // Эластичное расталкивание соседей при ресайзе — ТОЛЬКО в режиме
+        // коллизии (Super+S). Без него плавающие окна на холсте должны стоять
+        // там, где их поставили: ресайз соседа не имеет права их двигать.
+        // Обзор ничего не меняет — ресайз там работает по обычной логике
+        // (тайловые окна тянут деления раскладки), как будто обзора нет.
+        let elastic = self.is_snapping_enabled;
+        handle_commit(&mut self.space, surface, elastic);
         self.popups.commit(surface);
 
         // Без этого новый буфер клиента (например, первый кадр kitty/foot)

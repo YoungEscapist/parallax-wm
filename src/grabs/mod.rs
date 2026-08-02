@@ -1,5 +1,4 @@
 pub mod move_grab;
-pub mod pan_grab;
 pub mod resize_grab;
 pub mod select_grab;
 

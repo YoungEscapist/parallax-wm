@@ -29,7 +29,7 @@ use smithay::{
         session::{libseat::LibSeatSession, Event as SessionEvent, Session},
         udev::{UdevBackend, UdevEvent},
     },
-    desktop::{Window, space::SpaceRenderElements},
+    desktop::{Window, space::SpaceRenderElements, layer_map_for_output},
     input::pointer::{CursorImageStatus, CursorImageSurfaceData},
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
@@ -42,7 +42,10 @@ use smithay::{
         rustix::fs::OFlags,
     },
     utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size, Transform},
-    wayland::compositor::with_states,
+    wayland::{
+        compositor::with_states,
+        shell::wlr_layer::Layer as WlrLayer,
+    },
 };
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay_drm_extras::{
@@ -1045,37 +1048,70 @@ fn build_overview_bg_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
     const SHADOW_LAYERS: [(i32, f32); 3] = [(3, 0.10), (7, 0.05), (12, 0.02)];
     // Фон бэнда — тёмный полупрозрачный прямоугольник со скруглёнными углами.
     const BG_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.28];
+    // ПУСТОЙ стол (ни одного окна) карточкой не заливается — только светлый
+    // контур. В ленте этажи стоят вплотную, и хвост пустых столов (niri всегда
+    // держит пустой снизу, а при заходе на дальний стол их набирается несколько
+    // подряд) сливался в одно чёрное пятно под лентой — та самая «тень».
+    const EMPTY_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
     const ROUNDING: i32 = 12;
     let zoom = state.viewport.zoom;
     let cam_x = state.viewport.cam_x;
     let cam_y = state.viewport.cam_y;
     // Собираем прямоугольники до взятия &mut на пул: overview_band_rects()
     // читает state целиком, а пул живёт в нём же.
-    let bands: Vec<_> = state.overview_band_rects().into_iter().collect();
+    let bands: Vec<(Rectangle<i32, Logical>, bool)> = state.overview_band_rects();
+    // Лента (niri): этажи стоят ВПЛОТНУЮ друг к другу, без зазора, и тени у неё
+    // нет вовсе. Слои тени — это СПЛОШНЫЕ прямоугольники позади карточек, а
+    // карточки полупрозрачные (BG_COLOR alpha 0.28): общая тень на всю полосу
+    // просвечивала сквозь этажи чёрным пятном и вылезала ореолом под нижним
+    // этажом. В сетке столов (не лента) карточки разнесены зазорами, там тень
+    // читается как ореол и остаётся.
+    //
+    // Пустые столы тени не отбрасывают тем более: их карточки нет, а тень —
+    // сплошной чёрный прямоугольник, то есть ровно то пятно, от которого мы
+    // и уходим.
+    let strip = state.overview_strip;
+    let shadow_rects: Vec<Rectangle<i32, Logical>> = if strip {
+        Vec::new()
+    } else {
+        bands.iter().filter(|(_, empty)| !empty).map(|(r, _)| *r).collect()
+    };
+    let to_screen = |r: Rectangle<i32, Logical>| -> (i32, i32, i32, i32) {
+        (
+            ((r.loc.x as f64 - cam_x) * zoom).round() as i32,
+            ((r.loc.y as f64 - cam_y) * zoom).round() as i32,
+            (r.size.w as f64 * zoom).round() as i32,
+            (r.size.h as f64 * zoom).round() as i32,
+        )
+    };
     let pool = &mut state.overview_bg_ids;
     let mut idx = 0usize;
-    for r in bands {
-        let sx = ((r.loc.x as f64 - cam_x) * zoom).round() as i32;
-        let sy = ((r.loc.y as f64 - cam_y) * zoom).round() as i32;
-        let sw = (r.size.w as f64 * zoom).round() as i32;
-        let sh = (r.size.h as f64 * zoom).round() as i32;
+
+    // ── Фоны столов ──
+    // ВАЖНО: сначала фоны, тени — ниже. Список элементов идёт спереди назад,
+    // так что запушенное РАНЬШЕ рисуется ПОВЕРХ. Тени, стоявшие до фона своего
+    // же стола, ложились полупрозрачным пятном на всю его карточку и делали её
+    // темнее задуманного вместо ореола по краям.
+    for &(r, empty) in &bands {
+        let (sx, sy, sw, sh) = to_screen(r);
         if sw <= 0 || sh <= 0 {
             continue;
         }
-
-        // ── Тени (позади бэнда) ──
-        for (spread, alpha) in SHADOW_LAYERS {
-            let sx_sh = sx - spread;
-            let sy_sh = sy - spread;
-            let sw_sh = sw + 2 * spread;
-            let sh_sh = sh + 2 * spread;
-            let color = [0.0f32, 0.0, 0.0, alpha];
+        // Пустой стол — только рамка: место под ним видно (туда бросают окно,
+        // чтобы завести новый стол), но чёрной заливки нет.
+        if empty {
+            let t = ((2.0 * zoom).round() as i32).max(1);
+            if sw <= 2 * t || sh <= 2 * t {
+                continue;
+            }
+            els.push(pooled_solid(pool, &mut idx, (sx, sy), (sw, t), EMPTY_COLOR));
+            els.push(pooled_solid(pool, &mut idx, (sx, sy + sh - t), (sw, t), EMPTY_COLOR));
+            els.push(pooled_solid(pool, &mut idx, (sx, sy + t), (t, sh - 2 * t), EMPTY_COLOR));
             els.push(pooled_solid(
-                pool, &mut idx, (sx_sh, sy_sh), (sw_sh.max(1), sh_sh.max(1)), color,
+                pool, &mut idx, (sx + sw - t, sy + t), (t, sh - 2 * t), EMPTY_COLOR,
             ));
+            continue;
         }
-
-        // ── Фон бэнда (скруглённый) ──
         let r_px = (ROUNDING as f64 * zoom).round() as i32;
         let widths = corner_cutout_widths(r_px);
         let rr = widths.len() as i32;
@@ -1089,6 +1125,174 @@ fn build_overview_bg_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
             let i = i as i32;
             els.push(pooled_solid(pool, &mut idx, (sx + cw, sy + i), (rw, sh - 2 * i), BG_COLOR));
         }
+    }
+
+    // ── Тени (позади карточек) ──
+    for r in &shadow_rects {
+        let (sx, sy, sw, sh) = to_screen(*r);
+        if sw <= 0 || sh <= 0 {
+            continue;
+        }
+        for (spread, alpha) in SHADOW_LAYERS {
+            let color = [0.0f32, 0.0, 0.0, alpha];
+            els.push(pooled_solid(
+                pool, &mut idx,
+                (sx - spread, sy - spread),
+                ((sw + 2 * spread).max(1), (sh + 2 * spread).max(1)),
+                color,
+            ));
+        }
+    }
+    els
+}
+
+/// Нарисовать скруглённый прямоугольник solid-элементами (строчный corner-cutout).
+/// Каждый ряд — один `pooled_solid`; для больших радиусов генерирует ~2×radius
+/// элементов. Если радиус 0 или ≥ половины меньшей стороны — рисует обычный rect.
+fn rounded_solid(
+    pool: &mut Vec<SolidSlot>, idx: &mut usize,
+    x: i32, y: i32, w: i32, h: i32, radius: i32, color: [f32; 4],
+    out: &mut Vec<OutputRenderElements>,
+) {
+    if radius <= 0 || radius > w.min(h) / 2 {
+        out.push(pooled_solid(pool, idx, (x, y), (w, h), color));
+        return;
+    }
+    let widths = corner_cutout_widths(radius);
+    let rr = widths.len() as i32; // радиус в пикселях (число строк)
+    // Верхняя половина: отрезаем углы построчно
+    for i in 0..rr {
+        let cw = widths[i as usize];
+        let rw = w - 2 * cw;
+        if rw > 0 {
+            out.push(pooled_solid(pool, idx, (x + cw, y + i), (rw, 1), color));
+        }
+    }
+    // Средняя часть: сплошной прямоугольник на всю ширину
+    let mid_h = h - 2 * rr;
+    if mid_h > 0 {
+        out.push(pooled_solid(pool, idx, (x, y + rr), (w, mid_h), color));
+    }
+    // Нижняя половина
+    for i in 0..rr {
+        let cw = widths[i as usize];
+        let rw = w - 2 * cw;
+        if rw > 0 {
+            out.push(pooled_solid(pool, idx, (x + cw, y + h - rr + i), (rw, 1), color));
+        }
+    }
+}
+
+/// Панель рабочих столов — скруглённый бар сверху по центру.
+/// Круглые точки = новые (непосещённые) столы. Белые иконки для посещённых:
+/// круг=Tile, две колонки=Columns (niri), две тильды=Float, рамка=Monocle.
+fn build_workspace_bar_elements(state: &mut Dawn, output: &Output) -> Vec<OutputRenderElements> {
+    let mut els = Vec::new();
+    let mode = match output.current_mode() { Some(m) => m, None => return els };
+
+    // Размеры: крупный скруглённый бар сверху.
+    const BAR_H: i32 = 48;
+    const BAR_RADIUS: i32 = 20;        // скругление фона бара
+    const DOT: i32 = 28;
+    const DOT_RADIUS: i32 = 14;        // скругление точек = круги
+    const GAP: i32 = 8;
+    const PAD_H: i32 = 20;
+    const PAD_V: i32 = (BAR_H - DOT) / 2;
+    const BAR_W: i32 = 2 * PAD_H + 9 * DOT + 8 * GAP;
+
+    let ox = (mode.size.w - BAR_W) / 2;
+    let oy = 10; // сверху, с отступом 10px
+
+    let pool = &mut state.bar_ids;
+    let mut idx = 0usize;
+
+    // Фон бара — тёмный полупрозрачный скруглённый прямоугольник.
+    const BG: [f32; 4] = [0.04, 0.04, 0.07, 0.65];
+    rounded_solid(pool, &mut idx, ox, oy, BAR_W, BAR_H, BAR_RADIUS, BG, &mut els);
+
+    let current_tags = state.viewport.current_tags();
+
+    for i in 0..9u32 {
+        let tag = 1u32 << i;
+        let cx = ox + PAD_H + i as i32 * (DOT + GAP);
+
+        // Определяем layout стола
+        let layout = state.tag_layouts.get(&tag).copied();
+
+        if layout.is_none() && tag != current_tags && !state.visited_tags.contains(&tag) {
+            // Новый, ещё не посещённый стол — серая круглая точка.
+            const DOT_GRAY: [f32; 4] = [0.5, 0.5, 0.55, 0.6];
+            rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, DOT, DOT_RADIUS, DOT_GRAY, &mut els);
+        } else {
+            let act = tag == current_tags;
+            let base_color: [f32; 4] = if act {
+                [1.0, 1.0, 1.0, 0.95]
+            } else {
+                [1.0, 1.0, 1.0, 0.40]
+            };
+
+            match layout.unwrap_or(crate::tiling::Layout::Tile) {
+                crate::tiling::Layout::Tile => {
+                    // Круг — сам по себе иконка Tile
+                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, DOT, DOT_RADIUS, base_color, &mut els);
+                }
+                crate::tiling::Layout::Columns => {
+                    // Фон — круг; поверх него две скруглённые колонки
+                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, DOT, DOT_RADIUS, base_color, &mut els);
+                    let cw = (DOT * 2 / 5).max(2);
+                    let gap = DOT - 2 * cw;
+                    let inner_r = (cw / 2).max(1);
+                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, cw, DOT, inner_r, base_color, &mut els);
+                    rounded_solid(pool, &mut idx, cx + cw + gap, oy + PAD_V, cw, DOT, inner_r, base_color, &mut els);
+                }
+                crate::tiling::Layout::Float => {
+                    // Фон — круг; поверх него две скруглённые тильды
+                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, DOT, DOT_RADIUS, base_color, &mut els);
+                    let th = (DOT / 3).max(2);
+                    let tgap = DOT - 2 * th;
+                    let inner_r = (th / 2).max(1);
+                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, th, inner_r, base_color, &mut els);
+                    rounded_solid(pool, &mut idx, cx, oy + PAD_V + th + tgap, DOT, th, inner_r, base_color, &mut els);
+                }
+                crate::tiling::Layout::Monocle => {
+                    // Фон — круг; поверх него скруглённый вложенный квадрат
+                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, DOT, DOT_RADIUS, base_color, &mut els);
+                    let inset = (DOT / 4).max(1);
+                    let mw = DOT - 2 * inset;
+                    let mh = DOT - 2 * inset;
+                    let inner_r = (inset / 2).max(1);
+                    rounded_solid(pool, &mut idx, cx + inset, oy + PAD_V + inset, mw, mh, inner_r, base_color, &mut els);
+                }
+            }
+        }
+    }
+
+    els
+}
+
+/// Рендер layer-поверхностей (wlr-layer-shell) для заданных слоёв.
+/// Каждая layer-поверхность рисуется через render_elements_from_surface_tree
+/// в позиции, которую ей назначил LayerMap.
+fn build_layer_elements(
+    _state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    layers: &[WlrLayer],
+) -> Vec<OutputRenderElements> {
+    let mut els = Vec::new();
+    let map = layer_map_for_output(output);
+    // Собираем все подходящие layer-поверхности (сортируем по вложению).
+    let to_render: Vec<_> = map.layers().filter(|l| layers.contains(&l.layer())).cloned().collect();
+    for layer_surface in to_render {
+        let Some(geo) = map.layer_geometry(&layer_surface) else { continue };
+        let phys_loc: Point<i32, Physical> = (geo.loc.x, geo.loc.y).into();
+        // Рендерим основную поверхность + дочерние.
+        layer_surface.with_surfaces(|surface, _states| {
+            let surface_els = render_elements_from_surface_tree(
+                renderer, surface, phys_loc, 1.0, 1.0, Kind::Unspecified,
+            );
+            els.extend(surface_els);
+        });
     }
     els
 }
@@ -1221,6 +1425,12 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     // элементы, когда сессия просит кадр без курсора (см. serve_pending).
     let cursor_elements = elements.len();
 
+    // ── Overlay-слой (wlr-layer-shell): выше всего, ниже курсора ──────────────
+    elements.extend(build_layer_elements(state, renderer, &surface.output, &[WlrLayer::Overlay]));
+
+    // ── Панель рабочих столов (всегда видна, поверх окон, под курсором) ────
+    elements.extend(build_workspace_bar_elements(state, &surface.output));
+
     // ── Миникарта (3.1, поверх окон, под курсором) ───────────────────────────
     // Не показываем во время обзора столов (перекрывает ленту).
     if state.is_minimap_visible && !state.overview_active {
@@ -1269,6 +1479,9 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     // ── Мультивыделение (rubber-band + подсветка "созвездий") ───────────────
     elements.extend(build_selection_elements(state));
 
+    // ── Top-слой (wlr-layer-shell): поверх окон, под UI -----------------------
+    elements.extend(build_layer_elements(state, renderer, &surface.output, &[WlrLayer::Top]));
+
     // ── Space elements (behind cursor) ───────────────────────────────────────
     // ВАЖНО: используем штатный space.render_elements_for_output (проверенный,
     // работавший путь), а не ручной per-window цикл — на живом тесте ручной
@@ -1280,6 +1493,9 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
         Ok(els) => elements.extend(els.into_iter().map(OutputRenderElements::from)),
         Err(e) => { tracing::warn!("dawn/udev: render_elements: {:?}", e); return; }
     }
+
+    // ── Bottom-слой (wlr-layer-shell): под окнами, над фоном ──────────────────
+    elements.extend(build_layer_elements(state, renderer, &surface.output, &[WlrLayer::Bottom]));
 
     // ── Тени окон (полупрозрачные, скруглённые), сразу ПОЗАДИ окон ──────────
     // В обзоре тоже рисуем: раньше их там отключали из-за цены (225 элементов
@@ -1293,10 +1509,11 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     // ── Фон рабочих столов в обзоре (только при тапе Super), позади окон ────
     elements.extend(build_overview_bg_elements(state));
 
-    // ── Параллакс-фон (5.1) — самый задний слой, сдвигается медленнее окон ──
+    // ── Parallax + Background-слой (wlr-layer-shell): самый задний план ─────────
     if let Some(mode) = surface.output.current_mode() {
         elements.extend(build_parallax_elements(state, renderer, mode));
     }
+    elements.extend(build_layer_elements(state, renderer, &surface.output, &[WlrLayer::Background]));
 
     let element_count = elements.len();
     let output_name = surface.output.name();
@@ -1367,6 +1584,17 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
             );
         }
     });
+    // Frame callbacks для layer-поверхностей
+    {
+        let map = layer_map_for_output(&surface.output);
+        for layer_surface in map.layers() {
+            layer_surface.send_frame(
+                &surface.output, elapsed,
+                Some(Duration::from_millis(16)),
+                |_, _| Some(surface.output.clone()),
+            );
+        }
+    }
 }
 
 /// Рендерит все CRTC на всех устройствах прямо сейчас.

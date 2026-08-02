@@ -104,10 +104,10 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
     ) {
         handle.motion(data, None, event);
 
-        // Проверяем — окно в тайлинге? В обзоре столов тайлинг НЕ активен
-        // (arrange отключён), поэтому там ресайз свободный, как во Float.
-        let is_tiled = !data.overview_active
-            && data.tile_config.layout != Layout::Float
+        // Окно в тайлинге? В обзоре — ровно та же проверка: ресайз там обязан
+        // работать «как будто обзора нет», то есть тянуть деления раскладки, а
+        // не менять размер окна свободно.
+        let is_tiled = data.tile_config.layout != Layout::Float
             && data.tagged_windows.iter().any(|tw| {
                 !tw.floating
                     && tw.window == self.window
@@ -182,31 +182,12 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
 
         let min_w = min_size.w.max(1);
         let min_h = min_size.h.max(1);
-        let mut max_w = if max_size.w == 0 { i32::MAX } else { max_size.w };
-        let mut max_h = if max_size.h == 0 { i32::MAX } else { max_size.h };
+        let max_w = if max_size.w == 0 { i32::MAX } else { max_size.w };
+        let max_h = if max_size.h == 0 { i32::MAX } else { max_size.h };
 
-        // В обзоре рамка стола — такой же ограничитель, как max_size клиента:
-        // окно ресайзится в пределах своего стола и не «выталкивается» за него.
-        // Считаем от неподвижного края (тянем за LEFT/TOP — двигается левый/
-        // верхний край, значит упираемся в левую/верхнюю границу стола).
-        if data.overview_active {
-            if let Some(area) = data.overview_mask_of_window(&self.window)
-                .and_then(|m| data.overview_window_area(m))
-            {
-                let limit_w = if self.edges.intersects(ResizeEdge::LEFT) {
-                    self.initial_rect.loc.x + self.initial_rect.size.w - area.loc.x
-                } else {
-                    area.loc.x + area.size.w - self.initial_rect.loc.x
-                };
-                let limit_h = if self.edges.intersects(ResizeEdge::TOP) {
-                    self.initial_rect.loc.y + self.initial_rect.size.h - area.loc.y
-                } else {
-                    area.loc.y + area.size.h - self.initial_rect.loc.y
-                };
-                max_w = max_w.min(limit_w.max(1));
-                max_h = max_h.min(limit_h.max(1));
-            }
-        }
+        // Рамкой стола ресайз в обзоре больше НЕ ограничен: плавающее окно
+        // тянется там ровно так же, как вне обзора (у остальных ресайз идёт
+        // тайловой веткой выше).
 
         self.last_window_size = Size::from((
             new_w.min(max_w).max(min_w),
@@ -286,8 +267,7 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
             // Только для floating (и обзора) — финализируем resize.
             // В tiling/columns: сбрасываем ResizeSurfaceState (commit-хендлер
             // не должен корректировать позицию — ей управляет layout).
-            let is_tiled = !data.overview_active
-                && data.tile_config.layout != Layout::Float
+            let is_tiled = data.tile_config.layout != Layout::Float
                 && data.tagged_windows.iter().any(|tw| {
                     !tw.floating
                         && tw.window == self.window
@@ -518,9 +498,7 @@ fn elastic_displace(
     }
 }
 
-/// `elastic` — расталкивать ли соседей примыкающими краями (2.3). В обзоре
-/// столов выключено: миниатюры стоят в зазоре GAP_INNER друг от друга, то есть
-/// все соседи «примыкающие», и любой ресайз выдавливал бы их за рамку стола.
+/// `elastic` — расталкивать ли соседей примыкающими краями (2.3).
 pub fn handle_commit(space: &mut Space<Window>, surface: &WlSurface, elastic: bool) -> Option<()> {
     let window = space
         .elements()

@@ -5,11 +5,16 @@
 //! отдаляется. В обзоре:
 //!  · ОКНА не трогаются — только ПАН (ЛКМ-драг по пустому месту / 2-пальца) и
 //!    ЗУМ (колесо);
-//!  · Win+Alt+ЛКМ-драг → перетащить сам стол: он переезжает по ячейкам сетки
-//!    вслед за курсором, на отпускании встаёт в ближайшую (потянул влево →
-//!    слева от центрального); занятая ячейка → столы меняются местами;
+//!  · САМИ СТОЛЫ не двигаются: ячейку каждому выдаёт обзор (кольцами вокруг
+//!    центрального, см. first_free_cell) — перетаскивания столов нет;
 //!  · повторный тап Super или ПКМ → выйти на стол ПОД КУРСОРОМ (плавный перелёт);
 //!  · LMB-клик по столу → плавный перелёт к нему.
+//!
+//! В ленте (Layout::Columns, niri) обзор устроен иначе — см. «Обзор ленты»
+//! ниже: там столы уже лежат этажами одного холста, поэтому окна не
+//! перекладываются вовсе, а камера просто отъезжает и вписывает ленту целиком
+//! (как Super+Space, только с точным кадром). Клики, драг окон, зум колесом и
+//! выход работают там так же, как в сеточном обзоре.
 //!
 //! При выходе на ДРУГОЙ стол: камера летит к его ячейке в обзоре, затем
 //! финализируется выход (восстановление layout/зума). При выходе на тот же
@@ -49,9 +54,35 @@ impl Dawn {
         self.tile_config.layout != Layout::Float
     }
 
+    /// Помнит ли стол `tag` ПЛАВАЮЩУЮ раскладку. Правило то же, что у
+    /// columns_is_strip_tag: закрепление (стол 3 = Float) сильнее памяти, а у
+    /// ТЕКУЩЕГО стола источник правды — живая раскладка.
+    ///
+    /// Плавающие столы в обзор не попадают ВООБЩЕ (ни рамкой, ни окнами): их
+    /// окна разбросаны вручную по бесконечному холсту, в ячейку сетки они
+    /// влезают только сжатыми в миниатюры, а на выходе их приходится
+    /// восстанавливать снимком — то есть обзор для них не показывает ничего
+    /// полезного и только рискует ручной раскладкой.
+    pub fn overview_is_float_tag(&self, tag: u32) -> bool {
+        match self.tag_layouts.get(&tag) {
+            Some(l) => *l == Layout::Float,
+            None if tag == self.viewport.current_tags() => {
+                self.tile_config.layout == Layout::Float
+            }
+            None => false,
+        }
+    }
+
     pub fn toggle_overview(&mut self) {
         // Если идёт exit-анимация — не трогаем, даём завершиться.
         if self.overview_exit_pending {
+            return;
+        }
+        // Лента (niri): обзор — это отъезд камеры, а не пересборка окон, и
+        // выходим мы просто на этаж под курсором (см. exit_overview_strip).
+        if self.overview_strip {
+            let mask = self.overview_workspace_at(self.pointer_location);
+            self.exit_overview_strip(mask, None);
             return;
         }
         // Вход разрешён из всех раскладок, кроме Float (см. overview_allowed);
@@ -84,6 +115,10 @@ impl Dawn {
             return;
         }
         let mask = self.overview_workspace_at(self.pointer_location);
+        if self.overview_strip {
+            self.exit_overview_strip(mask, None);
+            return;
+        }
 
         if let Some(target_mask) = mask {
             let cur_mask = self.viewport.current_tags();
@@ -126,8 +161,11 @@ impl Dawn {
         if !self.overview_active {
             return;
         }
+        if self.overview_strip {
+            self.exit_overview_strip(switch_to, None);
+            return;
+        }
         self.overview_active = false;
-        self.overview_drag_ws = None;
         self.overview_exit_pending = false;
         self.overview_exit_target_ws = None;
 
@@ -243,7 +281,7 @@ impl Dawn {
     /// Порядок внутри кольца — по часовой от правого соседа, так что при 5
     /// столах получается «крест»: центр и по одному соседу с каждой стороны,
     /// и только с шестого стола идут диагонали.
-    /// Диапазон тот же, что у снапа перетаскивания стола (±9).
+    /// Диапазон ячеек — ±9 (больше девяти столов не бывает).
     fn first_free_cell(taken: &std::collections::HashSet<(i32, i32)>) -> (i32, i32) {
         for cell in Self::spiral_cells() {
             if !taken.contains(&cell) {
@@ -288,8 +326,10 @@ impl Dawn {
     }
 
     /// Область ВНУТРИ стола, в которой разрешено находиться окну: рамка минус
-    /// внешний отступ. За её пределы окно в обзоре не выпускают ни перетаскивание
-    /// (move_grab), ни ресайз (resize_grab) — стол работает как жёсткая рамка.
+    /// внешний отступ. За её пределы окно в обзоре не выпускает перетаскивание
+    /// (move_grab) — стол работает как жёсткая рамка. Ресайз рамкой НЕ
+    /// ограничен: он в обзоре идёт по обычной логике раскладки (см.
+    /// resize_grab.rs), а тайловому дереву эта же область служит рабочей.
     pub fn overview_window_area(&self, mask: u32) -> Option<Rectangle<i32, Logical>> {
         let r = self.overview_band_rect(mask)?;
         Some(Rectangle::new(
@@ -316,6 +356,11 @@ impl Dawn {
         loc: Point<i32, Logical>,
         size: Size<i32, Logical>,
     ) -> Point<i32, Logical> {
+        // В ленте окно тащат свободно: этажи стоят вплотную, и «жёсткая рамка»
+        // стола мешала бы перетащить окно на соседний этаж.
+        if self.overview_strip {
+            return loc;
+        }
         let Some(area) = self.overview_window_area(mask) else { return loc };
         let max_x = area.loc.x + (area.size.w - size.w).max(0);
         let max_y = area.loc.y + (area.size.h - size.h).max(0);
@@ -323,73 +368,6 @@ impl Dawn {
             loc.x.clamp(area.loc.x, max_x),
             loc.y.clamp(area.loc.y, max_y),
         ))
-    }
-
-    /// Ячейка сетки, в которую попадает точка `pos` (canvas).
-    fn cell_at(pos: Point<f64, Logical>, w: i32, h: i32) -> (i32, i32) {
-        let stride_x = (w + BAND_GAP) as f64;
-        let stride_y = (h + BAND_GAP) as f64;
-        (
-            (pos.x / stride_x).round() as i32,
-            (pos.y / stride_y).round() as i32,
-        )
-    }
-
-    /// Ставит стол `mask` в ячейку `cell`; занята другим столом → столы
-    /// меняются ячейками местами. Возвращает true, если расстановка изменилась
-    /// (вызывающему нужен overview_layout).
-    fn overview_place_workspace(&mut self, mask: u32, cell: (i32, i32)) -> bool {
-        let cur = *self.overview_slots.get(&mask).unwrap_or(&(0, 0));
-        if cur == cell || cell.0.abs() > 9 || cell.1.abs() > 9 {
-            return false;
-        }
-        let occupant = self.overview_slots.iter()
-            .find(|(t, &c)| **t != mask && c == cell)
-            .map(|(t, _)| *t);
-        if let Some(other) = occupant {
-            self.overview_slots.insert(other, cur);
-        }
-        self.overview_slots.insert(mask, cell);
-        tracing::info!(
-            "dawn: overview workspace {:#b} → cell ({},{})",
-            mask, cell.0, cell.1
-        );
-        true
-    }
-
-    /// Живой драг стола мышью (Win+Alt+ЛКМ): стол переезжает в ячейку под
-    /// курсором, вместе со всеми своими окнами. Переклеиваем раскладку только
-    /// на смене ячейки — иначе overview_layout молотил бы на каждое событие
-    /// движения мыши.
-    pub fn overview_drag_workspace_to(&mut self, mask: u32, pos: Point<f64, Logical>) {
-        if !self.overview_active {
-            return;
-        }
-        let Some((w, h)) = self.overview_band_size() else { return };
-        if self.overview_place_workspace(mask, Self::cell_at(pos, w, h)) {
-            self.overview_layout(w, h);
-            self.request_plane_reset();
-        }
-        self.request_redraw();
-    }
-
-    /// Переставить ВЕСЬ стол под курсором в соседнюю ячейку сетки обзора с
-    /// клавиатуры. По умолчанию ни на что не забиндено (стол таскают мышью,
-    /// Win+Alt+ЛКМ), но действие `move_workspace_slot` доступно из config.lua.
-    pub fn overview_move_workspace_slot(&mut self, dx: i32, dy: i32) {
-        if !self.overview_active || self.overview_exit_pending {
-            return;
-        }
-        let Some((w, h)) = self.overview_band_size() else { return };
-        let mask = self.overview_workspace_at(self.pointer_location)
-            .or_else(|| self.overview_nearest_workspace(self.pointer_location))
-            .unwrap_or_else(|| self.viewport.current_tags());
-        let cur = *self.overview_slots.get(&mask).unwrap_or(&(0, 0));
-        if self.overview_place_workspace(mask, (cur.0 + dx, cur.1 + dy)) {
-            self.overview_layout(w, h);
-            self.request_plane_reset();
-            self.request_redraw();
-        }
     }
 
     /// Camera position to center a given slot on screen at current zoom.
@@ -439,7 +417,18 @@ impl Dawn {
             return;
         }
         if !self.overview_allowed() {
-            tracing::debug!("dawn: обзор не открывается в тайловом режиме");
+            // Текст отставал от кода: запрет давно переехал с Tile на Float
+            // (overview_allowed выше), а сообщение осталось прежним и в логе
+            // 20260729_190042 одиннадцать раз врало про «тайловый режим».
+            tracing::debug!(
+                "dawn: обзор не открывается в раскладке {:?} (разрешён везде, кроме Float)",
+                self.tile_config.layout,
+            );
+            return;
+        }
+        // Лента (niri) — свой обзор: окна остаются в полосе, отъезжает камера.
+        if self.tile_config.layout == Layout::Columns {
+            self.enter_overview_strip();
             return;
         }
         let (w, h) = match self.overview_band_size() {
@@ -457,48 +446,54 @@ impl Dawn {
             self.tile_config.layout,
         ));
         self.overview_active = true;
+        self.overview_strip = false;
         self.momentum.stop();
         self.camera_anim = None;
         self.zoom_anim = None;
-        self.overview_drag_ws = None;
 
-        // Обзор для ВСЕХ раскладок (включая Columns/niri) — единая многостоловая
-        // сетка-бэнды: каждый стол = ячейка сетки со своими окнами (dwindle),
-        // камера вписывает все столы (overview_fit_all). Раньше Columns имел
-        // отдельную ветку, показывавшую только колонки ТЕКУЩЕГО стола — из-за
-        // чего в niri другие воркспейсы в обзоре не отображались. На выходе
-        // layout восстанавливается в Columns (exit_overview_immediate → view_tag).
+        // Сеточный обзор: каждый стол = ячейка сетки со своими окнами (dwindle),
+        // камера вписывает все столы (overview_fit_all). Лента (Columns) сюда не
+        // доходит — у неё свой обзор (enter_overview_strip, ветка выше).
 
-        // Занятые столы: текущий + все с окнами, но ТОЛЬКО в том же режиме.
+        // Занятые столы: текущий + все с окнами, но ТОЛЬКО из СВОЕЙ изоляции.
         //
-        // Столы помнят свою раскладку (Dawn::tag_layouts), и смешивать их в
-        // одном обзоре нельзя: выход на ленточный стол из тайлового переключает
-        // режим целиком, окна доехавшего стола пересобираются чужой раскладкой,
-        // а снимок геометрии остаётся от прежней. Показываем только совместимые.
+        // Изоляций две: лента (Columns) и всё остальное — tiling и floating
+        // вместе. Ленточные столы в эту сетку не попадают никогда: у ленты свой
+        // обзор, её этажи лежат на общем холсте, и выход на такой стол из сетки
+        // переключил бы режим целиком — окна доехавшего стола пересобрались бы
+        // чужой раскладкой поверх снимка от прежней.
+        //
+        // А вот Tile, Dwindle и Monocle — соседи по одной изоляции: столы там
+        // независимы, и стол, ВЫШЕДШИЙ из ленты (Win+N), обязан оказаться
+        // именно здесь. Раньше сравнивались точные раскладки, и обзор тайлового
+        // стола не показывал ни monocle-соседей, ни вернувшихся из ленты.
+        //
+        // ПЛАВАЮЩИЕ столы отсюда исключены совсем (overview_is_float_tag): в
+        // обзоре их не должно быть видно ни рамкой, ни окнами.
         let cur = self.viewport.current_tags();
         let cur_layout = self.tile_config.layout;
         let mut order: Vec<u32> = vec![cur];
-        // В niri-режиме обзор показывает ТОЛЬКО текущий стол. Лента и так своя
-        // у каждого стола, а переключение между ними — Win+цифра и
-        // Super+PageUp/Down; сетка чужих столов в обзоре здесь лишняя.
+        // Columns сюда не попадает (у ленты свой обзор), проверка оставлена
+        // страховкой: собирать ленточные столы в сетку нельзя.
         if cur_layout != Layout::Columns {
             for i in 0..9u32 {
                 let m = 1u32 << i;
                 if m == cur || !self.tagged_windows.iter().any(|tw| tw.tags & m != 0) {
                     continue;
                 }
-                let m_layout = *self.tag_layouts.get(&m).unwrap_or(&Layout::Tile);
-                if m_layout == cur_layout {
+                // Ленточные (свой обзор) и ПЛАВАЮЩИЕ (обзор им не нужен вовсе,
+                // см. overview_is_float_tag) столы в сетку не берём.
+                if !self.columns_is_strip_tag(m) && !self.overview_is_float_tag(m) {
                     order.push(m);
                 }
             }
         }
         self.overview_order = order.clone();
 
-        // Ячейки сетки ПЕРЕЖИВАЮТ выход из обзора: стол, который перетащили
-        // влево от соседа (мышью или Win+Alt+стрелка), должен остаться слева и
-        // в следующем обзоре. Сохраняем прежнюю ячейку столу, если её не занял
-        // кто-то раньше по порядку; остальным выдаём первую свободную.
+        // Ячейки сетки ПЕРЕЖИВАЮТ выход из обзора: стол, который в прошлый раз
+        // стоял слева от соседа, должен остаться слева и в следующем обзоре.
+        // Сохраняем прежнюю ячейку столу, если её не занял кто-то раньше по
+        // порядку; остальным выдаём первую свободную.
         let prev_slots = std::mem::take(&mut self.overview_slots);
         let mut taken: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
         for &m in &order {
@@ -603,20 +598,35 @@ impl Dawn {
         }
     }
 
-    /// Canvas-прямоугольники всех столов (для отрисовки фона в обзоре).
-    pub fn overview_band_rects(&self) -> Vec<Rectangle<i32, Logical>> {
+    /// Canvas-прямоугольники всех столов обзора вместе с признаком «стол ПУСТ»
+    /// (ни одного окна). Пустые рисуются не тёмной карточкой, а тонким контуром
+    /// — см. build_overview_bg_elements: в ленте этажи стоят вплотную, и подряд
+    /// идущие пустые карточки сливались в одно чёрное пятно под столами.
+    pub fn overview_band_rects(&self) -> Vec<(Rectangle<i32, Logical>, bool)> {
+        let empty = |m: u32| !self.tagged_windows.iter().any(|tw| tw.tags & m != 0);
+        if self.overview_strip {
+            return self.overview_order.iter()
+                .filter_map(|&m| self.overview_strip_floor_rect(m).map(|r| (r, empty(m))))
+                .collect();
+        }
         let (w, h) = match self.overview_band_size() {
             Some(s) => s,
             None => return Vec::new(),
         };
         self.overview_order.iter()
-            .map(|m| Self::slot_rect(*self.overview_slots.get(m).unwrap_or(&(0, 0)), w, h))
+            .map(|&m| {
+                let r = Self::slot_rect(*self.overview_slots.get(&m).unwrap_or(&(0, 0)), w, h);
+                (r, empty(m))
+            })
             .collect()
     }
 
     /// Маска стола, ПОД которым точка `pos` (canvas). None вне столов.
     /// Обзор для всех раскладок — сетка-бэнды, поэтому всегда по slot_rects.
     pub fn overview_workspace_at(&self, pos: Point<f64, Logical>) -> Option<u32> {
+        if self.overview_strip {
+            return self.overview_strip_workspace_at(pos);
+        }
         let (w, h) = self.overview_band_size()?;
         for &m in &self.overview_order {
             let r = Self::slot_rect(*self.overview_slots.get(&m).unwrap_or(&(0, 0)), w, h);
@@ -635,6 +645,9 @@ impl Dawn {
     /// когда точка в зазоре между столами или чуть за краем — нужно для
     /// перетаскивания окна между столами (иначе перенос срабатывает «через раз»).
     pub fn overview_nearest_workspace(&self, pos: Point<f64, Logical>) -> Option<u32> {
+        if self.overview_strip {
+            return self.overview_strip_nearest_workspace(pos);
+        }
         let (w, h) = self.overview_band_size()?;
         let mut best: Option<u32> = None;
         let mut best_d = f64::MAX;
@@ -649,40 +662,6 @@ impl Dawn {
             }
         }
         best
-    }
-
-    /// Двигает все окна стола на дельту (canvas), не выпуская их за его рамку.
-    /// Больше не используется живым драгом стола (Win+Alt+ЛКМ) — тот переставляет
-    /// стол по ячейкам сетки (см. overview_drag_workspace_to), а сдвиг окон
-    /// внутри рамки выглядел как «стол стоит на месте, окна дёргаются».
-    #[allow(dead_code)]
-    pub fn overview_move_workspace_windows(&mut self, mask: u32, dx: f64, dy: f64) {
-        let (dxi, dyi) = (dx.round() as i32, dy.round() as i32);
-        if dxi == 0 && dyi == 0 {
-            return;
-        }
-        // Границы бэнда этого воркспейса — окна не должны уходить за них
-        let (bw, bh) = match self.overview_band_size() {
-            Some(s) => s,
-            None => return,
-        };
-        let slot = *self.overview_slots.get(&mask).unwrap_or(&(0, 0));
-        let brect = Self::slot_rect(slot, bw, bh);
-        let margin = GAP_OUTER;
-
-        let wins: Vec<Window> = self.tagged_windows.iter()
-            .filter(|tw| tw.tags & mask != 0)
-            .map(|tw| tw.window.clone())
-            .collect();
-        for win in wins {
-            if let Some(g) = self.space.element_geometry(&win) {
-                let x = (g.loc.x + dxi).clamp(brect.loc.x + margin, brect.loc.x + bw - g.size.w - margin);
-                let y = (g.loc.y + dyi).clamp(brect.loc.y + margin, brect.loc.y + bh - g.size.h - margin);
-                let loc: Point<i32, Logical> = (x, y).into();
-                self.space.map_element(win, loc, false);
-            }
-        }
-        self.request_redraw();
     }
 
     /// Окно стола `mask`, под точкой `pos` (canvas), кроме `exclude`.
@@ -753,6 +732,10 @@ impl Dawn {
     /// Стол ищем ближайший (не строгое попадание): иначе перенос срабатывает
     /// «через раз», когда окно отпущено в зазоре между столами.
     pub fn overview_reassign(&mut self, window: &Window) {
+        if self.overview_strip {
+            self.overview_reassign_strip(window);
+            return;
+        }
         let pos = match self.space.element_geometry(window) {
             Some(g) => Point::<f64, Logical>::from((
                 (g.loc.x + g.size.w / 2) as f64,
@@ -797,107 +780,6 @@ impl Dawn {
         self.request_redraw();
     }
 
-    /// Поменять местами содержимое двух воркспейсов: все окна с тегом `a`
-    /// переезжают на тег `b`, и наоборот. Вызывается при отпускании перетаскивания
-    /// стола в обзоре Super+ЛКМ (записан `overview_drag_ws`).
-    pub fn overview_swap_workspaces(&mut self, a: u32, b: u32) {
-        if a == b {
-            return;
-        }
-        for tw in &mut self.tagged_windows {
-            if tw.tags == a {
-                tw.tags = b;
-            } else if tw.tags == b {
-                tw.tags = a;
-            }
-        }
-        if let Some((w, h)) = self.overview_band_size() {
-            self.overview_layout(w, h);
-        }
-        self.request_plane_reset();
-        self.request_redraw();
-    }
-
-    /// Отпустили перетаскиваемый стол: снапим в ближайшую ячейку сетки по
-    /// позиции курсора `pos`. Сначала ищет смежные (col±1/row±1) с другими
-    /// столами ячейки — «магнит» на все 4 стороны. Если не нашёл — обычная
-    /// сетка. Занятая ячейка → свап содержимого со столом-владельцем.
-    pub fn overview_snap_workspace(&mut self, mask: u32, pos: Point<f64, Logical>) {
-        let (w, h) = match self.overview_band_size() {
-            Some(s) => s,
-            None => return,
-        };
-        let raw_cell = Self::cell_at(pos, w, h);
-
-        // Ищем ближайшую СВОБОДНУЮ ячейку, смежную с занятыми (магнит).
-        // Если не нашли — используем raw_cell.
-        let cell = self.find_best_snap_cell(mask, raw_cell, w, h);
-
-        // Свап, если ячейка занята другим столом.
-        let occupant = self.overview_slots.iter()
-            .find(|(t, &c)| **t != mask && c == cell)
-            .map(|(t, _)| *t);
-        if let Some(other) = occupant {
-            let old = *self.overview_slots.get(&mask).unwrap_or(&(0, 0));
-            self.overview_slots.insert(other, old);
-        }
-        self.overview_slots.insert(mask, cell);
-        self.overview_layout(w, h);
-        self.request_plane_reset();
-        self.request_redraw();
-    }
-
-    /// Выбирает лучшую ячейку для стола: предпочитает смежные с занятыми
-    /// столами ячейки (col±1/row±1) — «магнит» на все 4 стороны. Если
-    /// ни одна смежная ячейка не подходит — возвращает raw_cell.
-    fn find_best_snap_cell(&self, mask: u32, raw_cell: (i32, i32), _w: i32, _h: i32) -> (i32, i32) {
-        let occupied: std::collections::HashSet<(i32, i32)> = self.overview_slots.iter()
-            .filter(|(t, _)| **t != mask)
-            .map(|(_, &c)| c)
-            .collect();
-        if occupied.is_empty() {
-            return raw_cell;
-        }
-
-        // Сначала пробуем raw_cell
-        if !occupied.contains(&raw_cell) {
-            // Проверяем, смежна ли raw_cell с каким-нибудь занятым столом
-            let adj = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
-            for &(dc, dr) in &adj {
-                if occupied.contains(&(raw_cell.0 + dc, raw_cell.1 + dr)) {
-                    return raw_cell; // магнит сработал!
-                }
-            }
-        }
-
-        // Ищем смежные свободные ячейки вокруг занятых, ближайшие к курсору
-        let mut best: Option<(i32, (i32, i32))> = None;
-        let mut best_dist = i64::MAX;
-        for &occ in &occupied {
-            for (dc, dr) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
-                let cand = (occ.0 + dc, occ.1 + dr);
-                if cand == raw_cell {
-                    // Точное совпадение с сырой клеткой — отличный кандидат
-                    return raw_cell;
-                }
-                if occupied.contains(&cand) {
-                    continue; // занята
-                }
-                if cand.0 < -9 || cand.0 > 9 || cand.1 < -9 || cand.1 > 9 {
-                    continue; // слишком далеко
-                }
-                let d = (cand.0 as i64 - raw_cell.0 as i64).pow(2)
-                    + (cand.1 as i64 - raw_cell.1 as i64).pow(2);
-                if d < best_dist {
-                    best_dist = d;
-                    best = Some((0, cand));
-                }
-            }
-        }
-
-        best.map(|(_, c)| c).unwrap_or(raw_cell)
-    }
-
     /// Выйти из обзора на стол окна `window` и сфокусироваться на нём.
     /// Используется при ЛКМ по окну в обзоре.
     pub fn exit_overview_to_window(&mut self, window: &Window) {
@@ -907,8 +789,240 @@ impl Dawn {
         let mask = self.tagged_windows.iter()
             .find(|tw| same_window(&tw.window, window))
             .map(|tw| tw.tags);
+        if self.overview_strip {
+            self.exit_overview_strip(mask, Some(window.clone()));
+            return;
+        }
         self.exit_overview_immediate(mask);
         // Перефокусируемся на этом окне после view_tag
         crate::xwin::focus(self, &window.clone());
+    }
+
+    // ── Обзор ленты (niri): камера отъезжает, окна остаются на местах ────────
+    //
+    // В Columns столы — это этажи ОДНОЙ вертикальной ленты (см. columns.rs), и
+    // окна всех ленточных столов и так лежат на холсте. Значит обзор здесь не
+    // должен ничего перекладывать: достаточно отъехать камерой так, чтобы в
+    // кадр вошла вся лента — это ровно то, что делает Super+Space (zoom-nav),
+    // только с точным вписыванием. Обзорные фишки при этом остаются: клик по
+    // окну — выход на него, клик по этажу — выход на этот стол, Super+ЛКМ —
+    // перетаскивание окна между колонками и этажами, ПКМ/тап Super — выход.
+
+    /// Этажи, которые показывает ленточный обзор: вся лента столов — занятые
+    /// плюс один пустой снизу (niri-модель динамических воркспейсов, см.
+    /// niri_ws_count). Пустой этаж тоже нужен: на него бросают окно, чтобы
+    /// завести новый стол.
+    ///
+    /// ЧУЖИЕ столы (те, что помнят НЕ ленточную раскладку — Tile/Dwindle/Float)
+    /// в ленточный обзор не попадают вовсе. Их окна на холсте и так не лежат
+    /// (см. refresh_tags: в Columns видимы только ленточные столы), так что
+    /// рамка такого этажа рисовалась пустой дырой в ленте, а клик по ней
+    /// выбрасывал из ленты в чужой режим.
+    fn overview_strip_tags(&self) -> Vec<u32> {
+        // columns_strip_order уже отсеивает чужие столы, а niri_ws_count меряет
+        // ленту в ЭТАЖАХ (занятые + один пустой снизу) — значит первые n этажей
+        // порядка и есть вся лента, дырок от чужих тегов в ней нет.
+        let n = self.niri_ws_count().clamp(1, 9) as usize;
+        let mut tags: Vec<u32> = self.columns_strip_order().into_iter().take(n).collect();
+        if tags.is_empty() {
+            tags.push(self.viewport.current_tags());
+        }
+        tags
+    }
+
+    /// Прямоугольник этажа `tag` на холсте: во всю ширину его полосы.
+    pub fn overview_strip_floor_rect(&self, tag: u32) -> Option<Rectangle<i32, Logical>> {
+        let (w, h) = self.overview_band_size()?;
+        let y = self.columns_ws_y(tag).round() as i32;
+        let mut min_x = 0;
+        let mut max_x = w;
+        for tw in self.tagged_windows.iter().filter(|tw| tw.tags & tag != 0) {
+            if let Some(g) = self.space.element_geometry(&tw.window) {
+                min_x = min_x.min(g.loc.x);
+                max_x = max_x.max(g.loc.x + g.size.w + GAP_OUTER);
+            }
+        }
+        Some(Rectangle::new(
+            (min_x, y).into(),
+            ((max_x - min_x).max(1), h).into(),
+        ))
+    }
+
+    /// Этаж, на который попала точка `pos` (по Y — этажи идут ровно по высоте
+    /// экрана, без зазоров).
+    fn overview_strip_workspace_at(&self, pos: Point<f64, Logical>) -> Option<u32> {
+        let (_, h) = self.overview_band_size()?;
+        self.overview_order.iter().copied().find(|&m| {
+            let y = self.columns_ws_y(m);
+            pos.y >= y && pos.y < y + h as f64
+        })
+    }
+
+    /// Ближайший этаж по Y — для драга, когда окно отпустили над самым краем.
+    fn overview_strip_nearest_workspace(&self, pos: Point<f64, Logical>) -> Option<u32> {
+        let (_, h) = self.overview_band_size()?;
+        self.overview_order.iter().copied().min_by(|&a, &b| {
+            let d = |m: u32| (pos.y - (self.columns_ws_y(m) + h as f64 / 2.0)).abs();
+            d(a).total_cmp(&d(b))
+        })
+    }
+
+    fn enter_overview_strip(&mut self) {
+        let Some((w, h)) = self.overview_band_size() else { return };
+        // Обзор показывает ленту целиком, поэтому съехавшие этажи (состав ленты
+        // менялся, пока на них не смотрели) надо поправить ДО замера кадра —
+        // иначе в bbox попадёт пустота от этажа, стоящего не на своём месте.
+        self.columns_relayout_strip();
+        let prev_cam = Point::from((self.viewport.cam_x, self.viewport.cam_y));
+        let prev_zoom = self.viewport.zoom;
+
+        self.overview_prev = Some((
+            self.viewport.current_tags(),
+            prev_cam.x,
+            prev_cam.y,
+            prev_zoom,
+            self.tile_config.layout,
+        ));
+        self.overview_active = true;
+        self.overview_strip = true;
+        // Ленточный обзор окна не двигает — снимок геометрии и ячейки сетки
+        // (это про сеточный обзор) здесь не нужны и не должны остаться от
+        // прошлого захода.
+        self.overview_saved_geo.clear();
+        self.overview_slots.clear();
+        self.momentum.stop();
+        self.camera_anim = None;
+        self.zoom_anim = None;
+        self.overview_order = self.overview_strip_tags();
+
+        // Кадр обзора: вся лента с небольшим полем по краям. Берём и габариты
+        // колонок, и рамки этажей — иначе пустой этаж снизу (куда бросают окно
+        // ради нового стола) остался бы за кадром.
+        let mut bbox = self.columns_strip_bbox()
+            .unwrap_or_else(|| Rectangle::new((0, 0).into(), (w, h).into()));
+        for m in self.overview_order.clone() {
+            if let Some(r) = self.overview_strip_floor_rect(m) {
+                bbox = bbox.merge(r);
+            }
+        }
+        let zoom = (0.92
+            * (w as f64 / bbox.size.w as f64).min(h as f64 / bbox.size.h as f64))
+            .clamp(0.1, 1.0);
+        let cx = bbox.loc.x as f64 + bbox.size.w as f64 / 2.0;
+        let cy = bbox.loc.y as f64 + bbox.size.h as f64 / 2.0;
+        let to_cam = Point::from((cx - w as f64 / (2.0 * zoom), cy - h as f64 / (2.0 * zoom)));
+
+        self.zoom_anim = Some(crate::anim::ZoomAnim::new_pan(
+            prev_cam, to_cam, prev_zoom, zoom, Duration::from_millis(OVERVIEW_FLY_MS),
+        ));
+        self.request_plane_reset();
+        self.request_redraw();
+        tracing::info!(
+            "dawn: overview (лента) on ({} этажей, zoom={:.3})",
+            self.overview_order.len(), zoom,
+        );
+    }
+
+    /// Выход из ленточного обзора: возвращаем прежний зум и приземляемся на
+    /// стол `switch_to` (или на текущий), при `focus_win` — прямо на это окно.
+    fn exit_overview_strip(&mut self, switch_to: Option<u32>, focus_win: Option<Window>) {
+        if !self.overview_active {
+            return;
+        }
+        self.overview_active = false;
+        self.overview_strip = false;
+        self.overview_exit_pending = false;
+        self.overview_exit_target_ws = None;
+        self.momentum.stop();
+
+        let cur_zoom = self.viewport.zoom;
+        let cur_cam = Point::from((self.viewport.cam_x, self.viewport.cam_y));
+        let prev = self.overview_prev.take();
+        let prev_zoom = prev.map(|p| p.3).unwrap_or(1.0);
+        let prev_cam = prev
+            .map(|p| Point::from((p.1, p.2)))
+            .unwrap_or(cur_cam);
+
+        // ВАЖНО: сначала возвращаем НОРМАЛЬНЫЙ кадр (зум и камеру, с которыми
+        // заходили), и только потом переключаем стол и подтягиваем прокрутку.
+        // Вся арифметика ленты (columns_fit_view и т.п.) меряет экран в
+        // canvas-единицах — при обзорном зуме он «шире» настоящего, и цели
+        // прокрутки посчитались бы не туда.
+        self.camera_anim = None;
+        self.zoom_anim = None;
+        self.viewport.zoom = prev_zoom;
+        self.viewport.cam_x = prev_cam.x;
+        self.viewport.cam_y = prev_cam.y;
+        // Плавающие окна ленты держатся экрана и едут за дельтой камеры
+        // (columns_pin_floating). Обзор камеру уже увёз, поэтому базу дельты
+        // переставляем на восстановленный кадр — иначе первый же apply_camera
+        // после обзора швырнул бы плавающие окна на всю эту дельту.
+        self.columns_float_cam = (prev_cam.x, prev_cam.y);
+        // И СРАЗУ применяем (строго ПОСЛЕ columns_float_cam — apply_camera тянет
+        // за собой плавающие окна): apply_camera выставляет output'у scale = зум,
+        // а вся арифметика ленты ниже (arrange в view_tag,
+        // columns_scroll_to_active) меряет экран через ЛОГИЧЕСКУЮ геометрию
+        // output'а. Без этого вызова она считалась бы по обзорному зуму — экран
+        // «шире» втрое, колонки раскладываются на несуществующую ширину, а цель
+        // прокрутки уезжает мимо.
+        self.apply_camera();
+
+        if let Some(mask) = switch_to {
+            if mask != self.viewport.current_tags() {
+                self.view_tag(mask);
+            }
+        }
+        if let Some(win) = focus_win {
+            self.columns_set_active_to_window(&win);
+            crate::xwin::focus(self, &win);
+        }
+        self.columns_scroll_to_active();
+        // Куда в итоге едет лента: цель уже поставленных анимаций (перелёт на
+        // этаж + прокрутка к активной колонке) — их мы забираем себе.
+        let to_x = self.camera_anim.take().map(|a| a.to.x).unwrap_or(self.viewport.cam_x);
+        let to_cam = Point::from((to_x, self.columns_cur_y()));
+
+        // Обратно к столу — одним движением: зум и камера едут вместе.
+        self.viewport.zoom = cur_zoom;
+        self.viewport.cam_x = cur_cam.x;
+        self.viewport.cam_y = cur_cam.y;
+        self.columns_float_cam = (cur_cam.x, cur_cam.y);
+        self.zoom_anim = Some(crate::anim::ZoomAnim::new_pan(
+            cur_cam, to_cam, cur_zoom, prev_zoom, Duration::from_millis(OVERVIEW_FLY_MS),
+        ));
+        self.apply_camera();
+        self.request_plane_reset();
+        self.request_redraw();
+        tracing::info!("dawn: overview (лента) off");
+    }
+
+    /// Отпустили перетаскивание окна в ленточном обзоре: окно встаёт в полосу
+    /// того этажа, над которым его бросили — новой колонкой или в стопку, как
+    /// показывала бы подсказка вставки в niri.
+    fn overview_reassign_strip(&mut self, window: &Window) {
+        let Some(g) = self.space.element_geometry(window) else { return };
+        let pos = Point::<f64, Logical>::from((
+            (g.loc.x + g.size.w / 2) as f64,
+            (g.loc.y + g.size.h / 2) as f64,
+        ));
+        let Some(target) = self.overview_strip_workspace_at(pos)
+            .or_else(|| self.overview_strip_nearest_workspace(pos))
+        else {
+            return;
+        };
+        // Полоса пересобирается сама и тянет за собой прокрутку/фокус — а обзор
+        // обязан остаться в своём кадре, поэтому камеру возвращаем как была.
+        let cam = (self.viewport.cam_x, self.viewport.cam_y, self.viewport.zoom);
+        self.columns_drop_window_on_ws(window, target, pos.x);
+        self.camera_anim = None;
+        self.zoom_anim = None;
+        self.viewport.cam_x = cam.0;
+        self.viewport.cam_y = cam.1;
+        self.viewport.zoom = cam.2;
+        self.apply_camera();
+        // Этажи могли появиться/опустеть — пересчитываем набор рамок.
+        self.overview_order = self.overview_strip_tags();
+        self.request_plane_reset();
+        self.request_redraw();
     }
 }
