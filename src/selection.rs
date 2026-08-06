@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use smithay::{
     desktop::Window,
-    utils::{Logical, Point, Rectangle},
+    utils::{Logical, Point, Rectangle, Size},
 };
 
 use crate::state::Dawn;
@@ -333,5 +333,134 @@ impl Dawn {
         } else {
             self.kill_focused();
         }
+    }
+
+    // ── Win+V: выбранные окна в плавающий слой ───────────────────────────────
+
+    /// Переводит ВЫДЕЛЕННЫЕ окна (а если выделения нет — сфокусированное) в
+    /// плавающий слой и обратно. Работает и в тайлинге, и в ленте niri: обе
+    /// раскладки сами выкидывают плавающие окна из своей структуры
+    /// (`sync_dwindle_tree` и `columns_reconcile` фильтруют по `!floating`) и
+    /// принимают их назад, когда флаг снят.
+    ///
+    /// Окно НЕ ПОКИДАЕТ свой стол: позиция считается внутри прямоугольника
+    /// текущего рабочего стола (в ленте это его этаж и текущий кадр прокрутки,
+    /// см. workspace_rect) и зажимается в него вместе с размером. Поэтому
+    /// всплывшее окно не может оказаться ни на соседнем этаже ленты, ни за
+    /// краем экрана.
+    ///
+    /// Флаг ставится «намеренным» (float_pinned): сборка в тайлинг по Win+D
+    /// такие окна не забирает — они для того и подняты, чтобы висеть поверх.
+    pub fn float_selected(&mut self) {
+        let targets: Vec<Window> = if !self.selected_windows.is_empty() {
+            self.selected_windows.clone()
+        } else {
+            self.focused_window().into_iter().collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        // В Float поднимать некуда — там плавает всё.
+        if self.tile_config.layout == Layout::Float {
+            tracing::info!("dawn: float_selected — уже во Float, нечего поднимать");
+            return;
+        }
+        let current = self.viewport.current_tags();
+        // Тумблер по большинству: если ВСЕ цели уже плавающие — опускаем их
+        // обратно в раскладку, иначе поднимаем все.
+        let вниз = targets.iter().all(|w| {
+            self.tagged_windows.iter()
+                .any(|tw| same_window(&tw.window, w) && tw.floating)
+        });
+
+        if вниз {
+            for w in &targets {
+                if let Some(tw) = self.tagged_windows.iter_mut()
+                    .find(|tw| same_window(&tw.window, w))
+                {
+                    tw.floating = false;
+                    tw.float_pinned = false;
+                }
+            }
+            self.arrange();
+            self.request_plane_reset();
+            self.request_redraw();
+            tracing::info!("dawn: float_selected — {} окон вернулись в раскладку", targets.len());
+            return;
+        }
+
+        let Some(стол) = self.workspace_rect() else { return };
+        // Размер: не больше 70% стола по каждой стороне, чтобы всплывшее окно
+        // оставалось «окном поверх», а не закрывало стол целиком.
+        let max_w = (стол.size.w * 7 / 10).max(1);
+        let max_h = (стол.size.h * 7 / 10).max(1);
+
+        let mut подняты = 0usize;
+        for (i, w) in targets.iter().enumerate() {
+            if !self.tagged_windows.iter().any(|tw| {
+                same_window(&tw.window, w) && tw.tags & current != 0
+            }) {
+                continue; // окно не с этого стола — не трогаем
+            }
+            let текущий = self.space.element_geometry(w)
+                .map(|g| g.size)
+                .unwrap_or_else(|| (max_w, max_h).into());
+            let size: Size<i32, Logical> = (
+                текущий.w.min(max_w).max(1),
+                текущий.h.min(max_h).max(1),
+            ).into();
+
+            // Каскад от центра стола, чтобы поднятые окна не легли стопкой.
+            const ШАГ: i32 = 36;
+            let cx = стол.loc.x + (стол.size.w - size.w) / 2 + i as i32 * ШАГ;
+            let cy = стол.loc.y + (стол.size.h - size.h) / 2 + i as i32 * ШАГ;
+            // Зажимаем в границы стола с полем GAP_OUTER.
+            let поле = crate::tiling::GAP_OUTER;
+            let min_x = стол.loc.x + поле;
+            let min_y = стол.loc.y + поле;
+            let max_x = (стол.loc.x + стол.size.w - size.w - поле).max(min_x);
+            let max_y = (стол.loc.y + стол.size.h - size.h - поле).max(min_y);
+            let pos: Point<i32, Logical> = (cx.clamp(min_x, max_x), cy.clamp(min_y, max_y)).into();
+
+            crate::xwin::set_size(w, Some(size), crate::xwin::Tiled::Unset);
+            crate::xwin::configure(w);
+            self.animate_window_to_dur(w, pos, Duration::from_millis(200));
+            if let Some(tw) = self.tagged_windows.iter_mut()
+                .find(|tw| same_window(&tw.window, w))
+            {
+                tw.floating = true;
+                tw.float_pinned = true;
+                tw.float_size = Some(size);
+                tw.float_position = pos;
+                tw.float_position_set = true;
+                tw.position = pos;
+            }
+            подняты += 1;
+        }
+
+        // Раскладка пересобирается уже без поднятых окон: дерево/колонки
+        // сомкнутся, освободив их слоты.
+        self.arrange();
+        self.clear_selection();
+        self.request_plane_reset();
+        self.request_redraw();
+        tracing::info!("dawn: float_selected — поднято {} окон в границах стола {:?}",
+            подняты, стол);
+    }
+
+    /// Прямоугольник ТЕКУЩЕГО рабочего стола на холсте.
+    ///
+    /// В ленте niri столы стоят этажами друг под другом, а колонки ещё и
+    /// прокручиваются вбок — поэтому там стол это «экран на своём этаже в
+    /// текущем кадре прокрутки». В остальных раскладках стол всегда стоит в
+    /// начале холста: тайлинг раскладывается от (0,0) при камере в нуле.
+    pub(crate) fn workspace_rect(&self) -> Option<Rectangle<i32, Logical>> {
+        let screen = self.screen_area()?;
+        let loc: Point<i32, Logical> = if self.tile_config.layout == Layout::Columns {
+            (self.viewport.cam_x.round() as i32, self.columns_cur_y().round() as i32).into()
+        } else {
+            (0, 0).into()
+        };
+        Some(Rectangle::new(loc, screen.size))
     }
 }

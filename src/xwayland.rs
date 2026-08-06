@@ -10,10 +10,11 @@
 //!   * позиции X11-окнам досылает [`Dawn::sync_x11_geometry`] один раз за
 //!     итерацию главного цикла — см. комментарий у функции.
 //!
-//! Ограничение бесконечного холста: X11 хранит координаты окон в i16, поэтому
-//! окна, уехавшие дальше ±32767 от начала холста, зажимаются в этот диапазон.
-//! На сами окна это не влияет (их рисуем мы), но X11-клиент, размещающий свои
-//! меню в корневых координатах, в такой дали промахнётся.
+//! Ограничение бесконечного холста: у X-сервера корневое окно конечно (размер
+//! выхода), а указатель вне него стоять не может — X зажимает его на край.
+//! Поэтому позиции X11-окон зажимаются в экран, а координаты, которые клиент
+//! выбирает сам (меню, тултипы), переводятся обратно через [`Dawn::x11_to_canvas`].
+//! Сами окна от этого не двигаются: на холсте их рисуем мы.
 
 use std::process::Stdio;
 
@@ -22,7 +23,7 @@ use smithay::{
     desktop::Window,
     input::pointer::Focus,
     reexports::calloop::EventLoop,
-    utils::{Logical, Rectangle, SERIAL_COUNTER, Size},
+    utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Size},
     wayland::{
         selection::{
             SelectionTarget,
@@ -44,10 +45,6 @@ use crate::{
     state::Dawn,
     xwin,
 };
-
-/// Диапазон, в который X11 умеет класть координаты окна (протокольный i16).
-const X11_COORD_MIN: i32 = i16::MIN as i32;
-const X11_COORD_MAX: i32 = i16::MAX as i32;
 
 /// Запустить XWayland. Всё асинхронно: процесс поднимается сразу, а XWM
 /// стартует уже по событию `Ready` — до этого X11-клиенты просто не смогут
@@ -140,7 +137,50 @@ impl Dawn {
         }
     }
 
-    /// Досылает X11-окнам их позицию на холсте.
+    /// Куда уехала X-позиция окна относительно его позиции на холсте.
+    ///
+    /// Ненулевая у окон, которые холст унёс за пределы корневого окна X: их
+    /// позицию мы зажимаем (см. [`Dawn::sync_x11_geometry`]). Нужна, чтобы
+    /// перевести обратно в холст координаты, которые X11-клиент выбрал сам —
+    /// позиции меню и тултипов (override-redirect).
+    fn x11_offset(&self, window: &Window) -> Option<Point<i32, Logical>> {
+        let surface = window.x11_surface()?;
+        let canvas = self.space.element_location(window)?;
+        Some(surface.geometry().loc - canvas)
+    }
+
+    /// Перевести точку из координат X-сервера в координаты холста.
+    ///
+    /// Клиент выбирает место для меню в корневых координатах, отсчитывая его
+    /// от позиции своего окна — то есть от ЗАЖАТОЙ позиции. Чтобы вернуть меню
+    /// под его пункт, надо вычесть ровно то смещение, которое мы этому окну и
+    /// дали. Ищем окно, в чей X-прямоугольник попала точка; если не нашли (меню
+    /// вылезло за край родителя) — берём смещение окна в фокусе.
+    pub fn x11_to_canvas(&self, point: Point<i32, Logical>) -> Point<i32, Logical> {
+        let mut focused_offset = None;
+        for window in self.space.elements() {
+            let Some(surface) = window.x11_surface() else {
+                continue;
+            };
+            if surface.is_override_redirect() {
+                continue;
+            }
+            let Some(offset) = self.x11_offset(window) else {
+                continue;
+            };
+            if surface.geometry().contains(point) {
+                return point - offset;
+            }
+            if focused_offset.is_none()
+                && self.focused_surface().is_some_and(|f| crate::xwin::is_surface(window, &f))
+            {
+                focused_offset = Some(offset);
+            }
+        }
+        point - focused_offset.unwrap_or_default()
+    }
+
+    /// Досылает X11-окнам их позицию.
     ///
     /// Wayland-клиент про свою позицию ничего не знает — её целиком держит
     /// компоситор. X11-клиент, наоборот, живёт в корневых координатах, и всё,
@@ -155,6 +195,28 @@ impl Dawn {
     /// отстаёт на кадр-другой — сверять его здесь значило бы гонять configure
     /// по кругу.
     pub fn sync_x11_geometry(&mut self) {
+        // Координаты X-сервера — это координаты холста, ЗАЖАТЫЕ в корневое окно.
+        //
+        // Сдвиг сам по себе безобиден: событие мыши доходит до X11-клиента через
+        // Xwayland, который берёт surface-локальную точку и прибавляет позицию
+        // окна, известную X-серверу — ровно ту, что мы отправили. Клиент тут же
+        // вычитает её обратно, сверяя с геометрией своего окна, и сдвиг
+        // сокращается, каким бы он ни был.
+        //
+        // Чего он НЕ переживает — выхода за корневое окно. Указатель в X не
+        // может стоять вне экрана: всё, что снаружи, X зажимает на край, и до
+        // клиента доезжает точка, которая после вычитания даёт мусор. Холст же
+        // бесконечен, так что окно, отъехавшее от начала холста дальше экрана,
+        // теряло клики целиком (замер 05.08.2026: окно на (-812,831), клик по
+        // кнопке даёт root (-567,1433) при экране 2560×1080 — Amnezia не
+        // реагирует; то же окно на (137,409) — root (351,1001), клик проходит).
+        // Поэтому позицию зажимаем так, чтобы ВСЁ окно лежало внутри экрана.
+        //
+        // Зажим считается от холста, а не от камеры: иначе панорамирование и
+        // зум гнали бы поток configure каждый кадр. Цена — override-redirect
+        // окна: место для меню клиент выбирает сам, отсчитывая от зажатой
+        // позиции, и обратно в холст мы его переводим через [`x11_to_canvas`].
+        let экран = self.screen_size();
         let updates: Vec<(X11Surface, Rectangle<i32, Logical>)> = self
             .space
             .elements()
@@ -166,9 +228,12 @@ impl Dawn {
                 }
                 let loc = self.space.element_location(window)?;
                 let current = surface.geometry();
+                // Окно шире или выше экрана внутрь не влезет — прижимаем к
+                // началу: max(0) вместо отрицательной границы (clamp с min >
+                // max паникует).
                 let loc = smithay::utils::Point::from((
-                    loc.x.clamp(X11_COORD_MIN, X11_COORD_MAX),
-                    loc.y.clamp(X11_COORD_MIN, X11_COORD_MAX),
+                    loc.x.clamp(0, (экран.w - current.size.w).max(0)),
+                    loc.y.clamp(0, (экран.h - current.size.h).max(0)),
                 ));
                 (current.loc != loc).then(|| (surface.clone(), Rectangle::new(loc, current.size)))
             })
@@ -217,10 +282,10 @@ impl XwmHandler for Dawn {
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, surface: X11Surface) {
         // Меню, тултипы, drag-иконки: позицию выбрал клиент в корневых
-        // координатах — они же и есть координаты холста (см. sync_x11_geometry).
-        // В tagged_windows такие окна не заводим: тегов у них нет, живут они
-        // ровно до закрытия меню.
-        let location = surface.geometry().loc;
+        // координатах, отсчитав её от зажатой позиции своего окна — переводим
+        // обратно в холст (см. sync_x11_geometry). В tagged_windows такие окна
+        // не заводим: тегов у них нет, живут они ровно до закрытия меню.
+        let location = self.x11_to_canvas(surface.geometry().loc);
         let window = Window::new_x11_window(surface);
         self.space.map_element(window, location, true);
         self.request_redraw();
@@ -238,6 +303,22 @@ impl XwmHandler for Dawn {
     fn destroyed_window(&mut self, _xwm: XwmId, surface: X11Surface) {
         if let Some(window) = self.window_for_x11(&surface) {
             self.forget_window(&window);
+        }
+    }
+
+    /// X11-клиент просит полный экран (_NET_WM_STATE_FULLSCREEN): игры,
+    /// видеоплееры, полноэкранный режим браузера. Тот же путь, что и F11.
+    fn fullscreen_request(&mut self, _xwm: XwmId, surface: X11Surface) {
+        if let Some(window) = self.window_for_x11(&surface) {
+            self.set_fullscreen(&window);
+        }
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, surface: X11Surface) {
+        let это_окно = self.window_for_x11(&surface)
+            .is_some_and(|w| self.fullscreen_requested(&w));
+        if это_окно {
+            self.unset_fullscreen();
         }
     }
 
@@ -280,7 +361,8 @@ impl XwmHandler for Dawn {
             return;
         }
         if let Some(window) = self.window_for_x11(&surface) {
-            self.space.map_element(window, geometry.loc, true);
+            let loc = self.x11_to_canvas(geometry.loc);
+            self.space.map_element(window, loc, true);
             self.request_redraw();
         }
     }

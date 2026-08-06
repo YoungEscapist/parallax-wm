@@ -62,6 +62,26 @@ pub fn app_id(window: &Window) -> Option<String> {
     }
 }
 
+/// Заголовок окна: `xdg_toplevel.title` у Wayland, `WM_NAME` у X11.
+///
+/// Нужен поиску окон (Super+F): человек помнит не app_id, а «ту вкладку с
+/// документацией». Пустую строку не возвращаем — вызывающий подставит app_id.
+pub fn title(window: &Window) -> Option<String> {
+    let t = match window.underlying_surface() {
+        WindowSurface::Wayland(t) => {
+            smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                    .and_then(|d| d.lock().ok())
+                    .and_then(|d| d.title.clone())
+            })
+        }
+        WindowSurface::X11(s) => Some(s.title()),
+    };
+    t.filter(|s| !s.trim().is_empty())
+}
+
 // ── Размер и configure ───────────────────────────────────────────────────────
 
 /// Что делать с tiled-состояниями окна при смене размера.
@@ -118,6 +138,51 @@ pub fn set_size(window: &Window, size: Option<Size<i32, Logical>>, tiled: Tiled)
     }
 }
 
+/// Развернуть окно на весь экран: размер монитора + состояние Fullscreen.
+///
+/// Состояние важно не меньше размера: по нему клиент убирает СВОИ рамки,
+/// скругления и тени (GTK/Electron рисуют их сами), а видеоплееры включают
+/// полноэкранный режим. Tiled-состояния при этом снимаются — они бы заставили
+/// клиента и дальше считать себя частью сетки.
+pub fn set_fullscreen(window: &Window, size: Option<Size<i32, Logical>>) {
+    match window.underlying_surface() {
+        WindowSurface::Wayland(t) => {
+            t.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+                state.states.unset(xdg_toplevel::State::TiledLeft);
+                state.states.unset(xdg_toplevel::State::TiledRight);
+                state.states.unset(xdg_toplevel::State::TiledTop);
+                state.states.unset(xdg_toplevel::State::TiledBottom);
+                state.size = size;
+            });
+        }
+        WindowSurface::X11(s) => {
+            if let Err(err) = s.set_fullscreen(true) {
+                tracing::warn!("dawn/xwayland: set_fullscreen: {}", err);
+            }
+            set_size(window, size, Tiled::Keep);
+        }
+    }
+}
+
+/// Снять полноэкранный режим и вернуть окну прежний размер.
+pub fn unset_fullscreen(window: &Window, size: Option<Size<i32, Logical>>) {
+    match window.underlying_surface() {
+        WindowSurface::Wayland(t) => {
+            t.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+                state.size = size;
+            });
+        }
+        WindowSurface::X11(s) => {
+            if let Err(err) = s.set_fullscreen(false) {
+                tracing::warn!("dawn/xwayland: unset_fullscreen: {}", err);
+            }
+            set_size(window, size, Tiled::Keep);
+        }
+    }
+}
+
 /// Отметить/снять состояние «идёт интерактивный ресайз» (только Wayland —
 /// клиенты по нему отключают дорогую перерисовку).
 pub fn set_resizing(window: &Window, resizing: bool) {
@@ -160,6 +225,18 @@ pub fn size_constraints(window: &Window) -> (Size<i32, Logical>, Size<i32, Logic
     }
 }
 
+/// Размер буфера, прикреплённого к поверхности (в логических пикселях).
+/// Нужен для курсоров клиентов: их картинку мы приводим к своему размеру.
+pub fn surface_buffer_size(surface: &WlSurface) -> Option<Size<i32, Logical>> {
+    smithay::wayland::compositor::with_states(surface, |states| {
+        states
+            .data_map
+            .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+            .and_then(|d| d.lock().ok())
+            .and_then(|d| d.surface_size())
+    })
+}
+
 /// Размер, который окно занимает сейчас (по последнему буферу/геометрии).
 pub fn current_size(window: &Window) -> Size<i32, Logical> {
     window.geometry().size
@@ -177,15 +254,56 @@ pub fn close(window: &Window) {
     }
 }
 
+/// Окно — это override-redirect X11-окно (меню, тултип, иконка драга)?
+///
+/// Такие окна X-клиент рисует сам и сам же ими распоряжается: место выбирает
+/// в корневых координатах, а из списка кандидатов на фокус выпадает по самому
+/// смыслу флага (ICCCM: «оконный менеджер, не трогай»). У нативных
+/// Wayland-клиентов аналог — xdg_popup, и он тоже не toplevel, поэтому в space
+/// как отдельное окно не попадает.
+pub fn is_override_redirect(window: &Window) -> bool {
+    match window.underlying_surface() {
+        WindowSurface::X11(s) => s.is_override_redirect(),
+        WindowSurface::Wayland(_) => false,
+    }
+}
+
 /// Сфокусировать окно клавиатурой: активирует его, гасит остальные и
 /// поднимает наверх.
 pub fn focus(state: &mut Dawn, window: &Window) {
+    // Меню и тултипы X11-клиента (override-redirect) фокус не принимают —
+    // и что важнее, не имеют права его ОТНИМАТЬ.
+    //
+    // Ниже по коду focus() гасит все остальные окна (`set_activated(false)`) и
+    // переводит клавиатуру на цель. Для меню Steam это смертельно: наведя на
+    // выпавшее меню курсор, пользователь через sloppy focus (input.rs) вызывал
+    // focus() на самом меню, главное окно Steam получало «ты больше не
+    // активно» и тут же своё меню закрывало. Ровно то же было бы при клике по
+    // пункту меню.
+    //
+    // Наверх такие окна поднимать тоже не нужно: они и так замаплены последними
+    // (mapped_override_redirect_window), то есть уже поверх всего.
+    if is_override_redirect(window) {
+        return;
+    }
     let serial = smithay::utils::SERIAL_COUNTER.next_serial();
     state.space.raise_element(window, true);
+    // Меню и тултипы обязаны остаться поверх своего окна. raise_element выше
+    // кладёт наверх ЕГО, то есть уже открытое меню оказалось бы за родителем —
+    // видно это было бы как «меню моргнуло и пропало». Поднимаем их следом.
+    let popups: Vec<Window> = state
+        .space
+        .elements()
+        .filter(|w| is_override_redirect(w))
+        .cloned()
+        .collect();
+    for popup in &popups {
+        state.space.raise_element(popup, false);
+    }
     let others: Vec<Window> = state
         .space
         .elements()
-        .filter(|w| *w != window)
+        .filter(|w| *w != window && !is_override_redirect(w))
         .cloned()
         .collect();
     for w in others {
@@ -299,6 +417,9 @@ impl Dawn {
                 float_size: floating.then_some(size),
                 float_position_set: false,
                 floating,
+                // Диалоги плавают по своей природе — сборка в тайлинг их не
+                // трогает (см. TaggedWindow::float_pinned).
+                float_pinned: floating,
                 folded: false,
             },
         );
@@ -361,6 +482,18 @@ impl Dawn {
     /// выделение, созвездия, анимации. Общее для xdg (`toplevel_destroyed`) и
     /// X11 (`destroyed_window`/`unmapped_window`).
     pub fn forget_window(&mut self, window: &Window) {
+        // niri: соседа и признак «закрыли именно активное окно» считаем ДО
+        // всех удалений — после них окна уже нет ни в полосе, ни в фокусе.
+        let (сосед, был_в_фокусе) = if self.tile_config.layout == Layout::Columns {
+            let f = self.focused_surface()
+                .is_some_and(|fs| is_surface(window, &fs));
+            (self.columns_neighbour_before(window), f)
+        } else {
+            (None, false)
+        };
+        // Закрылось развёрнутое окно — снимаем режим и возвращаем камеру с
+        // зумом, иначе холст остался бы «залипшим» в кадре мёртвого окна.
+        self.forget_fullscreen(window);
         self.tagged_windows.retain(|tw| &tw.window != window);
         // Иначе анимации продолжат слать configure/map_element мёртвому окну.
         self.window_pos_anims.retain(|(w, _)| w != window);
@@ -383,6 +516,8 @@ impl Dawn {
         // теги независимы и трогать их нельзя, см. columns_compact_workspaces).
         self.columns_compact_workspaces();
         self.arrange();
+        // Фокус на предыдущее окно ленты + камера следом за ним.
+        self.columns_after_close(сосед, был_в_фокусе);
         self.request_plane_reset();
         self.request_redraw();
     }

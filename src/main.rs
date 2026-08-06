@@ -1,20 +1,30 @@
 mod anim;
+mod bluetooth;
 mod canvas;
+mod capture;
 mod columns;
 mod config;
 mod decor;
 mod dwindle;
 mod focus;
+mod fullscreen;
 mod grabs;
 mod handlers;
 mod input;
 mod overview;
+mod portal;
+mod portal_stream;
 mod screencopy;
 mod selection;
 mod session;
 mod state;
+mod switcher;
+mod text;
 mod udev;
+mod audio;
 mod tiling;
+mod tray;
+mod wifi;
 mod winit;
 mod xwayland;
 mod xwin;
@@ -122,6 +132,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // демонстрации экрана в Discord это обязательный шаг — см. screencopy.rs.
     export_session_env();
 
+    // ── Портал (демонстрация экрана) ─────────────────────────────────────────
+    // Бэкенд живёт в своём потоке на сессионной шине, а выбор источника делает
+    // сам композитор — запросы приходят сюда каналом calloop. См. portal.rs.
+    crate::portal::install_portal_files();
+    {
+        use smithay::reexports::calloop::channel;
+        let (to_dawn, from_portal) = channel::channel::<crate::portal::Request>();
+        if crate::portal::spawn(to_dawn) {
+            event_loop.handle().insert_source(from_portal, |event, _, state| {
+                if let channel::Event::Msg(request) = event {
+                    state.handle_portal_request(request);
+                }
+            })?;
+        }
+    }
+
+    // ── Блютуз ───────────────────────────────────────────────────────────────
+    // BlueZ живёт на СИСТЕМНОЙ шине, поэтому поток поднимается независимо от
+    // сессионной (её может и не быть): меню устройств и автоподключение
+    // работают даже в сессии, запущенной без dbus-run-session. См. bluetooth.rs.
+    {
+        use smithay::reexports::calloop::channel;
+        let (to_dawn, from_bt) = channel::channel::<crate::bluetooth::Event>();
+        if let Some(tx) = crate::bluetooth::spawn(to_dawn) {
+            let autoconnect = state.lua_config.bluetooth_autoconnect;
+            state.init_bluetooth(tx, autoconnect);
+            event_loop.handle().insert_source(from_bt, |event, _, state| {
+                if let channel::Event::Msg(event) = event {
+                    state.handle_bluetooth_event(event);
+                }
+            })?;
+        }
+    }
+
+    // ── Полка состояния ──────────────────────────────────────────────────────
+    // Вайфай (NetworkManager), звук (wpctl) и батарея (/sys) — см. tray.rs.
+    // Поток спит, пока полку не открыли, поэтому поднимаем его всегда.
+    {
+        use smithay::reexports::calloop::channel;
+        let (to_dawn, from_tray) = channel::channel::<crate::tray::Event>();
+        if let Some(tx) = crate::tray::spawn(to_dawn) {
+            state.init_tray(tx);
+            event_loop.handle().insert_source(from_tray, |event, _, state| {
+                if let channel::Event::Msg(event) = event {
+                    state.handle_tray_event(event);
+                }
+            })?;
+        }
+    }
+
+    // ── Вайфай и звук ────────────────────────────────────────────────────────
+    // Оба спят, пока не открыта полка или их меню (см. Cmd::Watch).
+    {
+        use smithay::reexports::calloop::channel;
+        let (to_dawn, from_wifi) = channel::channel::<crate::wifi::Event>();
+        if let Some(tx) = crate::wifi::spawn(to_dawn) {
+            state.init_wifi(tx);
+            event_loop.handle().insert_source(from_wifi, |event, _, state| {
+                if let channel::Event::Msg(event) = event {
+                    state.handle_wifi_event(event);
+                }
+            })?;
+        }
+        let (to_dawn, from_audio) = channel::channel::<crate::audio::Event>();
+        if let Some(tx) = crate::audio::spawn(to_dawn) {
+            state.init_audio(tx);
+            event_loop.handle().insert_source(from_audio, |event, _, state| {
+                if let channel::Event::Msg(event) = event {
+                    state.handle_audio_event(event);
+                }
+            })?;
+        }
+    }
+
     // XWayland поднимаем ПОСЛЕ бэкенда: DISPLAY выставится по готовности
     // сервера, и всё, что мы спавним дальше, увидит уже рабочий X11.
     crate::xwayland::start(&mut event_loop, &mut state);
@@ -132,6 +216,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let anim_timer = Timer::from_duration(std::time::Duration::from_millis(16));
     event_loop.handle().insert_source(anim_timer, |_, _, state| {
         crate::anim::tick(state);
+        // Пока идёт демонстрация экрана, кадр нужен РОВНО по расписанию.
+        // Обычно dawn рисует только по изменениям, и на статичном экране поток
+        // проседал до 3 кадров в секунду — зритель видел рывки, а клиент мог
+        // счесть поток зависшим. Кадры берутся из отрисованного (см.
+        // push_cast_frame), поэтому будим рендер сами, ровно с частотой потока.
+        if state.portal_cast.as_ref().is_some_and(|c| c.due()) {
+            state.request_redraw();
+        }
         TimeoutAction::ToDuration(std::time::Duration::from_millis(16))
     })?;
 
@@ -144,6 +236,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if result.is_err() { break; }
         state.space.refresh();
         state.popups.cleanup();
+        // Переход в полный экран доигрывается СТРОГО до отрисовки: кадр
+        // клиента во весь экран и переключённый холст обязаны попасть в один
+        // и тот же кадр, иначе видно промежуточное состояние (см.
+        // fullscreen.rs).
+        state.apply_pending_fullscreen();
         // X11-клиенты должны узнать, куда мы их передвинули за этот тик
         // (раскладка, анимации, драг) — см. Dawn::sync_x11_geometry.
         state.sync_x11_geometry();

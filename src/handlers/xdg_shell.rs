@@ -1,13 +1,20 @@
 use smithay::{
-    delegate_xdg_shell,
-    desktop::Window,
+    delegate_xdg_decoration, delegate_xdg_shell,
+    desktop::{
+        PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
+        find_popup_root_surface, get_popup_toplevel_coords,
+    },
+    input::{Seat, pointer::Focus},
     reexports::{
+        wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::protocol::wl_seat::WlSeat,
+        wayland_server::protocol::wl_output::WlOutput,
     },
     utils::Serial,
     wayland::shell::xdg::{
         PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+        decoration::XdgDecorationHandler,
     },
 };
 
@@ -75,14 +82,174 @@ impl XdgShellHandler for Dawn {
         }
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
+    /// Клиент сам просится на весь экран: полноэкранное видео, игра,
+    /// демонстрация экрана. Ведём себя ровно как по F11 — иначе кнопка
+    /// «во весь экран» внутри приложения не делает ничего.
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+        let window = self.tagged_windows.iter()
+            .map(|tw| tw.window.clone())
+            .find(|w| crate::xwin::is_surface(w, surface.wl_surface()));
+        if let Some(window) = window {
+            self.set_fullscreen(&window);
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let это_окно = self.fullscreen.as_ref()
+            .is_some_and(|f| crate::xwin::is_surface(&f.window, surface.wl_surface()));
+        if это_окно {
+            self.unset_fullscreen();
+        }
+    }
+
+    /// Всплывающее окно клиента: выпадающее меню, контекстное меню, подсказка,
+    /// список автодополнения.
+    ///
+    /// Раньше здесь было пусто — и это ломало ВСЕ меню нативных
+    /// Wayland-приложений разом. Popup в smithay живёт не сам по себе: и
+    /// отрисовка (`Window::render_elements`), и хит-тест
+    /// (`Window::surface_under`, `bbox_with_popups`) ходят за списком попапов в
+    /// `PopupManager::popups_for_surface`, а туда попадает только то, что
+    /// зарегистрировали через `track_popup`. Без регистрации меню не
+    /// рисовалось и не получало кликов: снаружи это выглядело как «кнопка,
+    /// открывающая меню, не работает» — а такие кнопки почти всегда справа
+    /// (гамбургер, «⋮», меню профиля).
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        self.unconstrain_popup(&surface);
+        if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface)) {
+            tracing::warn!("dawn: не удалось завести попап: {}", err);
+        }
+    }
+
+    /// Клиент просит захват на время меню: пока оно открыто, ввод принадлежит
+    /// ему, а клик мимо — закрывает. Без этого меню не закрывается по щелчку
+    /// снаружи и не отдаёт клавиатуру (стрелки, Escape).
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        let Some(seat) = Seat::<Dawn>::from_resource(&seat) else { return };
+        let kind = PopupKind::Xdg(surface);
+        let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
+            self.space
+                .elements()
+                .find(|w| crate::xwin::is_surface(w, &root))
+                .cloned()
+                .and_then(|w| crate::focus::KeyboardFocusTarget::for_window(&w))
+        }) else {
+            return;
+        };
+
+        let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) else { return };
+
+        // Чужой захват отдавать нельзя: если клавиатуру/указатель уже держит
+        // кто-то другой (не эта же цепочка меню), меню молча закрываем.
+        if let Some(keyboard) = seat.get_keyboard() {
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(grab.serial())))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or(grab.serial())))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
+    }
+
+    /// Клиент пересчитал место для уже открытого меню (подменю уехало за край).
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
-    ) {}
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        self.unconstrain_popup(&surface);
+        surface.send_repositioned(token);
+    }
+}
+
+impl Dawn {
+    /// Подвинуть меню так, чтобы оно поместилось на экране.
+    ///
+    /// Клиент выбирает место сам, относительно своего окна, и без поправки
+    /// меню у правого края экрана вылезло бы за него. Прямоугольник, в который
+    /// вписываем, задаётся в координатах РОДИТЕЛЬСКОГО окна — поэтому от
+    /// экрана вычитается и позиция окна, и смещение попапа внутри цепочки
+    /// (у подменю родитель — не toplevel, а меню выше).
+    fn unconstrain_popup(&self, popup: &PopupSurface) {
+        let kind = PopupKind::Xdg(popup.clone());
+        let Ok(root) = find_popup_root_surface(&kind) else { return };
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|w| crate::xwin::is_surface(w, &root))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(output) = self.space.outputs().next() else { return };
+        let Some(output_geo) = self.space.output_geometry(output) else { return };
+        let Some(window_geo) = self.space.element_geometry(&window) else { return };
+
+        let mut target = output_geo;
+        target.loc -= get_popup_toplevel_coords(&kind);
+        target.loc -= window_geo.loc;
+
+        popup.with_pending_state(|state| {
+            state.geometry = state.positioner.get_unconstrained_geometry(target);
+        });
+    }
 }
 
 delegate_xdg_shell!(Dawn);
+
+/// xdg-decoration: dawn рисует рамки, тени и подсветку фокуса сам (см.
+/// decor.rs), поэтому всем клиентам отвечаем «декорации серверные».
+///
+/// Без этого протокола GTK-приложения (ghostty, nautilus, любой libadwaita)
+/// остаются со СВОИМ заголовком, а его содержимое задаёт окну жёсткий
+/// минимальный размер: у ghostty это 315 px по ширине. В тайлинге слот
+/// становился уже — и окно, не умея сжаться, лезло на соседей (замер: слот
+/// 63×115 → окно 315×126, перелив 252 px). Alacritty своего заголовка не
+/// рисует, поэтому у него пол ~23 px и проблема не проявлялась.
+impl XdgDecorationHandler for Dawn {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        self.set_server_decoration(&toplevel);
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
+        // Пожелание клиента игнорируем сознательно: две рамки (наша и его)
+        // выглядели бы как рамка внутри рамки, а CSD ещё и тянет за собой
+        // headerbar с его минимальной шириной.
+        self.set_server_decoration(&toplevel);
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        self.set_server_decoration(&toplevel);
+    }
+}
+
+impl Dawn {
+    fn set_server_decoration(&mut self, toplevel: &ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        if toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        }
+    }
+}
+
+delegate_xdg_decoration!(Dawn);

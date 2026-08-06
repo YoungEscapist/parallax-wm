@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, os::unix::fs::OpenOptionsExt, time::Duration};
 
 use smithay::{
     backend::{
@@ -22,6 +22,7 @@ use smithay::{
                 memory::MemoryRenderBufferRenderElement,
                 solid::SolidColorRenderElement,
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+                utils::RescaleRenderElement,
             },
             gles::GlesRenderer,
             utils::CommitCounter,
@@ -56,6 +57,21 @@ use smithay_drm_extras::{
 use smithay::backend::renderer::ImportDma;
 use crate::Dawn;
 
+/// ВРЕМЕННАЯ ДИАГНОСТИКА (артефакты на анимированных обоях, 04.08.2026).
+///
+/// Включается переменной `DAWN_DEBUG_FRAME=1`. Даёт две вещи, которых иначе
+/// не увидеть:
+///  · строку с damage-прямоугольниками КАЖДОГО кадра (что компоситор реально
+///    считает изменившимся);
+///  · по появлению файла `/tmp/dawn_dump` — снимок НАСТОЯЩЕГО кадра со
+///    сканаута (`blit_frame_result`) в `/tmp/dawn_frame.raw`. Обычный grim
+///    сюда не годится: screencopy перерисовывает кадр с нуля свежим damage
+///    tracker'ом и артефактов частичной перерисовки не показывает.
+fn debug_frame_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DAWN_DEBUG_FRAME").is_ok_and(|v| v != "0"))
+}
+
 // Курсор в dawn всегда client-side (нет server-side cursor протокола) — клиент
 // сам рисует картинку в отдельном wl_surface через wl_pointer.set_cursor, и
 // компоситор обязан вставить эту поверхность как ещё один render-элемент
@@ -69,6 +85,9 @@ smithay::backend::renderer::element::render_elements! {
     // Текстурные элементы: курсор темы и плитки декораций (см. decor.rs).
     Memory = MemoryRenderBufferRenderElement<GlesRenderer>,
     Solid = SolidColorRenderElement,
+    // Layer-поверхности (обои, панели, меню dwall): обёрнуты в Rescale, чтобы
+    // не масштабироваться вместе с зумом холста (см. build_layer_elements).
+    Layer = RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
 }
 
 type GbmDrmCompositor = DrmCompositor<
@@ -98,6 +117,9 @@ pub struct Surface {
     /// если VBlank почему-то не пришёл (потеря page flip, гонка при VT-switch),
     /// через FRAME_QUEUE_STALE_MS флаг игнорируется и рендер идёт как раньше.
     pub frame_queued_at: std::time::Instant,
+    /// Сколько элементов было в прошлом кадре — под столько и резервируем
+    /// список следующего (см. render_surface).
+    pub last_elements: usize,
 }
 
 /// Посекундная сводка по рендеру — дешёвая замена профайлеру, которого на этой
@@ -113,6 +135,9 @@ pub struct RenderStats {
     total_us: u64,
     max_us: u64,
     max_elements: usize,
+    /// Сколько кадр ждал GPU перед page flip (см. needs_sync в render_surface).
+    sync_us: u64,
+    sync_max_us: u64,
 }
 
 impl RenderStats {
@@ -120,6 +145,7 @@ impl RenderStats {
         Self {
             since: std::time::Instant::now(),
             frames: 0, skipped: 0, total_us: 0, max_us: 0, max_elements: 0,
+            sync_us: 0, sync_max_us: 0,
         }
     }
 
@@ -129,6 +155,11 @@ impl RenderStats {
         self.max_us = self.max_us.max(us);
         self.max_elements = self.max_elements.max(elements);
         self.flush();
+    }
+
+    fn record_sync(&mut self, us: u64) {
+        self.sync_us += us;
+        self.sync_max_us = self.sync_max_us.max(us);
     }
 
     fn record_skip(&mut self) {
@@ -142,12 +173,15 @@ impl RenderStats {
         let secs = self.since.elapsed().as_secs_f64();
         tracing::debug!(
             "dawn/render: {:.0} кадр/с, средний {:.1} мс, худший {:.1} мс, \
-             элементов до {}, пропущено (кадр уже в очереди) {}",
+             элементов до {}, пропущено (кадр уже в очереди) {}, \
+             ожидание GPU: среднее {:.2} мс, худшее {:.2} мс",
             self.frames as f64 / secs,
             self.total_us as f64 / self.frames.max(1) as f64 / 1000.0,
             self.max_us as f64 / 1000.0,
             self.max_elements,
             self.skipped,
+            self.sync_us as f64 / self.frames.max(1) as f64 / 1000.0,
+            self.sync_max_us as f64 / 1000.0,
         );
         *self = Self::new();
     }
@@ -416,8 +450,28 @@ fn add_device(
     // false = не берём master при инициализации
     // Seatd даст его нам через ActivateSession
     let (drm, notifier) = DrmDevice::new(device_fd.clone(), false)?;
+    // GBM на ПЕРВИЧНОМ узле — только для буферов скан-аута: их выделяет и
+    // экспортирует в KMS-фреймбуферы тот же узел, что владеет дисплеем.
     let gbm = GbmDevice::new(device_fd.clone())?;
-    let egl = unsafe { EGLDisplay::new(gbm.clone())? };
+
+    // А рисуем на РЕНДЕР-узле (/dev/dri/renderD128), отдельным fd. Раньше
+    // EGL/GLES строились поверх card0 — то есть весь рендер шёл через узел,
+    // который требует DRM master и монопольно принадлежит владельцу экрана.
+    // Из-за этого dawn забирал видеокарту целиком и не мог делить её с чужой
+    // сессией (Xorg/другой Wayland): узел один, хозяин может быть только один.
+    // Рендер-узел никакого master не требует (права crw-rw-rw-), это штатный
+    // путь всех компоновщиков: KMS — на card0, GL — на renderD128.
+    let render_gbm = open_render_gbm(&render_node);
+    let egl = match render_gbm {
+        Some(rgbm) => unsafe { EGLDisplay::new(rgbm)? },
+        None => {
+            tracing::warn!(
+                "dawn/udev: рендер-узел недоступен, EGL на первичном узле \
+                 (видеокарта будет занята монопольно)"
+            );
+            unsafe { EGLDisplay::new(gbm.clone())? }
+        }
+    };
     let ctx = EGLContext::new(&egl)?;
     let gles = unsafe { GlesRenderer::new(ctx)? };
 
@@ -431,6 +485,32 @@ fn add_device(
     scan_connectors(&mut device, state);
     tracing::info!("dawn/udev: added {:?}", path);
     Ok((device, notifier, drm_node))
+}
+
+/// Открывает GBM-устройство на рендер-узле карты. Узел открываем НАПРЯМУЮ, а
+/// не через сессию (libseat): рендер-узел не имеет отношения ни к seat'у, ни к
+/// DRM master — он доступен всем на чтение-запись и переживает смену VT, в
+/// отличие от card0, который сессия отбирает на паузе.
+///
+/// None — узла нет (проприетарный драйвер без render node, vgem и т.п.);
+/// вызывающий откатывается на первичный узел.
+fn open_render_gbm(render_node: &DrmNode) -> Option<GbmDevice<DrmDeviceFd>> {
+    if render_node.ty() != NodeType::Render {
+        return None;
+    }
+    let path = render_node.dev_path()?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|e| tracing::warn!("dawn/udev: не открыть рендер-узел {:?}: {}", path, e))
+        .ok()?;
+    let gbm = GbmDevice::new(DrmDeviceFd::new(DeviceFd::from(std::os::fd::OwnedFd::from(file))))
+        .map_err(|e| tracing::warn!("dawn/udev: GBM на рендер-узле {:?}: {}", path, e))
+        .ok()?;
+    tracing::info!("dawn/udev: рендер на {:?} (скан-аут на первичном узле)", path);
+    Some(gbm)
 }
 
 fn scan_connectors(device: &mut Device, state: &mut Dawn) {
@@ -461,21 +541,97 @@ fn add_surface(
     connector: &connector::Info,
     crtc: crtc::Handle,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mode_info = connector.modes().iter()
-        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-        .or_else(|| connector.modes().first())
-        .copied()
-        .ok_or("no modes")?;
+    // Имя коннектора в терминах ядра/DRM — "DP-2", "HDMI-A-1". Именно оно
+    // пишется в monitor{ name = ... }: модель из EDID ("Redmi 30 HFCW") тоже
+    // принимается, но коннектор стабильнее и виден в /sys/class/drm.
+    let connector_name = format!("{}-{}", connector.interface().as_str(), connector.interface_id());
+
+    let display = display_info::for_connector(&device.drm, connector.handle());
+    let model = display.as_ref().and_then(|d| d.model())
+        .unwrap_or_else(|| format!("{:?}", connector.interface()));
+    let output_name = format!("{}-{}", model, connector.interface_id());
+
+    // monitor{} из config.lua: ищем по имени коннектора, по модели из EDID или
+    // по полному имени выхода. Первый подошедший выигрывает.
+    let mon_cfg = state.lua_config.monitors.iter()
+        .find(|m| m.name == connector_name || m.name == model || m.name == output_name)
+        .cloned();
+
+    // Режим: если в конфиге задан размер/частота — берём ТОЧНОЕ совпадение,
+    // иначе ближайший по частоте среди подходящих по размеру. Без конфига —
+    // прежнее поведение (PREFERRED, затем первый).
+    let mode_info = match &mon_cfg {
+        Some(cfg) if cfg.width > 0 && cfg.height > 0 => {
+            let подходящие: Vec<_> = connector.modes().iter()
+                .filter(|m| m.size().0 as i32 == cfg.width && m.size().1 as i32 == cfg.height)
+                .collect();
+            let выбран = if cfg.refresh > 0 {
+                подходящие.iter()
+                    .min_by_key(|m| (m.vrefresh() as i32 - cfg.refresh).abs())
+                    .copied()
+            } else {
+                подходящие.iter()
+                    .max_by_key(|m| m.vrefresh())
+                    .copied()
+            };
+            match выбран {
+                Some(m) => {
+                    tracing::info!(
+                        "dawn/udev: {}: режим из конфига {}x{}@{}Hz",
+                        connector_name, m.size().0, m.size().1, m.vrefresh(),
+                    );
+                    *m
+                }
+                None => {
+                    tracing::warn!(
+                        "dawn/udev: {}: режим {}x{}@{}Hz из конфига не поддерживается, беру PREFERRED",
+                        connector_name, cfg.width, cfg.height, cfg.refresh,
+                    );
+                    connector.modes().iter()
+                        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+                        .or_else(|| connector.modes().first())
+                        .copied()
+                        .ok_or("no modes")?
+                }
+            }
+        }
+        // Задана только частота: тот же размер, что у PREFERRED, но с нужным Hz.
+        Some(cfg) if cfg.refresh > 0 => {
+            let базовый = connector.modes().iter()
+                .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+                .or_else(|| connector.modes().first())
+                .copied()
+                .ok_or("no modes")?;
+            connector.modes().iter()
+                .filter(|m| m.size() == базовый.size())
+                .min_by_key(|m| (m.vrefresh() as i32 - cfg.refresh).abs())
+                .copied()
+                .unwrap_or(базовый)
+        }
+        _ => connector.modes().iter()
+            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+            .or_else(|| connector.modes().first())
+            .copied()
+            .ok_or("no modes")?,
+    };
 
     let wl_mode = Mode {
         size: (mode_info.size().0 as i32, mode_info.size().1 as i32).into(),
         refresh: (mode_info.vrefresh() * 1000) as i32,
     };
 
-    let display = display_info::for_connector(&device.drm, connector.handle());
-    let model = display.as_ref().and_then(|d| d.model())
-        .unwrap_or_else(|| format!("{:?}", connector.interface()));
-    let output_name = format!("{}-{}", model, connector.interface_id());
+    let transform = match mon_cfg.as_ref().map(|c| c.transform.as_str()) {
+        Some("90") => Transform::_90,
+        Some("180") => Transform::_180,
+        Some("270") => Transform::_270,
+        Some("flipped") => Transform::Flipped,
+        Some("flipped-90") => Transform::Flipped90,
+        Some("flipped-180") => Transform::Flipped180,
+        Some("flipped-270") => Transform::Flipped270,
+        _ => Transform::Normal,
+    };
+    let position: smithay::utils::Point<i32, smithay::utils::Logical> =
+        mon_cfg.as_ref().map(|c| (c.x, c.y)).unwrap_or((0, 0)).into();
 
     let output = Output::new(output_name.clone(), PhysicalProperties {
         size: connector.size().map(|(w,h)| (w as i32, h as i32)).unwrap_or((0,0)).into(),
@@ -485,9 +641,34 @@ fn add_surface(
         serial_number: "Unknown".into(),
     });
     let _global = output.create_global::<Dawn>(&state.display_handle);
-    output.change_current_state(Some(wl_mode), Some(Transform::Normal), None, Some((0,0).into()));
+    output.change_current_state(Some(wl_mode), Some(transform), None, Some(position));
     output.set_preferred(wl_mode);
-    state.space.map_output(&output, (0, 0));
+    state.space.map_output(&output, position);
+
+    // Отдельный выход ТОЛЬКО для layer-поверхностей (обои, панели, меню dwall).
+    //
+    // Зум холста у dawn сделан через output scale, а логический размер выхода
+    // делится на масштаб — то есть на «птичьем глазе» (zoom 0.2) LayerMap
+    // выдавал обоям размер 12800×5400 и требовал от клиента отрисовать буфер в
+    // 25 раз больше экрана. dwall на этом просто ложился, обои и меню исчезали.
+    // У этого выхода масштаб всегда 1, поэтому слои всегда считаются в
+    // ЭКРАННЫХ пикселях, независимо от зума. Глобал ему не создаём: клиенты о
+    // нём не знают и знать не должны, он нужен только как ключ для LayerMap.
+    let layer_output = Output::new(format!("{}-layers", output_name), PhysicalProperties {
+        size: connector.size().map(|(w,h)| (w as i32, h as i32)).unwrap_or((0,0)).into(),
+        subpixel: Subpixel::Unknown,
+        make: "Unknown".into(),
+        model,
+        serial_number: "Unknown".into(),
+    });
+    layer_output.change_current_state(
+        Some(wl_mode),
+        Some(Transform::Normal),
+        Some(smithay::output::Scale::Integer(1)),
+        Some((0, 0).into()),
+    );
+    layer_output.set_preferred(wl_mode);
+    state.layer_output = Some(layer_output);
 
     // Ставим курсор в центр экрана при первом output'е
     if state.pointer_location.x == 0.0 && state.pointer_location.y == 0.0 {
@@ -518,6 +699,7 @@ fn add_surface(
         output, compositor, damage_tracker,
         frame_queued: false,
         frame_queued_at: std::time::Instant::now(),
+        last_elements: 0,
     });
     tracing::info!("dawn/udev: output '{}' {}x{}@{}Hz",
         output_name, wl_mode.size.w, wl_mode.size.h, wl_mode.refresh/1000);
@@ -568,6 +750,156 @@ fn build_selection_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
     elements
 }
 
+/// Снять кадр для потока демонстрации и отдать его в PipeWire.
+///
+/// Экран снимается целиком (это же ровно то, что видит пользователь), а для
+/// выбранного ОКНА кадр вырезается по его текущему месту на экране. Размер
+/// потока зафиксирован при старте: PipeWire согласует формат один раз, поэтому
+/// уехавшее или изменившее размер окно даёт частично чёрный кадр, а не рассыпавшийся
+/// поток.
+fn push_cast_frame<E>(
+    state: &mut Dawn,
+    output: &Output,
+    renderer: &mut GlesRenderer,
+    elements: &[E],
+) where
+    E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
+{
+    let Some(mode) = output.current_mode() else { return };
+    let screen: Size<i32, smithay::utils::Buffer> = (mode.size.w, mode.size.h).into();
+    let Some(cast) = state.portal_cast.as_ref() else { return };
+    let (cw, ch) = (cast.width as i32, cast.height as i32);
+    // Прямоугольник, который уйдёт в поток, в экранных пикселях.
+    let crop = match &cast.source {
+        crate::portal::Capture::Output => None,
+        crate::portal::Capture::Window(window) => {
+            let zoom = state.viewport.zoom;
+            let geo = state.space.element_geometry(window);
+            geo.map(|g| (
+                ((g.loc.x as f64 - state.viewport.cam_x) * zoom).round() as i32,
+                ((g.loc.y as f64 - state.viewport.cam_y) * zoom).round() as i32,
+            ))
+        }
+    };
+
+    let Some(shot) = crate::screencopy::capture(renderer, output, elements, screen) else {
+        return;
+    };
+
+    let frame = match crop {
+        // Весь экран: если размеры совпали — отдаём как есть.
+        None if screen.w == cw && screen.h == ch => shot,
+        // Иначе вырезаем окно (или подгоняем экран под согласованный размер).
+        _ => {
+            let (ox, oy) = crop.unwrap_or((0, 0));
+            let mut out = vec![0u8; (cw * ch * 4) as usize];
+            for y in 0..ch {
+                let sy = oy + y;
+                if sy < 0 || sy >= screen.h {
+                    continue;
+                }
+                // Пересечение строки окна с экраном — копируем одним куском.
+                let x0 = ox.max(0);
+                let x1 = (ox + cw).min(screen.w);
+                if x1 <= x0 {
+                    continue;
+                }
+                let src = ((sy * screen.w + x0) * 4) as usize;
+                let dst = ((y * cw + (x0 - ox)) * 4) as usize;
+                let len = ((x1 - x0) * 4) as usize;
+                out[dst..dst + len].copy_from_slice(&shot[src..src + len]);
+            }
+            out
+        }
+    };
+
+    if let Some(cast) = state.portal_cast.as_mut() {
+        cast.push(frame);
+    }
+}
+
+/// Подсветка выбора источника для демонстрации экрана (portal.rs).
+///
+/// Пока портал ждёт ответа, под курсором подсвечивается то, что уйдёт в поток:
+/// окно — рамкой по его границам, пустой холст — рамкой по всему экрану («весь
+/// экран»). Своего шрифта у dawn нет, поэтому подсказка визуальная, без текста:
+/// ЛКМ — выбрать, ПКМ или Escape — отменить.
+fn build_portal_pick_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
+    let mut elements = Vec::new();
+    if !state.portal_picking() {
+        return elements;
+    }
+    let mode = state.space.element_under(state.pointer_location)
+        .and_then(|(w, _)| state.space.element_geometry(w));
+    let (x, y, w, h) = match mode {
+        Some(geo) => {
+            let zoom = state.viewport.zoom;
+            (
+                ((geo.loc.x as f64 - state.viewport.cam_x) * zoom).round() as i32,
+                ((geo.loc.y as f64 - state.viewport.cam_y) * zoom).round() as i32,
+                ((geo.size.w as f64 * zoom).round() as i32).max(1),
+                ((geo.size.h as f64 * zoom).round() as i32).max(1),
+            )
+        }
+        None => {
+            let s = state.screen_size();
+            (0, 0, s.w, s.h)
+        }
+    };
+
+    const РАМКА: i32 = 4;
+    // Цвет ПРЕМУЛЬТИПЛИЦИРОВАН: рендер берёт компоненты как есть и складывает
+    // их с фоном по (1 − alpha). Без домножения на альфу лёгкая заливка 0.15
+    // красила весь экран в плотный голубой — обои под ней тонули.
+    const ЦВЕТ: [f32; 4] = [0.30, 0.64, 0.85, 0.85];
+    const ЗАЛИВКА: [f32; 4] = [0.05, 0.11, 0.15, 0.15];
+    let pool = &mut state.portal_pick_ids;
+    let mut idx = 0usize;
+    // Четыре полосы рамки + лёгкая заливка: сплошными прямоугольниками, как
+    // остальные оверлеи dawn (своего шейдера у нас нет).
+    elements.push(pooled_solid(pool, &mut idx, (x, y), (w, РАМКА), ЦВЕТ));
+    elements.push(pooled_solid(pool, &mut idx, (x, y + h - РАМКА), (w, РАМКА), ЦВЕТ));
+    elements.push(pooled_solid(pool, &mut idx, (x, y), (РАМКА, h), ЦВЕТ));
+    elements.push(pooled_solid(pool, &mut idx, (x + w - РАМКА, y), (РАМКА, h), ЦВЕТ));
+    elements.push(pooled_solid(pool, &mut idx, (x, y), (w, h), ЗАЛИВКА));
+    elements
+}
+
+/// Цифра 3×5 «пикселей» из сплошных прямоугольников, увеличенная в PX раз.
+/// Своего шрифта у dawn нет, а подпись нужна крошечная — этого хватает.
+fn draw_digit(
+    pool: &mut Vec<SolidSlot>, idx: &mut usize,
+    x: i32, y: i32, digit: u32, color: [f32; 4],
+    out: &mut Vec<OutputRenderElements>,
+) {
+    // Каждая строка — 3 бита, старший бит слева.
+    const ЦИФРЫ: [[u8; 5]; 10] = [
+        [0b111, 0b101, 0b101, 0b101, 0b111], // 0
+        [0b010, 0b110, 0b010, 0b010, 0b111], // 1
+        [0b111, 0b001, 0b111, 0b100, 0b111], // 2
+        [0b111, 0b001, 0b111, 0b001, 0b111], // 3
+        [0b101, 0b101, 0b111, 0b001, 0b001], // 4
+        [0b111, 0b100, 0b111, 0b001, 0b111], // 5
+        [0b111, 0b100, 0b111, 0b101, 0b111], // 6
+        [0b111, 0b001, 0b010, 0b010, 0b010], // 7
+        [0b111, 0b101, 0b111, 0b101, 0b111], // 8
+        [0b111, 0b101, 0b111, 0b001, 0b111], // 9
+    ];
+    const PX: i32 = 2; // сторона «пикселя» цифры
+    let Some(glyph) = ЦИФРЫ.get((digit % 10) as usize) else { return };
+    for (row, bits) in glyph.iter().enumerate() {
+        for col in 0..3i32 {
+            if bits & (1 << (2 - col)) != 0 {
+                out.push(pooled_solid(
+                    pool, idx,
+                    (x + col * PX, y + row as i32 * PX),
+                    (PX, PX), color,
+                ));
+            }
+        }
+    }
+}
+
 fn build_minimap_elements(state: &mut Dawn, output: &Output) -> Vec<OutputRenderElements> {
     let mut elements = Vec::new();
     let mode = match output.current_mode() { Some(m) => m, None => return elements };
@@ -585,11 +917,18 @@ fn build_minimap_elements(state: &mut Dawn, output: &Output) -> Vec<OutputRender
             }))
             .collect();
 
-    let proj = crate::canvas::project_minimap(&windows);
+    // Закладки обязаны попасть в кадр миникарты — иначе поставленная в
+    // стороне от окон точка не рисуется вовсе.
+    let якоря: Vec<_> = state.camera_bookmarks.values().copied().collect();
+    let proj = crate::canvas::project_minimap_with(&windows, &якоря);
     let origin = crate::canvas::minimap_panel_origin(mode.size);
 
     // Закладки камеры читаем до заимствования пула — обе части лежат в state.
-    let bookmarks: Vec<_> = state.camera_bookmarks.values().copied().collect();
+    // Берём ПАРАМИ со слотом: номер рисуется рядом с точкой, чтобы было видно,
+    // какая цифра куда прыгает (Super+N в режиме закладок).
+    let mut bookmarks: Vec<(u32, Point<f64, Logical>)> =
+        state.camera_bookmarks.iter().map(|(s, p)| (*s, *p)).collect();
+    bookmarks.sort_by_key(|(s, _)| *s);
     let pool = &mut state.minimap_ids;
     let mut idx = 0usize;
 
@@ -599,26 +938,12 @@ fn build_minimap_elements(state: &mut Dawn, output: &Output) -> Vec<OutputRender
         [0.05, 0.05, 0.08, 0.75],
     ));
 
-    for b in &proj.boxes {
-        let color: [f32; 4] = if b.focused { [0.35, 0.55, 0.95, 0.9] } else { [0.6, 0.6, 0.65, 0.75] };
-        elements.push(pooled_solid(
-            pool, &mut idx,
-            (origin.x + b.loc.x, origin.y + b.loc.y),
-            (b.size.w, b.size.h), color,
-        ));
-    }
-
-    // Рамку текущего viewport (жёлтый прямоугольник) НЕ рисуем: при отдалении
-    // камеры она разрасталась в "жёлтый квадрат" вокруг панели и делала
-    // миникарту дёрганой. Миникарта теперь статична — просто мини-рисунок
-    // всего холста (окна + крестики закладок), без индикатора камеры.
-
     // ── Закладки камеры (bookmarks_mode): крестик на минимапе за каждую точку ─
     // Проецируем якорь закладки тем же bbox/scale, что и окна; рисуем крест из
     // двух перекладин. Точки вне панели (сильный зум/далеко) пропускаем.
     const CROSS_ARM: i32 = 5; // длина луча от центра, px
     const CROSS_TH: i32 = 2;  // толщина перекладины, px
-    for anchor in bookmarks {
+    for (slot, anchor) in bookmarks {
         let p = crate::canvas::project_point_minimap(anchor, proj.bbox, proj.scale);
         if p.x < 0 || p.y < 0
             || p.x >= crate::canvas::MINIMAP_PANEL_W
@@ -639,7 +964,35 @@ fn build_minimap_elements(state: &mut Dawn, output: &Output) -> Vec<OutputRender
             (origin.x + p.x - CROSS_TH / 2, origin.y + p.y - CROSS_ARM),
             (CROSS_TH, CROSS_ARM * 2 + 1), color,
         ));
+        // Номер слота — справа сверху от крестика, тем же цветом.
+        draw_digit(
+            pool, &mut idx,
+            origin.x + p.x + CROSS_ARM + 2,
+            origin.y + p.y - CROSS_ARM - 1,
+            slot,
+            color,
+            &mut elements,
+        );
     }
+
+    // Прямоугольники окон рисуем ПОСЛЕ закладок: список кадра идёт от
+    // переднего плана к заднему, поэтому то, что добавлено позже, лежит ниже.
+    // Раньше закладки шли последними и тонули под полупрозрачными окнами —
+    // крестики с номерами были едва различимы.
+    for b in &proj.boxes {
+        let color: [f32; 4] = if b.focused { [0.35, 0.55, 0.95, 0.9] } else { [0.6, 0.6, 0.65, 0.75] };
+        elements.push(pooled_solid(
+            pool, &mut idx,
+            (origin.x + b.loc.x, origin.y + b.loc.y),
+            (b.size.w, b.size.h), color,
+        ));
+    }
+
+    // Рамку текущего viewport (жёлтый прямоугольник) НЕ рисуем: при отдалении
+    // камеры она разрасталась в "жёлтый квадрат" вокруг панели и делала
+    // миникарту дёрганой. Миникарта теперь статична — просто мини-рисунок
+    // всего холста (окна + крестики закладок), без индикатора камеры.
+
 
     elements
 }
@@ -867,6 +1220,24 @@ fn corner_radius_logical(state: &Dawn) -> i32 {
 }
 
 /// Геометрия окна на экране: (x0, y0, ширина, высота) в физических пикселях.
+/// Виден ли на экране прямоугольник (в физических пикселях кадра) с запасом
+/// `margin` по краям.
+///
+/// Холст в dawn бесконечен, а декорации (тени, маски углов) строились для ВСЕХ
+/// окон текущих тегов — включая те, что стоят в тысячах пикселей от камеры.
+/// Каждое такое окно — это 11 элементов тени плюс 4 маски углов, которые
+/// создаются, попадают в список кадра и сравниваются damage tracker'ом с
+/// прошлым кадром 190 раз в секунду, чтобы затем быть обрезанными по краю
+/// экрана. Ровно ту же проверку окна проходят перед отрисовкой (см. `видимое`
+/// в render_surface) — декорации просто про неё забыли.
+fn on_screen(screen: Size<i32, Logical>, r: (f64, f64, f64, f64), margin: f64) -> bool {
+    let (x, y, w, h) = r;
+    x + w + margin > 0.0
+        && y + h + margin > 0.0
+        && x - margin < screen.w as f64
+        && y - margin < screen.h as f64
+}
+
 fn window_screen_rect(state: &Dawn, window: &Window) -> Option<(f64, f64, f64, f64)> {
     let geo = state.space.element_geometry(window)?;
     let zoom = state.viewport.zoom;
@@ -893,6 +1264,7 @@ fn build_corner_mask_elements(
     }
     let _ = output;
     let zoom = state.viewport.zoom;
+    let screen = state.screen_size();
     let radius = corner_radius_logical(state);
     state.decor.ensure(radius, [CLEAR_COLOR[0], CLEAR_COLOR[1], CLEAR_COLOR[2]]);
     let r_px = state.decor.mask_px() as f64 * zoom;
@@ -900,9 +1272,18 @@ fn build_corner_mask_elements(
     let windows: Vec<Window> = state.tagged_windows.iter().map(|tw| tw.window.clone()).collect();
     let mut slot = 0usize;
     for window in windows {
+        // Развёрнутое на весь экран окно не скругляем: у края монитора
+        // скругление выглядит рамкой вокруг «полного экрана».
+        if state.is_fullscreen(&window) {
+            continue;
+        }
         let Some((x0, y0, w, h)) = window_screen_rect(state, &window) else { continue };
         if w < r_px * 2.0 || h < r_px * 2.0 {
             continue; // окно слишком маленькое для радиуса — не портим его совсем
+        }
+        // Окно за краем экрана — его углов не видно (см. on_screen).
+        if !on_screen(screen, (x0, y0, w, h), 0.0) {
+            continue;
         }
         let corners = [
             (crate::decor::TL, x0, y0),
@@ -910,11 +1291,19 @@ fn build_corner_mask_elements(
             (crate::decor::BL, x0, y0 + h - r_px),
             (crate::decor::BR, x0 + w - r_px, y0 + h - r_px),
         ];
+        // Размер задаём ЯВНО. Плитка сделана в логических пикселях, и раньше её
+        // домножал на зум сам рендер (масштаб выхода был равен зуму). Теперь
+        // масштаб выхода всегда 1 (зум живёт в отрисовке окон), и без явного
+        // размера маска рисовалась бы во всю величину зума 1 поверх маленького
+        // окна — те самые «фантомные» пятна по углам.
+        let dst_mask = Size::<i32, Logical>::from((
+            (r_px.round() as i32).max(1), (r_px.round() as i32).max(1),
+        ));
         for (corner, x, y) in corners {
             let buf = state.decor.mask_corner(corner, slot);
             match MemoryRenderBufferRenderElement::from_buffer(
                 renderer, Point::<f64, Physical>::from((x, y)), buf,
-                None, None, None, Kind::Unspecified,
+                None, None, Some(dst_mask), Kind::Unspecified,
             ) {
                 Ok(el) => elements.push(OutputRenderElements::Memory(el)),
                 Err(e) => tracing::warn!("dawn/udev: маска угла: {:?}", e),
@@ -944,6 +1333,7 @@ fn build_shadow_elements(
         return els;
     }
     let zoom = state.viewport.zoom;
+    let screen = state.screen_size();
     let radius = corner_radius_logical(state);
     state.decor.ensure(radius, [CLEAR_COLOR[0], CLEAR_COLOR[1], CLEAR_COLOR[2]]);
 
@@ -961,8 +1351,18 @@ fn build_shadow_elements(
     let windows: Vec<Window> = state.tagged_windows.iter().map(|tw| tw.window.clone()).collect();
     let mut slot = 0usize;
     for window in windows {
+        // Тень у полноэкранного окна рисовать негде и не нужно — см. выше.
+        if state.is_fullscreen(&window) {
+            continue;
+        }
         let Some((x0, y0raw, w, h)) = window_screen_rect(state, &window) else { continue };
         if w < 8.0 || h < 8.0 || w < 2.0 * r || h < 2.0 * r {
+            continue;
+        }
+        // Окно далеко за краем экрана — тени от него не видно (см. on_screen).
+        // Запас берём с ширину самой тени: она вылезает за окно на s и уезжает
+        // вниз на drop.
+        if !on_screen(screen, (x0, y0raw, w, h), s + drop) {
             continue;
         }
         let y0 = y0raw + drop;
@@ -974,11 +1374,17 @@ fn build_shadow_elements(
             (crate::decor::BL, x0 - s,     y0 + h - r),
             (crate::decor::BR, x0 + w - r, y0 + h - r),
         ];
+        // Тот же явный размер, что и у масок: плитка угла тени — это
+        // (кромка + радиус) логических пикселей, на экране она должна занять
+        // столько же, умноженное на зум (s и r уже с зумом).
+        let dst_corner = Size::<i32, Logical>::from((
+            ((s + r).round() as i32).max(1), ((s + r).round() as i32).max(1),
+        ));
         for (corner, x, y) in corners {
             let buf = state.decor.shadow_corner(corner, slot);
             match MemoryRenderBufferRenderElement::from_buffer(
                 renderer, Point::<f64, Physical>::from((x, y)), buf,
-                None, None, None, Kind::Unspecified,
+                None, None, Some(dst_corner), Kind::Unspecified,
             ) {
                 Ok(el) => els.push(OutputRenderElements::Memory(el)),
                 Err(e) => tracing::warn!("dawn/udev: угол тени: {:?}", e),
@@ -989,13 +1395,18 @@ fn build_shadow_elements(
         // ── Кромки ───────────────────────────────────────────────────────────
         // Текстура толщиной в пиксель растягивается вдоль стороны через dst:
         // альфа вдоль стороны постоянна, так что растяжение точное.
-        let side_w = ((w - 2.0 * r) / zoom).round().max(1.0) as i32;
-        let side_h = ((h - 2.0 * r) / zoom).round().max(1.0) as i32;
+        // Длина стороны уже в экранных пикселях (w и r посчитаны с зумом), а
+        // толщина кромки — логическая, её домножаем на зум сами: раньше это
+        // делал за нас масштаб выхода, отсюда и деление на зум, которое теперь
+        // не нужно.
+        let side_w = (w - 2.0 * r).round().max(1.0) as i32;
+        let side_h = (h - 2.0 * r).round().max(1.0) as i32;
+        let толщина = (s.round() as i32).max(1);
         let edges = [
-            (crate::decor::TOP,    x0 + r,     y0 - s,     side_w, crate::decor::SPREAD),
-            (crate::decor::BOTTOM, x0 + r,     y0 + h,     side_w, crate::decor::SPREAD),
-            (crate::decor::LEFT,   x0 - s,     y0 + r,     crate::decor::SPREAD, side_h),
-            (crate::decor::RIGHT,  x0 + w,     y0 + r,     crate::decor::SPREAD, side_h),
+            (crate::decor::TOP,    x0 + r,     y0 - s,     side_w, толщина),
+            (crate::decor::BOTTOM, x0 + r,     y0 + h,     side_w, толщина),
+            (crate::decor::LEFT,   x0 - s,     y0 + r,     толщина, side_h),
+            (crate::decor::RIGHT,  x0 + w,     y0 + r,     толщина, side_h),
         ];
         for (edge, x, y, dw, dh) in edges {
             let buf = state.decor.shadow_edge(edge, slot);
@@ -1173,12 +1584,107 @@ fn rounded_solid(
     if mid_h > 0 {
         out.push(pooled_solid(pool, idx, (x, y + rr), (w, mid_h), color));
     }
-    // Нижняя половина
+    // Нижняя половина — ЗЕРКАЛО верхней: вырезы идут в обратном порядке.
+    // Раньше здесь стоял тот же widths[i], что и наверху, то есть снизу
+    // рисовалась ВТОРАЯ ВЕРХНЯЯ дуга: широкий вырез оказывался у шва, узкий —
+    // у нижнего края. У точки бара 28×28 с радиусом 14 средней части нет
+    // совсем, поэтому кружок вырождался в две одинаковые полудуги со швом
+    // посередине — весь бар выглядел сломанным. Задевало это всё, что рисуется
+    // скруглённым: бар, миникарту, индикаторы вкладок, подсказку вставки.
     for i in 0..rr {
-        let cw = widths[i as usize];
+        let cw = widths[(rr - 1 - i) as usize];
         let rw = w - 2 * cw;
         if rw > 0 {
             out.push(pooled_solid(pool, idx, (x + cw, y + h - rr + i), (rw, 1), color));
+        }
+    }
+}
+
+// Геометрия панели столов. Лежит на уровне модуля, потому что от неё считают
+// себя ещё двое: значок блютуза рядом (build_bluetooth_indicator) и полоса,
+// которую под панель резервирует раскладка (tiling::BAR_RESERVED). Раньше эти
+// же числа стояли в каждом месте своим литералом — панель уезжала от значка.
+/// Высота бара.
+pub const BAR_H: i32 = 34;
+/// Отступ бара от верхнего края экрана.
+pub const BAR_TOP: i32 = 8;
+const BAR_RADIUS: i32 = 12;        // скругление фона бара
+const DOT: i32 = 20;
+const DOT_RADIUS: i32 = 10;        // скругление точек = круги
+const GAP: i32 = 6;
+const PAD_H: i32 = 14;
+const PAD_V: i32 = (BAR_H - DOT) / 2;
+/// Ширина бара; от неё полка состояния отсчитывает свою левую границу.
+pub const BAR_W: i32 = 2 * PAD_H + 9 * DOT + 8 * GAP;
+/// Фон бара и значка блютуза — тёмный полупрозрачный.
+const BAR_BG: [f32; 4] = [0.04, 0.04, 0.07, 0.65];
+
+/// Куда пришёлся клик по панели столов.
+pub enum BarHit {
+    /// Столбик стола: маска тега.
+    Tag(u32),
+    /// По панели, но мимо столов.
+    Background,
+}
+
+/// Попадание клика в панель столов; координаты — физические пиксели экрана.
+///
+/// Геометрия считается ТОЙ ЖЕ арифметикой, что и отрисовка ниже, из тех же
+/// констант. Второй копии чисел здесь нет намеренно — по той же причине, что
+/// и у полки состояния: разъехавшись, они дают «на экране одно, а в проверке
+/// другое».
+pub fn bar_hit(screen_w: i32, x: f64, y: f64) -> Option<BarHit> {
+    let ox = (screen_w - BAR_W) / 2;
+    let oy = BAR_TOP;
+
+    let внутри = x >= ox as f64
+        && x < (ox + BAR_W) as f64
+        && y >= oy as f64
+        && y < (oy + BAR_H) as f64;
+    if !внутри {
+        return None;
+    }
+
+    for i in 0..9i32 {
+        let cx = ox + PAD_H + i * (DOT + GAP);
+        // Столбик шире самой точки: она всего 20 пикселей, и целиться в неё
+        // мышью неудобно. Берём точку вместе с половинами зазоров по бокам и
+        // всю высоту панели — промах по вертикали внутри бара всё равно
+        // означает «этот стол».
+        let left = (cx - GAP / 2) as f64;
+        let right = (cx + DOT + GAP / 2) as f64;
+        if x >= left && x < right {
+            return Some(BarHit::Tag(1u32 << i));
+        }
+    }
+
+    Some(BarHit::Background)
+}
+
+impl crate::state::Dawn {
+    /// Клик по панели столов: столбик — перейти на этот стол.
+    ///
+    /// `true` = клик съеден. Мимо панели — `false`: под ней окно, и оно должно
+    /// получить свой клик (так же ведёт себя полка состояния).
+    pub fn bar_click(&mut self, pos: smithay::utils::Point<f64, smithay::utils::Physical>) -> bool {
+        // Под полноэкранным окном панели на экране нет — значит нет и кликов
+        // по ней. Условие ровно то же, что у отрисовки.
+        if self.fullscreen_here() {
+            return false;
+        }
+
+        match bar_hit(self.screen_size().w, pos.x, pos.y) {
+            Some(BarHit::Tag(mask)) => {
+                // Переход делаем не своим кодом, а тем же действием, что и
+                // Super+цифра: у него своя логика для ленты, обзора и закладок
+                // камеры, и вторая её копия здесь разъехалась бы с первой.
+                if mask != self.viewport.current_tags() {
+                    self.dispatch_action(crate::config::Action::ViewTag(mask));
+                }
+                true
+            }
+            Some(BarHit::Background) => true,
+            None => false,
         }
     }
 }
@@ -1188,27 +1694,23 @@ fn rounded_solid(
 /// круг=Tile, две колонки=Columns (niri), две тильды=Float, рамка=Monocle.
 fn build_workspace_bar_elements(state: &mut Dawn, output: &Output) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
+    // Про полноэкранное окно проверка ОДНА и стоит на месте вызова
+    // (`!fullscreen_here()`), а считается она по текущему столу. Здесь раньше
+    // стояла вторая, по «фуллскрин существует вообще», и она молча отменяла
+    // первую: развернув окно на одном столе и уйдя на другой, человек оставался
+    // без панели везде и навсегда — вернуть её можно было только F11 обратно.
+    // Ровно это и было в логе 05.08.2026: F11, потом Super+2, Super+1 — и до
+    // конца сеанса ни панели, ни полки.
     let mode = match output.current_mode() { Some(m) => m, None => return els };
 
-    // Размеры: крупный скруглённый бар сверху.
-    const BAR_H: i32 = 48;
-    const BAR_RADIUS: i32 = 20;        // скругление фона бара
-    const DOT: i32 = 28;
-    const DOT_RADIUS: i32 = 14;        // скругление точек = круги
-    const GAP: i32 = 8;
-    const PAD_H: i32 = 20;
-    const PAD_V: i32 = (BAR_H - DOT) / 2;
-    const BAR_W: i32 = 2 * PAD_H + 9 * DOT + 8 * GAP;
-
     let ox = (mode.size.w - BAR_W) / 2;
-    let oy = 10; // сверху, с отступом 10px
+    let oy = BAR_TOP;
 
     let pool = &mut state.bar_ids;
     let mut idx = 0usize;
 
     // Фон бара — тёмный полупрозрачный скруглённый прямоугольник.
-    const BG: [f32; 4] = [0.04, 0.04, 0.07, 0.65];
-    rounded_solid(pool, &mut idx, ox, oy, BAR_W, BAR_H, BAR_RADIUS, BG, &mut els);
+    rounded_solid(pool, &mut idx, ox, oy, BAR_W, BAR_H, BAR_RADIUS, BAR_BG, &mut els);
 
     let current_tags = state.viewport.current_tags();
 
@@ -1231,43 +1733,64 @@ fn build_workspace_bar_elements(state: &mut Dawn, output: &Output) -> Vec<Output
                 [1.0, 1.0, 1.0, 0.40]
             };
 
+            // Иконка = САМА ФИГУРА, без круглой подложки. Раньше под каждую
+            // фигуру рисовался сплошной круг ТЕМ ЖЕ ЦВЕТОМ, а фигура ложилась
+            // поверх — она сливалась с подложкой, и все столы выглядели
+            // одинаковыми кружками, по которым режим не читался вообще.
+            let y = oy + PAD_V;
             match layout.unwrap_or(crate::tiling::Layout::Tile) {
+                // Тайлинг — круг.
                 crate::tiling::Layout::Tile => {
-                    // Круг — сам по себе иконка Tile
-                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, DOT, DOT_RADIUS, base_color, &mut els);
+                    rounded_solid(pool, &mut idx, cx, y, DOT, DOT, DOT_RADIUS, base_color, &mut els);
                 }
+                // niri — две колонки рядом, во всю высоту.
                 crate::tiling::Layout::Columns => {
-                    // Фон — круг; поверх него две скруглённые колонки
-                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, DOT, DOT_RADIUS, base_color, &mut els);
-                    let cw = (DOT * 2 / 5).max(2);
-                    let gap = DOT - 2 * cw;
-                    let inner_r = (cw / 2).max(1);
-                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, cw, DOT, inner_r, base_color, &mut els);
-                    rounded_solid(pool, &mut idx, cx + cw + gap, oy + PAD_V, cw, DOT, inner_r, base_color, &mut els);
+                    let cw = (DOT * 2 / 5).max(2);          // 8 из 20
+                    let gap = DOT - 2 * cw;                 // 4 между ними
+                    let r = (cw / 2).max(1);
+                    rounded_solid(pool, &mut idx, cx, y, cw, DOT, r, base_color, &mut els);
+                    rounded_solid(pool, &mut idx, cx + cw + gap, y, cw, DOT, r, base_color, &mut els);
                 }
+                // Float — две горизонтальные тильды одна под другой.
                 crate::tiling::Layout::Float => {
-                    // Фон — круг; поверх него две скруглённые тильды
-                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, DOT, DOT_RADIUS, base_color, &mut els);
-                    let th = (DOT / 3).max(2);
-                    let tgap = DOT - 2 * th;
-                    let inner_r = (th / 2).max(1);
-                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, th, inner_r, base_color, &mut els);
-                    rounded_solid(pool, &mut idx, cx, oy + PAD_V + th + tgap, DOT, th, inner_r, base_color, &mut els);
+                    let th = (DOT / 4).max(2);              // 5 из 20
+                    let gap = (DOT / 5).max(2);             // 4 между ними
+                    let r = (th / 2).max(1);
+                    let top = y + (DOT - (2 * th + gap)) / 2;
+                    rounded_solid(pool, &mut idx, cx, top, DOT, th, r, base_color, &mut els);
+                    rounded_solid(pool, &mut idx, cx, top + th + gap, DOT, th, r, base_color, &mut els);
                 }
+                // Monocle — одно окно на весь стол: сплошной скруглённый квадрат.
                 crate::tiling::Layout::Monocle => {
-                    // Фон — круг; поверх него скруглённый вложенный квадрат
-                    rounded_solid(pool, &mut idx, cx, oy + PAD_V, DOT, DOT, DOT_RADIUS, base_color, &mut els);
-                    let inset = (DOT / 4).max(1);
-                    let mw = DOT - 2 * inset;
-                    let mh = DOT - 2 * inset;
-                    let inner_r = (inset / 2).max(1);
-                    rounded_solid(pool, &mut idx, cx + inset, oy + PAD_V + inset, mw, mh, inner_r, base_color, &mut els);
+                    let r = (DOT / 5).max(1);
+                    rounded_solid(pool, &mut idx, cx, y, DOT, DOT, r, base_color, &mut els);
                 }
             }
         }
     }
 
     els
+}
+
+/// Закрыт ли экран целиком фоновой layer-поверхностью (обои dwall).
+///
+/// Если да, то параллакс-сетка под ней невидима, и строить её незачем: это
+/// ~8 элементов на КАЖДЫЙ кадр, которые damage tracker потом ещё и сравнивает
+/// с прошлым кадром. Обои — самый обычный случай, так что экономия постоянная.
+fn background_covers_output(state: &Dawn, output: &Output, screen: Size<i32, Logical>) -> bool {
+    let output = state.layer_output.clone().unwrap_or_else(|| output.clone());
+    let map = layer_map_for_output(&output);
+    let covered = map
+        .layers()
+        .filter(|l| l.layer() == WlrLayer::Background)
+        .any(|l| {
+            map.layer_geometry(l).is_some_and(|g| {
+                g.loc.x <= 0 && g.loc.y <= 0
+                    && g.loc.x + g.size.w >= screen.w
+                    && g.loc.y + g.size.h >= screen.h
+            })
+        });
+    covered
 }
 
 /// Рендер layer-поверхностей (wlr-layer-shell) для заданных слоёв.
@@ -1280,21 +1803,86 @@ fn build_layer_elements(
     layers: &[WlrLayer],
 ) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
+    // Слои живут на своём выходе с масштабом 1 (см. scan_connectors).
+    let output = &_state.layer_output.clone().unwrap_or_else(|| output.clone());
     let map = layer_map_for_output(output);
     // Собираем все подходящие layer-поверхности (сортируем по вложению).
     let to_render: Vec<_> = map.layers().filter(|l| layers.contains(&l.layer())).cloned().collect();
     for layer_surface in to_render {
         let Some(geo) = map.layer_geometry(&layer_surface) else { continue };
+        // Геометрия слоёв ЛОГИЧЕСКАЯ, а логический размер выхода у dawn
+        // делится на зум (зум сделан через output scale, см. apply_camera).
+        // Раньше её клали в кадр как физическую и рисовали в масштабе 1:1 —
+        // при отдалении обои сжимались в угол экрана, а меню Win+W уезжало
+        // вместе с ними. Переводим в физические координаты тем же зумом и им
+        // же масштабируем содержимое: слой остаётся приклеенным к экрану на
+        // любом зуме — обои во весь экран, меню по центру.
+        // Слои приклеены к ЭКРАНУ и зумом не масштабируются: их геометрия уже
+        // в экранных пикселях (масштаб выхода всегда 1, зум живёт в отрисовке
+        // окон — см. render_surface). Обёртка Rescale здесь не нужна.
         let phys_loc: Point<i32, Physical> = (geo.loc.x, geo.loc.y).into();
-        // Рендерим основную поверхность + дочерние.
-        layer_surface.with_surfaces(|surface, _states| {
-            let surface_els = render_elements_from_surface_tree(
-                renderer, surface, phys_loc, 1.0, 1.0, Kind::Unspecified,
-            );
-            els.extend(surface_els);
-        });
+        els.extend(render_elements_from_surface_tree(
+            renderer,
+            layer_surface.wl_surface(),
+            phys_loc,
+            1.0,
+            1.0,
+            Kind::Unspecified,
+        ));
     }
     els
+}
+
+/// ВРЕМЕННАЯ ДИАГНОСТИКА: выкладывает в `/tmp/dawn_frame.raw` содержимое того
+/// буфера, который РЕАЛЬНО уходит на монитор (`blit_frame_result` копирует сам
+/// сканаут, а не перерисовывает сцену). Формат — плотный RGBA, размер экрана.
+fn dump_scanout<B, F, E>(
+    res: &smithay::backend::drm::compositor::RenderFrameResult<'_, B, F, E>,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    idx: usize,
+)
+where
+    B: smithay::backend::allocator::Buffer + smithay::backend::allocator::dmabuf::AsDmabuf,
+    <B as smithay::backend::allocator::dmabuf::AsDmabuf>::Error: std::fmt::Debug,
+    F: smithay::backend::drm::Framebuffer,
+    E: smithay::backend::renderer::element::Element
+        + smithay::backend::renderer::element::RenderElement<GlesRenderer>,
+{
+    use smithay::backend::renderer::{Bind, ExportMem, Offscreen, gles::GlesRenderbuffer};
+    use smithay::utils::Buffer as BufferCoords;
+
+    let Some(mode) = output.current_mode() else { return };
+    let size = mode.size;
+    let bsize: Size<i32, BufferCoords> = (size.w, size.h).into();
+
+    let mut target: GlesRenderbuffer = match renderer.create_buffer(Fourcc::Abgr8888, bsize) {
+        Ok(t) => t,
+        Err(e) => { tracing::warn!("dawn/dbg: create_buffer: {:?}", e); return }
+    };
+    let mut fb = match renderer.bind(&mut target) {
+        Ok(fb) => fb,
+        Err(e) => { tracing::warn!("dawn/dbg: bind: {:?}", e); return }
+    };
+    if let Err(e) = res.blit_frame_result(
+        size, Transform::Normal, 1.0, renderer, &mut fb,
+        [Rectangle::from_size(size)], [],
+    ) {
+        tracing::warn!("dawn/dbg: blit_frame_result: {:?}", e);
+        return;
+    }
+    let mapping = match renderer.copy_framebuffer(&fb, Rectangle::from_size(bsize), Fourcc::Abgr8888) {
+        Ok(m) => m,
+        Err(e) => { tracing::warn!("dawn/dbg: copy_framebuffer: {:?}", e); return }
+    };
+    drop(fb);
+    match renderer.map_texture(&mapping) {
+        Ok(data) => {
+            let _ = std::fs::write(format!("/tmp/dawn_frame_{:02}.raw", idx), data);
+            tracing::debug!("dawn/dbg: снимок сканаута #{} {}x{} записан", idx, size.w, size.h);
+        }
+        Err(e) => tracing::warn!("dawn/dbg: map_texture: {:?}", e),
+    }
 }
 
 pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state: &mut Dawn) {
@@ -1327,6 +1915,13 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     }
 
     let render_started = std::time::Instant::now();
+    // Где курсор был в ЭТОМ кадре — то, что пользователь реально увидит на
+    // мониторе. Клик сравнивается с этим значением (см. PTR HIT): если человек
+    // жалуется на промах, а расхождение здесь ненулевое, значит мажет не
+    // хит-тест, а устаревшая картинка — кадр нарисован до того, как курсор
+    // доехал.
+    state.frame_cursor = state.pointer_location;
+    state.frame_drawn_at = std::time::Instant::now();
 
     // Сбрасываем plane-кэш только когда окна реально поменялись (тайлинг/
     // создание/уничтожение/переключение тега) — несколько кадров подряд
@@ -1339,7 +1934,12 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
 
     // Smithay принимает элементы в порядке front-to-back (первый = ближе к зрителю).
     // Курсор должен быть ПЕРВЫМ чтобы рендериться поверх окон.
-    let mut elements: Vec<OutputRenderElements> = Vec::new();
+    //
+    // Ёмкость берём по прошлому кадру: список набирается двумя десятками
+    // `extend` и на 300 элементах успевал переехать в новую память с десяток
+    // раз за кадр, то есть 190 раз в секунду.
+    let mut elements: Vec<OutputRenderElements> =
+        Vec::with_capacity(surface.last_elements.max(64));
 
     // ── Cursor (front layer) ─────────────────────────────────────────────────
     let cursor_pos_physical = {
@@ -1397,21 +1997,54 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
                 p.x - hotspot.x as f64,
                 p.y - hotspot.y as f64,
             )).to_i32_round();
-            let cursor_els: Vec<OutputRenderElements> =
+            // Курсор КЛИЕНТА рисуется РОВНО ТАКИМ, каким его прислали, — ни
+            // подгонки под размер нашей стрелки, ни какого-либо масштаба.
+            //
+            // Раньше здесь стояло ужатие до cursor_default_size (то есть до
+            // XCURSOR_SIZE из launch_native.sh): клиентский курсор крупнее
+            // нашего сжимался относительно острия. Это ломало ровно тот случай,
+            // ради которого клиент курсор и подменяет: игра, поставившая себе
+            // крупный прицел, получала его размером с системную стрелку, и
+            // сменить размер ИЗ ИГРЫ было нельзя — размер задавал компоновщик.
+            // Размер курсора внутри окна — дело окна; наш XCURSOR_SIZE остаётся
+            // размером ТОЛЬКО нашей собственной стрелки (ветка Named ниже).
+            //
+            // Отсюда же и Kind::Cursor: элемент не масштабируется, поэтому
+            // спокойно уходит на аппаратный слой курсора (тот масштаб не
+            // применяет и обрезал бы растянутую картинку).
+            // Строка на КАЖДЫЙ кадр, а под курсором клиента (браузер, Steam,
+            // игра) это 190 строк в секунду синхронной записью на диск прямо из
+            // потока рендера: в сеансе 05.08.2026 таких строк набежало 17 632 на
+            // каждые 20 МБ лога, а лог за сеанс вырос до 775 МБ. RUST_LOG у dawn
+            // штатно стоит в debug, поэтому уровня мало — включаем только по
+            // DAWN_DEBUG_FRAME, вместе с остальной покадровой диагностикой.
+            if debug_frame_enabled() {
+                let размер = crate::xwin::surface_buffer_size(cursor_surface);
+                let buf_scale = smithay::wayland::compositor::with_states(
+                    cursor_surface, |st| st.cached_state.get::<
+                        smithay::wayland::compositor::SurfaceAttributes
+                    >().current().buffer_scale,
+                );
+                tracing::debug!(
+                    "КУРСОР КЛИЕНТА: хотспот=({},{}) буфер={:?} buffer_scale={} \
+                     элемент=({},{}) остриё=({:.1},{:.1}) zoom={:.2}",
+                    hotspot.x, hotspot.y, размер, buf_scale,
+                    pos.x, pos.y, p.x, p.y, state.viewport.zoom,
+                );
+            }
+            let cursor_els: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                 render_elements_from_surface_tree(
                     renderer, cursor_surface, pos, 1.0, 1.0, Kind::Cursor,
                 );
-            elements.extend(cursor_els);
+            elements.extend(cursor_els.into_iter().map(OutputRenderElements::Cursor));
         }
         CursorImageStatus::Named(_) => {
             if let Some(ref buf) = state.cursor_default_buffer {
-                // Масштабируем курсор пропорционально зуму.
-                // dst задаёт логический размер: при zoom=2 логический пиксель = 2 физических,
-                // поэтому native_size логических → native_size*zoom физических пикселей.
-                let sz = state.cursor_default_size;
-                let dst = smithay::utils::Size::<i32, smithay::utils::Logical>::from((sz.w, sz.h));
+                // Размер НЕ трогаем: буфер уже нужного размера (курсор
+                // ужимается при загрузке, см. load_default_cursor). Любое
+                // растяжение здесь обрезалось бы аппаратным слоем курсора.
                 match MemoryRenderBufferRenderElement::from_buffer(
-                    renderer, cursor_pos_physical, buf, None, None, Some(dst), Kind::Cursor,
+                    renderer, cursor_pos_physical, buf, None, None, None, Kind::Cursor,
                 ) {
                     Ok(el) => elements.push(OutputRenderElements::Memory(el)),
                     Err(e) => tracing::warn!("dawn/udev: cursor render element: {:?}", e),
@@ -1428,12 +2061,26 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     // ── Overlay-слой (wlr-layer-shell): выше всего, ниже курсора ──────────────
     elements.extend(build_layer_elements(state, renderer, &surface.output, &[WlrLayer::Overlay]));
 
-    // ── Панель рабочих столов (всегда видна, поверх окон, под курсором) ────
-    elements.extend(build_workspace_bar_elements(state, &surface.output));
+    // ── Панель рабочих столов (поверх окон, под курсором) ──────────────────
+    // Под полноэкранным окном (F11, игра, видео) панель убирается: «на весь
+    // экран» значит на весь экран. Считается ПО ТЕКУЩЕМУ СТОЛУ: фуллскрин на
+    // соседнем столе панель здесь не трогает. Так же ведёт себя миникарта ниже.
+    if !state.fullscreen_here() {
+        elements.extend(build_workspace_bar_elements(state, &surface.output));
+    }
+
+    // ── Блютуз: меню поверх всего интерфейса, значок — рядом с панелью ───────
+    // Меню выше панели и миникарты намеренно: пока оно открыто, оно и есть
+    // главное на экране, и клавиши принадлежат ему (см. input.rs).
+    elements.extend(build_bluetooth_elements(state, renderer, &surface.output.clone()));
+    elements.extend(build_search_elements(state, renderer, &surface.output.clone()));
+    elements.extend(build_wifi_elements(state, renderer, &surface.output.clone()));
+    elements.extend(build_audio_elements(state, renderer, &surface.output.clone()));
+    elements.extend(build_tray_elements(state, renderer, &surface.output.clone()));
 
     // ── Миникарта (3.1, поверх окон, под курсором) ───────────────────────────
     // Не показываем во время обзора столов (перекрывает ленту).
-    if state.is_minimap_visible && !state.overview_active {
+    if state.is_minimap_visible && !state.overview_active && !state.fullscreen_here() {
         elements.extend(build_minimap_elements(state, &surface.output));
     }
 
@@ -1456,8 +2103,22 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
                     [0.0, 0.0, 0.0, 0.85],
                 ));
 
+                // Та же поправка на клиентские рамки, что и в главном цикле
+                // окон: render_elements кладёт по этой точке НАЧАЛО ДЕРЕВА
+                // ПОВЕРХНОСТЕЙ, а в рамку портала должна попасть ВИДИМАЯ часть
+                // окна. Без вычитания geometry().loc копия окна в портале
+                // съезжала вниз-вправо на поля тени клиента, и клики по ней
+                // (portal_hit_test) считались по несъехавшей.
+                let гло = window.geometry().loc;
+                let сдвиг: Point<i32, Physical> = (
+                    (гло.x as f64 * scale).round() as i32,
+                    (гло.y as f64 * scale).round() as i32,
+                ).into();
                 let els: Vec<OutputRenderElements> = window.render_elements(
-                    renderer, portal.screen_pos, smithay::utils::Scale::from(scale), 1.0f32,
+                    renderer,
+                    (portal.screen_pos.x - сдвиг.x, portal.screen_pos.y - сдвиг.y).into(),
+                    smithay::utils::Scale::from(scale),
+                    1.0f32,
                 );
                 elements.extend(els);
             }
@@ -1479,6 +2140,10 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     // ── Мультивыделение (rubber-band + подсветка "созвездий") ───────────────
     elements.extend(build_selection_elements(state));
 
+    // ── Выбор источника для демонстрации экрана (портал) ─────────────────────
+    // Выше окон и выделения: пока идёт выбор, он и есть главное на экране.
+    elements.extend(build_portal_pick_elements(state));
+
     // ── Top-слой (wlr-layer-shell): поверх окон, под UI -----------------------
     elements.extend(build_layer_elements(state, renderer, &surface.output, &[WlrLayer::Top]));
 
@@ -1489,9 +2154,61 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     // (4.1) и per-window fog (5.2) через этот путь недоступны (единый alpha
     // на весь батч) — оставлены как заготовки на будущее в этом комментарии,
     // но не подключены, чтобы не рисковать существующим рендером.
-    match state.space.render_elements_for_output::<GlesRenderer>(renderer, &surface.output, 1.0f32) {
-        Ok(els) => elements.extend(els.into_iter().map(OutputRenderElements::from)),
-        Err(e) => { tracing::warn!("dawn/udev: render_elements: {:?}", e); return; }
+    // Окна рисуем САМИ, а не через space.render_elements_for_output.
+    //
+    // Тот путь считает всё относительно output_geometry и обрезает по нему —
+    // он был пригоден, только пока зум ехал через масштаб выхода (и логический
+    // размер экрана сам собой рос при отдалении). Теперь зум живёт здесь:
+    // позиция окна — это (холст − камера) в экранных пикселях ДО зума, а сам
+    // зум накладывается обёрткой RescaleRenderElement вокруг начала экрана.
+    // Ровно так это устроено в driftwm (render/mod.rs, PixelSnapRescaleElement).
+    //
+    // Отсечение — по ВИДИМОЙ части холста (экран ⁄ зум): при отдалении в кадр
+    // попадает больше холста, чем сам экран.
+    {
+        let zoom = state.viewport.zoom.max(0.01);
+        let cam = Point::<f64, Logical>::from((state.viewport.cam_x, state.viewport.cam_y));
+        let vis = state.visible_canvas_size();
+        let видимое = Rectangle::<f64, Logical>::new(cam, vis);
+        // space.elements() идёт снизу вверх, а список кадра — от переднего
+        // плана к заднему, поэтому обходим в обратном порядке.
+        //
+        // ВАЖНО, две РАЗНЫЕ точки у одного окна:
+        // · `g.loc` (element_geometry) — где стоит ВИДИМАЯ часть окна. По ней
+        //   считают тайлинг, тени, скруглённые углы и хит-тест;
+        // · `g.loc − window.geometry().loc` — куда класть НАЧАЛО ДЕРЕВА
+        //   ПОВЕРХНОСТЕЙ. Клиент с клиентскими рамками (GTK, Firefox, Chromium,
+        //   Electron) рисует вокруг окна невидимые поля под тень и рамки
+        //   ресайза и объявляет их через xdg_surface.set_window_geometry —
+        //   тогда `window.geometry().loc` равен (26,26) и подобному.
+        //   Ровно это делает smithay в `InnerElement::render_location()`, и
+        //   ровно эту точку возвращает `space.element_under`, по которой мы
+        //   переводим клик в surface-локальные координаты (см. surface_under).
+        //
+        // Раньше сюда шёл `g.loc`, то есть дерево поверхностей клалось на
+        // начало ВИДИМОЙ части: картинка уезжала на +geometry().loc, а клики
+        // считались так, будто она не уехала. Клиент получал координаты на те
+        // же 26 px больше — курсор показывает на ссылку, а нажимается то, что
+        // ниже и правее. У ghostty и у X11-окон geometry().loc = (0,0), потому
+        // баг и не воспроизводился ни в терминале, ни в firefox под Xwayland.
+        let окна: Vec<(Window, Point<i32, Logical>)> = state.space.elements()
+            .rev()
+            .filter_map(|w| state.space.element_geometry(w).map(|g| (w.clone(), g)))
+            .filter(|(_, g)| видимое.overlaps(g.to_f64()))
+            .map(|(w, g)| { let loc = g.loc - w.geometry().loc; (w, loc) })
+            .collect();
+        for (window, loc) in окна {
+            let экран = Point::<f64, Logical>::from((loc.x as f64 - cam.x, loc.y as f64 - cam.y));
+            let phys: Point<i32, Physical> = (экран.x.round() as i32, экран.y.round() as i32).into();
+            let els: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = window.render_elements(
+                renderer, phys, smithay::utils::Scale::from(1.0), 1.0f32,
+            );
+            elements.extend(els.into_iter().map(|el| {
+                OutputRenderElements::Layer(
+                    RescaleRenderElement::from_element(el, (0, 0).into(), zoom),
+                )
+            }));
+        }
     }
 
     // ── Bottom-слой (wlr-layer-shell): под окнами, над фоном ──────────────────
@@ -1509,13 +2226,23 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     // ── Фон рабочих столов в обзоре (только при тапе Super), позади окон ────
     elements.extend(build_overview_bg_elements(state));
 
-    // ── Parallax + Background-слой (wlr-layer-shell): самый задний план ─────────
-    if let Some(mode) = surface.output.current_mode() {
-        elements.extend(build_parallax_elements(state, renderer, mode));
-    }
+    // ── Background-слой (wlr-layer-shell) и за ним параллакс ───────────────────
+    //
+    // Порядок важен: список идёт ОТ ПЕРЕДНЕГО ПЛАНА К ЗАДНЕМУ, и раньше
+    // параллакс добавлялся ПЕРЕД фоновым слоем — то есть его точки лежали
+    // ПОВЕРХ обоев и просвечивали сквозь любую картинку. Теперь обои идут
+    // первыми, а сетка точек — за ними: без обоев она видна как прежде, с
+    // обоями честно скрыта под ними.
     elements.extend(build_layer_elements(state, renderer, &surface.output, &[WlrLayer::Background]));
+    if let Some(mode) = surface.output.current_mode() {
+        // Под обоями во весь экран сетку не строим — её всё равно не видно.
+        if !background_covers_output(state, &surface.output, state.screen_size()) {
+            elements.extend(build_parallax_elements(state, renderer, mode));
+        }
+    }
 
     let element_count = elements.len();
+    surface.last_elements = element_count;
     let output_name = surface.output.name();
     match surface.compositor.render_frame(
         renderer, &elements, [0.1f32, 0.1, 0.1, 1.0], FrameFlags::empty()
@@ -1525,6 +2252,67 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
             // ~50 КБ/с), а лог из launch_tty.zsh идёт через tee синхронной
             // записью на диск прямо из потока рендера, который у dawn один.
             tracing::trace!("dawn/udev: render_frame[{}]: is_empty={}", output_name, res.is_empty);
+
+            // ── ВРЕМЕННАЯ ДИАГНОСТИКА (см. debug_frame_enabled) ──────────────
+            if debug_frame_enabled() {
+                if let Ok((damage, _states)) =
+                    res.damage_from_age(&mut surface.damage_tracker, 1, [])
+                {
+                    match damage {
+                        Some(rects) => {
+                            let area: i64 = rects.iter()
+                                .map(|r| r.size.w as i64 * r.size.h as i64).sum();
+                            tracing::debug!(
+                                "dawn/dbg: damage[{}]: n={} площадь={} needs_sync={} {:?}",
+                                output_name, rects.len(), area, res.needs_sync(),
+                                rects.iter().take(6).collect::<Vec<_>>(),
+                            );
+                        }
+                        None => tracing::debug!("dawn/dbg: damage[{}]: пусто", output_name),
+                    }
+                }
+                // Флаг взводит ПАЧКУ снимков подряд: одиночный кадр не поймает
+                // мерцание, а артефакт может жить один кадр из десяти.
+                static BURST: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                use std::sync::atomic::Ordering;
+                if std::path::Path::new("/tmp/dawn_dump").exists() {
+                    let _ = std::fs::remove_file("/tmp/dawn_dump");
+                    BURST.store(16, Ordering::Relaxed);
+                }
+                let n = BURST.load(Ordering::Relaxed);
+                if n > 0 {
+                    BURST.store(n - 1, Ordering::Relaxed);
+                    dump_scanout(&res, renderer, &surface.output, 16 - n);
+                }
+            }
+            // ── Дождаться GPU, прежде чем ставить кадр на показ ──────────────
+            //
+            // `needs_sync()` значит, что smithay НЕ может отдать драйверу fence
+            // отрисовки вместе с флипом (либо плоскость не умеет IN_FENCE_FD,
+            // либо EGL-fence не экспортируется), и по контракту ждать обязан
+            // сам компоситор — ровно это делает `DrmOutput::render_frame` в
+            // smithay. В dawn этого шага не было: `queue_frame` ставил буфер на
+            // page flip, пока GPU его ещё дорисовывал, и на монитор уходил
+            // НЕДОРИСОВАННЫЙ кадр — прямоугольные чёрные блоки размером с тайл
+            // растеризатора.
+            //
+            // Почему это било именно по анимированным обоям на неподвижной
+            // камере: каждый кадр обоев повреждает экран целиком, то есть
+            // рисуется всё поле 2560×1080, а видео идёт 15 fps — недорисованный
+            // кадр висит на экране до 66 мс и прекрасно виден. При движении
+            // камеры кадры идут по 60 Гц, и тот же артефакт живёт 16 мс, теряясь
+            // в движении. Замер 04.08.2026: needs_sync=true на 616 кадрах из 616.
+            if res.needs_sync() {
+                if let smithay::backend::drm::compositor::PrimaryPlaneElement::Swapchain(ref el) =
+                    res.primary_element
+                {
+                    let ждём = std::time::Instant::now();
+                    let _ = el.sync.wait();
+                    state.render_stats.record_sync(ждём.elapsed().as_micros() as u64);
+                }
+            }
+
             match surface.compositor.queue_frame(()) {
                 Ok(()) => {
                     // Кадр ушёл на показ — до его VBlank новые рендеры не нужны.
@@ -1550,6 +2338,14 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     crate::screencopy::serve_pending(
         state, &surface.output.clone(), renderer, &elements, cursor_elements,
     );
+
+    // ── Демонстрация экрана: кадр в PipeWire ─────────────────────────────────
+    // Тем же снимком, что и screencopy, и строго после кадра на монитор.
+    // Частоту держит сам Cast (30 fps): гнать 60 кадров по 11 МБ незачем —
+    // Discord всё равно перекодирует поток.
+    if state.portal_cast.as_ref().is_some_and(|c| c.due()) {
+        push_cast_frame(state, &surface.output.clone(), renderer, &elements);
+    }
 
     // Eco-mode (4.2): окна дальше 2 экранов от текущего viewport не получают
     // frame callback — клиент (браузер/плеер) перестаёт рендерить кадры и
@@ -1586,7 +2382,8 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     });
     // Frame callbacks для layer-поверхностей
     {
-        let map = layer_map_for_output(&surface.output);
+        let layer_out = state.layer_output.clone().unwrap_or_else(|| surface.output.clone());
+        let map = layer_map_for_output(&layer_out);
         for layer_surface in map.layers() {
             layer_surface.send_frame(
                 &surface.output, elapsed,
@@ -1626,4 +2423,1127 @@ pub fn render_all(state: &mut Dawn) {
         }
     }
     state.udev_devices = devices;
+}
+
+// ── Блютуз: меню устройств и индикатор ───────────────────────────────────────
+
+/// Руна блютуза 11×16: вертикаль с двумя треугольниками, как на устройствах.
+const BT_RUNE: [u32; 16] = [
+    0b00001100000,
+    0b00001110000,
+    0b00001101100,
+    0b00001100110,
+    0b00001100011,
+    0b01100110011,
+    0b00110110110,
+    0b00011111100,
+    0b00011111100,
+    0b00110110110,
+    0b01100110011,
+    0b00001100011,
+    0b00001100110,
+    0b00001101100,
+    0b00001110000,
+    0b00001100000,
+];
+
+
+// ── Маски значков полки ──────────────────────────────────────────────────────
+// Рисуются математикой (дуги, окружности) генератором из истории задачи и
+// вшиты сюда таблицей: по строке на пиксель, старший бит из ширины — левый
+// столбец. На экран кладутся через text.rs::bitmap_fit, который сжимает маску
+// до нужного размера со сглаживанием, — поэтому сетка нарочно крупнее, чем
+// значок на экране: у сжатия есть из чего усреднять.
+/// Ширина сетки вайфая: точка и три дуги лежат в ОДНОЙ сетке, чтобы гореть
+/// по отдельности, но складываться в один значок.
+const WIFI_W: i32 = 25;
+const VOLUME_W: i32 = 24;
+const BATTERY_W: i32 = 26;
+/// Внутреннее окно значка батареи (x, y, ширина, высота) в сетке BATTERY —
+/// по нему рисуется заливка заряда.
+const BATTERY_INNER: (i32, i32, i32, i32) = (2, 3, 19, 8);
+/// Кнопки питания, сна и перезагрузки живут в одной квадратной сетке.
+const POWER_W: i32 = 20;
+
+const WIFI_DOT: [u32; 17] = [
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000011100000000000,
+        0b0000000000111110000000000,
+        0b0000000000111110000000000,
+        0b0000000000011100000000000,
+    ];
+
+const WIFI_ARC1: [u32; 17] = [
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000111110000000000,
+        0b0000000011111111100000000,
+        0b0000000011111111100000000,
+        0b0000000001000001000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+    ];
+
+const WIFI_ARC2: [u32; 17] = [
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000111110000000000,
+        0b0000000111111111110000000,
+        0b0000011111111111111100000,
+        0b0000011110000000111100000,
+        0b0000001000000000001000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+    ];
+
+const WIFI_ARC3: [u32; 17] = [
+        0b0000001111111111111000000,
+        0b0000111111111111111110000,
+        0b0011111100000000011111100,
+        0b0011110000000000000111100,
+        0b0011000000000000000001100,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+        0b0000000000000000000000000,
+    ];
+
+const VOLUME: [u32; 18] = [
+        0b000000000000000000000000,
+        0b000000000010000000000000,
+        0b000000000110000001000000,
+        0b000000001110000011100000,
+        0b000000011110000001100000,
+        0b000000111110001101110000,
+        0b111111111110011100110000,
+        0b111111111110001110110000,
+        0b111111111110001110111000,
+        0b111111111110001110111000,
+        0b111111111110001110110000,
+        0b111111111110011100110000,
+        0b000000111110001101110000,
+        0b000000011110000001100000,
+        0b000000001110000011100000,
+        0b000000000110000001000000,
+        0b000000000010000000000000,
+        0b000000000000000000000000,
+    ];
+
+const VOLUME_MUTED: [u32; 18] = [
+        0b000000000000000000000000,
+        0b000000000010000000000000,
+        0b000000000110000000000000,
+        0b000000001110000000000000,
+        0b000000011110001100001100,
+        0b000000111110001110011100,
+        0b111111111110001110011100,
+        0b111111111110000111111000,
+        0b111111111110000011110000,
+        0b111111111110000011110000,
+        0b111111111110000111111000,
+        0b111111111110001110011100,
+        0b000000111110001110011100,
+        0b000000011110001100001100,
+        0b000000001110000000000000,
+        0b000000000110000000000000,
+        0b000000000010000000000000,
+        0b000000000000000000000000,
+    ];
+
+const BATTERY: [u32; 14] = [
+        0b00000000000000000000000000,
+        0b11111111111111111111111000,
+        0b11111111111111111111111000,
+        0b11000000000000000000011000,
+        0b11000000000000000000011000,
+        0b11000000000000000000011111,
+        0b11000000000000000000011111,
+        0b11000000000000000000011111,
+        0b11000000000000000000011111,
+        0b11000000000000000000011000,
+        0b11000000000000000000011000,
+        0b11111111111111111111111000,
+        0b11111111111111111111111000,
+        0b00000000000000000000000000,
+    ];
+
+const POWER: [u32; 20] = [
+        0b00000000011000000000,
+        0b00000000011000000000,
+        0b00000000011000000000,
+        0b00000011111111000000,
+        0b00000111111111100000,
+        0b00011111011011111000,
+        0b00011100011000111000,
+        0b00111000011000011100,
+        0b00110000011000001100,
+        0b01110000011000001110,
+        0b01110000011000001110,
+        0b01110000011000001110,
+        0b01110000000000001110,
+        0b01110000000000001110,
+        0b00110000000000001100,
+        0b00111000000000011100,
+        0b00011100000000111000,
+        0b00011110000001111000,
+        0b00000100000000100000,
+        0b00000000000000000000,
+    ];
+
+const REBOOT: [u32; 20] = [
+        0b00000000000000000000,
+        0b00000000001100000000,
+        0b00000001111111000000,
+        0b00000111111111110000,
+        0b00001111111111111100,
+        0b00011110001111110000,
+        0b00111100001111000000,
+        0b00111000001100000000,
+        0b01110000000000001110,
+        0b01110000000000001110,
+        0b01110000000000001110,
+        0b01110000000000001110,
+        0b01110000000000001110,
+        0b01110000000000001110,
+        0b00111000000000011100,
+        0b00111100000000111100,
+        0b00011110000001111000,
+        0b00001111111111110000,
+        0b00000111111111100000,
+        0b00000001111110000000,
+    ];
+
+const SLEEP: [u32; 20] = [
+        0b00000000000000000000,
+        0b00000000000000000000,
+        0b00000100000000000000,
+        0b00001100000000000000,
+        0b00011100000000000000,
+        0b00111100000000000000,
+        0b01111100000000000000,
+        0b01111100000000000000,
+        0b01111100000000000000,
+        0b01111110000000000000,
+        0b01111111000000000000,
+        0b01111111000000000000,
+        0b01111111100000000000,
+        0b01111111111000000000,
+        0b00111111111111000000,
+        0b00011111111111110000,
+        0b00001111111111100000,
+        0b00000111111111000000,
+        0b00000001111100000000,
+        0b00000000000000000000,
+    ];
+
+/// Масштаб шрифта в меню: «пиксель» глифа стороной в 2 экранных.
+const BT_TEXT: i32 = 2;
+/// Высота строки устройства.
+const BT_ROW_H: i32 = 34;
+/// Ширина панели меню.
+const BT_MENU_W: i32 = 760;
+
+/// Нарисовать строку текста одним элементом (см. text.rs). Возвращает ширину.
+fn draw_text(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    x: i32, y: i32,
+    text: &str,
+    scale: i32,
+    color: [f32; 4],
+    slot: usize,
+    out: &mut Vec<OutputRenderElements>,
+) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let (buf, w, h) = state.text_cache.buffer(text, scale, color, slot);
+    match MemoryRenderBufferRenderElement::from_buffer(
+        renderer, Point::<f64, Physical>::from((x as f64, y as f64)), buf,
+        None, None, Some(Size::<i32, Logical>::from((w, h))), Kind::Unspecified,
+    ) {
+        Ok(el) => out.push(OutputRenderElements::Memory(el)),
+        Err(e) => tracing::warn!("dawn/udev: строка текста: {:?}", e),
+    }
+    w
+}
+
+/// Меню блютуза: список устройств, состояние адаптера и подсказка по клавишам.
+///
+/// Приклеено к ЭКРАНУ, как панель столов: камера и зум на него не влияют, и
+/// хит-тест (см. bluetooth.rs::bt_click) считает в тех же экранных пикселях.
+fn build_bluetooth_elements(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    let mut els = Vec::new();
+    if !state.bt_menu_open() {
+        return els;
+    }
+    let Some(mode) = output.current_mode() else { return els };
+    let Some(bt) = state.bt.as_ref() else { return els };
+
+    let devices = bt.snap.devices.clone();
+    let powered = bt.snap.powered;
+    let discovering = bt.snap.discovering;
+    let has_adapter = bt.snap.adapter.is_some();
+    let sel = bt.sel;
+    let notice = bt.notice_text().map(|s| s.to_string());
+    let confirm = bt.confirm.as_ref().map(|c| (c.name.clone(), c.passkey));
+
+    // Высота: шапка + строки + подсказка. Список режем по экрану, а не по
+    // числу устройств: при поиске их набегает десяток за минуту.
+    let head_h = 46;
+    let foot_h = 30;
+    let max_rows = (((mode.size.h - 200) / BT_ROW_H).max(3) as usize).min(12);
+    let shown = devices.len().min(max_rows);
+    let menu_h = head_h + (shown.max(1) as i32) * BT_ROW_H + foot_h + 12;
+    let x = (mode.size.w - BT_MENU_W) / 2;
+    let y = (mode.size.h - menu_h) / 2;
+
+    // Цвета premultiplied: рендер складывает компоненты с фоном по (1 − alpha)
+    // и сам на альфу их не домножает (см. заметку в build_portal_pick_elements).
+    // Без домножения фон меню светился сквозь обои — ровно это и было видно на
+    // первом снимке.
+    const BG: [f32; 4] = [0.030, 0.030, 0.045, 0.96];
+    const SEL_BG: [f32; 4] = [0.130, 0.230, 0.330, 0.88];
+    const WHITE: [f32; 4] = [0.95, 0.95, 0.97, 1.0];
+    const DIM: [f32; 4] = [0.60, 0.62, 0.68, 1.0];
+    const ACCENT: [f32; 4] = [0.35, 0.75, 0.95, 1.0];
+    const WARN: [f32; 4] = [0.95, 0.55, 0.30, 1.0];
+
+    let mut idx = 0usize;
+    let mut pool = std::mem::take(&mut state.bt_ids);
+    rounded_solid(&mut pool, &mut idx, x, y, BT_MENU_W, menu_h, 16, BG, &mut els);
+
+    // Шапка: состояние адаптера. Точка слева — включён/выключен.
+    let dot_color = if !has_adapter { DIM } else if powered { ACCENT } else { DIM };
+    rounded_solid(&mut pool, &mut idx, x + 18, y + 16, 14, 14, 7, dot_color, &mut els);
+    state.bt_ids = pool;
+
+    let head = if !has_adapter {
+        "BLUETOOTH - no adapter".to_string()
+    } else if !powered {
+        "BLUETOOTH - off, press P".to_string()
+    } else if discovering {
+        "BLUETOOTH - scanning...".to_string()
+    } else {
+        format!("BLUETOOTH - {} connected", devices.iter().filter(|d| d.connected).count())
+    };
+    let mut slot = 0usize;
+    draw_text(state, renderer, x + 44, y + 12, &head, BT_TEXT, WHITE, slot, &mut els);
+    slot += 1;
+
+    // Строки устройств.
+    let mut rows = Vec::new();
+    // Окно прокрутки: держим выбранную строку внутри видимой части.
+    let first = if sel >= shown { sel + 1 - shown } else { 0 };
+    for (i, dev) in devices.iter().enumerate().skip(first).take(shown) {
+        let ry = y + head_h + (i - first) as i32 * BT_ROW_H;
+        if i == sel {
+            let mut pool = std::mem::take(&mut state.bt_ids);
+            rounded_solid(
+                &mut pool, &mut idx, x + 10, ry, BT_MENU_W - 20, BT_ROW_H - 4, 8,
+                SEL_BG, &mut els,
+            );
+            state.bt_ids = pool;
+        }
+        // Точка состояния: подключено — акцент, сопряжено — тускло, чужое — нет.
+        if dev.connected || dev.paired {
+            let c = if dev.connected { ACCENT } else { DIM };
+            let mut pool = std::mem::take(&mut state.bt_ids);
+            rounded_solid(&mut pool, &mut idx, x + 22, ry + 12, 10, 10, 5, c, &mut els);
+            state.bt_ids = pool;
+        }
+
+        // Имя режем по ширине панели, чтобы правые метки не съезжали.
+        let name: String = dev.name.chars().take(28).collect();
+        let color = if dev.connected { WHITE } else { DIM };
+        draw_text(state, renderer, x + 44, ry + 7, &name, BT_TEXT, color, slot, &mut els);
+        slot += 1;
+
+        // Справа: заряд, тип, сила сигнала — что известно.
+        let mut right = String::new();
+        if let Some(b) = dev.battery {
+            right.push_str(&format!("{b}%  "));
+        }
+        let kind = dev.kind();
+        if !kind.is_empty() {
+            right.push_str(kind);
+            right.push_str("  ");
+        }
+        if !dev.paired {
+            if let Some(rssi) = dev.rssi {
+                right.push_str(&format!("{rssi}dBm"));
+            }
+        }
+        let right = right.trim_end().to_string();
+        if !right.is_empty() {
+            let w = crate::text::width(&right, BT_TEXT);
+            let c = if dev.battery.is_some_and(|b| b <= 20) { WARN } else { DIM };
+            draw_text(
+                state, renderer, x + BT_MENU_W - 24 - w, ry + 7, &right,
+                BT_TEXT, c, slot, &mut els,
+            );
+            slot += 1;
+        }
+        rows.push(crate::bluetooth::Row {
+            x: x + 10, y: ry, w: BT_MENU_W - 20, h: BT_ROW_H - 4, device: i,
+        });
+    }
+
+    if devices.is_empty() {
+        let text = if powered { "no devices - press S to scan" } else { "adapter is off - press P" };
+        draw_text(state, renderer, x + 44, y + head_h + 8, text, BT_TEXT, DIM, slot, &mut els);
+        slot += 1;
+    }
+
+    // Подвал: либо подсказка о результате команды, либо шпаргалка по клавишам.
+    let foot_y = y + menu_h - foot_h + 2;
+    match (&confirm, &notice) {
+        (Some((name, passkey)), _) => {
+            let text = if *passkey > 0 {
+                format!("pairing code {passkey:06}: Enter confirm, Esc reject ({name})")
+            } else {
+                format!("allow pairing? Enter yes, Esc no ({name})")
+            };
+            draw_text(state, renderer, x + 20, foot_y, &text, BT_TEXT, WARN, slot, &mut els);
+        }
+        (None, Some(text)) => {
+            draw_text(state, renderer, x + 20, foot_y, text, BT_TEXT, ACCENT, slot, &mut els);
+        }
+        (None, None) => {
+            let text = "Enter connect  D disconnect  F forget  S scan  P power  Esc";
+            draw_text(state, renderer, x + 20, foot_y, text, BT_TEXT, DIM, slot, &mut els);
+        }
+    }
+
+    if let Some(bt) = state.bt.as_mut() {
+        bt.rows = rows;
+    }
+    // Список кадра идёт ОТ ПЕРЕДНЕГО ПЛАНА К ЗАДНЕМУ (см. render_surface), а
+    // собирали мы естественно: фон, подсветка, текст. Без разворота фон панели
+    // ложится ПОВЕРХ текста — ровно это и было видно на первом снимке: читалась
+    // только та часть подсказки, что вылезала за край панели.
+    els.reverse();
+    els
+}
+
+
+// ── Списочные меню (вайфай, звук) ────────────────────────────────────────────
+//
+// Один каркас на оба: панель по центру, шапка, строки с прокруткой, подвал с
+// подсказкой. Блютуз старше и рисуется своим кодом — переписывать рабочее меню
+// ради общего каркаса значило бы чинить то, что не сломано.
+
+/// Строка списочного меню.
+struct MenuRow {
+    /// Заголовок раздела: не выбирается и не кликается.
+    header: bool,
+    left: String,
+    right: String,
+    /// Точка слева: 2 — активно (акцент), 1 — известно (тускло), 0 — нет точки.
+    dot: u8,
+    /// Уровень сигнала 0..100 — рисуется столбиками у правого края.
+    strength: Option<u8>,
+}
+
+impl MenuRow {
+    fn head(text: &str) -> Self {
+        Self { header: true, left: text.to_string(), right: String::new(), dot: 0, strength: None }
+    }
+}
+
+const MENU_W: i32 = 880;
+const MENU_ROW_H: i32 = 34;
+const MENU_TEXT: i32 = 2;
+const MENU_HEAD_H: i32 = 46;
+const MENU_FOOT_H: i32 = 30;
+
+/// Каркас меню. Возвращает элементы кадра и прямоугольники строк — по ним
+/// хит-тест ловит клики (порядок совпадает с `rows`).
+#[allow(clippy::too_many_arguments)]
+fn build_list_menu(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    title: &str,
+    rows: &[MenuRow],
+    sel: usize,
+    foot: (&str, [f32; 4]),
+) -> (Vec<OutputRenderElements>, Vec<crate::tray::Rect>) {
+    const BG: [f32; 4] = [0.030, 0.030, 0.045, 0.96];
+    const SEL_BG: [f32; 4] = [0.130, 0.230, 0.330, 0.88];
+    const WHITE: [f32; 4] = [0.95, 0.95, 0.97, 0.98];
+    const DIM: [f32; 4] = [0.62, 0.62, 0.70, 0.75];
+    const ACCENT: [f32; 4] = [0.35, 0.75, 0.95, 0.95];
+
+    let mut els = Vec::new();
+    let mut hits = Vec::new();
+    let Some(mode) = output.current_mode() else { return (els, hits) };
+
+    // Список режем по экрану, а не по числу строк: точек в эфире набегает
+    // десяток за минуту.
+    let max_rows = (((mode.size.h - 220) / MENU_ROW_H).max(3) as usize).min(14);
+    let shown = rows.len().min(max_rows);
+    let menu_h = MENU_HEAD_H + (shown.max(1) as i32) * MENU_ROW_H + MENU_FOOT_H + 12;
+    let x = (mode.size.w - MENU_W) / 2;
+    let y = (mode.size.h - menu_h) / 2;
+
+    let mut idx = 0usize;
+    let mut pool = std::mem::take(&mut state.menu_ids);
+    rounded_solid(&mut pool, &mut idx, x, y, MENU_W, menu_h, 16, BG, &mut els);
+    state.menu_ids = pool;
+
+    let mut slot = 0usize;
+    draw_text(state, renderer, x + 22, y + 12, title, MENU_TEXT, WHITE, slot, &mut els);
+    slot += 1;
+
+    // Окно прокрутки: держим выбранную строку внутри видимой части.
+    let first = if sel >= shown { sel + 1 - shown } else { 0 };
+    for (i, row) in rows.iter().enumerate() {
+        if i < first || i >= first + shown {
+            hits.push(crate::tray::Rect { x: 0, y: 0, w: 0, h: 0 });
+            continue;
+        }
+        let ry = y + MENU_HEAD_H + (i - first) as i32 * MENU_ROW_H;
+        let rect = crate::tray::Rect { x: x + 10, y: ry, w: MENU_W - 20, h: MENU_ROW_H - 4 };
+        hits.push(rect);
+
+        if row.header {
+            draw_text(
+                state, renderer, x + 22, ry + 9, &row.left, 1, DIM, slot, &mut els,
+            );
+            slot += 1;
+            continue;
+        }
+
+        let mut pool = std::mem::take(&mut state.menu_ids);
+        if i == sel {
+            rounded_solid(
+                &mut pool, &mut idx, rect.x, rect.y, rect.w, rect.h, 8, SEL_BG, &mut els,
+            );
+        }
+        if row.dot > 0 {
+            let c = if row.dot >= 2 { ACCENT } else { DIM };
+            rounded_solid(&mut pool, &mut idx, x + 22, ry + 12, 10, 10, 5, c, &mut els);
+        }
+        // Уровень сигнала — четыре столбика у правого края: цифра рядом есть,
+        // но глазом ряд читается быстрее.
+        if let Some(s) = row.strength {
+            let bx = x + MENU_W - 24 - 4 * 7;
+            for n in 0..4i32 {
+                let lit = s as i32 > n * 25;
+                let h = 5 + n * 4;
+                let c = if lit { ACCENT } else { [0.5, 0.5, 0.55, 0.30] };
+                rounded_solid(
+                    &mut pool, &mut idx, bx + n * 7, ry + 8 + (17 - h), 5, h, 2, c, &mut els,
+                );
+            }
+        }
+        state.menu_ids = pool;
+
+        let left: String = row.left.chars().take(34).collect();
+        let color = if row.dot >= 2 { WHITE } else { DIM };
+        draw_text(state, renderer, x + 44, ry + 7, &left, MENU_TEXT, color, slot, &mut els);
+        slot += 1;
+
+        if !row.right.is_empty() {
+            let bars = if row.strength.is_some() { 4 * 7 + 10 } else { 0 };
+            let w = crate::text::width(&row.right, MENU_TEXT);
+            draw_text(
+                state, renderer, x + MENU_W - 24 - bars - w, ry + 7, &row.right,
+                MENU_TEXT, DIM, slot, &mut els,
+            );
+            slot += 1;
+        }
+    }
+
+    if rows.is_empty() {
+        draw_text(
+            state, renderer, x + 44, y + MENU_HEAD_H + 8, "nothing here yet",
+            MENU_TEXT, DIM, slot, &mut els,
+        );
+        slot += 1;
+    }
+
+    draw_text(
+        state, renderer, x + 22, y + menu_h - MENU_FOOT_H + 2, foot.0,
+        MENU_TEXT, foot.1, slot, &mut els,
+    );
+
+    // Список кадра идёт от переднего плана к заднему (см. render_surface), а
+    // собирали мы естественно: фон, подсветка, текст.
+    els.reverse();
+    (els, hits)
+}
+
+/// Меню вайфая: список сетей, ввод пароля и подсказка по клавишам.
+fn build_wifi_elements(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    const WARN: [f32; 4] = [0.95, 0.55, 0.35, 0.95];
+    const ACCENT: [f32; 4] = [0.35, 0.75, 0.95, 0.95];
+    const DIM: [f32; 4] = [0.62, 0.62, 0.70, 0.75];
+
+    if !state.wifi_menu_open() {
+        return Vec::new();
+    }
+    let Some(w) = state.wifi.as_ref() else { return Vec::new() };
+    let snap = w.snap.clone();
+    let sel = w.sel;
+    let notice = w.notice_text().map(str::to_string);
+    // Пароль на экране — звёздочками: за спиной бывают люди.
+    let ask = w.ask.as_ref().map(|a| {
+        (format!("Password for {}: {}", a.ssid, "*".repeat(a.text.chars().count())), a.text.is_empty())
+    });
+
+    let title = if !snap.present {
+        "WI-FI - no wireless device".to_string()
+    } else if !snap.enabled {
+        "WI-FI - radio off, press P".to_string()
+    } else if snap.connecting {
+        "WI-FI - connecting...".to_string()
+    } else {
+        match snap.ssid.as_deref() {
+            Some(s) => format!("WI-FI - {s}"),
+            None => "WI-FI - not connected".to_string(),
+        }
+    };
+
+    let rows: Vec<MenuRow> = snap
+        .aps
+        .iter()
+        .map(|ap| {
+            let mut right = String::new();
+            if ap.active {
+                right.push_str("connected  ");
+            } else if ap.saved {
+                right.push_str("saved  ");
+            }
+            right.push_str(if !ap.secure {
+                "open"
+            } else if ap.sae {
+                "WPA3"
+            } else {
+                "WPA2"
+            });
+            MenuRow {
+                header: false,
+                left: ap.ssid.clone(),
+                right,
+                dot: if ap.active { 2 } else if ap.saved { 1 } else { 0 },
+                strength: Some(ap.strength),
+            }
+        })
+        .collect();
+
+    let foot: (String, [f32; 4]) = match (&ask, &notice) {
+        (Some((line, empty)), _) => (
+            format!("{line}{}   Enter connect  Esc cancel", if *empty { "_" } else { "" }),
+            WARN,
+        ),
+        (None, Some(text)) => (text.clone(), ACCENT),
+        (None, None) => (
+            "Enter connect  D disconnect  F forget  S scan  P radio  Esc".to_string(),
+            DIM,
+        ),
+    };
+
+    let (els, hits) = build_list_menu(
+        state, renderer, output, &title, &rows, sel, (&foot.0, foot.1),
+    );
+    if let Some(w) = state.wifi.as_mut() {
+        w.rows = hits.into_iter().enumerate().map(|(i, r)| (r, i)).collect();
+    }
+    els
+}
+
+/// Меню звука: устройства вывода и ввода двумя разделами.
+fn build_audio_elements(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    const ACCENT: [f32; 4] = [0.35, 0.75, 0.95, 0.95];
+    const DIM: [f32; 4] = [0.62, 0.62, 0.70, 0.75];
+
+    if !state.audio_menu_open() {
+        return Vec::new();
+    }
+    let Some(a) = state.audio.as_ref() else { return Vec::new() };
+    let snap = a.snap.clone();
+    let picks = a.picks();
+    let sel = a.sel;
+    let notice = a.notice_text().map(str::to_string);
+
+    // Строки идут вперемешку с заголовками разделов, поэтому храним, какой
+    // строке какой pick соответствует, — по этому же порядку придут и
+    // прямоугольники клика.
+    let mut rows = Vec::new();
+    let mut row_pick: Vec<Option<crate::audio::Pick>> = Vec::new();
+    let mut sel_row = 0usize;
+
+    for (sink, list) in [(true, &snap.sinks), (false, &snap.sources)] {
+        rows.push(MenuRow::head(if sink { "OUTPUT" } else { "INPUT" }));
+        row_pick.push(None);
+        for (index, dev) in list.iter().enumerate() {
+            let pick = crate::audio::Pick { sink, index };
+            let mut right = String::new();
+            if dev.default {
+                right.push_str("default  ");
+            }
+            right.push_str(&format!("{}%", (dev.volume * 100.0).round() as i32));
+            if dev.muted {
+                right.push_str("  muted");
+            }
+            if picks.get(sel) == Some(&pick) {
+                sel_row = rows.len();
+            }
+            rows.push(MenuRow {
+                header: false,
+                left: dev.description.clone(),
+                right,
+                dot: if dev.default { 2 } else { 0 },
+                strength: None,
+            });
+            row_pick.push(Some(pick));
+        }
+    }
+
+    let title = match snap.default_sink() {
+        Some(d) => format!("SOUND - {}", d.description.chars().take(40).collect::<String>()),
+        None => "SOUND - no output device".to_string(),
+    };
+    let foot = match &notice {
+        Some(text) => (text.clone(), ACCENT),
+        None => (
+            "Enter use  M mute  -/+ volume  Esc".to_string(),
+            DIM,
+        ),
+    };
+
+    let (els, hits) = build_list_menu(
+        state, renderer, output, &title, &rows, sel_row, (&foot.0, foot.1),
+    );
+    if let Some(a) = state.audio.as_mut() {
+        a.rows = hits
+            .into_iter()
+            .zip(row_pick)
+            .filter_map(|(r, p)| p.map(|p| (r, p)))
+            .collect();
+    }
+    els
+}
+
+/// Поиск окон (Super+F): набранная строка в шапке и подходящие окна списком.
+///
+/// Каркас общий с меню вайфая и звука (build_list_menu) — намеренно: поиск
+/// ведёт себя как ещё одно приклеенное к экрану меню, и человеку не приходится
+/// заново учить, где тут выбранная строка и где подсказка.
+fn build_search_elements(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    const ACCENT: [f32; 4] = [0.35, 0.75, 0.95, 0.95];
+    const DIM: [f32; 4] = [0.62, 0.62, 0.70, 0.75];
+
+    let Some(ui) = state.search.as_ref() else { return Vec::new() };
+    let query = ui.query.clone();
+    let sel = ui.sel;
+    let current = state.viewport.current_tags();
+
+    let rows: Vec<MenuRow> = ui
+        .hits
+        .iter()
+        .map(|h| {
+            // Справа — приложение и номер стола: два окна с одинаковым
+            // заголовком («Telegram», «Терминал») иначе не различить.
+            let mut right = String::new();
+            if !h.app.is_empty() {
+                // app_id вида «com.mitchellh.ghostty» показываем последним
+                // куском: обрезанное по ширине «com.mitchellh.ghos» не говорит
+                // человеку ничего, а «ghostty» — говорит всё.
+                let короткий = h.app.rsplit('.').next().unwrap_or(&h.app);
+                right.push_str(&короткий.chars().take(18).collect::<String>());
+            }
+            if h.tags != 0 {
+                if !right.is_empty() {
+                    right.push_str("  ");
+                }
+                right.push_str(&format!("стол {}", h.tags.trailing_zeros() + 1));
+            }
+            MenuRow {
+                header: false,
+                left: h.title.clone(),
+                right,
+                // Точка слева: окно на текущем столе — акцентом, чужое — тускло.
+                dot: if h.tags & current != 0 { 2 } else { 1 },
+                strength: None,
+            }
+        })
+        .collect();
+
+    // Курсор в конце строки — видно, что поле принимает ввод, даже когда пусто.
+    let title = format!("ПОИСК ОКНА: {query}_");
+    // Стрелок ↑↓ в битмап-шрифте dawn нет — на экране вместо них выходили «??»
+    // (проверено снимком 05.08.2026). Пишем словами.
+    let foot = if rows.is_empty() && !query.is_empty() {
+        ("ничего не нашлось  -  Esc отмена".to_string(), DIM)
+    } else {
+        ("Enter перейти  Tab выбор  Esc отмена".to_string(), ACCENT)
+    };
+
+    let (els, hits) = build_list_menu(
+        state, renderer, output, &title, &rows, sel, (&foot.0, foot.1),
+    );
+    if let Some(ui) = state.search.as_mut() {
+        ui.rows = hits;
+    }
+    els
+}
+
+/// Цвета полки. Сплошные прямоугольники ждут premultiplied-компоненты
+/// (см. заметку в build_bluetooth_elements), поэтому в `rounded_solid` они
+/// уходят через `premul`, а в маски значков — как есть: там домножением
+/// занимается растеризатор.
+const TRAY_DIM: [f32; 4] = [0.80, 0.80, 0.85, 0.62];
+const TRAY_OFF: [f32; 4] = [0.75, 0.75, 0.80, 0.20];
+const TRAY_ON: [f32; 4] = [0.35, 0.75, 0.95, 0.95];
+const TRAY_WARN: [f32; 4] = [0.95, 0.45, 0.30, 0.95];
+const TRAY_GOOD: [f32; 4] = [0.45, 0.85, 0.55, 0.95];
+
+fn premul(c: [f32; 4]) -> [f32; 4] {
+    [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]]
+}
+
+/// Значок-маска по центру ячейки: высота задана, ширина берётся из пропорций
+/// самой маски (см. text.rs::bitmap_fit).
+fn draw_mask(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    name: &str,
+    rows: &[u32],
+    mask_w: i32,
+    cell: crate::tray::Rect,
+    h: i32,
+    color: [f32; 4],
+    out: &mut Vec<OutputRenderElements>,
+) {
+    let w = (h * mask_w / rows.len() as i32).max(1);
+    let x = cell.x + (cell.w - w) / 2;
+    let y = cell.y + (cell.h - h) / 2;
+    let (buf, _, _) = state.text_cache.bitmap_fit(name, rows, mask_w, w, h, color, 0);
+    match MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        Point::<f64, Physical>::from((x as f64, y as f64)),
+        buf,
+        None,
+        None,
+        Some(Size::<i32, Logical>::from((w, h))),
+        Kind::Unspecified,
+    ) {
+        Ok(el) => out.push(OutputRenderElements::Memory(el)),
+        Err(e) => tracing::warn!("dawn/udev: значок полки {}: {:?}", name, e),
+    }
+}
+
+/// Высота значка батареи и его рамка внутри ячейки. Нужна дважды — обводке
+/// (маска) и заливке (прямоугольник), поэтому считается одним местом.
+fn battery_box(cell: crate::tray::Rect) -> (i32, i32, i32, i32) {
+    let h = (BAR_H * 7 / 16).max(6);
+    let w = h * BATTERY_W / BATTERY.len() as i32;
+    (cell.x + (cell.w - w) / 2, cell.y + (cell.h - h) / 2, w, h)
+}
+
+/// Полка состояния справа от панели столов: вертикальная полосочка, а по клику
+/// из неё выезжает ряд — блютуз, вайфай, звук, батарея, питание.
+///
+/// Раскладку ячеек даёт `tray::layout`, и ТА ЖЕ функция считает попадания
+/// клика (см. tray.rs::tray_click). Второй копии геометрии в хит-тесте нет
+/// намеренно: именно так однажды разъехались клики по окнам — на экране одно,
+/// в проверке другое.
+fn build_tray_elements(
+    state: &mut Dawn,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    use crate::tray::{CellKind, PowerAction};
+
+    let mut els = Vec::new();
+    // По ТЕКУЩЕМУ столу, как и панель рядом: полноэкранная игра на соседнем
+    // столе не повод оставлять этот стол без полки (см.
+    // build_workspace_bar_elements — там на этом же месте была та же ошибка).
+    if state.fullscreen_here() {
+        return els;
+    }
+    let Some(mode) = output.current_mode() else { return els };
+    let Some(tray) = state.tray.as_ref() else { return els };
+
+    // Всё нужное снимаем сразу: дальше state занят пулом и кэшем текста.
+    let open = tray.open;
+    let snap = tray.snap.clone();
+    let armed = [PowerAction::Off, PowerAction::Reboot, PowerAction::Sleep]
+        .into_iter()
+        .find(|a| tray.is_armed(*a));
+    // Тире тут нарочно нет: в шрифте (см. text.rs) только ASCII и кириллица,
+    // и на месте «—» получался вопросительный знак.
+    let hint = armed
+        .map(|a| format!("press again: {}", a.human()))
+        .or_else(|| tray.notice_text().map(str::to_string));
+    let lay = crate::tray::layout(open, snap.battery.is_some(), mode.size.w);
+
+    // Полка только ПОКАЗЫВАЕТ: вайфай живёт в wifi.rs, звук в audio.rs,
+    // блютуз в bluetooth.rs.
+    let wifi = state.wifi_snapshot().cloned();
+    let volume = state.audio_snapshot().and_then(|s| s.volume());
+    let bt = state.bt.as_ref().map(|b| {
+        (
+            b.snap.powered,
+            b.snap.connected_count(),
+            b.snap.lowest_battery(),
+            b.snap.discovering,
+        )
+    });
+    let bt_color = match bt {
+        Some((_, _, Some(bat), _)) if bat <= 20 => TRAY_WARN,
+        Some((_, n, _, _)) if n > 0 => TRAY_ON,
+        Some((_, _, _, true)) => [0.75, 0.75, 0.35, 0.90],
+        Some((true, ..)) => TRAY_DIM,
+        _ => TRAY_OFF,
+    };
+
+    // ── Подложки и всё, что рисуется прямоугольниками ────────────────────────
+    let mut idx = 0usize;
+    let mut pool = std::mem::take(&mut state.tray_ids);
+
+    let handle = lay.cells[0].rect; // Handle всегда первая ячейка
+    rounded_solid(
+        &mut pool, &mut idx, handle.x, handle.y, handle.w, handle.h,
+        handle.w / 2, BAR_BG, &mut els,
+    );
+    if let Some(p) = lay.panel {
+        rounded_solid(&mut pool, &mut idx, p.x, p.y, p.w, p.h, BAR_RADIUS, BAR_BG, &mut els);
+    }
+    // Хват: короткая черта посреди полосочки. Без неё полоска читается как
+    // обрубок бара, а не как то, на что можно нажать.
+    {
+        let w = (handle.w / 3).max(2);
+        let h = handle.h / 2;
+        let color = if open { TRAY_ON } else { TRAY_DIM };
+        rounded_solid(
+            &mut pool, &mut idx,
+            handle.x + (handle.w - w) / 2, handle.y + (handle.h - h) / 2,
+            w, h, w / 2, premul(color), &mut els,
+        );
+    }
+
+    for cell in &lay.cells {
+        let r = cell.rect;
+        match cell.kind {
+            CellKind::VolumeSlider => {
+                let track_h = (BAR_H / 5).max(3);
+                let ty = r.y + (r.h - track_h) / 2;
+                rounded_solid(
+                    &mut pool, &mut idx, r.x, ty, r.w, track_h, track_h / 2,
+                    premul([1.0, 1.0, 1.0, 0.13]), &mut els,
+                );
+                if let Some((level, muted)) = volume {
+                    let fill = (r.w as f32 * level.clamp(0.0, 1.0)).round() as i32;
+                    if fill >= track_h {
+                        let c = if muted { TRAY_OFF } else { TRAY_ON };
+                        rounded_solid(
+                            &mut pool, &mut idx, r.x, ty, fill, track_h, track_h / 2,
+                            premul(c), &mut els,
+                        );
+                    }
+                }
+            }
+            CellKind::Battery => {
+                let Some(b) = snap.battery.as_ref() else { continue };
+                let (bx, by, bw, bh) = battery_box(r);
+                // Окно внутри обводки — в координатах маски BATTERY.
+                let (ix, iy, iw, ih) = BATTERY_INNER;
+                let x = bx + bw * ix / BATTERY_W;
+                let y = by + bh * iy / BATTERY.len() as i32;
+                let h = (bh * ih / BATTERY.len() as i32).max(1);
+                let w = (bw * iw / BATTERY_W) * b.percent as i32 / 100;
+                let c = if b.charging {
+                    TRAY_GOOD
+                } else if b.percent <= 20 {
+                    TRAY_WARN
+                } else {
+                    TRAY_DIM
+                };
+                if w > 0 {
+                    rounded_solid(&mut pool, &mut idx, x, y, w, h, 0, premul(c), &mut els);
+                }
+            }
+            // Взведённая кнопка питания подсвечена: видно, что следующий клик
+            // уже сработает.
+            CellKind::Power(a) if armed == Some(a) => {
+                rounded_solid(
+                    &mut pool, &mut idx, r.x, r.y, r.w, r.h, BAR_RADIUS / 2,
+                    premul([0.95, 0.45, 0.30, 0.30]), &mut els,
+                );
+            }
+            _ => {}
+        }
+    }
+    state.tray_ids = pool;
+
+    // ── Значки ───────────────────────────────────────────────────────────────
+    for cell in &lay.cells {
+        let r = cell.rect;
+        match cell.kind {
+            CellKind::Bluetooth => {
+                draw_mask(state, renderer, "bt-rune", &BT_RUNE, 11, r, BAR_H * 2 / 3, bt_color, &mut els);
+            }
+            CellKind::Wifi => {
+                // Дуг горит столько же, сколько на любом другом индикаторе
+                // сигнала: 1 из 3 при слабом, все три при сильном. Выключенный
+                // радиомодуль — оранжевая точка при погашенных дугах.
+                let h = BAR_H / 2;
+                let (lit, dot) = match wifi.as_ref() {
+                    None => (0, TRAY_OFF),
+                    Some(w) if !w.present => (0, TRAY_OFF),
+                    Some(w) if !w.enabled => (0, TRAY_WARN),
+                    Some(w) if w.ssid.is_none() => (0, TRAY_DIM),
+                    Some(w) => (1 + (w.strength as i32 / 34).min(2), TRAY_ON),
+                };
+                draw_mask(state, renderer, "wifi-dot", &WIFI_DOT, WIFI_W, r, h, dot, &mut els);
+                for (n, mask) in [(1, &WIFI_ARC1), (2, &WIFI_ARC2), (3, &WIFI_ARC3)] {
+                    let color = if n <= lit { TRAY_ON } else { TRAY_OFF };
+                    let name = ["wifi-arc1", "wifi-arc2", "wifi-arc3"][n as usize - 1];
+                    draw_mask(state, renderer, name, mask, WIFI_W, r, h, color, &mut els);
+                }
+            }
+            CellKind::Volume => {
+                let muted = volume.is_some_and(|(_, m)| m);
+                let (name, mask): (&str, &[u32]) = if muted {
+                    ("vol-muted", &VOLUME_MUTED)
+                } else {
+                    ("vol", &VOLUME)
+                };
+                let color = match volume {
+                    None => TRAY_OFF,
+                    Some(_) if muted => TRAY_WARN,
+                    Some(_) => TRAY_DIM,
+                };
+                draw_mask(state, renderer, name, mask, VOLUME_W, r, BAR_H / 2, color, &mut els);
+            }
+            CellKind::Battery => {
+                let Some(b) = snap.battery.as_ref() else { continue };
+                let color = if b.percent <= 20 && !b.charging { TRAY_WARN } else { TRAY_DIM };
+                let (_, _, _, h) = battery_box(r);
+                draw_mask(state, renderer, "battery", &BATTERY, BATTERY_W, r, h, color, &mut els);
+            }
+            CellKind::Power(a) => {
+                let (name, mask): (&str, &[u32]) = match a {
+                    PowerAction::Off => ("pwr-off", &POWER),
+                    PowerAction::Reboot => ("pwr-reboot", &REBOOT),
+                    PowerAction::Sleep => ("pwr-sleep", &SLEEP),
+                };
+                let color = if armed == Some(a) { TRAY_WARN } else { TRAY_DIM };
+                draw_mask(state, renderer, name, mask, POWER_W, r, BAR_H * 3 / 5, color, &mut els);
+            }
+            CellKind::Handle | CellKind::VolumeSlider => {}
+        }
+    }
+
+    // Подсказка под рядом: чем закончилась команда и, главное, что взведённая
+    // кнопка ждёт второго клика.
+    if let (Some(text), Some(panel)) = (hint, lay.panel) {
+        let color = if armed.is_some() { TRAY_WARN } else { TRAY_DIM };
+        let w = crate::text::width(&text, 1);
+        draw_text(
+            state, renderer,
+            (panel.x + panel.w - w).max(0), panel.y + panel.h + BAR_H / 6,
+            &text, 1, color, 0, &mut els,
+        );
+    }
+
+    // Разворот по той же причине, что и в меню: раньше в списке = выше в кадре.
+    els.reverse();
+    els
+}
+
+#[cfg(test)]
+mod tests {
+    use super::on_screen;
+    use smithay::utils::Size;
+
+    fn экран() -> Size<i32, smithay::utils::Logical> {
+        Size::from((2560, 1080))
+    }
+
+    #[test]
+    fn окно_в_кадре_видно() {
+        assert!(on_screen(экран(), (100.0, 100.0, 800.0, 600.0), 0.0));
+    }
+
+    #[test]
+    fn окно_за_краем_не_видно() {
+        // Ушло влево целиком и вправо целиком.
+        assert!(!on_screen(экран(), (-900.0, 100.0, 800.0, 600.0), 0.0));
+        assert!(!on_screen(экран(), (2600.0, 100.0, 800.0, 600.0), 0.0));
+        assert!(!on_screen(экран(), (100.0, -700.0, 800.0, 600.0), 0.0));
+        assert!(!on_screen(экран(), (100.0, 1100.0, 800.0, 600.0), 0.0));
+    }
+
+    #[test]
+    fn окно_наполовину_за_краем_видно() {
+        assert!(on_screen(экран(), (-400.0, 100.0, 800.0, 600.0), 0.0));
+        assert!(on_screen(экран(), (2400.0, 100.0, 800.0, 600.0), 0.0));
+    }
+
+    /// Тень вылезает за окно, поэтому у неё запас: окно уже за краем, а её
+    /// кромку ещё видно.
+    #[test]
+    fn запас_под_тень_учитывается() {
+        let чуть_за_краем = (-810.0, 100.0, 800.0, 600.0);
+        assert!(!on_screen(экран(), чуть_за_краем, 0.0));
+        assert!(on_screen(экран(), чуть_за_краем, 40.0));
+    }
 }

@@ -1,4 +1,5 @@
 use smithay::{
+    desktop::{layer_map_for_output, WindowSurfaceType},
     backend::{
         allocator::dmabuf::Dmabuf,
         renderer::{ImportDma, utils::on_commit_buffer_handler},
@@ -10,7 +11,8 @@ use smithay::{
     },
     wayland::{
         buffer::BufferHandler,
-        compositor::{CompositorClientState, CompositorHandler, CompositorState},
+        compositor::{CompositorClientState, CompositorHandler, CompositorState, with_states},
+        shell::wlr_layer::LayerSurfaceData,
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         shm::{ShmHandler, ShmState},
     },
@@ -64,11 +66,127 @@ impl CompositorHandler for Dawn {
         handle_commit(&mut self.space, surface, elastic);
         self.popups.commit(surface);
 
+        // Первый configure всплывающему окну шлём МЫ.
+        //
+        // Клиент, создав xdg_popup, коммитит его пустым и ждёт configure —
+        // пока он не придёт, буфер не прикрепляется и меню не появляется
+        // вообще. Ни smithay, ни PopupManager этот configure сами не шлют:
+        // размер и место — дело компоновщика (см. unconstrain_popup).
+        // Замер 05.08.2026: тестовый клиент создавал попап и молчал навсегда,
+        // «ПОПАП: получен configure» в его выводе не появлялось.
+        if let Some(popup) = self.popups.find_popup(surface) {
+            match popup {
+                smithay::desktop::PopupKind::Xdg(ref xdg) => {
+                    if !xdg.is_initial_configure_sent() {
+                        // Ошибка тут означает мёртвый ресурс — клиент уже ушёл.
+                        let _ = xdg.send_configure();
+                    }
+                }
+                smithay::desktop::PopupKind::InputMethod(_) => {}
+            }
+        }
+
+        self.ensure_layer_configured(surface);
+        self.focus_layer_if_wanted(surface);
+
         // Без этого новый буфер клиента (например, первый кадр kitty/foot)
         // остаётся закоммиченным только в состоянии — VBlank-цепочка рендера
         // могла уже умереть из-за отсутствия изменений, и без явного пинка
         // сюда экран так и останется на предыдущем кадре.
         self.request_redraw();
+    }
+}
+
+impl Dawn {
+    /// Отдать клавиатуру слою, который её просит (лаунчер, панель с вводом).
+    ///
+    /// Делаем это на КОММИТЕ, а не при создании поверхности: в момент
+    /// new_layer_surface клиент ещё не прислал ни буфера, ни своих желаний, и
+    /// фокус на пустую поверхность smithay просто терял — fuzzel открывался
+    /// немым, ни набрать, ни закрыть по Esc.
+    fn focus_layer_if_wanted(&mut self, surface: &WlSurface) {
+        use smithay::wayland::shell::wlr_layer::KeyboardInteractivity;
+        // Страховка: слой мог умереть не через layer_destroyed (клиента убили
+        // сигналом). Мёртвая ссылка глушила бы sloppy-focus навсегда — по
+        // экрану это выглядит как «в окнах перестали работать клики».
+        if let Some(s) = self.layer_keyboard.clone() {
+            use smithay::reexports::wayland_server::Resource;
+            if !s.is_alive() {
+                self.layer_keyboard = None;
+                if let Some(w) = self.focused_window() {
+                    crate::xwin::focus(self, &w);
+                }
+            }
+        }
+        if self.layer_keyboard.as_ref() == Some(surface) {
+            return; // уже отдали
+        }
+        let Some(output) = self.layer_output.clone()
+            .or_else(|| self.space.outputs().next().cloned()) else { return };
+        let слой = {
+            let map = layer_map_for_output(&output);
+            map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL).cloned()
+        };
+        let Some(слой) = слой else { return };
+        let хочет = matches!(
+            слой.cached_state().keyboard_interactivity,
+            KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand,
+        );
+        if !хочет { return; }
+        if let Some(kb) = self.seat.get_keyboard() {
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            let цель = crate::focus::KeyboardFocusTarget::Wayland(surface.clone());
+            kb.set_focus(self, Some(цель), serial);
+            self.layer_keyboard = Some(surface.clone());
+            tracing::info!("dawn: клавиатура отдана layer-поверхности");
+        }
+    }
+
+    /// Первый configure для layer-поверхности (wlr-layer-shell).
+    ///
+    /// Его ОБЯЗАН отправить композитор в ответ на первый commit клиента —
+    /// `LayerMap::arrange` этого сознательно не делает (см. комментарий в
+    /// smithay: до первого commit клиент ещё не сообщил свой желаемый размер,
+    /// и configure нарушил бы протокол). В dawn этого шага не было вообще:
+    /// layer-клиент вставал в LayerMap, но configure не получал никогда, а без
+    /// него ему запрещено прикреплять буфер. Поэтому обои dwall не появлялись
+    /// (его bg_configured навсегда оставался false), и меню выбора обоев тоже:
+    /// в WAYLAND_DEBUG видно set_size(740,480) без единого события в ответ.
+    fn ensure_layer_configured(&mut self, surface: &WlSurface) {
+        // Признак снимаем ДО захвата LayerMap: with_states берёт замок данных
+        // поверхности, и держать оба замка разом незачем (тем же вложением
+        // замков мы уже ловили мёртвый клинч в build_layer_elements).
+        let already = with_states(surface, |states| {
+            states.data_map.get::<LayerSurfaceData>()
+                .map(|d| d.lock().unwrap().initial_configure_sent)
+        });
+        // Не layer-поверхность (обычное окно, popup) — выходим.
+        let Some(already) = already else { return };
+
+        // Уже сконфигурирована — БОЛЬШЕ НИЧЕГО НЕ ДЕЛАЕМ.
+        //
+        // Здесь стоял map.arrange() на каждый commit (как в anvil), и он
+        // устраивал пинг-понг: arrange пересчитывал размер поверхности, слал
+        // configure, клиент отвечал ack + commit, commit снова звал arrange —
+        // и так по кругу. В протокольном логе dwall серийник configure за
+        // несколько секунд доходил до 9340, а размер меню приезжал 2482×1047
+        // вместо 740×480. Клиент при этом жёг ядро вхолостую и переставал
+        // отвечать на сигналы — меню открывалось один раз и больше никогда.
+        if already {
+            return;
+        }
+
+        let Some(output) = self.layer_output.clone()
+            .or_else(|| self.space.outputs().next().cloned()) else { return };
+        let layer = {
+            let mut map = layer_map_for_output(&output);
+            // Единственный arrange — перед ПЕРВЫМ configure: до него клиент
+            // как раз сообщил желаемый размер своим первым commit.
+            map.arrange();
+            map.layer_for_surface(surface, WindowSurfaceType::ALL).cloned()
+        }; // замок LayerMap отпущен здесь, до отправки configure
+        let Some(layer) = layer else { return };
+        layer.layer_surface().send_configure();
     }
 }
 

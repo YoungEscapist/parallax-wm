@@ -7,7 +7,7 @@ use smithay::{
     },
     input::{
         keyboard::{FilterResult, keysyms},
-        pointer::{AxisFrame, ButtonEvent, Focus, GrabStartData, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, Focus, GrabStartData, MotionEvent, RelativeMotionEvent},
     },
     utils::{Point, Rectangle, SERIAL_COUNTER},
 };
@@ -109,6 +109,19 @@ impl Dawn {
                             return FilterResult::Forward;
                         }
 
+                        // Отпустили Alt — перебор стопки (Alt+Tab) закончен, и
+                        // следующий Tab начнёт новую стопку с текущего окна.
+                        // Ловим ДО общего `if !pressed`: отпускание клавиши
+                        // ниже никуда не доходит.
+                        const ALT_L: u32 = keysyms::KEY_Alt_L;
+                        const ALT_R: u32 = keysyms::KEY_Alt_R;
+                        const META_L: u32 = keysyms::KEY_Meta_L;
+                        const META_R: u32 = keysyms::KEY_Meta_R;
+                        if matches!(raw, ALT_L | ALT_R | META_L | META_R) && !pressed {
+                            state.cycle_stack_end();
+                            return FilterResult::Forward;
+                        }
+
                         // Любое другое нажатие клавиши отменяет ожидающий тап Super
                         // (Super+D, Super+1 и т.п. — это не тап).
                         if pressed {
@@ -131,6 +144,15 @@ impl Dawn {
                         }
 
                         if !pressed { return FilterResult::Forward; }
+
+                        // Escape во время выбора источника для демонстрации
+                        // экрана — отмена (см. portal.rs). Перехватываем до
+                        // всех биндов и до клиента: пока идёт выбор, клавиша
+                        // принадлежит выбору.
+                        if state.portal_picking() && raw == keysyms::KEY_Escape {
+                            state.portal_pick_click(true);
+                            return FilterResult::Intercept(());
+                        }
 
                         let alt   = modifiers.alt;
                         let shift = modifiers.shift;
@@ -169,6 +191,57 @@ impl Dawn {
                             }
                         }
 
+                        // Открытый поиск окон (Super+F) — это поле ввода: пока
+                        // он на экране, ГОЛЫЕ клавиши принадлежат ему целиком,
+                        // включая буквы, Enter, Tab и Backspace. Комбинации с
+                        // модификаторами не трогаем — тем же Super+F поиск и
+                        // закрывается, и переключение стола из него работает.
+                        //
+                        // Символ берём из ТЕКУЩЕЙ раскладки (modified_sym), а не
+                        // из латинской: в поле ввода буква — это буква, и
+                        // русское имя окна надо уметь набрать по-русски.
+                        if state.search_open() && !logo && !ctrl && !alt {
+                            let ch = handle.modified_sym().key_char();
+                            if state.search_key(raw_latin, ch) {
+                                return FilterResult::Intercept(());
+                            }
+                        }
+
+                        // Открытое меню блютуза забирает ГОЛЫЕ клавиши: стрелки,
+                        // Enter и буквы действий принадлежат ему, а не клиенту
+                        // под курсором (см. bluetooth.rs). Комбинации с
+                        // модификаторами не трогаем — иначе тот же Super+Shift+B,
+                        // которым меню открыли, не смог бы его закрыть, а вместе
+                        // с ним отвалились бы и переключение стола, и VT.
+                        // Раскладка латинская: в русской иначе не сработали бы
+                        // D/F/S/P.
+                        if state.bt_menu_open() && !logo && !ctrl && !alt {
+                            if state.bt_key(raw_latin) {
+                                return FilterResult::Intercept(());
+                            }
+                        }
+
+                        // Меню вайфая и звука — как блютузное: голые клавиши
+                        // принадлежат им. Вайфаю нужен ещё и СИМВОЛ: в поле
+                        // пароля буквы это буквы, а не команды.
+                        if state.wifi_menu_open() && !logo && !ctrl && !alt {
+                            let ch = handle.modified_sym().key_char();
+                            if state.wifi_key(raw_latin, ch) {
+                                return FilterResult::Intercept(());
+                            }
+                        }
+                        if state.audio_menu_open() && !logo && !ctrl && !alt {
+                            if state.audio_key(raw_latin) {
+                                return FilterResult::Intercept(());
+                            }
+                        }
+
+                        // Открытая полка забирает только Esc — остальные
+                        // клавиши ей не нужны, и отнимать их у клиента незачем.
+                        if !logo && !ctrl && !alt && state.tray_key(raw_latin) {
+                            return FilterResult::Intercept(());
+                        }
+
                         // ── Биндинги из Lua-конфига (см. src/config.rs, default_config.lua) ──
                         let mods = crate::config::ModMask { ctrl, alt, shift, logo };
                         if let Some(action) = state.lua_config.find_action(mods, raw_latin) {
@@ -187,6 +260,35 @@ impl Dawn {
                let delta = event.delta();
                tracing::trace!("PTR MOTION: delta=({:.2},{:.2})", delta.x, delta.y);
                let zoom = self.viewport.zoom;
+
+               // ── Захват курсора приложением (см. capture.rs) ───────────────
+               // Относительные дельты уходят клиенту ВСЕГДА, а не только при
+               // захвате: игры подписываются на них заранее и ведут по ним
+               // обзор, пока курсор ещё свободен.
+               //
+               // Ускоренная дельта делится на зум — она в тех же единицах, что
+               // и движение курсора по холсту (surface-локальных). Сырая
+               // (delta_unaccel) идёт как есть: это «сколько прошла мышь»,
+               // масштаб холста к ней отношения не имеет, и игры считают по ней
+               // своё ускорение.
+               let под = self.surface_under(self.pointer_location);
+               let захват = self.pointer_constraint_at(под.as_ref());
+               {
+                   let pointer = self.seat.get_pointer().unwrap();
+                   let unaccel = event.delta_unaccel();
+                   pointer.relative_motion(self, под, &RelativeMotionEvent {
+                       delta: (delta.x / zoom, delta.y / zoom).into(),
+                       delta_unaccel: (unaccel.x, unaccel.y).into(),
+                       utime: event.time(),
+                   });
+                   // Курсор заперт на месте (мышиный обзор в игре): позицию не
+                   // трогаем вовсе — ни стрелку, ни камеру. Клиент уже получил
+                   // всё, что ему нужно, дельтами выше.
+                   if захват.locked {
+                       pointer.frame(self);
+                       return;
+                   }
+               }
 
                // Alt+LMB pan (Float) / ЛКМ-пан в обзоре столов: курсор стоит,
                // холст движется в сторону drag.
@@ -220,29 +322,36 @@ impl Dawn {
                }
 
                // Обычное движение курсора — дельта в canvas-единицах
+               let было = self.pointer_location;
                self.pointer_location.x += delta.x / zoom;
                self.pointer_location.y += delta.y / zoom;
 
                // Курсор не должен выходить за экран: зажимаем, переливаем в камеру.
                // Координаты в ЛОГИЧЕСКИХ единицах (output-local), без умножения на zoom.
                {
-                   let out_geo_opt = {
-                       let o = self.space.outputs().next().cloned();
-                       o.and_then(|o| self.space.output_geometry(&o))
-                   };
-                   if let Some(out_geo) = out_geo_opt {
-                       // Логическая позиция курсора относительно левого-верхнего угла output'а
+                   {
+                       // Логическая позиция курсора относительно камеры и предел —
+                       // ВИДИМАЯ часть холста (экран ⁄ зум), а не размер выхода:
+                       // при отдалении в кадре холста больше, чем экрана.
                        let sx = self.pointer_location.x - self.viewport.cam_x;
                        let sy = self.pointer_location.y - self.viewport.cam_y;
-                       let ow = out_geo.size.w as f64;
-                       let oh = out_geo.size.h as f64;
+                       let vis = self.visible_canvas_size();
+                       let ow = vis.w;
+                       let oh = vis.h;
                        let csx = sx.clamp(0.0, ow);
                        let csy = sy.clamp(0.0, oh);
                        // Зажимаем курсор (canvas coords)
                        self.pointer_location.x = csx + self.viewport.cam_x;
                        self.pointer_location.y = csy + self.viewport.cam_y;
-                       // Перелив → плавное движение камеры (только Float)
-                       if self.tile_config.layout == Layout::Float {
+                       // Перелив → плавное движение камеры (только Float).
+                       //
+                       // Полноэкранное окно — исключение: экран отдан ему
+                       // целиком, и «дотолкать» камеру курсором у края значило
+                       // бы уехать холстом из-под игры прямо во время игры.
+                       // Пока фуллскрин держит экран, камера стоит.
+                       if self.tile_config.layout == Layout::Float
+                           && self.fullscreen.is_none()
+                       {
                            let over_x = sx - csx;
                            let over_y = sy - csy;
                            if over_x != 0.0 || over_y != 0.0 {
@@ -258,6 +367,15 @@ impl Dawn {
                    }
                }
 
+               // Удержание (confine): курсор не выпускается за поверхность и за
+               // заданную клиентом область внутри неё. Если шаг вывел наружу —
+               // откатываем его целиком. Скользить вдоль границы не пытаемся:
+               // область произвольной формы, а откат по обеим осям сразу даёт
+               // ровно то поведение, которого ждёт клиент — «дальше некуда».
+               if захват.confined && !захват.holds(self, self.pointer_location) {
+                   self.pointer_location = было;
+               }
+
                let pos = self.pointer_location;
                let serial = SERIAL_COUNTER.next_serial();
                let pointer = self.seat.get_pointer().unwrap();
@@ -271,7 +389,12 @@ impl Dawn {
                // туда, куда пользователь не смотрел. У niri focus-follows-mouse
                // по той же причине выключен по умолчанию; остальные раскладки
                // dawn работают как раньше.
-               let sloppy = self.tile_config.layout != Layout::Columns;
+               // Пока открыто меню клиента, оно держит захват (см.
+               // XdgShellHandler::grab). Перевод фокуса под курсором в этот
+               // момент сорвал бы захват и закрыл меню — ровно то, чем болели
+               // меню Steam (там причина была та же, но по стороне X11).
+               let меню_захватило = self.seat.get_keyboard().is_some_and(|k| k.is_grabbed());
+               let sloppy = self.tile_config.layout != Layout::Columns && !меню_захватило;
                if sloppy {
                    if let Some((surface, _)) = &under {
                        let same = self.focused_surface().as_ref() == Some(surface);
@@ -297,6 +420,9 @@ impl Dawn {
                // в конце итерации сочтёт сдвиг камеры от "перелива" у края (выше)
                // самовольным и оттащит стрелку обратно — курсор резинил бы у края.
                self.pointer_warped();
+               // Курсор въехал в область, на которую клиент заранее попросил
+               // захват, — включаем его (до этого ограничение висит неактивным).
+               self.activate_pointer_constraint();
                // Курсор client-side — его позицию перерисовывает только сам
                // рендер; без явного пинка тут курсор будет виден в последнем
                // отрендеренном кадре, а не там, где мышь реально находится.
@@ -305,17 +431,33 @@ impl Dawn {
 
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 tracing::trace!("PTR MOTION ABS");
-                let output = self.space.outputs().next().unwrap();
-                let output_geo = self.space.output_geometry(output).unwrap();
-                // Абсолютная позиция в screen-пикселях → конвертируем в canvas
+                // Абсолютная позиция (планшет/тачскрин) приходит в долях экрана —
+                // разворачиваем её именно по ЭКРАНУ, а дальше переводим в холст
+                // общей формулой. Раньше здесь брался размер выхода, который
+                // сам уже был поделён на зум, и деление на зум ниже давало
+                // двойную поправку: абсолютный ввод мазал тем сильнее, чем
+                // дальше зум от единицы.
                 let zoom = self.viewport.zoom;
                 let cam_x = self.viewport.cam_x;
                 let cam_y = self.viewport.cam_y;
-                let screen_pos = event.position_transformed(output_geo.size);
-                let pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+                // Курсор заперт клиентом (см. capture.rs) — абсолютный ввод его
+                // не двигает: планшет или указатель виртуальной машины иначе
+                // выдернул бы стрелку из захвата, и игра потеряла бы обзор.
+                let под = self.surface_under(self.pointer_location);
+                let захват = self.pointer_constraint_at(под.as_ref());
+                if захват.locked {
+                    return;
+                }
+                let screen_pos = event.position_transformed(self.screen_size());
+                let mut pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
                     screen_pos.x / zoom + cam_x,
                     screen_pos.y / zoom + cam_y,
                 ));
+                // Удержание внутри поверхности: точку вне её просто не
+                // принимаем — стрелка остаётся там, где была.
+                if захват.confined && !захват.holds(self, pos) {
+                    pos = self.pointer_location;
+                }
                 self.pointer_location = pos;
                 let serial = SERIAL_COUNTER.next_serial();
                 let pointer = self.seat.get_pointer().unwrap();
@@ -324,7 +466,10 @@ impl Dawn {
                 // sloppyfocus: focus follows cursor (как в dwl sloppyfocus=1).
                 // В Columns выключен — см. подробный комментарий в ветке
                 // PointerMotion выше.
-                if self.tile_config.layout != Layout::Columns {
+                // Пока клавиатуру держит слой (открыт лаунчер), sloppy-focus
+                // молчит: иначе первое же движение мыши отдавало бы ввод окну
+                // под курсором, и лаунчер снова оставался немым.
+                if self.tile_config.layout != Layout::Columns && self.layer_keyboard.is_none() {
                     if let Some((surface, _)) = &under {
                     let same = self.focused_surface().as_ref() == Some(surface);
                     if !same {
@@ -346,6 +491,7 @@ impl Dawn {
                 // Абсолютный ввод (планшет/VM) задаёт позицию курсора прямо в
                 // экранных координатах — она и есть эталон для синхронизации.
                 self.pointer_warped();
+                self.activate_pointer_constraint();
                 self.request_redraw();
             }
 
@@ -367,8 +513,94 @@ impl Dawn {
                     kb_mods.alt,
                 );
 
+                // Курсор захвачен приложением (игра запросила pointer-lock или
+                // confine, см. capture.rs) — весь ввод принадлежит ему, и ни
+                // один оверлей компоновщика клик не перехватывает. При locked
+                // стрелка стоит там, где её заперли: если это оказалась зона
+                // полки или миникарты, КАЖДЫЙ выстрел в игре уходил бы в
+                // компоновщик, а не в игру.
+                let курсор_у_клиента = {
+                    let под = self.surface_under(self.pointer_location);
+                    let захват = self.pointer_constraint_at(под.as_ref());
+                    захват.locked || захват.confined
+                };
+
+                // Идёт выбор источника для демонстрации экрана: клик выбирает
+                // окно под курсором (пустой холст = весь экран), правая кнопка
+                // отменяет. Съедаем клик целиком — он не должен ни
+                // фокусировать, ни двигать окна. См. portal.rs.
+                // Меню блютуза приклеено к экрану, поэтому и клик по нему
+                // считается в экранных пикселях (см. bt_click).
+                // Замер «клик не сработал»: каждый выход ОТСЮДА означает, что
+                // приложение своего клика не увидело. Пока причина промахов не
+                // найдена, важно отличать «клик съел компоновщик» (тогда виден
+                // виновник и точка экрана) от «клик дошёл, но приложение его
+                // проигнорировало» — во втором случае здесь тихо.
+                let съел = |кто: &str, s: smithay::utils::Point<f64, smithay::utils::Physical>| {
+                    tracing::info!("КЛИК СЪЕДЕН: {} экран=({:.0},{:.0})", кто, s.x, s.y);
+                };
+
+                if ButtonState::Pressed == btn_state && !курсор_у_клиента && self.bt_menu_open() {
+                    let screen = self.pointer_screen_physical();
+                    if self.bt_click(screen) {
+                        съел("меню блютуза", screen);
+                        return;
+                    }
+                }
+
+                // Поиск окон (Super+F) — такое же приклеенное к экрану меню.
+                if ButtonState::Pressed == btn_state && !курсор_у_клиента && self.search_open() {
+                    let screen = self.pointer_screen_physical();
+                    if self.search_click(screen) {
+                        съел("поиск окон", screen);
+                        return;
+                    }
+                }
+
+                // Меню вайфая и звука приклеены к экрану, как и блютузное.
+                if ButtonState::Pressed == btn_state && !курсор_у_клиента
+                    && (self.wifi_menu_open() || self.audio_menu_open()) {
+                    let screen = self.pointer_screen_physical();
+                    if self.wifi_click(screen) || self.audio_click(screen) {
+                        съел("меню вайфая/звука", screen);
+                        return;
+                    }
+                }
+
+                // Полка состояния приклеена к экрану так же, как бар. Клик
+                // мимо неё она НЕ съедает (см. tray_click) — окно под курсором
+                // получит его как обычно. Правая кнопка по значку — быстрое
+                // действие вместо меню (радио, немота).
+                if ButtonState::Pressed == btn_state && !курсор_у_клиента {
+                    let screen = self.pointer_screen_physical();
+                    if self.tray_click(screen, button == BTN_RIGHT) {
+                        съел("полка состояния", screen);
+                        return;
+                    }
+                }
+
+                // Панель столов приклеена к экрану так же, как полка рядом:
+                // клик по столбику переводит на этот стол. Мимо панели клик не
+                // съедается — окно под ней получит его как обычно.
+                if ButtonState::Pressed == btn_state && !курсор_у_клиента && button == BTN_LEFT {
+                    let screen = self.pointer_screen_physical();
+                    if self.bar_click(screen) {
+                        съел("панель столов", screen);
+                        return;
+                    }
+                }
+
+                if ButtonState::Pressed == btn_state && self.portal_picking() {
+                    if self.portal_pick_click(button == BTN_RIGHT) {
+                        съел("выбор источника демонстрации", self.pointer_screen_physical());
+                        return;
+                    }
+                }
+
                 // Клик по миникарте: телепорт к окну под курсором.
-                if ButtonState::Pressed == btn_state && self.try_handle_minimap_click() {
+                if ButtonState::Pressed == btn_state && !курсор_у_клиента
+                    && self.try_handle_minimap_click() {
+                    съел("миникарта", self.pointer_screen_physical());
                     return;
                 }
 
@@ -443,7 +675,14 @@ impl Dawn {
                 // Висящий pointer-grab съедает Win+ЛКМ/Win+ПКМ целиком: ветка
                 // ниже под него не заходит, и клик выглядит "не работает".
                 if ButtonState::Pressed == btn_state && pointer.is_grabbed() {
-                    tracing::debug!("PTR: клик мимо биндов — активен pointer grab");
+                    // Висящий grab — вторая причина «клик не сработал»: событие
+                    // уходит владельцу захвата, а не тому, на что человек
+                    // показывает. Печатаем экранную точку, чтобы в логе было
+                    // видно, где именно это случается.
+                    let s = self.pointer_screen_physical();
+                    tracing::info!(
+                        "КЛИК В ЗАХВАТ: активен pointer grab, экран=({:.0},{:.0})", s.x, s.y,
+                    );
                 }
 
                 if ButtonState::Pressed == btn_state && !pointer.is_grabbed() {
@@ -459,6 +698,18 @@ impl Dawn {
                         let smithay_pos = pointer.current_location();
                         let hit = self.space.element_under(pos)
                             .and_then(|(w, _)| self.space.element_geometry(w));
+                        // Отставание КАРТИНКИ: где стрелку нарисовал последний
+                        // ушедший на монитор кадр против того, где курсор сейчас.
+                        // Ненулевое значение здесь и есть «кликаю не туда, где
+                        // вижу стрелку» — хит-тест при этом может быть точен.
+                        let кадр = self.frame_cursor;
+                        tracing::debug!(
+                            "PTR КАДР: стрелка_в_кадре=({:.1},{:.1}) сейчас=({:.1},{:.1}) \
+                             отставание=({:.1},{:.1}) возраст_кадра={}мс",
+                            кадр.x, кадр.y, pos.x, pos.y,
+                            pos.x - кадр.x, pos.y - кадр.y,
+                            self.frame_drawn_at.elapsed().as_millis(),
+                        );
                         tracing::debug!(
                             "PTR HIT: курсор=({:.1},{:.1}) smithay=({:.1},{:.1}) \
                              расхождение=({:.1},{:.1}) камера=({:.1},{:.1}) zoom={:.2} окно={:?}",
@@ -871,8 +1122,41 @@ impl Dawn {
                 let mut frame = AxisFrame::new(event.time_msec()).source(source);
                 if h != 0.0 { frame = frame.value(Axis::Horizontal, h); }
                 if v != 0.0 { frame = frame.value(Axis::Vertical, v); }
-                self.seat.get_pointer().unwrap().axis(self, frame);
-                self.seat.get_pointer().unwrap().frame(self);
+                // Дискретные щелчки колеса (v120) обязаны уходить вместе со
+                // значением. Xwayland переводит колесо в X11-кнопки 4/5 по
+                // щелчкам, а не по непрерывной амплитуде: без v120 прокрутка
+                // доходит до нативных wayland-клиентов и пропадает во всех
+                // X11-приложениях. Тачпад (source=Finger) v120 не имеет —
+                // там остаётся только непрерывное значение.
+                if source == AxisSource::Wheel || source == AxisSource::WheelTilt {
+                    if let Some(dh) = event.amount_v120(Axis::Horizontal) {
+                        if dh != 0.0 { frame = frame.v120(Axis::Horizontal, dh as i32); }
+                    }
+                    if let Some(dv) = event.amount_v120(Axis::Vertical) {
+                        if dv != 0.0 { frame = frame.v120(Axis::Vertical, dv as i32); }
+                    }
+                }
+                // Финальный кадр жеста (амплитуда 0) — это axis_stop. Без него
+                // клиент считает прокрутку незавершённой и продолжает кинетику.
+                if source == AxisSource::Finger {
+                    if h == 0.0 { frame = frame.stop(Axis::Horizontal); }
+                    if v == 0.0 { frame = frame.stop(Axis::Vertical); }
+                }
+                let ptr = self.seat.get_pointer().unwrap();
+                // Прокрутка уходит ТОЛЬКО в поверхность под указателем. Если
+                // здесь `фокус=нет`, колесо «не работает» не из-за самих
+                // событий: курсор просто вне окна (например, прижат к краю
+                // экрана ниже нижней границы окна) — смотреть надо туда, а не
+                // в ветку axis.
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        "SCROLL→КЛИЕНТ: h={:.2} v={:.2} v120={:?} источник={:?} фокус={}",
+                        h, v, event.amount_v120(Axis::Vertical), source,
+                        if ptr.current_focus().is_some() { "есть" } else { "нет" },
+                    );
+                }
+                ptr.axis(self, frame);
+                ptr.frame(self);
             }
 
             // ── Pinch → zoom canvas ──────────────────────────────────────

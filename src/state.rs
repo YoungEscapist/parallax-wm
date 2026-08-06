@@ -23,8 +23,10 @@ use smithay::{
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
+        pointer_constraints::PointerConstraintsState,
+        relative_pointer::RelativePointerManagerState,
         selection::data_device::DataDeviceState,
-        shell::xdg::XdgShellState,
+        shell::xdg::{XdgShellState, decoration::XdgDecorationState},
         shell::wlr_layer::WlrLayerShellState,
         shell::wlr_layer::Layer as WlrLayer,
         shm::ShmState,
@@ -72,6 +74,12 @@ pub struct TaggedWindow {
     pub float_size: Option<Size<i32, Logical>>, // размер в Float-режиме (None = клиент выбирает)
     pub float_position_set: bool,            // пользователь вручную размещал в Float
     pub floating: bool,                      // не тайлить
+    /// Плавающее НАМЕРЕННО: X11-диалог или явный toggle_floating. Такое окно
+    /// переживает переход Float→tiling и остаётся поверх раскладки. Всё
+    /// остальное, что стало floating попутно (окно подвинули мышью/жестом во
+    /// Float — см. input.rs), при сборке в тайлинг обязано вернуться в
+    /// раскладку: иначе «в tiling переносятся не все окна».
+    pub float_pinned: bool,
     pub folded: bool,                        // схлопнуто в стопку (2.4)
 }
 
@@ -101,6 +109,16 @@ pub struct Dawn {
     pub loop_signal: LoopSignal,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    /// xdg-decoration: без этого глобала GTK-клиенты рисуют свой заголовок и
+    /// получают из-за него большой минимальный размер (см. xdg_shell.rs).
+    pub xdg_decoration_state: XdgDecorationState,
+    /// Выход-«призрак» для layer-поверхностей: масштаб всегда 1, глобала нет.
+    /// Нужен, чтобы обои и панели считались в экранных пикселях и не зависели
+    /// от зума холста (см. scan_connectors в udev.rs).
+    pub layer_output: Option<smithay::output::Output>,
+    /// Слой, которому сейчас отдана клавиатура (лаунчер). Нужен, чтобы вернуть
+    /// фокус окну, когда слой закроется.
+    pub layer_keyboard: Option<WlSurface>,
     pub shm_state: ShmState,
    pub dmabuf_state: DmabufState,
    pub dmabuf_global: Option<DmabufGlobal>,
@@ -187,9 +205,40 @@ pub struct Dawn {
     pub pending_session: HashMap<String, Vec<Point<i32, Logical>>>,
     /// Активный оконный портал (4.4), не более одного одновременно.
     pub portal: Option<Portal>,
-    /// Позиция камеры для каждого воркспейса (тега) — восстанавливается при
-    /// переключении на него, сохраняется при уходе (см. view_tag).
-    pub tag_cameras: HashMap<u32, (f64, f64)>,
+    /// Окно, развёрнутое на весь экран (F11 или запрос клиента), и всё, что
+    /// нужно вернуть при выходе, — см. fullscreen.rs. Не более одного.
+    pub fullscreen: Option<crate::fullscreen::Fullscreen>,
+    /// Идёт выбор источника для демонстрации экрана: портал ждёт, пока
+    /// пользователь ткнёт в окно (или в пустой холст — тогда весь экран).
+    /// См. portal.rs.
+    pub portal_pick: Option<crate::portal::Pick>,
+    /// Что выбрали в прошлый раз — по нему режется кадр для потока.
+    pub portal_capture: Option<crate::portal::Capture>,
+    /// Живой поток кадров в PipeWire (демонстрация экрана идёт прямо сейчас).
+    pub portal_cast: Option<crate::portal_stream::Cast>,
+    /// Блютуз: последний снимок BlueZ, канал команд и состояние меню.
+    /// None — поток не поднялся (нет системной шины), меню не откроется.
+    pub bt: Option<crate::bluetooth::BtUi>,
+    /// Полка состояния у панели столов: вайфай, звук, батарея, питание
+    /// (см. tray.rs). None — поток опроса не поднялся.
+    pub tray: Option<crate::tray::TrayUi>,
+    /// Вайфай: снимок NetworkManager и состояние меню сетей (см. wifi.rs).
+    pub wifi: Option<crate::wifi::WifiUi>,
+    /// Звук: устройства вывода/ввода и состояние меню (см. audio.rs).
+    pub audio: Option<crate::audio::AudioUi>,
+    /// Идущий прямо сейчас перебор стопки по Alt+Tab (см. switcher.rs).
+    /// Живёт, пока держат Alt.
+    pub alt_tab: Option<crate::switcher::AltTab>,
+    /// Открытый поиск окон по Super+F: запрос, выдача, выбранная строка.
+    pub search: Option<crate::switcher::SearchUi>,
+    /// Кадр каждого воркспейса (тега): `(cam_x, cam_y, zoom)`. Сохраняется при
+    /// уходе со стола, восстанавливается при возврате на него (см. view_tag).
+    ///
+    /// Зум здесь наравне с камерой: стол — это ОКНО В ХОЛСТ, а окно задаётся и
+    /// точкой, и масштабом. Раньше хранилась только точка, и стол, на котором
+    /// пользователь отъехал зумом, при возврате показывался в масштабе того
+    /// стола, откуда пришли.
+    pub tag_cameras: HashMap<u32, (f64, f64, f64)>,
     /// Раскладка (Tile/Float/Monocle/Columns) КАЖДОГО стола по отдельности:
     /// уходя со стола, запоминаем его layout, приходя — восстанавливаем. Так
     /// стол 1 может быть тайловым, а стол 2 плавающим, и переключение столов
@@ -286,8 +335,26 @@ pub struct Dawn {
     pub minimap_ids: Vec<crate::udev::SolidSlot>,
     pub selection_ids: Vec<crate::udev::SolidSlot>,
     pub portal_ids: Vec<crate::udev::SolidSlot>,
+    /// Позиция курсора в последнем ОТРИСОВАННОМ кадре и его время — по ним
+    /// видно, отстаёт ли картинка от мыши (см. PTR HIT в input.rs).
+    pub frame_cursor: Point<f64, Logical>,
+    pub frame_drawn_at: std::time::Instant,
+    /// Пул прямоугольников для подсветки выбора источника (см. portal.rs).
+    pub portal_pick_ids: Vec<crate::udev::SolidSlot>,
     /// Пул под панель рабочих столов (бар снизу).
     pub bar_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул прямоугольников меню блютуза (фон, строки, подсветка).
+    pub bt_ids: Vec<crate::udev::SolidSlot>,
+    /// Отдельный пул под значок блютуза у панели столов: он виден и когда меню
+    /// открыто, поэтому делить слоты с меню нельзя.
+    pub bt_ind_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул под полку состояния (полосочка, фон ряда, шкала громкости).
+    pub tray_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул под списочные меню (вайфай, звук): открыто всегда не больше одного,
+    /// поэтому слоты у них общие.
+    pub menu_ids: Vec<crate::udev::SolidSlot>,
+    /// Растеризованные строки текста для оверлеев (см. text.rs).
+    pub text_cache: crate::text::TextCache,
     // ── Мультивыделение / "созвездия" ────────────────────────────────────────
     /// Рамка rubber-band выделения в процессе протяжки (canvas-координаты) —
     /// см. grabs/select_grab.rs.
@@ -359,29 +426,96 @@ fn load_default_cursor() -> (Option<MemoryRenderBuffer>, Point<i32, Logical>, Si
     use xcursor::{CursorTheme, parser::parse_xcursor};
 
     let try_load = || -> Option<(MemoryRenderBuffer, Point<i32, Logical>, Size<i32, Logical>)> {
-        let theme = CursorTheme::load("default");
+        // CursorTheme::load() берёт имя темы аргументом, а не из окружения —
+        // без этого она искала буквально тему с именем "default", которой
+        // почти нигде нет (есть Adwaita/Breeze/...), и курсор вне окон был
+        // невидим (клиенты рисуют свой курсор сами через Surface, поэтому
+        // внутри окон баг не проявлялся). XCURSOR_THEME — тот же env var,
+        // что читают GTK/Qt/wayland-cursor на стороне клиентов.
+        let theme_name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
+        let theme = CursorTheme::load(&theme_name);
         let path = theme.load_icon("left_ptr")
             .or_else(|| theme.load_icon("default"))
             .or_else(|| theme.load_icon("arrow"))?;
         let bytes = std::fs::read(path).ok()?;
         let images = parse_xcursor(&bytes)?;
-        let image = images.iter().min_by_key(|i| (i.size as i32 - 24).abs())?;
+        // Размер берём из XCURSOR_SIZE — тот же env var, что читают GTK/Qt и
+        // wayland-cursor у клиентов, так что курсор компоновщика и курсоры
+        // внутри окон получаются одного размера. Раньше здесь было жёстко 24.
+        let want = std::env::var("XCURSOR_SIZE").ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(24);
+        let image = images.iter().min_by_key(|i| (i.size as i32 - want).abs())?;
+        let k = (want as f64 / (image.width as f64).max(1.0)).min(1.0);
+        // Если картинка крупнее запрошенного, ужимаем САМИ ПИКСЕЛИ, а не
+        // растягиваем элемент при отрисовке.
+        //
+        // Курсор уходит на аппаратный слой (Kind::Cursor), а тот масштаб не
+        // применяет: он берёт буфер как есть и обрезает его по заданному
+        // размеру — стрелка выходила обрезанной. Ужатый буфер решает это раз и
+        // навсегда: на слой уезжает ровно то, что нужно показать.
+        let (пиксели, шир, выс) = if k < 1.0 {
+            let nw = ((image.width as f64 * k).round() as usize).max(1);
+            let nh = ((image.height as f64 * k).round() as usize).max(1);
+            let (ow, oh) = (image.width as usize, image.height as usize);
+            let mut out = vec![0u8; nw * nh * 4];
+            // Усреднение по исходному блоку (box filter): у стрелки тонкий
+            // контур, и «ближайший сосед» рвал бы его в клочья.
+            for y in 0..nh {
+                for x in 0..nw {
+                    let x0 = x * ow / nw;
+                    let x1 = (((x + 1) * ow).div_ceil(nw)).min(ow).max(x0 + 1);
+                    let y0 = y * oh / nh;
+                    let y1 = (((y + 1) * oh).div_ceil(nh)).min(oh).max(y0 + 1);
+                    let (mut a, mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+                    for sy in y0..y1 {
+                        for sx in x0..x1 {
+                            let i = (sy * ow + sx) * 4;
+                            r += image.pixels_rgba[i] as u32;
+                            g += image.pixels_rgba[i + 1] as u32;
+                            b += image.pixels_rgba[i + 2] as u32;
+                            a += image.pixels_rgba[i + 3] as u32;
+                            n += 1;
+                        }
+                    }
+                    let o = (y * nw + x) * 4;
+                    out[o] = (r / n) as u8;
+                    out[o + 1] = (g / n) as u8;
+                    out[o + 2] = (b / n) as u8;
+                    out[o + 3] = (a / n) as u8;
+                }
+            }
+            (out, nw as i32, nh as i32)
+        } else {
+            (image.pixels_rgba.clone(), image.width as i32, image.height as i32)
+        };
         let buf = MemoryRenderBuffer::from_slice(
-            &image.pixels_rgba,
+            &пиксели,
             Fourcc::Abgr8888,
-            (image.width as i32, image.height as i32),
+            (шир, выс),
             1,
             Transform::Normal,
             None,
         );
-        let hotspot = Point::from((image.xhot as i32, image.yhot as i32));
-        let size = Size::from((image.width as i32, image.height as i32));
+        // В теме может не быть картинки ровно запрошенного размера (у
+        // Vanilla-DMZ-AA минимальная — 24). Тогда берём ближайшую и ужимаем её
+        // при отрисовке до нужного: масштабируем и размер, и горячую точку,
+        // иначе остриё разъедется с картинкой.
+        let hotspot = Point::from((
+            (image.xhot as f64 * k).round() as i32,
+            (image.yhot as f64 * k).round() as i32,
+        ));
+        let size = Size::from((шир, выс));
         Some((buf, hotspot, size))
     };
 
     match try_load() {
         Some((buf, hs, sz)) => {
-            tracing::info!("dawn: loaded default cursor {}x{}", sz.w, sz.h);
+            tracing::info!("dawn: loaded default cursor {}x{} (тема {:?}, запрошен {})",
+                sz.w, sz.h,
+                std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into()),
+                std::env::var("XCURSOR_SIZE").unwrap_or_else(|_| "24".into()));
             (Some(buf), hs, sz)
         }
         None => {
@@ -396,6 +530,7 @@ impl Dawn {
         let dh = display.handle();
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
@@ -404,6 +539,13 @@ impl Dawn {
         // Захват экрана (ext-image-copy-capture): без этих глобалов
         // xdg-desktop-portal-wlr не видит у компоситора способа снять картинку,
         // и демонстрация экрана в Discord/OBS остаётся чёрной. См. screencopy.rs.
+        // Захват курсора приложением (см. capture.rs). Оба глобала нужны
+        // ВМЕСТЕ: constraints запирает стрелку, relative_pointer отдаёт клиенту
+        // сырые дельты мыши — без них запертый курсор просто перестал бы
+        // сообщать движение, и мышиный обзор в играх умер бы совсем.
+        // Сами объекты состояния держать не нужно: глобал живёт в display.
+        PointerConstraintsState::new::<Self>(&dh);
+        RelativePointerManagerState::new::<Self>(&dh);
         let image_capture_source_state = ImageCaptureSourceState::new();
         let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
         let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
@@ -423,6 +565,9 @@ impl Dawn {
             loop_signal,
             compositor_state,
             xdg_shell_state,
+            xdg_decoration_state,
+            layer_output: None,
+            layer_keyboard: None,
             shm_state,
            dmabuf_state: DmabufState::new(),
            dmabuf_global: None,
@@ -470,6 +615,16 @@ impl Dawn {
             is_minimap_visible: false,
             pending_session: crate::session::load(),
             portal: None,
+            fullscreen: None,
+            portal_pick: None,
+            portal_capture: None,
+            portal_cast: None,
+            bt: None,
+            tray: None,
+            wifi: None,
+            audio: None,
+            alt_tab: None,
+            search: None,
             tag_cameras: HashMap::new(),
             tag_layouts: HashMap::new(),
             focus_aura_target: None,
@@ -518,7 +673,15 @@ impl Dawn {
             minimap_ids: Vec::new(),
             selection_ids: Vec::new(),
             portal_ids: Vec::new(),
+            portal_pick_ids: Vec::new(),
+            frame_cursor: Point::from((0.0, 0.0)),
+            frame_drawn_at: std::time::Instant::now(),
             bar_ids: Vec::new(),
+            bt_ids: Vec::new(),
+            bt_ind_ids: Vec::new(),
+            tray_ids: Vec::new(),
+            menu_ids: Vec::new(),
+            text_cache: crate::text::TextCache::new(),
             image_capture_source_state,
             output_capture_source_state,
             image_copy_capture_state,
@@ -593,6 +756,66 @@ impl Dawn {
 
     /// Применяем camera к output — ВСЯ магия infinite canvas
     /// space.map_output(&output, camera) двигает весь viewport
+    // ── Координаты: холст ↔ экран ───────────────────────────────────────────
+    //
+    // Ровно две системы, и путать их нельзя (порт подхода driftwm/canvas.rs):
+    //  · ХОЛСТ — бесконечная плоскость, где живут окна (tw.position, камера);
+    //  · ЭКРАН — физические пиксели монитора, где живут бар, миникарта,
+    //    layer-поверхности и курсор.
+    //
+    //   экран = (холст − камера) × зум      холст = экран ⁄ зум + камера
+    //
+    // Зум НЕ меняет масштаб выхода (клиентам он не виден) — он применяется
+    // только при отрисовке, см. render_surface. Поэтому логический размер
+    // выхода всегда равен размеру экрана, а ВИДИМАЯ часть холста при отдалении
+    // больше экрана — её даёт visible_canvas_size().
+
+    /// Размер экрана в логических пикселях (режим монитора).
+    pub fn screen_size(&self) -> Size<i32, Logical> {
+        self.space.outputs().next()
+            .and_then(|o| o.current_mode())
+            .map(|m| Size::from((m.size.w, m.size.h)))
+            .unwrap_or_else(|| (1920, 1080).into())
+    }
+
+    /// Сколько холста влезает в экран при текущем зуме.
+    pub fn visible_canvas_size(&self) -> Size<f64, Logical> {
+        let z = self.viewport.zoom.max(0.01);
+        let s = self.screen_size();
+        Size::from((s.w as f64 / z, s.h as f64 / z))
+    }
+
+    /// Кадр `(cam_x, cam_y, zoom)`, к которому вид ЕДЕТ прямо сейчас: если
+    /// анимация камеры или зума ещё летит — её конечная точка, иначе текущая.
+    ///
+    /// Нужен там, где кадр запоминают (уход с воркспейса): взять на лету
+    /// `viewport.*` значило бы запомнить полпути, и стол при возврате
+    /// открывался бы между двумя местами. Зум и камера берутся из ОДНОГО
+    /// источника: zoom_anim умеет вести камеру за собой (см. ZoomAnim::new_pan),
+    /// и его цель важнее отдельного camera_anim.
+    pub fn view_frame_target(&self) -> (f64, f64, f64) {
+        if let Some(z) = self.zoom_anim.as_ref() {
+            let (zoom, cam) = z.target();
+            return (cam.x, cam.y, zoom);
+        }
+        let cam = self.camera_anim.as_ref()
+            .map(|c| c.to)
+            .unwrap_or_else(|| Point::from((self.viewport.cam_x, self.viewport.cam_y)));
+        (cam.x, cam.y, self.viewport.zoom)
+    }
+
+    /// Точка холста → точка экрана.
+    pub fn canvas_to_screen(&self, p: Point<f64, Logical>) -> Point<f64, Logical> {
+        let z = self.viewport.zoom;
+        Point::from(((p.x - self.viewport.cam_x) * z, (p.y - self.viewport.cam_y) * z))
+    }
+
+    /// Точка экрана → точка холста.
+    pub fn screen_to_canvas(&self, p: Point<f64, Logical>) -> Point<f64, Logical> {
+        let z = self.viewport.zoom.max(0.01);
+        Point::from((p.x / z + self.viewport.cam_x, p.y / z + self.viewport.cam_y))
+    }
+
     pub fn apply_camera(&mut self) {
         // Плавающие окна ленты держатся экрана — двигаем их на ту же дельту,
         // что и камеру (только в Columns, см. columns_pin_floating).
@@ -612,14 +835,17 @@ impl Dawn {
             // (ghostty/GTK) на каждый done() пересчитывают масштаб и перерисовываются,
             // их коммиты повреждают экран и заставляют компоситор рисовать ещё —
             // самоподдерживающаяся нагрузка ровно во время анимаций.
-            if (output.current_scale().fractional_scale() - zoom).abs() > f64::EPSILON {
-                output.change_current_state(
-                    None,
-                    None,
-                    Some(smithay::output::Scale::Fractional(zoom)),
-                    None,
-                );
-            }
+            // ЗУМ БОЛЬШЕ НЕ ЕДЕТ ЧЕРЕЗ МАСШТАБ ВЫХОДА.
+            //
+            // Раньше здесь стояло change_current_state(Scale::Fractional(zoom)),
+            // и это отравляло всё, что зависит от логического размера экрана:
+            // клиенты получали wl_output.scale и перерисовывались под чужой
+            // масштаб, layer-поверхностям выдавались размеры вроде 12800×5400
+            // (обои на этом ложились), screencopy отдавал снимки того же
+            // размера, хит-тест разъезжался. Зум теперь применяется ТОЛЬКО при
+            // отрисовке (RescaleRenderElement, см. render_surface) — ровно как
+            // в driftwm, где output scale отвечает лишь за DPI.
+            let _ = zoom;
             // map_output дешевле, но тоже незачем звать, когда камера стоит
             // на месте (в тике она округляется до целых пикселей).
             let mapped = self.space.output_geometry(&output).map(|g| g.loc);
@@ -729,12 +955,16 @@ impl Dawn {
     fn set_pointer_canvas(&mut self, mut pos: Point<f64, Logical>) {
         // За пределы монитора курсор не выпускаем — там его не видно, а клики
         // всё равно уходили бы в окна, которых на экране нет.
-        let out_geo = self.space.outputs().next().cloned()
-            .and_then(|o| self.space.output_geometry(&o));
-        if let Some(g) = out_geo {
-            pos.x = pos.x.clamp(g.loc.x as f64, (g.loc.x + g.size.w) as f64);
-            pos.y = pos.y.clamp(g.loc.y as f64, (g.loc.y + g.size.h) as f64);
-        }
+        // Зажимаем по ВИДИМОЙ ЧАСТИ ХОЛСТА, а не по размеру выхода: при зуме
+        // 0.5 в экран влезает вдвое больше холста, и курсор обязан доставать до
+        // его краёв. Раньше здесь стоял размер выхода — он совпадал с видимой
+        // областью только потому, что зум ехал через масштаб выхода. Теперь
+        // зум живёт в отрисовке (см. render_surface), размер выхода равен
+        // экрану, и без этой поправки курсор упирался в невидимую стену на
+        // половине экрана (тот самый «кривой хитбокс»).
+        let vis = self.visible_canvas_size();
+        pos.x = pos.x.clamp(self.viewport.cam_x, self.viewport.cam_x + vis.w);
+        pos.y = pos.y.clamp(self.viewport.cam_y, self.viewport.cam_y + vis.h);
         if pos == self.pointer_location {
             return;
         }
@@ -833,8 +1063,11 @@ impl Dawn {
         pos: Point<f64, Logical>,
         layers: &[WlrLayer],
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let output = self.space.outputs().next()?;
-        let map = layer_map_for_output(output);
+        let output = self.layer_output.clone().or_else(|| self.space.outputs().next().cloned())?;
+        let map = layer_map_for_output(&output);
+        // Экранная точка в тех же координатах, в которых слой РИСУЕТСЯ: он
+        // приклеен к экрану и от зума не зависит (см. build_layer_elements),
+        // поэтому положение курсора переводим в экранные пиксели зумом.
         let zoom = self.viewport.zoom;
         let screen = Point::<f64, Logical>::from((
             (pos.x - self.viewport.cam_x) * zoom,
@@ -872,16 +1105,22 @@ impl Dawn {
             return;
         };
         let local = pos - origin;
-        let win_geo = self.space.element_under(pos)
-            .and_then(|(w, _)| self.space.element_geometry(w))
+        let win = self.space.element_under(pos).map(|(w, _)| w.clone());
+        let win_geo = win.as_ref()
+            .and_then(|w| self.space.element_geometry(w))
             .map(|g| g.size);
+        // Поля клиентских рамок (тень, невидимые бортики ресайза): у окна с
+        // ними начало дерева поверхностей и начало видимой части разнесены на
+        // эту точку. Если тут не (0,0), а картинка и клики расходятся — смотреть
+        // на неё: она и есть величина расхождения (см. цикл окон в udev.rs).
+        let поля = win.as_ref().map(|w| w.geometry().loc);
         let surf_size = smithay::backend::renderer::utils::with_renderer_surface_state(
             &surface, |s| s.surface_size(),
         ).flatten();
         tracing::debug!(
             "PTR ЛОКАЛЬ: локальная=({:.1},{:.1}) начало=({:.1},{:.1}) окно={:?} \
-             поверхность={:?} zoom={:.2} обзор={}",
-            local.x, local.y, origin.x, origin.y, win_geo, surf_size,
+             поля_рамок={:?} поверхность={:?} zoom={:.2} обзор={}",
+            local.x, local.y, origin.x, origin.y, win_geo, поля, surf_size,
             self.viewport.zoom, self.overview_active,
         );
     }
@@ -914,7 +1153,15 @@ impl Dawn {
 
         let frac_x = local_x / portal.box_size.w as f64;
         let frac_y = local_y / portal.box_size.h as f64;
-        let surface_local = Point::from((frac_x * geo.size.w as f64, frac_y * geo.size.h as f64));
+        // Доля рамки — это доля ВИДИМОЙ части окна, а surface_under ждёт точку
+        // от НАЧАЛА ДЕРЕВА ПОВЕРХНОСТЕЙ. У клиентов с клиентскими рамками эти
+        // два начала разнесены на window.geometry().loc (поля под тень), и без
+        // слагаемого клик по порталу уходил выше-левее видимого.
+        let поля = window.geometry().loc;
+        let surface_local = Point::from((
+            поля.x as f64 + frac_x * geo.size.w as f64,
+            поля.y as f64 + frac_y * geo.size.h as f64,
+        ));
 
         window.surface_under(surface_local, WindowSurfaceType::ALL)?;
         let origin = pos - surface_local;
@@ -1043,10 +1290,11 @@ impl Dawn {
             self.exit_overview_immediate(Some(tag));
             return;
         }
-        // У каждого воркспейса своя позиция камеры И своя раскладка — запоминаем
-        // текущие перед уходом, восстанавливаем сохранённые для нового тега.
+        // У каждого воркспейса свой КАДР (камера + зум) И своя раскладка —
+        // запоминаем текущие перед уходом, восстанавливаем сохранённые для
+        // нового тега.
         let old_tag = self.viewport.current_tags();
-        self.tag_cameras.insert(old_tag, (self.viewport.cam_x, self.viewport.cam_y));
+        self.tag_cameras.insert(old_tag, self.view_frame_target());
         self.tag_layouts.insert(old_tag, self.tile_config.layout);
 
         // НОВЫЙ (ещё не посещённый) воркспейс → включаем tiling и раскладываем
@@ -1101,40 +1349,88 @@ impl Dawn {
             // scroll_to_active и arrange: окна нового стола уже разложены на
             // своём этаже, и камера летит к готовой картинке.
             self.columns_fly_to_workspace(tag);
+            // Зум у ленточного стола тоже свой. Перелёт выше ведёт только
+            // камеру, поэтому, если запомненный зум другой, ПОДМЕНЯЕМ его
+            // анимацию на общую (камера + зум одним ZoomAnim): две анимации
+            // разом писали бы cam_x/cam_y по очереди и дрались бы за камеру.
+            if let Some(&(_, _, zoom)) = self.tag_cameras.get(&tag) {
+                if (zoom - self.viewport.zoom).abs() > 0.001 {
+                    let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
+                    let to = self.camera_anim.as_ref().map(|a| a.to).unwrap_or(from);
+                    self.camera_anim = None;
+                    self.zoom_anim = Some(ZoomAnim::new_pan(
+                        from, to, self.viewport.zoom, zoom, Duration::from_millis(220),
+                    ));
+                }
+            }
             tracing::info!("dawn: view_tag → {:#b} (columns workspace)", tag);
             return;
         }
 
         if is_new {
-            self.set_layout(target_layout); // сам обнуляет камеру
+            // Стол ещё не видели: показывать его неоткуда — ставим кадр в
+            // начало координат сами. Раньше это делал restore_layout, но
+            // теперь он камеру при ПЕРЕХОДЕ НА СТОЛ не трогает (иначе затирал
+            // бы запомненный кадр, см. tiling::set_layout_inner).
+            self.restore_layout(target_layout);
+            self.momentum.stop();
+            self.camera_anim = None;
+            self.zoom_anim = None;
+            self.viewport.zoom = 1.0;
+            self.viewport.cam_x = 0.0;
+            self.viewport.cam_y = 0.0;
+            self.apply_camera();
             tracing::info!("dawn: view_tag → {:#b} (new workspace → {})", tag, target_layout.symbol());
             return;
         }
 
         // Стол помнит свой режим: если он отличается от текущего — переключаем.
-        // set_layout сам ставит камеру (тайлинг — в (0,0)) и раскладывает окна,
-        // поэтому для тайловых столов восстанавливать камеру уже не нужно.
+        // Камеру при этом restore_layout не двигает, кадр ниже ставим сами: он
+        // у стола свой независимо от раскладки.
         if target_layout != self.tile_config.layout {
-            self.set_layout(target_layout);
+            // Именно restore_layout: переход на стол не двигает его окна
+            // (см. tiling::restore_layout — иначе плавающие слетались в точку).
+            self.restore_layout(target_layout);
             tracing::info!("dawn: view_tag → {:#b} (layout {})", tag, target_layout.symbol());
-            if target_layout != Layout::Float {
-                return;
-            }
         }
 
-        // Плавный "перелёт" камеры между воркспейсами вместо мгновенного прыжка.
-        if let Some(&(x, y)) = self.tag_cameras.get(&tag) {
-            let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
-            let to = Point::from((x, y));
-            if (to.x - from.x).abs() > 0.5 || (to.y - from.y).abs() > 0.5 {
-                self.camera_anim = Some(CameraAnim::new(from, to, Duration::from_millis(300)));
-            } else {
-                self.viewport.cam_x = x;
-                self.viewport.cam_y = y;
-                self.apply_camera();
-            }
+        // Плавный "перелёт" в кадр стола вместо мгновенного прыжка. Кадр — это
+        // камера И зум: стол, с которого ушли отдалённым, обязан таким же и
+        // открыться. Пока зум не хранился, возврат показывал стол в масштабе
+        // того стола, откуда пришли.
+        //
+        // Когда зум меняется, камеру ведёт ZoomAnim::new_pan: две отдельные
+        // анимации (camera_anim + zoom_anim) писали бы cam_x/cam_y по очереди
+        // каждый кадр и дрались бы между собой.
+        let frame = self.tag_cameras.get(&tag).copied()
+            // Стол посещали ДО того, как кадры начали запоминаться (или он
+            // потерял запись) — открываем его в начале координат, как раньше.
+            .unwrap_or((0.0, 0.0, 1.0));
+        let (x, y, zoom) = frame;
+        let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
+        let to = Point::from((x, y));
+        let сдвиг = (to.x - from.x).abs() > 0.5 || (to.y - from.y).abs() > 0.5;
+        let зум_иной = (zoom - self.viewport.zoom).abs() > 0.001;
+        self.momentum.stop();
+        if зум_иной {
+            self.camera_anim = None;
+            self.zoom_anim = Some(ZoomAnim::new_pan(
+                from, to, self.viewport.zoom, zoom, Duration::from_millis(300),
+            ));
+        } else if сдвиг {
+            self.zoom_anim = None;
+            self.camera_anim = Some(CameraAnim::new(from, to, Duration::from_millis(300)));
+        } else {
+            self.camera_anim = None;
+            self.zoom_anim = None;
+            self.viewport.cam_x = x;
+            self.viewport.cam_y = y;
+            self.viewport.zoom = zoom;
+            self.apply_camera();
         }
-        tracing::info!("dawn: view_tag → {:#b}", tag);
+        tracing::info!(
+            "dawn: view_tag → {:#b} (кадр {:.0},{:.0} zoom {:.2})", tag, x, y, zoom,
+        );
     }
 
     /// Число активных воркспейсов в niri-модели: индекс последнего занятого
@@ -1458,7 +1754,14 @@ impl Dawn {
     /// к его центру. Если клик пришёлся на пустое место — центрирует камеру
     /// на этой точке. Возвращает true (клик съеден, не должен доходить до окон).
     pub fn try_handle_minimap_click(&mut self) -> bool {
-        if !self.is_minimap_visible {
+        // Условия ровно те же, при которых миникарта РИСУЕТСЯ (см. render_surface):
+        // невидимая панель не имеет права есть клики. Раньше здесь стояла
+        // проверка только на `is_minimap_visible`, а в кадре миникарту прятали
+        // ещё и под полноэкранным окном и в обзоре — то есть в полноэкранной
+        // игре её панель 460×300 висела в правом верхнем углу НЕВИДИМОЙ ловушкой:
+        // выстрел в ту зону экрана съедался компоновщиком и уносил камеру к
+        // окну «под точкой клика».
+        if !self.is_minimap_visible || self.overview_active || self.fullscreen_here() {
             return false;
         }
         let output = match self.space.outputs().next() { Some(o) => o.clone(), None => return false };
@@ -1576,6 +1879,29 @@ impl Dawn {
             .unwrap_or(((self.camera_bookmarks.len() as u32) % 9) + 1);
         self.camera_bookmarks.insert(slot, anchor);
         tracing::info!("dawn: camera bookmark {} pinned at cursor ({:.0},{:.0})", slot, anchor.x, anchor.y);
+    }
+
+    /// Alt+Super+B: убрать ближайшую к курсору закладку.
+    ///
+    /// «Ближайшая» считается по холсту от точки под курсором — то есть от того
+    /// же места, куда её ставит Alt+B (pin_bookmark_at_cursor). Так удаление
+    /// зеркально постановке: подвёл курсор к ненужному крестику — убрал.
+    pub fn delete_nearest_bookmark(&mut self) {
+        let точка = self.pointer_location;
+        let Some((&slot, _)) = self.camera_bookmarks.iter()
+            .min_by(|(_, a), (_, b)| {
+                let da = (a.x - точка.x).powi(2) + (a.y - точка.y).powi(2);
+                let db = (b.x - точка.x).powi(2) + (b.y - точка.y).powi(2);
+                da.total_cmp(&db)
+            })
+        else {
+            tracing::info!("dawn: закладок нет — удалять нечего");
+            return;
+        };
+        self.camera_bookmarks.remove(&slot);
+        tracing::info!("dawn: удалена закладка {} (ближайшая к курсору)", slot);
+        self.request_plane_reset();
+        self.request_redraw();
     }
 
     pub fn jump_to_camera_bookmark(&mut self, slot: u32) {

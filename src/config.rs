@@ -47,6 +47,11 @@ pub enum Action {
     ToggleLayoutFloatTile,
     Zoom,
     ToggleFloatingFocused,
+    /// F11: окно на весь экран (без скруглений и теней) и обратно.
+    ToggleFullscreen,
+    /// Win+V: выделенные (или сфокусированное) окна — во floating и обратно,
+    /// не покидая свой рабочий стол. См. Dawn::float_selected.
+    FloatSelected,
     FocusDirection(i32, i32),
     FocusStack(i32),
     IncNmaster(i32),
@@ -74,6 +79,11 @@ pub enum Action {
     UngroupSelected,
     /// Закрепить закладку камеры на текущей позиции курсора (Alt+B).
     PinBookmarkAtCursor,
+    /// Alt+Super+B: удалить ближайшую к курсору закладку камеры.
+    DeleteNearestBookmark,
+    /// Win+Alt+N: прыжок к закладке камеры N без режима закладок
+    /// (Super+цифра занят рабочими столами, Super+N — лентой niri).
+    JumpBookmark(u32),
     /// Columns (niri): сменить пресет ширины активной колонки (Super+R).
     ColumnWidthCycle,
     // ── Действия колонок как в niri (см. columns.rs) ──────────────────────
@@ -108,6 +118,21 @@ pub enum Action {
     /// Тумблер niri-режим (Columns) ↔ Tile (Win+N): в niri — выход в обычный
     /// tile, не в niri — вход в niri.
     ToggleNiriMode,
+    /// Меню блютуза (см. bluetooth.rs).
+    BluetoothMenu,
+    /// Тумблер питания блютуз-адаптера, без открытия меню.
+    BluetoothPower,
+    /// Полка состояния у бара: вайфай, звук, батарея, питание (см. tray.rs).
+    TrayMenu,
+    /// Меню выбора сети (см. wifi.rs).
+    WifiMenu,
+    /// Меню устройств вывода и ввода звука (см. audio.rs).
+    AudioMenu,
+    /// Alt+Tab: перебор окон, лежащих друг под другом (см. switcher.rs).
+    /// Аргумент — направление: +1 вглубь стопки, −1 назад.
+    CycleStack(i32),
+    /// Super+F: поиск окна по имени с перелётом к нему (см. switcher.rs).
+    WindowSearch,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +177,20 @@ impl XkbSettings {
     }
 }
 
+// ── Monitor config ───────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct MonitorConfig {
+    pub name: String,
+    pub width: i32,
+    pub height: i32,
+    pub refresh: i32,  // Hz
+    pub x: i32,
+    pub y: i32,
+    pub scale: f64,
+    pub transform: String,
+}
+
 // ── Config ───────────────────────────────────────────────────────────────────
 
 pub struct Config {
@@ -162,6 +201,11 @@ pub struct Config {
     pub bird_eye_key: u32,
     /// `dwindle{}` — Hyprland's dwindle:* knobs for Layout::Tile (see dwindle.rs).
     pub dwindle: crate::dwindle::DwindleConfig,
+    /// `set{ bluetooth_autoconnect = ... }` — при старте сессии поднять адаптер
+    /// и подключить устройство, которым пользовались последним (см. bluetooth.rs).
+    pub bluetooth_autoconnect: bool,
+    /// `monitor{}` — конфигурация выходов: имя, разрешение, частота, позиция.
+    pub monitors: Vec<MonitorConfig>,
 }
 
 impl Config {
@@ -200,6 +244,8 @@ impl Default for Config {
             xkb: XkbSettings::default(),
             bird_eye_key: xkb::keysyms::KEY_space,
             dwindle: crate::dwindle::DwindleConfig::default(),
+            bluetooth_autoconnect: true,
+            monitors: Vec::new(),
         }
     }
 }
@@ -256,9 +302,18 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
         }
         "toggle_layout" => ToggleLayoutFloatTile,
         "zoom" => Zoom,
+        "bluetooth_menu" => BluetoothMenu,
+        "bluetooth_power" => BluetoothPower,
+        "tray_menu" => TrayMenu,
+        "wifi_menu" => WifiMenu,
+        "audio_menu" => AudioMenu,
         "toggle_floating" => ToggleFloatingFocused,
+        "toggle_fullscreen" => ToggleFullscreen,
+        "float_selected" => FloatSelected,
         "focus_direction" => FocusDirection(get_i32("dx", 0), get_i32("dy", 0)),
         "focus_stack" => FocusStack(get_i32("dir", 1)),
+        "cycle_stack" => CycleStack(get_i32("dir", 1)),
+        "window_search" => WindowSearch,
         "inc_nmaster" => IncNmaster(get_i32("n", 1)),
         "set_mfact" => SetMfact(get_f32("delta", 0.05)),
         "move_focused" => MoveFocused(get_i32("dx", 0), get_i32("dy", 0)),
@@ -279,6 +334,8 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
         "group_selected" => GroupSelected,
         "ungroup_selected" => UngroupSelected,
         "pin_bookmark_at_cursor" => PinBookmarkAtCursor,
+        "delete_nearest_bookmark" => DeleteNearestBookmark,
+        "jump_bookmark" => JumpBookmark(get_i32("slot", 1).clamp(1, 9) as u32),
         "column_width_cycle" => ColumnWidthCycle,
         // niri-действия колонок. Проценты — как в niri: set-column-width "+10%".
         "window_height_cycle" => WindowHeightCycle,
@@ -362,6 +419,8 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let bird_eye_key: Rc<RefCell<u32>> = Rc::new(RefCell::new(xkb::keysyms::KEY_space));
     let dwindle_cfg: Rc<RefCell<crate::dwindle::DwindleConfig>> =
         Rc::new(RefCell::new(crate::dwindle::DwindleConfig::default()));
+    let bt_autoconnect: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let monitors: Rc<RefCell<Vec<MonitorConfig>>> = Rc::new(RefCell::new(Vec::new()));
 
     {
         let bindings = bindings.clone();
@@ -419,7 +478,11 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     }
     {
         let bird_eye_key = bird_eye_key.clone();
+        let bt_autoconnect = bt_autoconnect.clone();
         let set_fn = lua.create_function(move |_, tbl: Table| {
+            if let Ok(v) = tbl.get::<bool>("bluetooth_autoconnect") {
+                *bt_autoconnect.borrow_mut() = v;
+            }
             if let Ok(v) = tbl.get::<String>("bird_eye_key") {
                 if let Some(k) = keysym_from_name(&v) {
                     *bird_eye_key.borrow_mut() = k;
@@ -452,6 +515,34 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         })?;
         lua.globals().set("dwindle", dwindle_fn)?;
     }
+    {
+        // monitor{} — конфигурация выхода: имя коннектора (DP-2, HDMI-A-1) или
+        // модель из EDID. Режим ищется по width/height/refresh; если точного
+        // нет — берётся ближайший по частоте среди подходящих по размеру.
+        let monitors = monitors.clone();
+        let monitor_fn = lua.create_function(move |_, tbl: Table| {
+            let name = match tbl.get::<String>("name") {
+                Ok(n) => n,
+                Err(_) => {
+                    tracing::warn!("dawn/config: monitor{{}} без name — пропущен");
+                    return Ok(());
+                }
+            };
+            monitors.borrow_mut().push(MonitorConfig {
+                name,
+                width: tbl.get::<i32>("width").unwrap_or(0),
+                height: tbl.get::<i32>("height").unwrap_or(0),
+                refresh: tbl.get::<i32>("refresh").unwrap_or(0),
+                x: tbl.get::<i32>("x").unwrap_or(0),
+                y: tbl.get::<i32>("y").unwrap_or(0),
+                scale: tbl.get::<f64>("scale").unwrap_or(1.0).clamp(0.25, 8.0),
+                transform: tbl.get::<String>("transform")
+                    .unwrap_or_else(|_| "normal".into()),
+            });
+            Ok(())
+        })?;
+        lua.globals().set("monitor", monitor_fn)?;
+    }
 
     lua.load(source).exec()?;
 
@@ -460,6 +551,8 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         xkb: xkb_settings.borrow().clone(),
         bird_eye_key: *bird_eye_key.borrow(),
         dwindle: *dwindle_cfg.borrow(),
+        bluetooth_autoconnect: *bt_autoconnect.borrow(),
+        monitors: monitors.borrow().clone(),
     };
     Ok(result)
 }
@@ -513,6 +606,8 @@ impl Dawn {
             }
             Zoom => self.zoom(),
             ToggleFloatingFocused => self.toggle_floating(),
+            ToggleFullscreen => self.toggle_fullscreen(),
+            FloatSelected => self.float_selected(),
             // В Columns стрелки листают колонки/строки (niri), в остальных
             // режимах — пространственная навигация как раньше.
             FocusDirection(dx, dy) => {
@@ -529,6 +624,8 @@ impl Dawn {
                     self.focus_stack(dir);
                 }
             }
+            CycleStack(dir) => self.cycle_stack(dir),
+            WindowSearch => self.search_toggle(),
             // Super+Comma/Period: в Columns — consume/expel окна в стопку
             // колонки; иначе — inc/dec nmaster в тайлинге.
             IncNmaster(n) => {
@@ -630,6 +727,8 @@ impl Dawn {
             GroupSelected => self.group_selected_into_constellation(),
             UngroupSelected => self.ungroup_focused_constellation(),
             PinBookmarkAtCursor => self.pin_bookmark_at_cursor(),
+            DeleteNearestBookmark => self.delete_nearest_bookmark(),
+            JumpBookmark(slot) => self.jump_to_camera_bookmark(slot),
             // Всё, что ниже до ColumnCenterMode, имеет смысл только в Columns:
             // в Tile/Float/Monocle геометрией распоряжается своя раскладка, и
             // «сделать колонку шире» там нечего.
@@ -657,6 +756,14 @@ impl Dawn {
                 self.columns.center_focused = mode;
                 tracing::info!("dawn/columns: center-focused-column = {:?}", mode);
                 self.columns_scroll_to_active();
+            }
+            BluetoothMenu => self.bt_toggle_menu(),
+            TrayMenu => self.tray_toggle(),
+            WifiMenu => self.wifi_toggle_menu(),
+            AudioMenu => self.audio_toggle_menu(),
+            BluetoothPower => {
+                let on = self.bt.as_ref().is_some_and(|b| b.snap.powered);
+                self.bt_send(crate::bluetooth::Cmd::Power(!on));
             }
             WorkspaceStep(d) => self.workspace_step(d),
             MoveColumnToWorkspace(d) => self.columns_move_to_workspace(d),
@@ -715,3 +822,40 @@ impl Dawn {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Разбор конфига по-настоящему проверить негде, кроме как разобрав его:
+    /// опечатка в имени действия (`window_search` против `search_window`) не
+    /// ломает ни сборку, ни запуск — бинд просто молча не работает.
+    fn действие(cfg: &Config, mods: ModMask, key: u32) -> String {
+        format!("{:?}", cfg.find_action(mods, key))
+    }
+
+    #[test]
+    fn встроенный_конфиг_разбирается() {
+        let cfg = load_from_str(DEFAULT_CONFIG_LUA).expect("default_config.lua не разобрался");
+        assert!(cfg.bindings.len() > 40, "биндов подозрительно мало: {}", cfg.bindings.len());
+    }
+
+    #[test]
+    fn alt_tab_перебирает_стопку() {
+        let cfg = load_from_str(DEFAULT_CONFIG_LUA).unwrap();
+        let alt = ModMask { ctrl: false, alt: true, shift: false, logo: false };
+        let alt_shift = ModMask { ctrl: false, alt: true, shift: true, logo: false };
+        assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_Tab), "Some(CycleStack(1))");
+        assert_eq!(действие(&cfg, alt_shift, xkb::keysyms::KEY_Tab), "Some(CycleStack(-1))");
+    }
+
+    #[test]
+    fn super_f_открывает_поиск() {
+        let cfg = load_from_str(DEFAULT_CONFIG_LUA).unwrap();
+        let logo = ModMask { ctrl: false, alt: false, shift: false, logo: true };
+        let logo_shift = ModMask { ctrl: false, alt: false, shift: true, logo: true };
+        assert_eq!(действие(&cfg, logo, xkb::keysyms::KEY_f), "Some(WindowSearch)");
+        // Максимизация колонки не потерялась, а переехала.
+        assert_eq!(действие(&cfg, logo_shift, xkb::keysyms::KEY_f), "Some(ColumnMaximize)");
+    }
+}

@@ -1235,6 +1235,84 @@ impl Dawn {
         crate::xwin::focus(self, &window.clone());
     }
 
+    /// Сосед закрываемого окна в ленте: ПРЕДЫДУЩЕЕ окно в линейном порядке
+    /// (колонка за колонкой, сверху вниз внутри колонки). Если закрывается
+    /// самое первое — берём следующее за ним, иначе после закрытия первого
+    /// окна фокусу некуда деться и лента остаётся без активного окна.
+    ///
+    /// Возвращает None, если окна нет в ленте или оно в ней единственное.
+    pub fn columns_neighbour_before(&self, window: &Window) -> Option<Window> {
+        let flat: Vec<Window> = self.columns.columns.iter()
+            .flat_map(|col| col.windows.iter().cloned())
+            .collect();
+        let idx = flat.iter().position(|w| same_window(w, window))?;
+        if flat.len() < 2 {
+            return None;
+        }
+        let сосед = if idx > 0 { idx - 1 } else { 1 };
+        flat.get(сосед).cloned()
+    }
+
+    /// Закрылось окно ленты: фокус уходит на соседа, камера едет за ним.
+    ///
+    /// Без этого niri-лента после закрытия окна оставалась смотреть в пустоту
+    /// (камера стоит там, где была колонка) и без активного окна — приходилось
+    /// руками листать назад. Зовётся из forget_window; `был_в_фокусе` говорит,
+    /// нужно ли вообще переносить фокус, — если закрыли фоновое окно, чужой
+    /// фокус трогать нельзя, а вот камеру подтянуть всё равно надо: колонки
+    /// сомкнулись, и активная могла уехать за край кадра.
+    pub fn columns_after_close(&mut self, сосед: Option<Window>, был_в_фокусе: bool) {
+        if self.tile_config.layout != Layout::Columns {
+            return;
+        }
+        self.columns_reconcile();
+        if self.columns.columns.is_empty() {
+            // Стол опустел — возвращаем камеру к началу его этажа, иначе она
+            // так и висит на месте закрытой колонки.
+            self.viewport.cam_x = 0.0;
+            self.columns_float_cam = (self.viewport.cam_x, self.viewport.cam_y);
+            self.apply_camera();
+            return;
+        }
+        if был_в_фокусе {
+            if let Some(w) = сосед.filter(|w| self.columns_contains(w)) {
+                self.columns_give_focus(&w);
+            }
+        }
+        self.columns_set_active_to_focus();
+        self.columns_scroll_to_active();
+        self.columns_clamp_view_to_strip();
+    }
+
+    /// Не даёт кадру висеть ЗА концом ленты.
+    ///
+    /// После закрытия последней колонки прокрутка честно подтягивалась к новой
+    /// активной, но справа от неё оставалась пустота во весь освободившийся
+    /// экран — именно это и выглядело как «камера не вернулась». niri в такой
+    /// ситуации подтягивает вид назад, к правому краю полосы. Влево дальше
+    /// нуля тоже не пускаем: начало ленты — это левый край экрана.
+    fn columns_clamp_view_to_strip(&mut self) {
+        let Some(geo) = self.primary_output_geo() else { return };
+        let Some(last) = self.columns.columns.len().checked_sub(1) else { return };
+        let view_w = geo.size.w as f64;
+        let right = self.columns_column_x(last, view_w)
+            + self.columns.columns[last].width_px(view_w)
+            + COL_GAP;
+        let max_x = (right - view_w).max(0.0);
+        let cur = self.columns_target_view_x();
+        if cur > max_x + 0.5 {
+            self.columns_animate_view_to(max_x);
+        } else if cur < -0.5 {
+            self.columns_animate_view_to(0.0);
+        }
+    }
+
+    /// Есть ли окно в полосе колонок текущего стола.
+    fn columns_contains(&self, window: &Window) -> bool {
+        self.columns.columns.iter()
+            .any(|col| col.windows.iter().any(|w| same_window(w, window)))
+    }
+
     /// Синхронизирует активную колонку/строку с текущим клавиатурным фокусом
     /// (например после Super+N или sloppy-focus мышью).
     pub fn columns_set_active_to_focus(&mut self) {

@@ -808,6 +808,31 @@ mod tests {
         }
     }
 
+
+    /// Сборка стола ПАЧКОЙ, как при переключении воркспейса: окна приходят все
+    /// сразу и каждое садится к ближайшему по своей позиции соседу
+    /// (см. sync_dwindle_tree). Все обязаны оказаться в раскладке, сколько бы
+    /// их ни было — тайлинг просто делит слоты всё мельче.
+    #[test]
+    fn целая_пачка_окон_попадает_в_раскладку() {
+        let cfg = DwindleConfig::default();
+        for n in 1..=20u32 {
+            let mut t = DwindleTree::<W>::default();
+            for w in 1..=n {
+                let focal = p((w as f64 * 137.0) % 1600.0, (w as f64 * 251.0) % 900.0);
+                let on = t.closest_node(focal, Some(&W(w)));
+                t.insert(W(w), on, focal, area(), &cfg, None);
+                t.recalc(area(), &cfg);
+            }
+            let rects = t.leaf_rects();
+            assert_eq!(rects.len(), n as usize, "при {n} окнах в раскладке {} — часть потерялась", rects.len());
+            let total: i64 = rects.iter().map(|(_, r)| r.size.w as i64 * r.size.h as i64).sum();
+            assert_eq!(total, 1600 * 900, "при {n} окнах площади не сходятся: {rects:?}");
+            for (_, r) in &rects {
+                assert!(r.size.w > 0 && r.size.h > 0, "при {n} окнах вырожденный слот {r:?}");
+            }
+        }
+    }
     #[test]
     fn single_window_takes_whole_area() {
         let mut t = DwindleTree::<W>::default();

@@ -6,6 +6,13 @@
 # Использование:
 #   ./build_env.sh check   — cargo check --release
 #   ./build_env.sh build   — cargo build --release --target-dir /mnt/dawn-build/target
+#
+# ПРЕДУПРЕЖДЕНИЕ (2026-08-03): `build` через nix-shell даёт бинарь, который
+# падает с general protection fault в libc.so.6 при каждом запуске —
+# системный ld.so (PT_INTERP) + Nix-glibc, подтянутая транзитивно через
+# RUNPATH нижних либ, несовместимы. `check` безопасен (компиляция без
+# финальной линковки в исполняемый файл). Для реальной сборки используйте
+# build.sh (чистый системный тулчейн, в системе уже есть все -dev пакеты).
 
 cmd="${1:-check}"
 case "$cmd" in

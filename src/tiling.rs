@@ -39,6 +39,11 @@ impl Layout {
 pub const GAP_INNER: i32 = 16;
 /// Отступ от краёв экрана до крайних окон в Tile.
 pub const GAP_OUTER: i32 = 18;
+/// Сколько места сверху занимает бар рабочих столов (высота + отступ). Под ним
+/// плавающие окна не размещаем — иначе их заголовок оказывается под баром.
+/// Считается от самой панели (см. udev::BAR_H): поменяли её — резерв поехал
+/// следом, а не остался прежним литералом.
+pub const BAR_RESERVED: i32 = crate::udev::BAR_TOP + crate::udev::BAR_H + 10;
 
 /// Сжимает прямоугольник на `inset` с каждой стороны (не уходя в отрицательный размер).
 fn inset_rect(rect: Rectangle<i32, Logical>, inset: i32) -> Rectangle<i32, Logical> {
@@ -140,9 +145,24 @@ impl Dawn {
     /// камерой; при фиксированном (0,0) камере можно красиво перелетать к нему
     /// (см. set_layout). Внешний отступ GAP_OUTER уже вычтен.
     pub fn tile_work_area(&self) -> Option<Rectangle<i32, Logical>> {
+        Some(inset_rect(self.screen_area()?, GAP_OUTER))
+    }
+
+    /// Экран как прямоугольник холста от (0,0), размером С САМ ЭКРАН и
+    /// НЕЗАВИСИМО ОТ ЗУМА.
+    ///
+    /// Берём режим монитора, а не space.output_geometry: последний делится на
+    /// зум (так камера показывает больше холста при отдалении), и раскладка,
+    /// посчитанная при зуме 0.45, растягивалась на 5689×2400 — окна улетали за
+    /// правый край экрана и уже не возвращались (см. exit_overview_immediate).
+    /// Тайлинг обязан считать по экрану: в него он и попадает.
+    pub(crate) fn screen_area(&self) -> Option<Rectangle<i32, Logical>> {
         let output = self.space.outputs().next()?;
-        let geo = self.space.output_geometry(output)?;
-        Some(inset_rect(Rectangle::new((0, 0).into(), geo.size), GAP_OUTER))
+        let size = match output.current_mode() {
+            Some(m) => Size::from((m.size.w, m.size.h)),
+            None => self.space.output_geometry(output)?.size,
+        };
+        Some(Rectangle::new((0, 0).into(), size))
     }
 
     /// Окно, за которым сейчас клавиатурный фокус.
@@ -285,13 +305,10 @@ impl Dawn {
     }
 
     pub fn apply_monocle_layout(&mut self) {
-        let output = match self.space.outputs().next() {
-            Some(o) => o.clone(),
-            None => return,
-        };
-        // От (0,0), не от камеры (см. apply_tile_layout).
-        let geo = match self.space.output_geometry(&output) {
-            Some(g) => Rectangle::new((0, 0).into(), g.size),
+        // От (0,0), не от камеры, и по РАЗМЕРУ ЭКРАНА, а не output_geometry
+        // (тот делится на зум — см. screen_area).
+        let geo = match self.screen_area() {
+            Some(g) => g,
             None => return,
         };
         let current_tags = self.viewport.current_tags();
@@ -316,6 +333,18 @@ impl Dawn {
         rect: Rectangle<i32, Logical>,
         animate: bool,
     ) {
+        // Окно, которое сейчас держит мышь, раскладка не трогает ВООБЩЕ.
+        // Иначе выходила драка: каждый свап соседей звал arrange, тот заводил
+        // окну анимацию в слот, и она каждый тик тянула окно туда, пока motion
+        // тянул его за курсором — окно дёргалось между двумя позициями. Заодно
+        // arrange менял ему размер под чужой слот прямо под курсором. Плитка
+        // должна спокойно висеть на мыши; в слот её посадит arrange из button()
+        // на отпускании, уже с анимацией (к тому моменту dragged_window снят).
+        if self.dragged_window.as_ref()
+            .is_some_and(|d| crate::dwindle::same_window(d, window))
+        {
+            return;
+        }
         crate::xwin::set_size(window, Some(rect.size), crate::xwin::Tiled::Set);
         crate::xwin::configure(window);
         // Размер применяется сразу (клиент сам не умеет анимировать resize),
@@ -436,7 +465,42 @@ impl Dawn {
         self.animate_window_to_dur(window, target, Duration::from_millis(180));
     }
 
+    /// Смена раскладки ПО КОМАНДЕ пользователя (Win+D/Win+T/Win+N): окна
+    /// переезжают в новую раскладку — тайлинг их раскладывает, Float
+    /// разбрасывает кольцом вокруг центра экрана.
     pub fn set_layout(&mut self, layout: Layout) {
+        self.set_layout_inner(layout, true);
+    }
+
+    /// Восстановление раскладки ПРИ ПЕРЕХОДЕ НА СТОЛ (view_tag): раскладка у
+    /// стола своя, и её надо вернуть, но окна при этом трогать НЕЛЬЗЯ — они уже
+    /// лежат там, где их оставили.
+    ///
+    /// Разница видна именно во Float. Разлёт (scatter_to_float) зажимает каждое
+    /// окно в коробку размером с экран вокруг текущей камеры — на бесконечном
+    /// холсте всё, что лежало дальше экрана, прижимается к одному и тому же
+    /// углу. При смене раскладки руками это правильно (окна обязаны оказаться в
+    /// кадре), а при переключении столов давало «все плавающие окна слетелись в
+    /// одну точку»: достаточно было уехать камерой, уйти на соседний стол и
+    /// вернуться. Плюс камера в этот момент ещё не финальная — свою позицию
+    /// стол восстанавливает уже после (tag_cameras), — так что зажималось по
+    /// чужому кадру.
+    pub(crate) fn restore_layout(&mut self, layout: Layout) {
+        self.set_layout_inner(layout, false);
+    }
+
+    fn set_layout_inner(&mut self, layout: Layout, move_windows: bool) {
+        // Смена раскладки из-под живого обзора: обзор держит на холсте окна
+        // ВСЕХ столов сетки и свою камеру/зум, а arrange под ним не работает
+        // вовсе (см. arrange). Раньше Win+T/Win+N в обзоре меняли layout молча:
+        // сетка оставалась на экране, и после выхода из тайлинга рядом с
+        // текущим столом висел чужой. Столы обязаны быть строго разделены —
+        // сначала выходим из обзора (он вернёт геометрию и смапит только свой
+        // стол), потом уже меняем раскладку. Рекурсии нет: exit_overview_*
+        // сам set_layout не зовёт, а overview_active уже сброшен.
+        if self.overview_active || self.overview_exit_pending {
+            self.exit_overview_immediate(None);
+        }
         let prev = self.tile_config.layout;
         self.tile_config.prev_layout = prev;
         self.tile_config.layout = layout;
@@ -471,6 +535,13 @@ impl Dawn {
             // Стол покинул ленту (или вошёл в неё) — этажи ниже сдвинулись на
             // экран, их геометрию надо пересчитать.
             self.columns_relayout_strip();
+        } else {
+            // Смена раскладки внутри одной изоляции видимость не меняет, но
+            // холст мог остаться с чужими окнами: обзор маппит столы сетки
+            // рядом, и любой сбой на выходе из него оставлял соседний стол на
+            // экране. refresh_tags — единственное место, где состав холста
+            // считается заново по тегам, и он дёшев (окна уже смаплены).
+            self.refresh_tags();
         }
 
         if layout == Layout::Float {
@@ -480,19 +551,39 @@ impl Dawn {
             // снимка выход во Float каждый раз выбрасывал в начало координат:
             // окна, к которым пользователь долго ехал по холсту, оставались
             // где-то далеко, а «привычное место» терялось.
-            if let Some((cam_x, cam_y, zoom)) = self.pre_tiling_view.take() {
-                self.momentum.stop();
-                self.camera_anim = None;
-                self.zoom_anim = None;
-                self.viewport.zoom = zoom;
-                self.viewport.cam_x = cam_x;
-                self.viewport.cam_y = cam_y;
-                self.apply_camera();
+            // Обе части — и камера, и разлёт — только для команды
+            // пользователя: при переходе на стол камеру ставит view_tag по
+            // tag_cameras, а окна остаются на своих местах.
+            if move_windows {
+                if let Some((cam_x, cam_y, zoom)) = self.pre_tiling_view.take() {
+                    self.momentum.stop();
+                    self.camera_anim = None;
+                    self.zoom_anim = None;
+                    self.viewport.zoom = zoom;
+                    self.viewport.cam_x = cam_x;
+                    self.viewport.cam_y = cam_y;
+                    self.apply_camera();
+                }
+                // Строго ПОСЛЕ восстановления камеры: разлёт считает кольцо от
+                // центра ЭКРАНА, то есть от текущего положения камеры.
+                self.scatter_to_float(prev);
             }
-            // Строго ПОСЛЕ восстановления камеры: разлёт считает кольцо от
-            // центра ЭКРАНА, то есть от текущего положения камеры.
-            self.scatter_to_float(prev);
         } else {
+            // Float → tiling: в раскладку идут ВСЕ окна стола, а не только те,
+            // что случайно уцелели с флагом !floating. Во Float любое движение
+            // окна мышью/жестом ставит tw.floating = true (см. input.rs,
+            // move_grab) — это метка «вытащено из тайлинга», и на обратном пути
+            // она обязана сниматься, иначе после десятка перетасканных окон в
+            // тайлинг переезжали единицы. Намеренно плавающие (диалоги, явный
+            // toggle_floating — float_pinned) остаются поверх раскладки.
+            if prev == Layout::Float {
+                let cur_tags = self.viewport.current_tags();
+                for tw in self.tagged_windows.iter_mut() {
+                    if tw.tags & cur_tags != 0 && !tw.float_pinned {
+                        tw.floating = false;
+                    }
+                }
+            }
             // Снимок берём только на первом входе Float→tiling: переходы
             // между тайловыми раскладками (Tile→Columns→Monocle) идут уже с
             // камерой (0,0) и затёрли бы запомненное место.
@@ -503,26 +594,100 @@ impl Dawn {
                     self.viewport.zoom,
                 ));
             }
-            // Любой переход в tiling/columns (Win+D/Win+T/Win+N): камера в (0,0),
-            // zoom=1, arrange раскладывает окна. Окна плывут от текущей позиции
-            // к тайловой через window_pos_anims (animate_window_to, 180ms).
-            // Без slide-in (N map_element на кадр + пустой кадр выброса влево).
-            self.momentum.stop();
-            self.camera_anim = None;
-            self.zoom_anim = None;
-            self.viewport.zoom = 1.0;
-            self.viewport.cam_x = 0.0;
-            // В ленте начало холста — не (0,0), а ЭТАЖ этого стола: столы там
-            // стоят друг под другом (стол N на высоте N × экран). Камера в
-            // нулевую точку показала бы первый этаж ленты вместо того стола, на
-            // котором её включили.
-            self.viewport.cam_y = if layout == Layout::Columns {
-                self.columns_cur_y()
-            } else {
-                0.0
-            };
-            self.columns_float_cam = (self.viewport.cam_x, self.viewport.cam_y);
-            self.apply_camera();
+            // Запоминаем, КАК СТОЯЛ ХОЛСТ, — место и размер каждого окна на
+            // момент ухода во тайлинг. Обратный переход (scatter_to_float)
+            // ставит окна ровно сюда, а разлёт кольцом остаётся только для
+            // тех, кто во Float ещё не жил ни разу.
+            //
+            // Раньше запоминалась одна позиция и только у окон, которые
+            // двигали руками; размер брался «текущий» — то есть ТАЙЛОВЫЙ, — и
+            // ужимался до 70% экрана, после чего позиция ещё и зажималась в
+            // экранную коробку. Окна возвращались похоже, но не туда и не
+            // того размера.
+            // Снимок берём по ЦЕЛИ анимации, если окно ещё летит.
+            //
+            // Из-за этого окна и «сжимались к центру», если нажать Win+D
+            // несколько раз подряд (жалоба 06.08.2026). Разлёт во Float —
+            // анимация на 600 мс; нажатие Win+D раньше, чем она доиграла,
+            // заставало окно НА ПОЛПУТИ между тайловым местом (у камеры, то
+            // есть в середине экрана) и своим float-местом. Именно эта
+            // промежуточная точка и записывалась сюда как «своё место», а
+            // следующий разлёт вёл окно уже в неё. Каждое нажатие съедало
+            // часть пути, и окна шаг за шагом сползались к центру: в логе
+            // 05.08.2026 за один цикл окно с (-1539,-391) переезжало на
+            // (-389,101), за следующий — ещё ближе, и так до кучи в середине.
+            //
+            // Цель анимации — это ровно то место, куда окно СОБИРАЛОСЬ встать,
+            // то есть его настоящее float-место; окно, стоящее спокойно,
+            // анимации не имеет, и берётся его живая геометрия (перетащили
+            // мышью — запомним новое место, как и раньше).
+            if prev == Layout::Float && move_windows {
+                let cur_tags = self.viewport.current_tags();
+                let снимок: Vec<(Window, Point<i32, Logical>, Size<i32, Logical>, bool)> =
+                    self.tagged_windows.iter()
+                        .filter(|tw| tw.tags & cur_tags != 0)
+                        .filter_map(|tw| {
+                            let летит = self.window_anim_target(&tw.window);
+                            self.space.element_geometry(&tw.window)
+                                .map(|g| (
+                                    tw.window.clone(),
+                                    летит.unwrap_or(g.loc),
+                                    g.size,
+                                    летит.is_some(),
+                                ))
+                        })
+                        .collect();
+                for (window, loc, size, летит) in снимок {
+                    if let Some(tw) = self.tagged_windows.iter_mut()
+                        .find(|tw| tw.window == window)
+                    {
+                        tracing::debug!(
+                            "dawn/float: снимок места {:?} size {:?}{}",
+                            loc, size, if летит { " (по цели анимации)" } else { "" },
+                        );
+                        tw.float_position = loc;
+                        // Размер трогаем только у осевшего окна. Пока идёт
+                        // перелёт, клиент ещё не успел применить configure, и
+                        // живая геометрия — это размер ПРЕДЫДУЩЕЙ раскладки;
+                        // записав его, мы бы точно так же, шаг за шагом,
+                        // подменяли float-размер тайловым.
+                        if !летит {
+                            tw.float_size = Some(size);
+                        }
+                        tw.float_position_set = true;
+                    }
+                }
+            }
+            // Переход в tiling/columns ПО КОМАНДЕ (Win+D/Win+T/Win+N): камера в
+            // (0,0), zoom=1, arrange раскладывает окна. Окна плывут от текущей
+            // позиции к тайловой через window_pos_anims (animate_window_to,
+            // 180ms). Без slide-in (N map_element на кадр + пустой кадр выброса
+            // влево).
+            //
+            // При ПЕРЕХОДЕ НА СТОЛ (restore_layout, move_windows = false) камеру
+            // не трогаем вовсе: у стола свой запомненный кадр — камера И зум, —
+            // и ставит его view_tag сразу после нас. Пока обнуление стояло тут
+            // безусловно, кадр стола было не вернуть: сначала его затирали
+            // нулями, а потом view_tag для тайловых столов и вовсе выходил
+            // раньше восстановления. Отсюда и «камера остаётся на одном месте».
+            if move_windows {
+                self.momentum.stop();
+                self.camera_anim = None;
+                self.zoom_anim = None;
+                self.viewport.zoom = 1.0;
+                self.viewport.cam_x = 0.0;
+                // В ленте начало холста — не (0,0), а ЭТАЖ этого стола: столы там
+                // стоят друг под другом (стол N на высоте N × экран). Камера в
+                // нулевую точку показала бы первый этаж ленты вместо того стола, на
+                // котором её включили.
+                self.viewport.cam_y = if layout == Layout::Columns {
+                    self.columns_cur_y()
+                } else {
+                    0.0
+                };
+                self.columns_float_cam = (self.viewport.cam_x, self.viewport.cam_y);
+                self.apply_camera();
+            }
             if layout == Layout::Columns {
                 self.columns_set_active_to_focus();
             }
@@ -544,19 +709,25 @@ impl Dawn {
     /// Если окно уже размещалось в Float → восстановить позицию и float_size.
     /// Иначе → кольцеобразный разлёт (30-45% от min(w,h)) вокруг центра.
     fn scatter_to_float(&mut self, _prev: Layout) {
-        let output = match self.space.outputs().next().cloned() {
-            Some(o) => o,
-            None => return,
-        };
-        let output_geo = match self.space.output_geometry(&output) {
-            Some(g) => g,
-            None => return,
-        };
         let current_tags = self.viewport.current_tags();
 
-        // Центр экрана в canvas-координатах
-        let cx = self.viewport.cam_x + output_geo.size.w as f64 / 2.0;
-        let cy = self.viewport.cam_y + output_geo.size.h as f64 / 2.0;
+        // Центр разлёта — середина ТОГО, ЧТО ВИДНО (она же середина экрана),
+        // а размер коробки, в которую зажимаем окна, — РОВНО ЭКРАН.
+        //
+        // Обе части важны. Если считать по видимой области целиком, то на
+        // отдалённом зуме (видно 12800×5400 холста) окна разлетаются по всему
+        // этому простору. Если же брать экран, но привязывать его к УГЛУ
+        // камеры, окна на отдалённом зуме улетают к дальнему краю холста — и
+        // при возврате к зуму 1 экран оказывается пуст. Экран по центру видимой
+        // области даёт одно и то же место при любом зуме.
+        let видимое = self.visible_canvas_size();
+        let cx = self.viewport.cam_x + видимое.w / 2.0;
+        let cy = self.viewport.cam_y + видимое.h / 2.0;
+        let экран = self.screen_size();
+        let vis = Size::<f64, Logical>::from((экран.w as f64, экран.h as f64));
+        let output_geo = Rectangle::<i32, Logical>::new(
+            (0, 0).into(), (vis.w.round() as i32, vis.h.round() as i32).into(),
+        );
 
         let time_seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -581,12 +752,60 @@ impl Dawn {
                 .filter(|tw| tw.tags & current_tags != 0)
                 .enumerate()
                 .map(|(idx, tw)| {
-                    let win_size = self.space.element_geometry(&tw.window)
+                    // Окно уже жило во Float — возвращаем ровно туда и ровно
+                    // таким, каким оно оттуда уходило: ни ужатия до 70%, ни
+                    // зажатия в экранную коробку. Холст бесконечный, а камера к
+                    // этому моменту уже вернулась на своё место (pre_tiling_view
+                    // в set_layout_inner), так что окно окажется в кадре там же,
+                    // где его оставили. Кольцевой разлёт ниже — только для тех,
+                    // кто во Float ещё не был ни разу.
+                    if tw.float_position_set {
+                        tracing::debug!("dawn/float: возврат на место {:?} size {:?}",
+                            tw.float_position, tw.float_size);
+                        return (tw.window.clone(), tw.float_size, tw.float_position);
+                    }
+                    let текущий = self.space.element_geometry(&tw.window)
                         .map(|g| g.size)
-                        .unwrap_or((400, 300).into());
-                    let pos = if tw.float_position_set {
-                        tw.float_position
-                    } else {
+                        .unwrap_or_else(|| (400, 300).into());
+                    // Размер во Float: своё запомненное, иначе текущий, но не
+                    // больше 70% видимой области. Окно, пришедшее из тайлинга
+                    // во весь экран, иначе занимало бы во Float ровно столько
+                    // же — три таких окна ложились друг на друга стопкой, и
+                    // «разлёта» было не видно.
+                    let доступно_w = (vis.w.round() as i32 - 2 * GAP_OUTER).max(200);
+                    let доступно_h = (vis.h.round() as i32 - BAR_RESERVED - GAP_OUTER).max(150);
+                    let предел_w = (доступно_w as f64 * 0.7).round() as i32;
+                    let предел_h = (доступно_h as f64 * 0.7).round() as i32;
+                    let желаемый = tw.float_size.unwrap_or(текущий);
+                    let k = (предел_w as f64 / желаемый.w.max(1) as f64)
+                        .min(предел_h as f64 / желаемый.h.max(1) as f64)
+                        .min(1.0);
+                    let win_size: Size<i32, Logical> = (
+                        ((желаемый.w as f64 * k).round() as i32).max(200),
+                        ((желаемый.h as f64 * k).round() as i32).max(150),
+                    ).into();
+                    // Куда бы окно ни просилось — оно обязано остаться В КАДРЕ.
+                    // Кольцо разлёта считается от центра и не знает про размеры
+                    // окна: окно, пришедшее из тайлинга во весь экран, уезжало
+                    // наполовину за край и лезло под бар. Зажимаем позицию так,
+                    // чтобы окно целиком помещалось в видимую область, а сверху
+                    // оставалась полоса под бар.
+                    let зажать = |p: smithay::utils::Point<i32, Logical>| {
+                        let поле = GAP_OUTER;
+                        let верх = BAR_RESERVED;
+                        // Коробка размером с экран, центрированная на (cx, cy).
+                        let x0 = (cx - vis.w / 2.0).round() as i32;
+                        let y0 = (cy - vis.h / 2.0).round() as i32;
+                        let min_x = x0 + поле;
+                        let min_y = y0 + верх;
+                        let max_x = (x0 + vis.w.round() as i32 - поле - win_size.w).max(min_x);
+                        let max_y = (y0 + vis.h.round() as i32 - поле - win_size.h).max(min_y);
+                        smithay::utils::Point::<i32, Logical>::from((
+                            p.x.clamp(min_x, max_x),
+                            p.y.clamp(min_y, max_y),
+                        ))
+                    };
+                    let pos = {
                         let base_angle = angle_step * idx as f64;
                         // jitter ± 40% от шага угла
                         let jitter = (lcg_f64(time_seed.wrapping_add(idx as u64)) - 0.5)
@@ -596,9 +815,10 @@ impl Dawn {
                             * (max_r - min_r);
                         let x = (cx + angle.cos() * r - win_size.w as f64 / 2.0) as i32;
                         let y = (cy + angle.sin() * r - win_size.h as f64 / 2.0) as i32;
-                        smithay::utils::Point::from((x, y))
+                        зажать(smithay::utils::Point::from((x, y)))
                     };
-                    (tw.window.clone(), tw.float_size, pos)
+                    tracing::debug!("dawn/float: РАЗЛЁТ кольцом в {:?} size {:?}", pos, win_size);
+                    (tw.window.clone(), Some(win_size), pos)
                 })
                 .collect();
 
@@ -614,12 +834,19 @@ impl Dawn {
         }
 
         // Обновляем tagged_windows
-        for (window, _, pos) in &updates {
+        for (window, float_size, pos) in &updates {
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
                 &tw.window == window
             }) {
                 tw.float_position = *pos;
                 tw.position = *pos;
+                // Размер тоже фиксируем: без этого следующий переход во Float
+                // считал «желаемый» размер от ТАЙЛОВОЙ геометрии окна и ужимал
+                // её до 70% экрана — окно возвращалось на своё место, но
+                // каждый раз другого размера.
+                if float_size.is_some() {
+                    tw.float_size = *float_size;
+                }
                 // ВАЖНО: фиксируем позицию как "выбранную" — иначе при каждом
                 // следующем переходе в Float scatter_to_float заново
                 // рандомизирует угол/радиус и окна разлетаются по-новому.
@@ -634,15 +861,13 @@ impl Dawn {
     /// видимую область БЕЗ центрирования (иначе полэкранное окно оставляет
     /// пустоту по бокам), слева направо, cam_x ≥ 0. Tile/Monocle — камера
     /// зафиксирована на (0,0), не трогаем.
-    fn snap_camera_to_window(&mut self, window: &Window) {
-        let output = match self.space.outputs().next().cloned() {
-            Some(o) => o,
-            None => return,
-        };
-        let out_geo = match self.space.output_geometry(&output) {
-            Some(g) => g,
-            None => return,
-        };
+    pub(crate) fn snap_camera_to_window(&mut self, window: &Window) {
+        // Кадр = видимая часть холста (экран ⁄ зум).
+        let vis = self.visible_canvas_size();
+        let out_geo = Rectangle::<i32, Logical>::new(
+            (self.viewport.cam_x.round() as i32, self.viewport.cam_y.round() as i32).into(),
+            (vis.w.round() as i32, vis.h.round() as i32).into(),
+        );
         let geo = match self.space.element_geometry(window) {
             Some(g) => g,
             None => return,
@@ -852,6 +1077,8 @@ impl Dawn {
                 crate::xwin::is_surface(&tw.window, &focused)
             }) {
                 tw.floating = !tw.floating;
+                // Явный выбор пользователя — сборка в тайлинг его не отменяет.
+                tw.float_pinned = tw.floating;
             }
         }
         self.arrange();

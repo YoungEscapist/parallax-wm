@@ -230,7 +230,11 @@ pub fn serve_pending<E>(
 
 /// Рисует `elements` в offscreen-буфер размера `size` и возвращает пиксели в
 /// Argb8888 (плотная упаковка, stride = w*4).
-fn capture<E>(
+///
+/// Тем же снимком кормится и поток PipeWire для демонстрации экрана
+/// (см. portal_stream.rs): картинка обязана совпадать с той, что ушла на
+/// монитор, поэтому источник кадра ровно один.
+pub(crate) fn capture<E>(
     renderer: &mut GlesRenderer,
     output: &Output,
     elements: &[E],

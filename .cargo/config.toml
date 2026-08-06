@@ -1,2 +1,4 @@
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+# target-cpu=native — код под Zen 3 этой машины (AVX2/BMI2 без рантайм-проверок).
+# Бинарь после этого не переносится на другое железо; для portable-сборки убрать.
+rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "target-cpu=native"]

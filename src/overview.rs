@@ -172,16 +172,26 @@ impl Dawn {
         if let Some((tag, cam_x, cam_y, zoom, layout)) = self.overview_prev.take() {
             self.viewport.tagset[self.viewport.seltags] = tag;
             self.tile_config.layout = layout;
+            // Кадр (зум и камеру) возвращаем ПЕРВЫМ делом — до refresh_tags и
+            // arrange. Рабочая область тайлинга считается от output_geometry, а
+            // та делится на зум: при обзорном зуме 0.45 экран 2560×1080
+            // притворяется холстом 5689×2400, и arrange раскладывал окна по
+            // нему — второе окно уезжало на x≈4288, третье и четвёртое ещё
+            // дальше. Дальше зум возвращался в 1.0, и на экране оставалось одно
+            // окно (а то и ни одного), причём эти координаты оседали в
+            // tw.position: следующий заход на такой стол по Super+N уже не
+            // звал arrange (стол посещён, раскладка та же) и показывал ровно ту
+            // же пустоту. Ровно это и выглядело как «столы теряют окна».
+            self.viewport.zoom = zoom;
+            self.viewport.cam_x = cam_x;
+            self.viewport.cam_y = cam_y;
+            self.apply_camera();
             self.refresh_tags();
             // ВАЖНО: строго после refresh_tags — он сам переписывает tw.position
             // текущей (обзорной) позицией окна, так что снимок надо накатывать
             // поверх него, а не до.
             self.restore_pre_overview_geometry();
             self.arrange();
-            self.viewport.zoom = zoom;
-            self.viewport.cam_x = cam_x;
-            self.viewport.cam_y = cam_y;
-            self.apply_camera();
         }
         self.momentum.stop();
         self.camera_anim = None;
@@ -372,10 +382,16 @@ impl Dawn {
 
     /// Camera position to center a given slot on screen at current zoom.
     fn center_cam_on_slot(&self, slot: (i32, i32), w: i32, h: i32) -> Point<f64, Logical> {
+        self.center_cam_on_slot_zoom(slot, w, h, self.viewport.zoom)
+    }
+
+    /// То же, но для ЗАДАННОГО зума: при входе в обзор камера считается под
+    /// будущий (обзорный) зум, а не под текущий — на момент расчёта viewport
+    /// ещё держит доовзорный (см. enter_overview).
+    fn center_cam_on_slot_zoom(&self, slot: (i32, i32), w: i32, h: i32, zoom: f64) -> Point<f64, Logical> {
         let rect = Self::slot_rect(slot, w, h);
         let cx = rect.loc.x as f64 + w as f64 / 2.0;
         let cy = rect.loc.y as f64 + h as f64 / 2.0;
-        let zoom = self.viewport.zoom;
         Point::from((
             cx - (w as f64) / (2.0 * zoom),
             cy - (h as f64) / (2.0 * zoom),
@@ -516,22 +532,32 @@ impl Dawn {
         // фиксированным (OVERVIEW_ZOOM=0.5) с центрированием на слоте (0,0) —
         // при 2+ столах остальные уходили за край экрана («виден только 1»).
         // Теперь вписываем ВСЕ столы: зум под их общий bbox + центр на bbox.
-        let (fit_zoom, target_cam) = self.overview_fit_all(w, h);
+        // Зум берём такой, чтобы столы влезли в кадр целиком, а вот КАМЕРА
+        // встаёт не над общим bbox сетки, а строго над ТЕКУЩИМ столом: обзор
+        // — это подъём над тем столом, на котором его открыли. При
+        // центрировании по bbox активный стол уезжал в сторону тем сильнее,
+        // чем больше соседей, и было непонятно, откуда ты вышел.
+        let (fit_zoom, _) = self.overview_fit_all(w, h);
+        let cur_slot = *self.overview_slots.get(&cur).unwrap_or(&(0, 0));
+        let target_cam = self.center_cam_on_slot_zoom(cur_slot, w, h, fit_zoom);
         self.viewport.zoom = prev_zoom;
         self.viewport.cam_x = prev_cam.x;
         self.viewport.cam_y = prev_cam.y;
         self.apply_camera();
 
-        self.camera_anim = Some(CameraAnim::new(
-            prev_cam, target_cam, Duration::from_millis(OVERVIEW_FLY_MS),
+        // Зум и перелёт — ОДНОЙ анимацией (new_pan), с явно заданной конечной
+        // камерой. Раньше здесь стояли две: CameraAnim везла камеру к цели, а
+        // ZoomAnim::new считал камеру САМ, из якоря в центре экрана. В anim::tick
+        // зум тикает ПОСЛЕ камеры и переписывает cam_x/cam_y своим значением —
+        // то есть перелёт к нужному столу молча выбрасывался на каждом кадре, и
+        // обзор всегда всплывал над той точкой, где холст был до него. Ровно
+        // поэтому камера «не поднималась над текущим столом». Лента этой беды
+        // не знала: там изначально new_pan (см. enter_overview_strip).
+        self.camera_anim = None;
+        self.zoom_anim = Some(crate::anim::ZoomAnim::new_pan(
+            prev_cam, target_cam, prev_zoom, fit_zoom,
+            Duration::from_millis(OVERVIEW_FLY_MS),
         ));
-        if (fit_zoom - prev_zoom).abs() > 0.01 {
-            self.zoom_anim = Some(crate::anim::ZoomAnim::new(
-                Point::from((w as f64 / 2.0, h as f64 / 2.0)),
-                Point::from((w as f64 / 2.0, h as f64 / 2.0)),
-                prev_zoom, fit_zoom, Duration::from_millis(OVERVIEW_FLY_MS),
-            ));
-        }
         self.request_plane_reset();
         self.request_redraw();
         tracing::info!("dawn: overview on ({} workspaces, fit_zoom={:.3})", order.len(), fit_zoom);
@@ -909,7 +935,13 @@ impl Dawn {
             * (w as f64 / bbox.size.w as f64).min(h as f64 / bbox.size.h as f64))
             .clamp(0.1, 1.0);
         let cx = bbox.loc.x as f64 + bbox.size.w as f64 / 2.0;
-        let cy = bbox.loc.y as f64 + bbox.size.h as f64 / 2.0;
+        // Камера поднимается над ТЕКУЩИМ этажом, а не над серединой ленты: как
+        // и в сеточном обзоре, вход — это подъём над своим столом (по вертикали
+        // этажи и различаются). По горизонтали центрируем ленту целиком.
+        let cur = self.viewport.current_tags();
+        let cy = self.overview_strip_floor_rect(cur)
+            .map(|r| r.loc.y as f64 + r.size.h as f64 / 2.0)
+            .unwrap_or(bbox.loc.y as f64 + bbox.size.h as f64 / 2.0);
         let to_cam = Point::from((cx - w as f64 / (2.0 * zoom), cy - h as f64 / (2.0 * zoom)));
 
         self.zoom_anim = Some(crate::anim::ZoomAnim::new_pan(

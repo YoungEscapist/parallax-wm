@@ -59,6 +59,35 @@ impl From<WlSurface> for KeyboardFocusTarget {
     }
 }
 
+/// Меню на время своего захвата забирает клавиатуру себе (Escape, стрелки,
+/// набор в поле поиска). Требуется `PopupManager::grab_popup`.
+impl From<smithay::desktop::PopupKind> for KeyboardFocusTarget {
+    fn from(popup: smithay::desktop::PopupKind) -> Self {
+        Self::Wayland(popup.wl_surface().clone())
+    }
+}
+
+/// Цель клавиатуры → цель указателя (у dawn это просто поверхность).
+///
+/// Нужно ровно одному месту: захвату меню (`PopupPointerGrab`), который по
+/// цепочке попапов вычисляет, кому отдавать движения мыши. Требование
+/// `PointerFocus: From<KeyboardFocus>` идёт из smithay.
+///
+/// Ветка X11 сюда не попадает и попасть не может: xdg_popup — это протокол
+/// Wayland, корнем цепочки меню всегда оказывается wayland-toplevel, а сами
+/// звенья цепочки приходят через `From<PopupKind>` выше. X11-меню живут
+/// override-redirect окнами и захвата smithay не заводят (см. xwayland.rs).
+impl From<KeyboardFocusTarget> for WlSurface {
+    fn from(target: KeyboardFocusTarget) -> Self {
+        match target {
+            KeyboardFocusTarget::Wayland(s) => s,
+            KeyboardFocusTarget::X11(s) => s
+                .wl_surface()
+                .expect("X11-окно не бывает целью захвата xdg-меню, см. focus.rs"),
+        }
+    }
+}
+
 impl IsAlive for KeyboardFocusTarget {
     fn alive(&self) -> bool {
         match self {

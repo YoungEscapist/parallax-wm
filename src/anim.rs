@@ -271,6 +271,19 @@ impl ZoomAnim {
         self.start.elapsed() >= self.duration
     }
 
+    /// Кадр, в котором анимация ЗАКОНЧИТСЯ: (zoom, камера).
+    ///
+    /// Нужен тем, кто снимает состояние вида, пока анимация ещё летит
+    /// (уход с воркспейса — см. Dawn::view_frame_target): запоминать
+    /// промежуточный кадр нельзя, стол потом открылся бы на полпути.
+    pub fn target(&self) -> (f64, Point<f64, Logical>) {
+        let cam = match self.cam {
+            Some((_, to)) => to,
+            None => zoom_anchor_camera(self.anchor_canvas, self.anchor_screen, self.to_zoom),
+        };
+        (self.to_zoom, cam)
+    }
+
     /// Returns (zoom, camera) for the current instant.
     pub fn current(&self) -> (f64, Point<f64, Logical>) {
         let t = self.t();
@@ -515,6 +528,14 @@ const MAX_DT: Duration = Duration::from_millis(100);
 /// animating, so it's safe to run unconditionally forever.
 pub fn tick(state: &mut Dawn) {
     let mut dirty = false;
+
+    // Взвод кнопки питания в полке протухает по времени, а не по событию, —
+    // снять его больше некому: на статичном экране других тиков нет. Кадр
+    // просим напрямую: камеры это не касается, а `dirty` тянет за собой
+    // apply_camera.
+    if state.tray_expire_armed() {
+        state.request_redraw();
+    }
 
     // Реальный dt, а не фиксированные 16мс: тик зовут и 60Гц-таймер из main.rs,
     // и VBlank-хендлер перед кадром (чтобы анимация сэмплировалась ровно в

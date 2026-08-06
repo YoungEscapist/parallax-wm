@@ -437,14 +437,37 @@ pub struct MinimapProjection {
 /// bbox считается от всех окон (с запасом 20%), масштаб подгоняет их под размер
 /// панели. Не зависит от камеры/zoom холста — миникарта всегда показывает
 /// все окна, независимо от того куда направил камеру пользователь.
+/// `extra` — дополнительные точки холста, которые обязаны попасть в кадр
+/// миникарты (закладки камеры). Без них bbox считался ТОЛЬКО по окнам, и
+/// закладка, поставленная в стороне от окон, выпадала за панель и просто не
+/// рисовалась — «первая закладка не отображается».
+pub fn project_minimap_with(
+    windows: &[(Point<i32, Logical>, Size<i32, Logical>, bool)],
+    extra: &[Point<f64, Logical>],
+) -> MinimapProjection {
+    project_minimap_inner(windows, extra)
+}
+
 pub fn project_minimap(
     windows: &[(Point<i32, Logical>, Size<i32, Logical>, bool)],
+) -> MinimapProjection {
+    project_minimap_inner(windows, &[])
+}
+
+fn project_minimap_inner(
+    windows: &[(Point<i32, Logical>, Size<i32, Logical>, bool)],
+    extra: &[Point<f64, Logical>],
 ) -> MinimapProjection {
     let panel_size = Size::<i32, Physical>::from((MINIMAP_PANEL_W, MINIMAP_PANEL_H));
 
     // bbox всех окон с запасом 20% (чтобы окна не упирались в края панели)
     let bbox_margin = 0.20;
-    let bbox = match all_windows_bbox(windows.iter().map(|(loc, size, _)| (*loc, *size))) {
+    // Точки-закладки участвуют в bbox наравне с окнами (нулевой размер).
+    let точки: Vec<(Point<i32, Logical>, Size<i32, Logical>)> = extra.iter()
+        .map(|p| (Point::from((p.x.round() as i32, p.y.round() as i32)), Size::from((1, 1))))
+        .collect();
+    let всё = windows.iter().map(|(loc, size, _)| (*loc, *size)).chain(точки.iter().copied());
+    let bbox = match all_windows_bbox(всё) {
         Some(mut b) => {
             let margin_w = (b.size.w as f64 * bbox_margin).ceil() as i32;
             let margin_h = (b.size.h as f64 * bbox_margin).ceil() as i32;

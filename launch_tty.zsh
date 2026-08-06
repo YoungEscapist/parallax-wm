@@ -41,7 +41,11 @@ export RUST_LOG="${RUST_LOG:-debug}"
 # в этой системе это kde, а его ScreenCast работает только под kwin, отсюда
 # чёрный кадр в демонстрации экрана.
 export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-dawn}"
-export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+# Именно "=", а не ":-": elogind выставляет XDG_SESSION_TYPE=tty раньше нас, и
+# значение по умолчанию не срабатывает. libwebrtc внутри Electron считает
+# сессию вэйландовой только по этой переменной, иначе снимает X11-путём пустое
+# root-окно XWayland (см. подробный комментарий в launch_native.sh).
+export XDG_SESSION_TYPE=wayland
 # Electron (Vesktop/Discord) идёт в Wayland нативно только с этим флагом. Через
 # Xwayland он снимает экран X11-путём — то есть пустое root-окно, тот самый
 # чёрный кадр; портал он спрашивает только будучи wayland-клиентом.
