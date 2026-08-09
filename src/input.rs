@@ -22,6 +22,32 @@ const BTN_LEFT:  u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 
 impl Dawn {
+    /// Можно ли сейчас двигать камеру жестами тачпада (пан и зум щипком).
+    ///
+    /// Запрещено в двух раскладках, где камера принадлежит не пользователю, а
+    /// самой раскладке:
+    ///   * Columns (niri) — это полоса колонок, а не бесконечный холст. Вид
+    ///     ходит по ней свайпом (columns_swipe_scroll/workspace) и по вертикали
+    ///     между столами; свободный пан позволял уехать в пустоту мимо колонок,
+    ///     а зум щипком раскладку не проверял ВООБЩЕ и ломал её наравне с паном.
+    ///     Свайп по полосе при этом остаётся — он отрабатывает раньше, в своей
+    ///     ветке, и до камеры дело не доходит.
+    ///   * Tile — окна разложены деревом под размер экрана, возить холст под
+    ///     ними незачем.
+    /// Во Float и Monocle пан и зум работают как раньше.
+    ///
+    /// Обзор столов и лупа (Super+Space) — исключение поверх всего: там вид уже
+    /// оторван от раскладки и ходит свободно, какой бы она ни была.
+    ///
+    /// Мышь живёт по своим правилам и здесь не участвует: Alt+колесо зумит
+    /// только во Float, Alt+ЛКМ панит во Float и в обзоре — те ветки не тронуты.
+    fn touchpad_camera_allowed(&self) -> bool {
+        if self.overview_active || self.zoom_nav_mode {
+            return true;
+        }
+        !matches!(self.tile_config.layout, Layout::Tile | Layout::Columns)
+    }
+
     pub(crate) fn kill_focused(&mut self) {
         if let Some(surface) = self.focused_surface() {
             // Ищем сперва в space, потом в собственном списке окон.
@@ -825,6 +851,22 @@ impl Dawn {
                                 "PTR: Win+клик без окна под курсором ({:.1},{:.1})", pos.x, pos.y
                             );
                         }
+                        // «Окна под курсором нет» — ещё не «под курсором пусто».
+                        // Layer-поверхности (меню обоев dwall, лаунчер) в space
+                        // не лежат, а рисуются поверх окон. Раньше клик по ним
+                        // попадал сюда: фокус снимался, а ЛКМ вдобавок уходила
+                        // в rubber-band c Focus::Clear и до клиента не доходила
+                        // ВООБЩЕ — в меню dwall работала только ПКМ, потому что
+                        // она grab не создаёт и проваливалась в общую пересылку
+                        // ниже. Отдаём такой клик слою и не трогаем фокус.
+                        if self.курсор_над_слоем(pos) {
+                            pointer.button(self, &ButtonEvent {
+                                button, state: btn_state, serial, time: event.time_msec(),
+                            });
+                            pointer.frame(self);
+                            return;
+                        }
+
                         let all: Vec<_> = self.space.elements().cloned().collect();
                         for w in all {
                             w.set_activated(false);
@@ -932,6 +974,20 @@ impl Dawn {
                         None => {
                             let w = self.space.element_under(self.pointer_location)
                                 .map(|(w, _)| w.clone());
+                            // Снимаем анимации с окна И со всех, кто поедет с
+                            // ним (выделение, созвездие). Иначе недоигранный
+                            // доезд от прошлого действия каждый тик тянет окно
+                            // на свою траекторию, и под пальцами оно
+                            // «резинится» — то самое ощущение инерции.
+                            //
+                            // При перетаскивании мышью это уже делалось (см.
+                            // ветку Super+ЛКМ), а тачпадный жест был забыт.
+                            if let Some(ref w) = w {
+                                self.freeze_window_anim(w);
+                                for m in self.group_drag_members_excluding(w) {
+                                    self.freeze_window_anim(&m);
+                                }
+                            }
                             self.touchpad_move_window = w.clone();
                             tracing::debug!(
                                 "ЖЕСТ: Super+2пальца → перенос окна, окно под курсором={} \
@@ -943,6 +999,25 @@ impl Dawn {
                         }
                     };
                     if let Some(window) = window {
+                        // Свободно возить окно можно ТОЛЬКО когда оно и так
+                        // плавающее: либо вся раскладка Float, либо окно
+                        // сделали плавающим руками (Super+V, float_selected).
+                        //
+                        // Раньше проверки не было вовсе, а ниже стояло
+                        // `tw.floating = true` — жест молча вырывал окно из
+                        // тайлинга в любой раскладке. В Tile и в ленте Columns
+                        // это ломало саму модель: раскладка перестаёт быть
+                        // раскладкой, если любое случайное движение двумя
+                        // пальцами выкидывает из неё окно.
+                        let плавающее = self.tile_config.layout == Layout::Float
+                            || self.tagged_windows.iter()
+                                .find(|tw| tw.window == window)
+                                .map(|tw| tw.floating)
+                                .unwrap_or(false);
+                        if !плавающее {
+                            self.touchpad_move_window = None;
+                            return;
+                        }
                         let zoom = self.viewport.zoom;
                         let dx = (h * TOUCHPAD_MOVE_SPEED / zoom).round() as i32;
                         let dy = (v * TOUCHPAD_MOVE_SPEED / zoom).round() as i32;
@@ -955,7 +1030,8 @@ impl Dawn {
                                 tw.float_position = new_loc;
                                 tw.position = new_loc;
                                 tw.float_position_set = true;
-                                tw.floating = true; // вытащили из тайлинга — теперь плавающее
+                                // floating НЕ ставим: до сюда доходят только уже
+                                // плавающие окна (см. проверку выше).
                             }
                             // Выделение едет вместе с окном — тем же смещением
                             // (см. group_drag_members_excluding).
@@ -967,7 +1043,7 @@ impl Dawn {
                                     tw.float_position = loc;
                                     tw.position = loc;
                                     tw.float_position_set = true;
-                                    tw.floating = true;
+                                    // floating НЕ ставим — по той же причине.
                                 }
                             }
                             // Курсор едет ЗА окном: жест таскает окно, и стрелка
@@ -1012,19 +1088,12 @@ impl Dawn {
                     return;
                 }
 
-                // Alt + 2-палец тачпад-скролл → pan холста (новое, как Alt+ЛКМ).
+                // Alt + 2-палец тачпад-скролл → pan холста.
                 // Отличаем от колеса мыши по source=Finger, поэтому Alt+колесо
                 // по-прежнему зумит как раньше (ветка ниже) — старое поведение
                 // не тронуто, это отдельная ветка только для тачпада.
-                // В ленте (Columns) свободного пана НЕТ — это не бесконечный
-                // холст, а полоса колонок: вид ходит только по ней (свайп без
-                // модификаторов) и по вертикали между столами. Пан здесь ломал
-                // саму модель — можно было уехать в пустоту мимо колонок.
-                // В обзоре ленты пан РАЗРЕШЁН: там камера уже отъехала от полосы
-                // и ходит по кадру обзора свободно.
-                if alt_held && source == AxisSource::Finger
-                    && (self.tile_config.layout != Layout::Columns || self.overview_active)
-                {
+                // Разрешено ТОЛЬКО в обзоре и лупе, см. touchpad_camera_allowed.
+                if alt_held && source == AxisSource::Finger && self.touchpad_camera_allowed() {
                     // Скролл-единицы тачпада заметно мельче, чем raw pixel delta
                     // мыши при Alt+ЛКМ — усиливаем, чтобы скорость ощущалась так же.
                     const TOUCHPAD_PAN_SPEED: f64 = 2.5;
@@ -1216,6 +1285,15 @@ impl Dawn {
                     .map(|kb| kb.modifier_state().alt)
                     .unwrap_or(false);
                 if !alt_held { return; }
+                // Зум камеры щипком раньше не проверял раскладку ВООБЩЕ: он
+                // работал и во Float, и в ленте Columns, где пан для того же
+                // жеста давно закрыт. Теперь условие одно на все жесты камеры.
+                if !self.touchpad_camera_allowed() {
+                    // Масштаб всё равно запоминаем: иначе на следующем жесте
+                    // factor посчитается от единицы и камера прыгнет рывком.
+                    self.pinch_last_scale = scale;
+                    return;
+                }
                 let factor = scale / self.pinch_last_scale;
                 self.pinch_last_scale = scale;
 
@@ -1303,6 +1381,9 @@ impl Dawn {
                     .map(|kb| kb.modifier_state().alt)
                     .unwrap_or(false);
                 if !alt { return; }
+                // Камеру свайпом двигаем только в обзоре и лупе — в обычных
+                // раскладках жест не должен уводить вид (touchpad_camera_allowed).
+                if !self.touchpad_camera_allowed() { return; }
                 // Alt + 2-пальца → pan
                 let zoom = self.viewport.zoom;
                 let dcam_x = delta.x / zoom;

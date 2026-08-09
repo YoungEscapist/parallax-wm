@@ -421,6 +421,7 @@ impl Dawn {
                 // трогает (см. TaggedWindow::float_pinned).
                 float_pinned: floating,
                 folded: false,
+                pre_constellation: None,
             },
         );
 

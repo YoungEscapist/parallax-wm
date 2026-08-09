@@ -225,3 +225,7 @@ impl DmabufHandler for Dawn {
 delegate_compositor!(Dawn);
 delegate_shm!(Dawn);
 delegate_dmabuf!(Dawn);
+// wp_viewporter: обработчика писать не надо, smithay сам складывает src/dst в
+// состояние поверхности, а рендер читает их в SurfaceView::from_states.
+// См. Dawn::viewporter_state.
+smithay::delegate_viewporter!(Dawn);

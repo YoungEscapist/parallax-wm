@@ -28,6 +28,7 @@ use smithay::{
         selection::data_device::DataDeviceState,
         shell::xdg::{XdgShellState, decoration::XdgDecorationState},
         shell::wlr_layer::WlrLayerShellState,
+        viewporter::ViewporterState,
         shell::wlr_layer::Layer as WlrLayer,
         shm::ShmState,
         socket::ListeningSocketSource,
@@ -81,6 +82,13 @@ pub struct TaggedWindow {
     /// раскладку: иначе «в tiling переносятся не все окна».
     pub float_pinned: bool,
     pub folded: bool,                        // схлопнуто в стопку (2.4)
+    /// Где окно стояло ДО того, как его собрали в созвездие.
+    ///
+    /// Созвездие — операция обратимая: разобрал — окна обязаны вернуться туда,
+    /// откуда их собрали, а не разлететься куда попало. Пишется один раз, при
+    /// сборке (повторная сборка уже собранного не затирает исходное место), и
+    /// снимается при разборке. См. selection.rs.
+    pub pre_constellation: Option<Point<i32, Logical>>,
 }
 
 // ── Portal (4.4) ─────────────────────────────────────────────────────────────
@@ -420,6 +428,17 @@ pub struct Dawn {
     // ── wlr-layer-shell ──────────────────────────────────────────────────────
     /// Состояние протокола wlr-layer-shell (фоновые обои, панели и т.п.).
     pub layer_shell_state: WlrLayerShellState,
+
+    /// Состояние wp_viewporter. Держим ради глобала: пока структура жива, жив
+    /// и он.
+    ///
+    /// Протокол позволяет клиенту сказать «мой буфер такого-то размера, но
+    /// показывай его вот в этом прямоугольнике» — масштабирование делает GPU
+    /// при отрисовке. Заведён ради dwall: живые обои 1280×720 он растягивал до
+    /// 3840×2160 на процессоре и держал этим полъядра. Smithay применяет src и
+    /// dst сам, при построении вида поверхности (SurfaceView::from_states), так
+    /// что рендеру дополнительной работы не досталось.
+    pub viewporter_state: ViewporterState,
 }
 
 fn load_default_cursor() -> (Option<MemoryRenderBuffer>, Point<i32, Logical>, Size<i32, Logical>) {
@@ -536,6 +555,7 @@ impl Dawn {
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        let viewporter_state = ViewporterState::new::<Self>(&dh);
         // Захват экрана (ext-image-copy-capture): без этих глобалов
         // xdg-desktop-portal-wlr не видит у компоситора способа снять картинку,
         // и демонстрация экрана в Discord/OBS остаётся чёрной. См. screencopy.rs.
@@ -688,6 +708,7 @@ impl Dawn {
             capture_sessions: Vec::new(),
             pending_frames: Vec::new(),
             layer_shell_state,
+            viewporter_state,
         }
     }
 
@@ -1047,6 +1068,17 @@ impl Dawn {
             window.surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                 .map(|(s, p)| (s, (p + location).to_f64()))
         })
+    }
+
+    /// Стоит ли курсор над layer-поверхностью верхних слоёв (Overlay/Top).
+    ///
+    /// Нужно там, где «под курсором нет ОКНА» ошибочно принималось за «под
+    /// курсором пусто»: layer-поверхности не лежат в `space`, поэтому меню
+    /// обоев (dwall) или лаунчер считались голым холстом — клик по ним снимал
+    /// фокус и запускал рамку выделения, а до клиента не доходил.
+    pub fn курсор_над_слоем(&self, pos: Point<f64, Logical>) -> bool {
+        self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
+            .is_some()
     }
 
     /// Попадание курсора в layer-поверхность (wlr-layer-shell).

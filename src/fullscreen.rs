@@ -94,9 +94,14 @@ impl Dawn {
         if self.overview_active {
             return;
         }
+        // Свернуть можно только то, что развёрнуто НА ЭТОМ СТОЛЕ. Раньше
+        // проверялось одно лишь «фуллскрин вообще есть», и F11 на втором столе
+        // сворачивал окно первого — заодно возвращая камеру и зум ТОГО стола
+        // прямо здесь. Со стороны это и выглядело как «столы смешиваются»: на
+        // экране чужой кадр, а своё окно так и не развернулось.
         match self.fullscreen.as_ref().map(|f| f.window.clone()) {
-            Some(_) => self.unset_fullscreen(),
-            None => {
+            Some(_) if self.fullscreen_here() => self.unset_fullscreen(),
+            _ => {
                 let Some(window) = self.focused_window()
                     .or_else(|| self.space.element_under(self.pointer_location).map(|(w, _)| w.clone()))
                 else {
@@ -239,14 +244,30 @@ impl Dawn {
         }
         self.space.map_element(window.clone(), fs.prev_loc, true);
 
+        // Камеру возвращаем только если окно было развёрнуто НА ЭТОМ СТОЛЕ.
+        //
+        // У каждого стола свой кадр (см. tag_cameras в view_tag), и кадр,
+        // запомненный при развороте, принадлежит СВОЕМУ столу. Применить его,
+        // стоя на другом, значит увезти чужую камеру на чужой стол — это и было
+        // главным проявлением «столы смешиваются». Поэтому для чужого стола
+        // кадр не применяем, а кладём в его ячейку: он восстановится сам, когда
+        // на этот стол вернутся.
+        let свой_стол = self.tagged_windows.iter()
+            .find(|tw| tw.window == window)
+            .map(|tw| tw.tags & self.viewport.current_tags() != 0)
+            .unwrap_or(true);
         if !недоигран {
-            self.momentum.stop();
-            self.camera_anim = None;
-            self.zoom_anim = None;
-            self.viewport.cam_x = fs.prev_cam.0;
-            self.viewport.cam_y = fs.prev_cam.1;
-            self.viewport.zoom = fs.prev_zoom;
-            self.apply_camera();
+            if свой_стол {
+                self.momentum.stop();
+                self.camera_anim = None;
+                self.zoom_anim = None;
+                self.viewport.cam_x = fs.prev_cam.0;
+                self.viewport.cam_y = fs.prev_cam.1;
+                self.viewport.zoom = fs.prev_zoom;
+                self.apply_camera();
+            } else if let Some(tw) = self.tagged_windows.iter().find(|tw| tw.window == window) {
+                self.tag_cameras.insert(tw.tags, (fs.prev_cam.0, fs.prev_cam.1, fs.prev_zoom));
+            }
         }
 
         // Окно вернулось в раскладку — пересобрать её (в Float это no-op).

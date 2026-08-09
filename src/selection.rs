@@ -170,6 +170,19 @@ impl Dawn {
             y += row_heights[ri] + GAP;
         }
 
+        // Куда окно вернётся при разборке. Запоминаем ДО переезда и только если
+        // ещё не запомнили: собрать уже собранное созвездие (или собрать его
+        // заново после переноса) не должно стирать исходное место — иначе
+        // «вернуть как было» возвращало бы в предыдущую гроздь.
+        let прежние: Vec<(Window, Point<i32, Logical>)> = targets.iter()
+            .filter_map(|(w, _)| self.space.element_geometry(w).map(|g| (w.clone(), g.loc)))
+            .collect();
+        for (w, было) in прежние {
+            if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| tw.window == w) {
+                tw.pre_constellation.get_or_insert(было);
+            }
+        }
+
         for (w, pos) in &targets {
             self.animate_window_to_dur(w, *pos, std::time::Duration::from_millis(260));
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
@@ -237,6 +250,47 @@ impl Dawn {
     /// Super+D по выделенному созвездию: распустить его и РАЗМЕТАТЬ окна в
     /// стороны от общего центра с анимацией (эффект "разлёта"). Окна остаются
     /// плавающими на новых позициях.
+    /// Лежат ли выделенные окна уже вплотную друг к другу.
+    ///
+    /// По этому и решается, что означает нажатие Super+G: раскиданные окна —
+    /// «собрать», уже сложенные — «разобрать». Считаем среднее расстояние от
+    /// центра тяжести до центров окон и сравниваем со средним «радиусом» окна
+    /// (половиной диагонали). В плотной грозди центры отстоят от общего центра
+    /// примерно на один такой радиус; у раскиданных по холсту — в разы больше.
+    ///
+    /// Мера безразмерная, поэтому одинаково работает и для пары маленьких
+    /// окошек, и для четырёх на весь экран.
+    pub fn selection_is_packed(&self) -> bool {
+        /// Во сколько раз среднее расстояние до центра может превышать средний
+        /// радиус окна, чтобы гроздь ещё считалась собранной. 1.0 — идеально
+        /// сложенная сетка; запас нужен на зазоры и разнокалиберные окна.
+        const ПОРОГ: f64 = 1.25;
+
+        let геометрии: Vec<_> = self.selected_windows.iter()
+            .filter_map(|w| self.space.element_geometry(w))
+            .collect();
+        if геометрии.len() < 2 {
+            return false;
+        }
+        let n = геометрии.len() as f64;
+        let (mut cx, mut cy) = (0.0f64, 0.0f64);
+        for g in &геометрии {
+            cx += g.loc.x as f64 + g.size.w as f64 / 2.0;
+            cy += g.loc.y as f64 + g.size.h as f64 / 2.0;
+        }
+        cx /= n;
+        cy /= n;
+
+        let (mut расстояние, mut радиус) = (0.0f64, 0.0f64);
+        for g in &геометрии {
+            let wx = g.loc.x as f64 + g.size.w as f64 / 2.0;
+            let wy = g.loc.y as f64 + g.size.h as f64 / 2.0;
+            расстояние += (wx - cx).hypot(wy - cy);
+            радиус += (g.size.w as f64).hypot(g.size.h as f64) / 2.0;
+        }
+        расстояние / n <= (радиус / n) * ПОРОГ
+    }
+
     pub fn scatter_selected_constellation(&mut self) {
         let idx = match self.selected_windows.first().and_then(|w| self.constellation_index_of(w)) {
             Some(i) => i,
@@ -260,9 +314,14 @@ impl Dawn {
         cx /= n;
         cy /= n;
 
-        // Каждое окно улетает от центра: новый вектор = текущий * SCATTER.
-        // Если окно ровно в центре (нулевой вектор) — толкаем по кругу, чтобы
-        // одиночная строка/столбец тоже разлетелись равномерно.
+        // Каждое окно возвращается ТУДА, ОТКУДА ЕГО СОБРАЛИ (см.
+        // TaggedWindow::pre_constellation). Разборка — обратная операция сборке,
+        // и «вернуть как было» — единственное её осмысленное поведение.
+        //
+        // Прежнее место известно не всегда: созвездие могло пережить
+        // перезапуск раскладки, или окно попало в него не через gather. На
+        // такой случай остаётся старый разлёт от центра — не идеально, но
+        // лучше, чем оставить окна лежать стопкой друг на друге.
         const SCATTER: f64 = 2.4;
         const MIN_PUSH: f64 = 320.0;
         let count = group.len();
@@ -271,18 +330,26 @@ impl Dawn {
                 Some(g) => g,
                 None => continue,
             };
-            let wcx = g.loc.x as f64 + g.size.w as f64 / 2.0;
-            let wcy = g.loc.y as f64 + g.size.h as f64 / 2.0;
-            let (mut dx, mut dy) = ((wcx - cx) * SCATTER, (wcy - cy) * SCATTER);
-            if dx.hypot(dy) < 1.0 {
-                let a = std::f64::consts::TAU * (i as f64) / (count.max(1) as f64);
-                dx = a.cos() * MIN_PUSH;
-                dy = a.sin() * MIN_PUSH;
-            }
-            let pos = Point::from((
-                (cx + dx - g.size.w as f64 / 2.0).round() as i32,
-                (cy + dy - g.size.h as f64 / 2.0).round() as i32,
-            ));
+            let было = self.tagged_windows.iter()
+                .find(|tw| &tw.window == w)
+                .and_then(|tw| tw.pre_constellation);
+            let pos = match было {
+                Some(p) => p,
+                None => {
+                    let wcx = g.loc.x as f64 + g.size.w as f64 / 2.0;
+                    let wcy = g.loc.y as f64 + g.size.h as f64 / 2.0;
+                    let (mut dx, mut dy) = ((wcx - cx) * SCATTER, (wcy - cy) * SCATTER);
+                    if dx.hypot(dy) < 1.0 {
+                        let a = std::f64::consts::TAU * (i as f64) / (count.max(1) as f64);
+                        dx = a.cos() * MIN_PUSH;
+                        dy = a.sin() * MIN_PUSH;
+                    }
+                    Point::from((
+                        (cx + dx - g.size.w as f64 / 2.0).round() as i32,
+                        (cy + dy - g.size.h as f64 / 2.0).round() as i32,
+                    ))
+                }
+            };
             self.animate_window_to_dur(w, pos, Duration::from_millis(320));
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
                 &tw.window == w
@@ -291,6 +358,9 @@ impl Dawn {
                 tw.float_position = pos;
                 tw.position = pos;
                 tw.float_position_set = true;
+                // Созвездия больше нет — и метка «откуда собрали» тоже не
+                // нужна: следующая сборка запишет её заново, от текущего места.
+                tw.pre_constellation = None;
             }
         }
 
