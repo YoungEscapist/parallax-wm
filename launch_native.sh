@@ -35,6 +35,31 @@ if ldd "$BINARY" 2>&1 | grep -q "not found"; then
     exit 1
 fi
 
+# ── NixOS: библиотеки, которые грузятся через dlopen ─────────────────────────
+# Проверка ldd выше видит только DT_NEEDED. А libwayland-client (winit-режим)
+# и libEGL/libGLESv2 (udev/DRM) подтягиваются dlopen'ом ПО SONAME, в ldd их
+# нет вовсе, и RUNPATH у бинаря пустой. На Void они лежат в /usr/lib и
+# находятся сами — там LD_LIBRARY_PATH действительно не нужен (см. шапку).
+# На NixOS каталога /usr/lib нет: без LD_LIBRARY_PATH winit падает сразу с
+# EventLoopCreation(... NoWaylandLib), а tty-режим — на инициализации EGL.
+#
+# Пути берём из shell.nix, а не хардкодом: после nix-collect-garbage хеши
+# в /nix/store меняются, и любой зафиксированный путь протухает.
+if [[ -e /etc/NIXOS && -z "${LD_LIBRARY_PATH:-}" && -f "$DAWN_DIR/shell.nix" ]]; then
+    echo "NixOS: беру LD_LIBRARY_PATH из shell.nix (dlopen-библиотеки)…"
+    LD_LIBRARY_PATH="$(nix-shell "$DAWN_DIR/shell.nix" --run 'printf %s "$LD_LIBRARY_PATH"')"
+    export LD_LIBRARY_PATH
+fi
+
+# ── Приветствие zsh в терминалах сессии ──────────────────────────────────────
+# .zshrc показывает fastfetch один раз на цепочку шеллов и помечает это
+# экспортом __FASTFETCH_SHOWN. Но dawn запускают ИЗ логин-шелла tty, который
+# приветствие уже показал, — и флаг наследовался дальше: в dawn, в каждый
+# ghostty, в каждый zsh внутри него. Итог: приветствия не было НИ В ОДНОМ
+# терминале сессии. Сессия компоновщика — новый контекст, флаг предыдущего
+# шелла к ней отношения не имеет.
+unset __FASTFETCH_SHOWN
+
 LOG_DIR="$DAWN_DIR/logs"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/dawn_native_$(date +%Y%m%d_%H%M%S).log"
