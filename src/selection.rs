@@ -12,6 +12,7 @@ fn same_window(a: &Window, b: &Window) -> bool {
     a == b
 }
 
+
 impl Dawn {
     pub fn is_selected(&self, window: &Window) -> bool {
         self.selected_windows.iter().any(|w| same_window(w, window))
@@ -70,9 +71,9 @@ impl Dawn {
     }
 
     /// Остальные окна из "созвездия" данного окна (без самого `window`).
-    /// Грабами больше НЕ используется (см. group_drag_members_excluding),
-    /// оставлено для операций над самим созвездием.
-    #[allow(dead_code)]
+    /// Двигать группой больше не используется (см.
+    /// group_drag_members_excluding) — только для операций над самим
+    /// созвездием: драг спрашивает у него, всю ли гроздь увезли (move_grab.rs).
     pub fn constellation_members_excluding(&self, window: &Window) -> Vec<Window> {
         self.constellation_index_of(window)
             .map(|i| self.constellations[i].iter()
@@ -102,7 +103,9 @@ impl Dawn {
         }
         self.constellations.retain(|g| g.len() > 1);
         self.constellations.push(self.selected_windows.clone());
-        tracing::info!("dawn: constellation formed ({} windows)", self.selected_windows.len());
+        let group = self.selected_windows.clone();
+        self.clear_constellation_torn(&group);
+        tracing::info!("dawn: constellation formed ({} windows)", group.len());
     }
 
     /// Super+D при активном выделении: магнитно стянуть выделенные окна в
@@ -203,7 +206,10 @@ impl Dawn {
             }
         }
         self.constellations.retain(|g| g.len() > 1);
-        self.constellations.push(group);
+        self.constellations.push(group.clone());
+        // Гроздь снова сложена нами — метка «растащено» снимается, и следующий
+        // Super+D по ней будет означать «разобрать».
+        self.clear_constellation_torn(&group);
         tracing::info!("dawn: constellation gathered ({} windows)", targets.len());
         // Выделение больше не нужно — созвездие зафиксировано.
         self.selected_windows.clear();
@@ -250,45 +256,37 @@ impl Dawn {
     /// Super+D по выделенному созвездию: распустить его и РАЗМЕТАТЬ окна в
     /// стороны от общего центра с анимацией (эффект "разлёта"). Окна остаются
     /// плавающими на новых позициях.
-    /// Лежат ли выделенные окна уже вплотную друг к другу.
+    /// Созвездие в выделении «растащено» — его окна двигали руками после
+    /// сборки (см. TaggedWindow::constellation_torn).
     ///
-    /// По этому и решается, что означает нажатие Super+G: раскиданные окна —
-    /// «собрать», уже сложенные — «разобрать». Считаем среднее расстояние от
-    /// центра тяжести до центров окон и сравниваем со средним «радиусом» окна
-    /// (половиной диагонали). В плотной грозди центры отстоят от общего центра
-    /// примерно на один такой радиус; у раскиданных по холсту — в разы больше.
-    ///
-    /// Мера безразмерная, поэтому одинаково работает и для пары маленьких
-    /// окошек, и для четырёх на весь экран.
-    pub fn selection_is_packed(&self) -> bool {
-        /// Во сколько раз среднее расстояние до центра может превышать средний
-        /// радиус окна, чтобы гроздь ещё считалась собранной. 1.0 — идеально
-        /// сложенная сетка; запас нужен на зазоры и разнокалиберные окна.
-        const ПОРОГ: f64 = 1.25;
+    /// По этому и решается, что означает Super+D по готовому созвездию:
+    /// растащенное — собрать заново, целое — разобрать.
+    pub fn selection_is_torn(&self) -> bool {
+        self.selected_windows.iter().any(|w| {
+            self.tagged_windows.iter()
+                .any(|tw| same_window(&tw.window, w) && tw.constellation_torn)
+        })
+    }
 
-        let геометрии: Vec<_> = self.selected_windows.iter()
-            .filter_map(|w| self.space.element_geometry(w))
-            .collect();
-        if геометрии.len() < 2 {
-            return false;
+    /// Пометить созвездие этого окна растащенным. Метка общая на всю группу:
+    /// увели одно окно — нарушено расположение всей грозди.
+    pub fn mark_constellation_torn(&mut self, window: &Window) {
+        let Some(idx) = self.constellation_index_of(window) else { return };
+        let group = self.constellations[idx].clone();
+        for tw in self.tagged_windows.iter_mut() {
+            if group.iter().any(|w| same_window(w, &tw.window)) {
+                tw.constellation_torn = true;
+            }
         }
-        let n = геометрии.len() as f64;
-        let (mut cx, mut cy) = (0.0f64, 0.0f64);
-        for g in &геометрии {
-            cx += g.loc.x as f64 + g.size.w as f64 / 2.0;
-            cy += g.loc.y as f64 + g.size.h as f64 / 2.0;
-        }
-        cx /= n;
-        cy /= n;
+    }
 
-        let (mut расстояние, mut радиус) = (0.0f64, 0.0f64);
-        for g in &геометрии {
-            let wx = g.loc.x as f64 + g.size.w as f64 / 2.0;
-            let wy = g.loc.y as f64 + g.size.h as f64 / 2.0;
-            расстояние += (wx - cx).hypot(wy - cy);
-            радиус += (g.size.w as f64).hypot(g.size.h as f64) / 2.0;
+    /// Снять метку «растащено» с окон: гроздь только что сложили заново.
+    fn clear_constellation_torn(&mut self, group: &[Window]) {
+        for tw in self.tagged_windows.iter_mut() {
+            if group.iter().any(|w| same_window(w, &tw.window)) {
+                tw.constellation_torn = false;
+            }
         }
-        расстояние / n <= (радиус / n) * ПОРОГ
     }
 
     pub fn scatter_selected_constellation(&mut self) {
@@ -361,6 +359,7 @@ impl Dawn {
                 // Созвездия больше нет — и метка «откуда собрали» тоже не
                 // нужна: следующая сборка запишет её заново, от текущего места.
                 tw.pre_constellation = None;
+                tw.constellation_torn = false;
             }
         }
 

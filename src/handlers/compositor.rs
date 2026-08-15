@@ -16,8 +16,11 @@ use smithay::{
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         shm::{ShmHandler, ShmState},
     },
+    utils::{Logical, Size},
     xwayland::XWaylandClientData,
 };
+
+use std::cell::RefCell;
 
 use crate::{
     grabs::resize_grab::handle_commit,
@@ -163,7 +166,8 @@ impl Dawn {
         // Не layer-поверхность (обычное окно, popup) — выходим.
         let Some(already) = already else { return };
 
-        // Уже сконфигурирована — БОЛЬШЕ НИЧЕГО НЕ ДЕЛАЕМ.
+        // Уже сконфигурирована — пересчитываем ТОЛЬКО если клиент сам
+        // передумал насчёт размера (см. relayout_if_client_resized).
         //
         // Здесь стоял map.arrange() на каждый commit (как в anvil), и он
         // устраивал пинг-понг: arrange пересчитывал размер поверхности, слал
@@ -173,6 +177,7 @@ impl Dawn {
         // вместо 740×480. Клиент при этом жёг ядро вхолостую и переставал
         // отвечать на сигналы — меню открывалось один раз и больше никогда.
         if already {
+            self.relayout_if_client_resized(surface);
             return;
         }
 
@@ -188,7 +193,61 @@ impl Dawn {
         let Some(layer) = layer else { return };
         layer.layer_surface().send_configure();
     }
+
+    /// Повторный configure для слоя, который САМ попросил другой размер.
+    ///
+    /// Layer-клиент, которому нужно вырасти, шлёт `set_size(w,h)` + commit и
+    /// ЖДЁТ configure: до него прикреплять новый буфер ему нельзя. Раз dawn
+    /// после первого configure не делал больше ничего, такой клиент застревал
+    /// навсегда на первом кадре.
+    ///
+    /// Так ломался mako (замер 10.08.2026): первое уведомление появлялось,
+    /// второе не появлялось никогда, а первое висело на экране даже после
+    /// `makoctl dismiss --all` — по dbus mako отвечал, что уведомлений нет,
+    /// но кадр не менялся, потому что mako стоял в ожидании configure на
+    /// новую высоту стопки.
+    ///
+    /// Пинг-понга, из-за которого arrange отсюда когда-то убрали, тут нет:
+    /// пересчёт запускает только смена ЗАПРОШЕННОГО клиентом размера, а не
+    /// каждый commit. Клиент с постоянным set_size (меню dwall) проходит
+    /// через эту ветку ровно один раз.
+    fn relayout_if_client_resized(&mut self, surface: &WlSurface) {
+        let Some(output) = self.layer_output.clone()
+            .or_else(|| self.space.outputs().next().cloned()) else { return };
+
+        // Слой достаём под замком LayerMap, а его cached_state читаем уже
+        // после — вложение «замок карты + замок данных поверхности» здесь ни
+        // к чему (той же вложенностью ловился клинч в build_layer_elements).
+        let layer = {
+            let map = layer_map_for_output(&output);
+            map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL).cloned()
+        };
+        let Some(layer) = layer else { return };
+        let запрошен = layer.cached_state().size;
+
+        let изменился = with_states(surface, |states| {
+            states.data_map.insert_if_missing(RefCell::<ПрошлыйЗапросРазмера>::default);
+            let ячейка = states.data_map.get::<RefCell<ПрошлыйЗапросРазмера>>().unwrap();
+            let прошлый = ячейка.borrow_mut().0.replace(запрошен);
+            прошлый != Some(запрошен)
+        });
+        if !изменился {
+            return;
+        }
+
+        // arrange сам шлёт configure — и только тем слоям, у которых размер
+        // реально поменялся (см. size_changed в LayerMap::arrange).
+        layer_map_for_output(&output).arrange();
+        self.request_redraw();
+    }
 }
+
+/// Размер, который layer-клиент просил в прошлый раз (`set_size`).
+///
+/// Живёт в data_map самой поверхности, поэтому исчезает вместе с ней —
+/// отдельной чистки при layer_destroyed не нужно.
+#[derive(Default)]
+struct ПрошлыйЗапросРазмера(Option<Size<i32, Logical>>);
 
 impl BufferHandler for Dawn {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}

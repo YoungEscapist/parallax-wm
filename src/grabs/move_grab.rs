@@ -113,6 +113,28 @@ impl MoveSurfaceGrab {
             last_swap: None,
         }
     }
+
+    /// Сдвинуть остальные окна выделения на ту же дельту, что и
+    /// перетаскиваемое. Нужно там, где окно под курсором доводят «руками»
+    /// (магнитирование): группа обязана приехать тем же смещением, иначе
+    /// строй, который держался весь драг, ломается на последнем шаге.
+    fn shift_group(&self, data: &mut Dawn, shift: Point<i32, Logical>) {
+        if shift.x == 0 && shift.y == 0 {
+            return;
+        }
+        for (member, _) in &self.group_initial {
+            let Some(loc) = data.space.element_geometry(member).map(|g| g.loc) else {
+                continue;
+            };
+            let new_loc = loc + shift;
+            data.space.map_element(member.clone(), new_loc, false);
+            if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| &tw.window == member) {
+                tw.float_position = new_loc;
+                tw.position = new_loc;
+                tw.float_position_set = true;
+            }
+        }
+    }
 }
 
 /// Ширина Y-полосы, в пределах которой окна считаются "одной горизонтальной
@@ -168,6 +190,7 @@ fn find_snap_target(
     data: &Dawn,
     window: &Window,
     free_loc: Point<i32, Logical>,
+    riding: &[Window],
 ) -> Option<Point<i32, Logical>> {
     let size = data.space.element_geometry(window)?.size;
     let (w, h) = (size.w, size.h);
@@ -178,6 +201,10 @@ fn find_snap_target(
     for other in data.space.elements() {
         let is_self = other == window;
         if is_self { continue; }
+        // Окна, которые едут вместе с нами, магнитной целью быть не могут:
+        // расстояние до них за весь драг не менялось, и «подравнивание» по ним
+        // означало бы просто сдвиг всей группы вбок.
+        if riding.iter().any(|w| crate::dwindle::same_window(w, other)) { continue; }
         let og = match data.space.element_geometry(other) { Some(g) => g, None => continue };
 
         for cand in [
@@ -557,18 +584,41 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
                 return;
             }
 
+            // Окно созвездия увели руками — гроздь «растащена», и следующий
+            // Super+D по ней должен собрать её заново, а не разбирать (см.
+            // TaggedWindow::constellation_torn). Тащили всё созвездие целиком
+            // (оно попало в выделение) — взаимное расположение не нарушено,
+            // метку не ставим.
+            let утащили_часть = {
+                let ехали: Vec<Window> = self.group_initial.iter()
+                    .map(|(w, _)| w.clone())
+                    .chain(std::iter::once(self.window.clone()))
+                    .collect();
+                data.constellation_members_excluding(&self.window)
+                    .iter()
+                    .any(|m| !ехали.contains(m))
+            };
+            if утащили_часть {
+                data.mark_constellation_torn(&self.window);
+            }
+
             // Магнитирование (2.1): один раз при отпускании подравниваем край
             // к ближайшему соседу в пределах SNAP_DISTANCE, если коллизия включена.
+            let riding: Vec<Window> = self.group_initial.iter().map(|(w, _)| w.clone()).collect();
             let mut snapped_applied = false;
             if data.is_snapping_enabled {
                 if let Some(loc) = data.space.element_geometry(&self.window).map(|g| g.loc) {
-                    if let Some(snapped) = find_snap_target(data, &self.window, loc) {
+                    if let Some(snapped) = find_snap_target(data, &self.window, loc, &riding) {
                         data.space.map_element(self.window.clone(), snapped, true);
                         if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
                             tw.window == self.window
                         }) {
                             tw.float_position = snapped;
                         }
+                        // Группа держит строй и на посадке: остальных двигаем
+                        // ровно тем же сдвигом, иначе примагниченное окно
+                        // уезжало из группы на величину подравнивания.
+                        self.shift_group(data, snapped - loc);
                         snapped_applied = true;
                     }
                 }
@@ -597,6 +647,21 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
                         tw.float_position = target;
                         tw.position = target;
                         tw.float_position_set = true;
+                    }
+                    // Выделение доезжает тем же броском. Одинаковые скорость и
+                    // ω дают одинаковый путь (|v|/ω) и одинаковую кривую, так
+                    // что взаимное расположение сохраняется. Без этого инерцию
+                    // получало только окно под курсором — и оно улетало из
+                    // группы, хотя весь драг они ехали вместе.
+                    for (member, _) in &self.group_initial {
+                        let member_target = data.fling_window(member, v, omega);
+                        if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
+                            &tw.window == member
+                        }) {
+                            tw.float_position = member_target;
+                            tw.position = member_target;
+                            tw.float_position_set = true;
+                        }
                     }
                 }
             }

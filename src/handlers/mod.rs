@@ -14,7 +14,8 @@ use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTa
 use smithay::wayland::selection::data_device::{
     DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
 };
-use smithay::{delegate_data_device, delegate_output, delegate_seat};
+use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
+use smithay::{delegate_data_control, delegate_data_device, delegate_output, delegate_seat};
 
 impl SeatHandler for Dawn {
     // Клавиатурный фокус — не просто поверхность: X11-окну нужен ещё и фокус
@@ -35,6 +36,16 @@ impl SeatHandler for Dawn {
     }
 }
 delegate_seat!(Dawn);
+
+// wp_cursor_shape_v1 умеет назначать форму не только указателю, но и перу
+// планшета, поэтому смитеевский delegate требует и этот трейт. Планшета у нас
+// нет — форму пера просто игнорируем (реализация по умолчанию).
+impl smithay::wayland::tablet_manager::TabletSeatHandler for Dawn {}
+
+// wp_cursor_shape_v1: клиент присылает не картинку, а имя формы, и оно
+// приходит сюда же, в cursor_image, как CursorImageStatus::Named — рисуем её
+// своей темой и своего размера (см. state::cursor_for_icon).
+smithay::delegate_cursor_shape!(Dawn);
 
 impl SelectionHandler for Dawn {
     type SelectionUserData = ();
@@ -88,6 +99,21 @@ impl WaylandDndGrabHandler for Dawn {
     }
 }
 delegate_data_device!(Dawn);
+
+/// `wlr-data-control`: доступ к буферу обмена БЕЗ фокуса на окне.
+///
+/// Обычный `wl_data_device` отдаёт содержимое только тому, у кого клавиатурный
+/// фокус, — это защита от подглядывания за буфером. Менеджеру буфера (cliphist,
+/// Super+C) она мешает: он должен видеть КАЖДОЕ копирование, ничего при этом не
+/// показывая на экране. Для таких клиентов и придуман этот протокол.
+///
+/// Без него `wl-paste --watch` выходит с «Watch mode requires a compositor that
+/// supports the data-control protocol» (замер 12.08.2026) — история буфера не
+/// набивалась вовсе.
+impl DataControlHandler for Dawn {
+    fn data_control_state(&mut self) -> &mut DataControlState { &mut self.data_control_state }
+}
+delegate_data_control!(Dawn);
 
 impl OutputHandler for Dawn {}
 delegate_output!(Dawn);

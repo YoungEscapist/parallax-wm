@@ -422,6 +422,7 @@ impl Dawn {
                 float_pinned: floating,
                 folded: false,
                 pre_constellation: None,
+                constellation_torn: false,
             },
         );
 

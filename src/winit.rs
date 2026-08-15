@@ -91,6 +91,23 @@ pub fn init_winit(
                         |_, _| Some(output.clone()),
                     )
                 });
+                // Frame callbacks слоям — как в udev.rs. Без них layer-клиент
+                // застревает навсегда после первого кадра: он просит
+                // wl_surface.frame и до ответа не рисует. В логе протокола
+                // mako это видно как wl_callback без единого .done (замер
+                // 10.08.2026 во вложенном dawn).
+                {
+                    let layer_out = state.layer_output.clone().unwrap_or_else(|| output.clone());
+                    let map = smithay::desktop::layer_map_for_output(&layer_out);
+                    for layer_surface in map.layers() {
+                        layer_surface.send_frame(
+                            &output,
+                            state.start_time.elapsed(),
+                            Some(Duration::ZERO),
+                            |_, _| Some(output.clone()),
+                        );
+                    }
+                }
 
                 state.space.refresh();
                 state.popups.cleanup();

@@ -17,15 +17,17 @@ use smithay::{
             protocol::wl_surface::WlSurface,
         },
     },
-    input::pointer::CursorImageStatus,
+    input::pointer::{CursorIcon, CursorImageStatus},
     utils::{Logical, Physical, Point, Rectangle, Size, Transform},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
+        cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         pointer_constraints::PointerConstraintsState,
         relative_pointer::RelativePointerManagerState,
         selection::data_device::DataDeviceState,
+        selection::wlr_data_control::DataControlState,
         shell::xdg::{XdgShellState, decoration::XdgDecorationState},
         shell::wlr_layer::WlrLayerShellState,
         viewporter::ViewporterState,
@@ -89,6 +91,19 @@ pub struct TaggedWindow {
     /// сборке (повторная сборка уже собранного не затирает исходное место), и
     /// снимается при разборке. См. selection.rs.
     pub pre_constellation: Option<Point<i32, Logical>>,
+    /// Созвездие, в котором состоит окно, «растащено»: одно из его окон увели
+    /// руками (драг мышью или Super+стрелки), и взаимное расположение, ради
+    /// которого созвездие и заводили, нарушено.
+    ///
+    /// По этой метке Super+D решает, что делать с выделенным созвездием:
+    /// растащенное — собрать заново, целое — разобрать. Раньше это решалось
+    /// геометрией (сложены ли окна вплотную), и метрика ошибалась ровно там,
+    /// где окна никто не двигал: стоило поменять размер ОДНОГО окна, как между
+    /// ним и соседом появлялась дыра, гроздь считалась раскиданной и Super+D
+    /// вместо разборки собирал её заново — «созвездие не разбирается обратно».
+    /// Метка ставится по ДЕЙСТВИЮ, а не по картинке, и ресайз ей не мешает.
+    /// См. selection.rs.
+    pub constellation_torn: bool,
 }
 
 // ── Portal (4.4) ─────────────────────────────────────────────────────────────
@@ -133,6 +148,9 @@ pub struct Dawn {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Dawn>,
     pub data_device_state: DataDeviceState,
+    /// wlr-data-control: менеджеры буфера обмена (cliphist за Super+C) читают
+    /// и пишут буфер, не имея фокуса. См. handlers::DataControlHandler.
+    pub data_control_state: DataControlState,
     /// Протокол xwayland_shell — по нему XWayland связывает свои wl_surface с
     /// X11-окнами (см. xwayland.rs).
     pub xwayland_shell_state: XWaylandShellState,
@@ -172,6 +190,15 @@ pub struct Dawn {
     pub cursor_default_buffer: Option<MemoryRenderBuffer>,
     pub cursor_default_hotspot: Point<i32, Logical>,
     pub cursor_default_size: Size<i32, Logical>,
+    /// Запрошенный размер курсора (см. cursor_size_from). Именно он, а не
+    /// фактический размер картинки, — потолок для курсоров клиентов.
+    pub cursor_size: i32,
+    /// Потолок размера для курсоров, которые клиент рисует сам
+    /// (`set{ cursor_client_max = ... }`); 0 — не ограничивать.
+    pub cursor_client_max: i32,
+    /// Курсоры темы по имени формы (wp_cursor_shape_v1). Тема читается с
+    /// диска, поэтому каждую форму грузим один раз; None = в теме её нет.
+    pub cursor_named_cache: HashMap<String, Option<ThemeCursor>>,
     pub session: Option<LibSeatSession>,
     /// false между SessionEvent::PauseSession и ActivateSession — рендер-хартбит
     /// и VBlank-хендлер в udev.rs должны пропускать render_all()/render_surface()
@@ -187,6 +214,10 @@ pub struct Dawn {
     pub momentum: crate::canvas::MomentumState,
     pub camera_anim: Option<crate::anim::CameraAnim>,
     pub zoom_anim: Option<crate::anim::ZoomAnim>,
+    /// Доезд зума колесом (см. anim::ZoomGlide). Живёт отдельно от zoom_anim:
+    /// тот везёт камеру по заданной траектории, а этот просто догоняет цель,
+    /// которую двигает колесо.
+    pub zoom_glide: Option<crate::anim::ZoomGlide>,
     /// true пока Super+Space зажат (bird's-eye view, устар. — см. zoom_nav_mode)
     pub bird_eye_active: bool,
     /// Режим лупы (Super+Space, тумблер): зум к центру экрана, навигация
@@ -213,9 +244,10 @@ pub struct Dawn {
     pub pending_session: HashMap<String, Vec<Point<i32, Logical>>>,
     /// Активный оконный портал (4.4), не более одного одновременно.
     pub portal: Option<Portal>,
-    /// Окно, развёрнутое на весь экран (F11 или запрос клиента), и всё, что
-    /// нужно вернуть при выходе, — см. fullscreen.rs. Не более одного.
-    pub fullscreen: Option<crate::fullscreen::Fullscreen>,
+    /// Окна, развёрнутые на весь экран (F11 или запрос клиента), и всё, что
+    /// нужно вернуть при выходе, — см. fullscreen.rs. Не более одного НА СТОЛ:
+    /// полноэкранная игра на первом столе не мешает развернуть окно на втором.
+    pub fullscreens: Vec<crate::fullscreen::Fullscreen>,
     /// Идёт выбор источника для демонстрации экрана: портал ждёт, пока
     /// пользователь ткнёт в окно (или в пустой холст — тогда весь экран).
     /// См. portal.rs.
@@ -441,10 +473,32 @@ pub struct Dawn {
     pub viewporter_state: ViewporterState,
 }
 
-fn load_default_cursor() -> (Option<MemoryRenderBuffer>, Point<i32, Logical>, Size<i32, Logical>) {
+/// Размер курсора компоновщика: `set{ cursor_size = ... }`, иначе XCURSOR_SIZE
+/// (тот же env var читают GTK/Qt/wayland-cursor у клиентов), иначе 24.
+pub fn cursor_size_from(cfg: &crate::config::Config) -> i32 {
+    if cfg.cursor_size > 0 {
+        return cfg.cursor_size;
+    }
+    std::env::var("XCURSOR_SIZE").ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(24)
+}
+
+/// Курсор из темы: картинка, горячая точка и размер после ужатия.
+pub type ThemeCursor = (MemoryRenderBuffer, Point<i32, Logical>, Size<i32, Logical>);
+
+/// Грузит курсор темы по списку имён (первое найденное побеждает) и ужимает
+/// его до `want` пикселей.
+///
+/// Имён несколько, потому что имя формы приходит из wp_cursor_shape_v1 в
+/// современном виде ("text", "ns-resize"), а темы вроде Vanilla-DMZ-AA знают
+/// только старые X11-имена ("xterm", "sb_v_double_arrow"). CursorIcon отдаёт и
+/// те, и другие (name + alt_names), поэтому просто перебираем.
+pub fn load_theme_cursor(names: &[&str], want: i32) -> Option<ThemeCursor> {
     use xcursor::{CursorTheme, parser::parse_xcursor};
 
-    let try_load = || -> Option<(MemoryRenderBuffer, Point<i32, Logical>, Size<i32, Logical>)> {
+    let try_load = || -> Option<ThemeCursor> {
         // CursorTheme::load() берёт имя темы аргументом, а не из окружения —
         // без этого она искала буквально тему с именем "default", которой
         // почти нигде нет (есть Adwaita/Breeze/...), и курсор вне окон был
@@ -453,18 +507,10 @@ fn load_default_cursor() -> (Option<MemoryRenderBuffer>, Point<i32, Logical>, Si
         // что читают GTK/Qt/wayland-cursor на стороне клиентов.
         let theme_name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
         let theme = CursorTheme::load(&theme_name);
-        let path = theme.load_icon("left_ptr")
-            .or_else(|| theme.load_icon("default"))
-            .or_else(|| theme.load_icon("arrow"))?;
+        let path = names.iter().find_map(|n| theme.load_icon(n))?;
         let bytes = std::fs::read(path).ok()?;
         let images = parse_xcursor(&bytes)?;
-        // Размер берём из XCURSOR_SIZE — тот же env var, что читают GTK/Qt и
-        // wayland-cursor у клиентов, так что курсор компоновщика и курсоры
-        // внутри окон получаются одного размера. Раньше здесь было жёстко 24.
-        let want = std::env::var("XCURSOR_SIZE").ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(24);
+        let want = if want > 0 { want } else { 24 };
         let image = images.iter().min_by_key(|i| (i.size as i32 - want).abs())?;
         let k = (want as f64 / (image.width as f64).max(1.0)).min(1.0);
         // Если картинка крупнее запрошенного, ужимаем САМИ ПИКСЕЛИ, а не
@@ -529,14 +575,22 @@ fn load_default_cursor() -> (Option<MemoryRenderBuffer>, Point<i32, Logical>, Si
         Some((buf, hotspot, size))
     };
 
-    match try_load() {
-        Some((buf, hs, sz)) => {
-            tracing::info!("dawn: loaded default cursor {}x{} (тема {:?}, запрошен {})",
-                sz.w, sz.h,
-                std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into()),
-                std::env::var("XCURSOR_SIZE").unwrap_or_else(|_| "24".into()));
-            (Some(buf), hs, sz)
-        }
+    let loaded = try_load();
+    match &loaded {
+        Some((_, _, sz)) => tracing::info!(
+            "dawn: курсор {:?} загружен {}x{} (тема {:?}, запрошен {})",
+            names.first().copied().unwrap_or("?"), sz.w, sz.h,
+            std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into()), want,
+        ),
+        None => tracing::warn!("dawn: в теме нет курсора {:?}", names),
+    }
+    loaded
+}
+
+/// Стрелка компоновщика — то, что видно вне окон.
+fn load_default_cursor(want: i32) -> (Option<MemoryRenderBuffer>, Point<i32, Logical>, Size<i32, Logical>) {
+    match load_theme_cursor(&["left_ptr", "default", "arrow"], want) {
+        Some((buf, hs, sz)) => (Some(buf), hs, sz),
         None => {
             tracing::warn!("dawn: could not load xcursor 'left_ptr', cursor will be invisible");
             (None, Point::from((0, 0)), Size::from((24, 24)))
@@ -545,6 +599,23 @@ fn load_default_cursor() -> (Option<MemoryRenderBuffer>, Point<i32, Logical>, Si
 }
 
 impl Dawn {
+    /// Курсор темы для формы, которую попросил клиент через
+    /// wp_cursor_shape_v1. Тема лежит на диске, поэтому каждую форму читаем
+    /// один раз и держим здесь; None = такой формы в теме нет (тогда рисуем
+    /// обычную стрелку, см. render_surface).
+    pub fn cursor_for_icon(&mut self, icon: CursorIcon) -> Option<&ThemeCursor> {
+        let key = icon.name();
+        if !self.cursor_named_cache.contains_key(key) {
+            // Сначала современное имя, потом старые X11-синонимы: тема может
+            // знать только "xterm", но не "text".
+            let mut names: Vec<&str> = vec![key];
+            names.extend_from_slice(icon.alt_names());
+            let loaded = load_theme_cursor(&names, self.cursor_size);
+            self.cursor_named_cache.insert(key.to_string(), loaded);
+        }
+        self.cursor_named_cache.get(key).and_then(|o| o.as_ref())
+    }
+
     pub fn new(event_loop: &mut EventLoop<Self>, display: Display<Self>) -> Self {
         let dh = display.handle();
         let compositor_state = CompositorState::new::<Self>(&dh);
@@ -553,6 +624,10 @@ impl Dawn {
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        // primary_selection нам не нужен (его глобала у dawn нет), фильтр
+        // клиентов — «пускать всех»: сессия своя, посторонних клиентов в ней
+        // не бывает.
+        let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
@@ -574,9 +649,24 @@ impl Dawn {
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "dawn");
         seat.add_keyboard(lua_config.xkb_config(), 200, 25).unwrap();
         seat.add_pointer();
+        // wp_cursor_shape_v1: клиент называет ФОРМУ курсора ("text", "pointer"),
+        // а рисует её компоновщик — своей темой и своего размера. Это и есть
+        // штатный способ не давать курсору скакать в размере над каждым окном:
+        // GTK4, Qt6 и Chromium, увидев глобал, перестают присылать собственные
+        // картинки на 24-32 px и просто просят форму. Курсоры, которые клиент
+        // всё-таки рисует сам (прицел в игре, инструмент в редакторе), остаются
+        // его собственным делом — см. cursor_client_max в udev.rs.
+        CursorShapeManagerState::new::<Self>(&dh);
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
-        let (cursor_default_buffer, cursor_default_hotspot, cursor_default_size) = load_default_cursor();
+        let cursor_size = cursor_size_from(&lua_config);
+        let cursor_client_max = if lua_config.cursor_client_max >= 0 {
+            lua_config.cursor_client_max
+        } else {
+            cursor_size
+        };
+        let (cursor_default_buffer, cursor_default_hotspot, cursor_default_size) =
+            load_default_cursor(cursor_size);
         Self {
             start_time: std::time::Instant::now(),
             display_handle: dh,
@@ -594,6 +684,7 @@ impl Dawn {
             output_manager_state,
             seat_state,
             data_device_state,
+            data_control_state,
             xwayland_shell_state,
             xwm: None,
             xdisplay: None,
@@ -618,12 +709,16 @@ impl Dawn {
             cursor_default_buffer,
             cursor_default_hotspot,
             cursor_default_size,
+            cursor_size,
+            cursor_client_max,
+            cursor_named_cache: HashMap::new(),
             session: None,
             session_active: true,
             plane_reset_frames: 0,
             momentum: crate::canvas::MomentumState::new(0.5),
             camera_anim: None,
             zoom_anim: None,
+            zoom_glide: None,
             bird_eye_active: false,
             zoom_nav_mode: false,
             camera_bookmarks: HashMap::new(),
@@ -635,7 +730,7 @@ impl Dawn {
             is_minimap_visible: false,
             pending_session: crate::session::load(),
             portal: None,
-            fullscreen: None,
+            fullscreens: Vec::new(),
             portal_pick: None,
             portal_capture: None,
             portal_cast: None,
@@ -804,6 +899,24 @@ impl Dawn {
         let z = self.viewport.zoom.max(0.01);
         let s = self.screen_size();
         Size::from((s.w as f64 / z, s.h as f64 / z))
+    }
+
+    /// Видимая часть холста прямоугольником: угол — камера, размер — экран,
+    /// делённый на зум.
+    ///
+    /// Не то же самое, что `space.output_geometry()`: там loc тоже равен камере
+    /// (её задаёт map_output в apply_camera), а вот размер всегда экранный,
+    /// потому что зум в масштаб выхода не идёт. На отдалённом зуме видно
+    /// БОЛЬШЕ холста, чем говорит output_geometry, на приближенном — меньше.
+    pub fn visible_canvas_rect(&self) -> Rectangle<i32, Logical> {
+        let size = self.visible_canvas_size();
+        Rectangle::new(
+            Point::from((
+                self.viewport.cam_x.round() as i32,
+                self.viewport.cam_y.round() as i32,
+            )),
+            Size::from((size.w.round() as i32, size.h.round() as i32)),
+        )
     }
 
     /// Кадр `(cam_x, cam_y, zoom)`, к которому вид ЕДЕТ прямо сейчас: если
@@ -1006,6 +1119,32 @@ impl Dawn {
     /// СПЕЦИАЛЬНО одновременно со сменой камеры (телепорт по миникарте) —
     /// иначе sync_pointer_to_camera примет это за уехавшую камеру и вернёт
     /// стрелку на прежнее место экрана.
+    /// Щелчок колеса зума: двигает ЦЕЛЬ, а не сам масштаб — доезд до неё
+    /// делает anim::ZoomGlide. Раньше зум переставлялся здесь же, и каждый
+    /// щелчок был мгновенным скачком на 10%.
+    pub fn zoom_step_at_cursor(&mut self, factor: f64) {
+        let cursor = self.pointer_location;
+        let zoom = self.viewport.zoom;
+        // Экранная точка курсора: её и держим неподвижной весь доезд.
+        let screen = Point::from((
+            (cursor.x - self.viewport.cam_x) * zoom,
+            (cursor.y - self.viewport.cam_y) * zoom,
+        ));
+        // Цель копится от ПРЕДЫДУЩЕЙ цели, а не от текущего масштаба: иначе
+        // быстрый прокрут терял бы щелчки — каждый следующий считался бы от
+        // ещё не доехавшего зума.
+        let base = self.zoom_glide.as_ref().map(|g| g.target).unwrap_or(zoom);
+        let target = (base * factor).clamp(0.05, 5.0);
+        // Жест пользователя главнее перелёта камеры: иначе обе анимации
+        // писали бы zoom по очереди и картинка дрожала бы.
+        self.zoom_anim = None;
+        match self.zoom_glide.as_mut() {
+            Some(g) => g.retarget(target, cursor, screen),
+            None => self.zoom_glide = Some(crate::anim::ZoomGlide::new(target, cursor, screen)),
+        }
+        self.request_redraw();
+    }
+
     pub fn pointer_warped(&mut self) {
         self.pointer_cam_ref = (self.viewport.cam_x, self.viewport.cam_y, self.viewport.zoom);
         self.pointer_screen = self.pointer_screen_physical();
@@ -1362,6 +1501,13 @@ impl Dawn {
         self.tag_layouts.insert(tag, target_layout);
         self.viewport.tagset[self.viewport.seltags] = tag;
         self.refresh_tags();
+        // Фокус за окном, которое только что ушло с экрана, — это клавиатура,
+        // проваливающаяся в никуда: полноэкранная игра с первого стола
+        // продолжала съедать набор на втором, а F11 разворачивал её же вместо
+        // окна перед глазами. Видимость спрашиваем у space (refresh_tags уже
+        // отработал), а не у тегов: в ленте на экране законно живут окна
+        // соседних этажей, и отбирать у них фокус не за что.
+        self.refocus_visible();
 
         // Режим — свойство СТОЛА, а не глобальный тумблер: уходя с ленты на
         // стол, который помнит себя тайловым, выходим из Columns (ниже общей
@@ -1696,6 +1842,41 @@ impl Dawn {
         self.request_redraw();
     }
 
+    /// Увести клавиатуру с окна, которого больше нет на экране.
+    ///
+    /// Зовётся после смены стола (см. view_tag). Фокус переходит верхнему
+    /// видимому окну; если видимых окон нет — снимается совсем, как при клике
+    /// по пустому холсту.
+    pub fn refocus_visible(&mut self) {
+        let Some(фокус) = self.focused_surface() else { return };
+        // Клавиатуру может держать не окно, а слой (панель, лончер) или меню —
+        // они со сменой стола никуда не деваются, и отбирать у них фокус не за
+        // что. Разбираемся только с окнами.
+        let это_окно = self.tagged_windows.iter()
+            .any(|tw| crate::xwin::is_surface(&tw.window, &фокус));
+        if !это_окно {
+            return;
+        }
+        if self.space.elements().any(|w| crate::xwin::is_surface(w, &фокус)) {
+            return;
+        }
+        // space.elements() идёт снизу вверх; меню и тултипы (override-redirect)
+        // фокус не принимают — их отсеивает сам xwin::focus.
+        let верхнее = self.space.elements()
+            .filter(|w| self.tagged_windows.iter().any(|tw| &tw.window == *w))
+            .next_back()
+            .cloned();
+        match верхнее {
+            Some(window) => crate::xwin::focus(self, &window),
+            None => {
+                if let Some(kb) = self.seat.get_keyboard() {
+                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                    kb.set_focus(self, None, serial);
+                }
+            }
+        }
+    }
+
 
     // ── Hold-to-zoom / bird's-eye (1.3) ──────────────────────────────────────
 
@@ -1970,4 +2151,34 @@ pub struct ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Курсор темы приходит РОВНО запрошенного размера, и форма ищется не
+    /// только по современному имени.
+    ///
+    /// Обе половины проверки — про то, из-за чего курсор над окнами и был
+    /// крупнее: тема Vanilla-DMZ-AA держит картинки от 24 px и знает только
+    /// старые X11-имена ("xterm", но не "text"). Если бы load_theme_cursor не
+    /// ужимал картинку или не перебирал синонимы, wp_cursor_shape_v1 отдавал
+    /// бы либо курсор чужого размера, либо стрелку вместо каретки.
+    #[test]
+    fn курсор_темы_нужного_размера_и_по_синониму() {
+        let Some((_, _, размер)) = load_theme_cursor(&["left_ptr"], 16) else {
+            eprintln!("темы курсоров в системе нет — проверка пропущена");
+            return;
+        };
+        assert!(размер.w <= 16 && размер.h <= 16, "курсор не ужат: {:?}", размер);
+
+        let текст = CursorIcon::Text;
+        let mut имена: Vec<&str> = vec![текст.name()];
+        имена.extend_from_slice(текст.alt_names());
+        assert!(имена.contains(&"xterm"), "синонимы формы потерялись: {:?}", имена);
+        if let Some((_, _, размер)) = load_theme_cursor(&имена, 16) {
+            assert!(размер.w <= 16 && размер.h <= 16, "каретка не ужата: {:?}", размер);
+        }
+    }
 }

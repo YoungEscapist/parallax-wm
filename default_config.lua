@@ -17,6 +17,13 @@
 --     (see below). A bind requires an EXACT modifier match — e.g. a
 --     mods="super" bind will NOT fire while shift is also held.
 --
+--   set{ cursor_size = 16, cursor_client_max = -1 }
+--     Размер курсора. cursor_size — размер стрелки компоновщика и всех форм,
+--     которые просят приложения через wp_cursor_shape_v1 (0 = взять из
+--     XCURSOR_SIZE). cursor_client_max — потолок для приложений, рисующих
+--     курсор своей картинкой (XWayland, GTK3): -1 = потолок равен cursor_size,
+--     0 = потолка нет и картинка показывается как прислана, N = потолок N px.
+--
 --   set{ bird_eye_key = "space" }
 --     Клавиша режима лупы (zoom-nav): Super+<эта клавиша> — тумблер увеличенного
 --     вида, где голые стрелки панорамируют холст. Перехватывается ДО биндов,
@@ -115,6 +122,13 @@ xkb{ layout = "us,ru", variant = "", options = "grp:alt_shift_toggle" }
 -- Клавиша режима лупы (Super+Space по умолчанию).
 set{ bird_eye_key = "space" }
 
+-- Курсор одного размера везде: и вне окон, и над ними. Приложения, знающие
+-- wp_cursor_shape_v1 (GTK4, Qt6, Chromium), просят у нас ФОРМУ и получают её
+-- нашей темой и нашего размера; остальным (XWayland, GTK3) их собственную
+-- картинку ужимаем до cursor_client_max. Если нужен крупный курсор из самого
+-- приложения (прицел в игре) — cursor_client_max = 0.
+set{ cursor_size = 0, cursor_client_max = -1 }
+
 -- ── VT switching ─────────────────────────────────────────────────────────
 for i = 1, 12 do
   bind{ mods = "ctrl+alt", key = "F" .. i, action = "vt_switch", vt = i }
@@ -161,7 +175,9 @@ bind{ mods = "super+shift", key = "equal", action = "window_height_adjust", perc
 -- switcher.rs. Колонка на всю ширину переехала отсюда на Super+Shift+F.
 bind{ mods = "super", key = "f", action = "window_search" }
 bind{ mods = "super+shift", key = "f", action = "column_maximize" }
-bind{ mods = "super", key = "c", action = "column_center" }
+-- Super+C занят историей буфера обмена (см. ниже), колонка по центру уехала
+-- на Super+Ctrl+C.
+bind{ mods = "super+ctrl", key = "c", action = "column_center" }
 -- Первая/последняя колонка и перенос колонки в начало/конец полосы.
 bind{ mods = "super", key = "Home", action = "column_focus_first" }
 bind{ mods = "super", key = "End",  action = "column_focus_last" }
@@ -335,6 +351,20 @@ bind{ mods = "super+shift", key = "a", action = "audio_menu" }
 -- fuzzel в цветах Void (тема: ~/.config/fuzzel/fuzzel.ini).
 -- Тумблер: второе нажатие гасит уже открытый лаунчер, а не плодит второй.
 bind{ mods = "super", key = "s", action = "spawn", cmd = "pkill -x fuzzel || fuzzel" }
+
+-- ── Снимок экрана и буфер обмена ────────────────────────────────────────────
+-- PrtScr: снимок ВСЕГО экрана прямо в буфер обмена, файл никуда не пишется.
+-- grim отдаёт png в stdout, wl-copy забирает его оттуда.
+bind{ mods = "", key = "Print", action = "spawn", cmd = "grim - | wl-copy" }
+-- Super+C: история буфера списком в fuzzel — и картинки, и текст. Выбранное
+-- снова кладётся в буфер (cliphist decode | wl-copy), то есть вставляется
+-- обычным Ctrl+V туда, куда нужно.
+--
+-- Саму историю набивают два сторожа wl-paste, они поднимаются в
+-- launch_native.sh вместе с сессией: без них список всегда пуст.
+-- Тумблер, как у лаунчера: второе нажатие гасит открытый список.
+bind{ mods = "super", key = "c", action = "spawn",
+      cmd = "pkill -x fuzzel || cliphist list | fuzzel --dmenu | cliphist decode | wl-copy" }
 
 -- ── Мониторы ────────────────────────────────────────────────────────────────
 -- monitor{ name = "DP-2", width = 2560, height = 1080, refresh = 200 }

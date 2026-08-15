@@ -206,6 +206,13 @@ pub struct Config {
     pub bluetooth_autoconnect: bool,
     /// `monitor{}` — конфигурация выходов: имя, разрешение, частота, позиция.
     pub monitors: Vec<MonitorConfig>,
+    /// `set{ cursor_size = ... }` — размер курсора компоновщика в пикселях.
+    /// 0 — взять из XCURSOR_SIZE (так же, как его читают клиенты).
+    pub cursor_size: i32,
+    /// `set{ cursor_client_max = ... }` — потолок для курсоров, которые клиент
+    /// рисует сам. -1 (по умолчанию) — потолок равен cursor_size, 0 — потолка
+    /// нет вовсе (курсор клиента показывается как прислан).
+    pub cursor_client_max: i32,
 }
 
 impl Config {
@@ -246,6 +253,8 @@ impl Default for Config {
             dwindle: crate::dwindle::DwindleConfig::default(),
             bluetooth_autoconnect: true,
             monitors: Vec::new(),
+            cursor_size: 0,
+            cursor_client_max: -1,
         }
     }
 }
@@ -421,6 +430,8 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         Rc::new(RefCell::new(crate::dwindle::DwindleConfig::default()));
     let bt_autoconnect: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let monitors: Rc<RefCell<Vec<MonitorConfig>>> = Rc::new(RefCell::new(Vec::new()));
+    let cursor_size: Rc<RefCell<i32>> = Rc::new(RefCell::new(0));
+    let cursor_client_max: Rc<RefCell<i32>> = Rc::new(RefCell::new(-1));
 
     {
         let bindings = bindings.clone();
@@ -479,9 +490,17 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     {
         let bird_eye_key = bird_eye_key.clone();
         let bt_autoconnect = bt_autoconnect.clone();
+        let cursor_size = cursor_size.clone();
+        let cursor_client_max = cursor_client_max.clone();
         let set_fn = lua.create_function(move |_, tbl: Table| {
             if let Ok(v) = tbl.get::<bool>("bluetooth_autoconnect") {
                 *bt_autoconnect.borrow_mut() = v;
+            }
+            if let Ok(v) = tbl.get::<i32>("cursor_size") {
+                *cursor_size.borrow_mut() = v.clamp(0, 256);
+            }
+            if let Ok(v) = tbl.get::<i32>("cursor_client_max") {
+                *cursor_client_max.borrow_mut() = v.clamp(-1, 256);
             }
             if let Ok(v) = tbl.get::<String>("bird_eye_key") {
                 if let Some(k) = keysym_from_name(&v) {
@@ -553,6 +572,8 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         dwindle: *dwindle_cfg.borrow(),
         bluetooth_autoconnect: *bt_autoconnect.borrow(),
         monitors: monitors.borrow().clone(),
+        cursor_size: *cursor_size.borrow(),
+        cursor_client_max: *cursor_client_max.borrow(),
     };
     Ok(result)
 }
@@ -598,12 +619,17 @@ impl Dawn {
                         // Float/Columns/Monocle → Tile (сборка)
                         self.gather_all_into_tiling();
                     }
-                } else if self.selection_is_packed() && self.selection_is_constellation() {
-                    // Решает РАССТОЯНИЕ, а не факт группировки: окна уже лежат
-                    // вплотную — значит нажатие означает «разобрать». Раньше
-                    // условием было одно лишь «это созвездие», и растащенное
-                    // руками созвездие нельзя было собрать обратно тем же
-                    // нажатием — оно сразу разбиралось.
+                } else if self.selection_is_constellation() && !self.selection_is_torn() {
+                    // Решает не картинка, а то, ТРОГАЛИ ли гроздь руками: целое
+                    // созвездие нажатие разбирает, растащенное — собирает
+                    // заново (иначе его нельзя было бы собрать тем же
+                    // нажатием — оно сразу разбиралось).
+                    //
+                    // Раньше «целое» определялось геометрией (окна лежат
+                    // вплотную). Ресайз ОДНОГО окна оставлял между ним и
+                    // соседом дыру, гроздь считалась растащенной, и созвездие
+                    // переставало разбираться вовсе — см.
+                    // TaggedWindow::constellation_torn.
                     self.scatter_selected_constellation();
                 } else {
                     self.gather_selected_into_constellation();
@@ -871,6 +897,28 @@ mod tests {
         let alt_shift = ModMask { ctrl: false, alt: true, shift: true, logo: false };
         assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_Tab), "Some(CycleStack(1))");
         assert_eq!(действие(&cfg, alt_shift, xkb::keysyms::KEY_Tab), "Some(CycleStack(-1))");
+    }
+
+    /// Снимок экрана и история буфера (12.08.2026). Проверяем ровно то, что на
+    /// глаз не видно: имя клавиши `Print` действительно разбирается в keysym, а
+    /// пустые `mods = ""` не превращаются в «любой модификатор».
+    #[test]
+    fn prtscr_снимает_экран_а_super_c_открывает_буфер() {
+        let cfg = load_from_str(DEFAULT_CONFIG_LUA).unwrap();
+        let без = ModMask { ctrl: false, alt: false, shift: false, logo: false };
+        let logo = ModMask { ctrl: false, alt: false, shift: false, logo: true };
+        let logo_ctrl = ModMask { ctrl: true, alt: false, shift: false, logo: true };
+        assert_eq!(
+            действие(&cfg, без, xkb::keysyms::KEY_Print),
+            r#"Some(Spawn("grim - | wl-copy"))"#,
+        );
+        assert!(
+            действие(&cfg, logo, xkb::keysyms::KEY_c).contains("cliphist"),
+            "Super+C не открывает историю буфера: {}",
+            действие(&cfg, logo, xkb::keysyms::KEY_c),
+        );
+        // Колонка по центру не потерялась, а переехала.
+        assert_eq!(действие(&cfg, logo_ctrl, xkb::keysyms::KEY_c), "Some(ColumnCenter)");
     }
 
     #[test]

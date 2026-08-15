@@ -314,8 +314,31 @@ pub fn init_udev(
                                     // вызов ничего не ломает — он просто
                                     // сэмплирует анимацию в момент отрисовки.
                                     crate::anim::tick(state);
-                                    let gles = &mut device.gles as *mut GlesRenderer;
-                                    unsafe { render_surface(surface, &mut *gles, state); }
+                                    // Кадр собираем ТОЛЬКО когда есть что
+                                    // показывать.
+                                    //
+                                    // Раньше каждый VBlank безусловно собирал
+                                    // весь список элементов (у Ярика это до
+                                    // 225 штук) и звал render_frame. На мониторе
+                                    // 200 Гц это 200 полных сборок сцены в
+                                    // секунду по 0.9 мс — около 18% ядра, и
+                                    // добрая половина из них заканчивалась
+                                    // EmptyFrame: показывать было нечего.
+                                    //
+                                    // Пропуск ничего не подвешивает: состояние
+                                    // «не рисуем, ждём изменений» уже
+                                    // существует и работает — ровно в него
+                                    // приходит EmptyFrame, когда сцена не
+                                    // изменилась. Любой источник изменений
+                                    // (коммит клиента, ввод, анимация, тик
+                                    // полки) зовёт request_redraw — на это
+                                    // опирается и главный цикл, который тоже
+                                    // рисует только по needs_redraw.
+                                    if state.needs_redraw {
+                                        state.needs_redraw = false;
+                                        let gles = &mut device.gles as *mut GlesRenderer;
+                                        unsafe { render_surface(surface, &mut *gles, state); }
+                                    }
                                 }
                             }
                             state.udev_devices = devices;
@@ -1885,6 +1908,44 @@ where
     }
 }
 
+/// Разрешаем ли DRM раскладывать элементы по аппаратным слоям.
+///
+/// Здесь стоял `FrameFlags::empty()` — с самого первого коммита и, судя по
+/// всему, по недосмотру: слои были запрещены ЦЕЛИКОМ. Это противоречило даже
+/// собственному `Cargo.toml`, где ради слоя курсора включён `renderer_pixman`
+/// с комментарием «иначе курсор подмешивается в кадр и заставляет
+/// перерисовывать его на каждое движение мыши» — ровно то, что и происходило.
+///
+/// Что даёт `DEFAULT` (он же ALLOW_SCANOUT):
+///   * **курсор — на своём слое**: движение мыши больше не пересобирает сцену,
+///     а меняет позицию слоя;
+///   * **полноэкранный клиент — прямо на экран**: буфер игры или плеера уходит
+///     на primary/overlay в обход композиции. Ровно то, что нужно Dota и
+///     видео.
+///
+/// Ничего не «режется»: если элемент на слой не годится (у нас это всё, что
+/// прошло через RescaleRenderElement, — то есть любое окно при зуме), smithay
+/// молча возвращает его в обычную композицию. Слои — это дополнительная
+/// быстрая дорожка, а не замена отрисовке.
+///
+/// `SKIP_CURSOR_ONLY_UPDATES` не берём намеренно: он превращает кадр, в
+/// котором сдвинулся только курсор, в EmptyFrame — стрелка начала бы отставать
+/// от руки.
+///
+/// Запасной выход без пересборки: `DAWN_NO_PLANES=1` возвращает прежнее
+/// поведение.
+fn flags_кадра() -> FrameFlags {
+    static ФЛАГИ: std::sync::OnceLock<FrameFlags> = std::sync::OnceLock::new();
+    *ФЛАГИ.get_or_init(|| {
+        if std::env::var_os("DAWN_NO_PLANES").is_some() {
+            tracing::info!("dawn/udev: аппаратные слои выключены (DAWN_NO_PLANES)");
+            FrameFlags::empty()
+        } else {
+            FrameFlags::DEFAULT
+        }
+    })
+}
+
 pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state: &mut Dawn) {
     // Курсор сводим с камерой ЗДЕСЬ — в самой нижней точке, через которую
     // проходят ВСЕ пути отрисовки. Раньше вызов стоял в render_all, но
@@ -1942,7 +2003,9 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
         Vec::with_capacity(surface.last_elements.max(64));
 
     // ── Cursor (front layer) ─────────────────────────────────────────────────
-    let cursor_pos_physical = {
+    // Только для диагностики ниже: сами ветки курсора считают свою точку
+    // каждая по своему хотспоту (см. match по cursor_status).
+    let cursor_pos_physical: Point<i32, Physical> = {
         let p = state.pointer_location - state.cursor_default_hotspot.to_f64();
         let output_local = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
             p.x - state.viewport.cam_x,
@@ -1973,7 +2036,10 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
         state.render_cam_logged = cam;
     }
 
-    match &state.cursor_status {
+    // Клонируем статус: ветка Named дочитывает тему через &mut state
+    // (cursor_for_icon кэширует прочитанное), а match по &state.cursor_status
+    // держал бы state занятым. Клон — это Arc у WlSurface либо Copy-енум.
+    match state.cursor_status.clone() {
         CursorImageStatus::Surface(ref cursor_surface) => {
             let hotspot = with_states(cursor_surface, |states| {
                 states.data_map.get::<CursorImageSurfaceData>()
@@ -1997,21 +2063,44 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
                 p.x - hotspot.x as f64,
                 p.y - hotspot.y as f64,
             )).to_i32_round();
-            // Курсор КЛИЕНТА рисуется РОВНО ТАКИМ, каким его прислали, — ни
-            // подгонки под размер нашей стрелки, ни какого-либо масштаба.
+            // Потолок размера для картинки, которую прислал клиент.
             //
-            // Раньше здесь стояло ужатие до cursor_default_size (то есть до
-            // XCURSOR_SIZE из launch_native.sh): клиентский курсор крупнее
-            // нашего сжимался относительно острия. Это ломало ровно тот случай,
-            // ради которого клиент курсор и подменяет: игра, поставившая себе
-            // крупный прицел, получала его размером с системную стрелку, и
-            // сменить размер ИЗ ИГРЫ было нельзя — размер задавал компоновщик.
-            // Размер курсора внутри окна — дело окна; наш XCURSOR_SIZE остаётся
-            // размером ТОЛЬКО нашей собственной стрелки (ветка Named ниже).
+            // Клиенты, ничего специально не просившие, берут курсор ИЗ ТЕМЫ, но
+            // своего размера: XWayland и GTK3 — 24, Chromium и Firefox — 32-33
+            // (замер по логам сеансов 03-10.08.2026), тогда как стрелка
+            // компоновщика 16. Отсюда и жалоба «курсор на окнах слишком
+            // большой»: он прыгал в размере на каждой границе окна.
             //
-            // Отсюда же и Kind::Cursor: элемент не масштабируется, поэтому
-            // спокойно уходит на аппаратный слой курсора (тот масштаб не
-            // применяет и обрезал бы растянутую картинку).
+            // Правильное место починки — не размер картинки, а протокол:
+            // wp_cursor_shape_v1 (см. Dawn::new) уводит все такие «просто дай
+            // мне стрелку» в ветку Named, где рисуем МЫ. Здесь остаётся
+            // страховка для тех, кто протокола не знает (XWayland, GTK3):
+            // ужимаем к cursor_client_max, по умолчанию равному нашему размеру.
+            //
+            // Из-под потолка выведено полноэкранное окно: границ окон на экране
+            // в этот момент нет, прыгать курсору не о что, и размер стрелки
+            // целиком дело клиента. Иначе игра, попросившая свой крупный
+            // прицел (Dota 2 рисует курсоры по 32-64 px), получала стрелку в
+            // 16 px — «курсор не меняет размер, когда просит игра».
+            // Насовсем потолок снимает `set{ cursor_client_max = 0 }` в
+            // config.lua, число побольше — поднимает.
+            let масштаб = {
+                let макс = if state.cursor_owned_by_fullscreen(cursor_surface) {
+                    0
+                } else {
+                    state.cursor_client_max
+                };
+                let размер = crate::xwin::surface_buffer_size(cursor_surface);
+                match (макс > 0, размер) {
+                    (true, Some(sz)) if sz.w.max(sz.h) > макс => {
+                        макс as f64 / sz.w.max(sz.h) as f64
+                    }
+                    _ => 1.0,
+                }
+            };
+            // Kind::Cursor и здесь: DrmCompositor рисует элемент курсора в
+            // отдельный буфер аппаратного слоя, и ужатый элемент туда только
+            // легче помещается (растянутый — наоборот, слой бы его отбросил).
             // Строка на КАЖДЫЙ кадр, а под курсором клиента (браузер, Steam,
             // игра) это 190 строк в секунду синхронной записью на диск прямо из
             // потока рендера: в сеансе 05.08.2026 таких строк набежало 17 632 на
@@ -2027,24 +2116,63 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
                 );
                 tracing::debug!(
                     "КУРСОР КЛИЕНТА: хотспот=({},{}) буфер={:?} buffer_scale={} \
-                     элемент=({},{}) остриё=({:.1},{:.1}) zoom={:.2}",
+                     элемент=({},{}) остриё=({:.1},{:.1}) zoom={:.2} ужатие={:.2}",
                     hotspot.x, hotspot.y, размер, buf_scale,
-                    pos.x, pos.y, p.x, p.y, state.viewport.zoom,
+                    pos.x, pos.y, p.x, p.y, state.viewport.zoom, масштаб,
                 );
             }
             let cursor_els: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                 render_elements_from_surface_tree(
                     renderer, cursor_surface, pos, 1.0, 1.0, Kind::Cursor,
                 );
-            elements.extend(cursor_els.into_iter().map(OutputRenderElements::Cursor));
+            if масштаб < 1.0 {
+                // Ужимаем ОТНОСИТЕЛЬНО ОСТРИЯ (точка p), а не левого верхнего
+                // угла картинки: тогда хотспот съезжает ровно на столько же, на
+                // сколько ужалась картинка, и остриё остаётся там, куда
+                // приходятся клики. Считать смещённый хотспот вручную не надо.
+                let остриё = p.to_i32_round();
+                elements.extend(cursor_els.into_iter().map(|el| {
+                    OutputRenderElements::Layer(
+                        RescaleRenderElement::from_element(el, остриё, масштаб),
+                    )
+                }));
+            } else {
+                elements.extend(cursor_els.into_iter().map(OutputRenderElements::Cursor));
+            }
         }
-        CursorImageStatus::Named(_) => {
-            if let Some(ref buf) = state.cursor_default_buffer {
+        CursorImageStatus::Named(icon) => {
+            // Форма пришла от клиента (wp_cursor_shape_v1) либо от нас самих —
+            // в обоих случаях рисуем курсор ТЕМЫ нашего размера. Формы, которой
+            // в теме нет, не бывает фатальной: показываем обычную стрелку.
+            let подобранный = state.cursor_for_icon(icon)
+                .map(|(buf, hs, _)| (buf.clone(), *hs));
+            let (буфер, хотспот) = match подобранный {
+                Some((buf, hs)) => (Some(buf), hs),
+                None => (state.cursor_default_buffer.clone(), state.cursor_default_hotspot),
+            };
+            // Хотспот вычитаем в ФИЗИЧЕСКИХ пикселях, как и у курсора клиента:
+            // картинка темы рисуется 1:1 и зумом не растягивается, поэтому
+            // вычитать hotspot ДО умножения на zoom (как делает
+            // cursor_pos_physical выше) значило бы вычесть hotspot*zoom. У
+            // стрелки с её хотспотом в углу разницы почти нет, а вот у форм
+            // вроде "text" остриё посередине — там промах был бы заметным.
+            let pos = {
+                let ol = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+                    state.pointer_location.x - state.viewport.cam_x,
+                    state.pointer_location.y - state.viewport.cam_y,
+                ));
+                let p = ol.to_physical(state.viewport.zoom);
+                smithay::utils::Point::<f64, smithay::utils::Physical>::from((
+                    p.x - хотспот.x as f64,
+                    p.y - хотспот.y as f64,
+                )).to_i32_round()
+            };
+            if let Some(buf) = буфер {
                 // Размер НЕ трогаем: буфер уже нужного размера (курсор
-                // ужимается при загрузке, см. load_default_cursor). Любое
+                // ужимается при загрузке, см. load_theme_cursor). Любое
                 // растяжение здесь обрезалось бы аппаратным слоем курсора.
                 match MemoryRenderBufferRenderElement::from_buffer(
-                    renderer, cursor_pos_physical, buf, None, None, None, Kind::Cursor,
+                    renderer, pos, &buf, None, None, None, Kind::Cursor,
                 ) {
                     Ok(el) => elements.push(OutputRenderElements::Memory(el)),
                     Err(e) => tracing::warn!("dawn/udev: cursor render element: {:?}", e),
@@ -2245,7 +2373,7 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     surface.last_elements = element_count;
     let output_name = surface.output.name();
     match surface.compositor.render_frame(
-        renderer, &elements, [0.1f32, 0.1, 0.1, 1.0], FrameFlags::empty()
+        renderer, &elements, [0.1f32, 0.1, 0.1, 1.0], flags_кадра()
     ) {
         Ok(res) => {
             // trace!, а не debug!: это две строки на КАЖДЫЙ кадр (при 60 Гц —
@@ -2382,9 +2510,23 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     });
     // Frame callbacks для layer-поверхностей
     {
+        // Обои под полноэкранным окном не видно вовсе — и будить их незачем:
+        // dwall тактуется кадровыми callback'ами, без них он засыпает, а за ним
+        // встаёт и ffmpeg (см. Dawn::wallpaper_hidden). Запрос на callback при
+        // этом никуда не девается: он ждёт в поверхности и уедет клиенту первым
+        // же кадром, когда обои снова покажутся.
+        let фон_скрыт = state.wallpaper_hidden();
         let layer_out = state.layer_output.clone().unwrap_or_else(|| surface.output.clone());
         let map = layer_map_for_output(&layer_out);
         for layer_surface in map.layers() {
+            let фон = matches!(
+                layer_surface.layer(),
+                smithay::wayland::shell::wlr_layer::Layer::Background
+                    | smithay::wayland::shell::wlr_layer::Layer::Bottom
+            );
+            if фон_скрыт && фон {
+                continue;
+            }
             layer_surface.send_frame(
                 &surface.output, elapsed,
                 Some(Duration::from_millis(16)),

@@ -11,7 +11,7 @@ use smithay::{
         wayland_server::protocol::wl_seat::WlSeat,
         wayland_server::protocol::wl_output::WlOutput,
     },
-    utils::Serial,
+    utils::{Logical, Point, Rectangle, Serial, Size},
     wayland::shell::xdg::{
         PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
         decoration::XdgDecorationHandler,
@@ -95,10 +95,14 @@ impl XdgShellHandler for Dawn {
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        let это_окно = self.fullscreen.as_ref()
-            .is_some_and(|f| crate::xwin::is_surface(&f.window, surface.wl_surface()));
-        if это_окно {
-            self.unset_fullscreen();
+        // Сворачиваем ИМЕННО то окно, которое попросило: развёрнутых окон может
+        // быть несколько (по одному на стол), и «свернуть текущее» здесь
+        // означало бы свернуть чужое.
+        let window = self.tagged_windows.iter()
+            .map(|tw| tw.window.clone())
+            .find(|w| crate::xwin::is_surface(w, surface.wl_surface()));
+        if let Some(window) = window {
+            self.unset_fullscreen_window(&window);
         }
     }
 
@@ -199,17 +203,105 @@ impl Dawn {
         else {
             return;
         };
-        let Some(output) = self.space.outputs().next() else { return };
-        let Some(output_geo) = self.space.output_geometry(output) else { return };
         let Some(window_geo) = self.space.element_geometry(&window) else { return };
 
-        let mut target = output_geo;
+        // Вписываем в ВИДИМУЮ часть холста, а не в output_geometry: у второго
+        // размер всегда экранный, зум в него не входит (см. visible_canvas_rect).
+        let mut target = self.visible_canvas_rect();
         target.loc -= get_popup_toplevel_coords(&kind);
         target.loc -= window_geo.loc;
 
-        popup.with_pending_state(|state| {
-            state.geometry = state.positioner.get_unconstrained_geometry(target);
+        let (было, стало, по_центру) = popup.with_pending_state(|state| {
+            let требуемое = state.positioner.get_geometry();
+            let новое = match center_if_window_sized(target, требуемое.size) {
+                Some(loc) => Rectangle::new(loc, требуемое.size),
+                None => state.positioner.get_unconstrained_geometry(target),
+            };
+            state.geometry = новое;
+            (требуемое, новое, новое.loc != требуемое.loc && новое.size == требуемое.size)
         });
+
+        tracing::debug!(
+            "dawn/popup: окно={:?} рамка={:?} просили={:?}×{:?} стало={:?} по_центру={}",
+            window_geo,
+            target,
+            было.loc,
+            было.size,
+            стало,
+            по_центру,
+        );
+    }
+}
+
+/// Попап размером почти во весь экран — это не меню, а окно: просмотрщик
+/// картинок (telegram), оверлей, всплывающий плеер. Для него возвращается
+/// позиция ПО ЦЕНТРУ видимой области, для обычного меню — None (пусть его
+/// двигает позиционер клиента).
+///
+/// Зачем: `get_unconstrained_geometry` умеет только двигать/переворачивать
+/// прямоугольник, чтобы тот влез в рамку. Прямоугольник размером с рамку (или
+/// больше) влезть не может, и подгонка прижимает его к углу — то есть к углу
+/// экрана. Именно так открывался просмотр картинок.
+fn center_if_window_sized(
+    target: Rectangle<i32, Logical>,
+    requested: Size<i32, Logical>,
+) -> Option<Point<i32, Logical>> {
+    // 70% хотя бы по одной стороне: меню такой ширины/высоты не бывает, а
+    // просмотрщик, наоборот, просит почти весь экран.
+    let крупный = requested.w * 10 >= target.size.w * 7
+        || requested.h * 10 >= target.size.h * 7;
+    if !крупный {
+        return None;
+    }
+    Some(Point::from((
+        target.loc.x + (target.size.w - requested.w) / 2,
+        target.loc.y + (target.size.h - requested.h) / 2,
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::center_if_window_sized;
+    use smithay::utils::{Logical, Point, Rectangle, Size};
+
+    /// Рамка в координатах родительского окна: окно стоит не в начале холста,
+    /// поэтому её угол отрицательный — так это и приходит в unconstrain_popup.
+    fn рамка() -> Rectangle<i32, Logical> {
+        Rectangle::new(Point::from((-400, -250)), Size::from((2560, 1080)))
+    }
+
+    #[test]
+    fn меню_позиционер_двигает_сам() {
+        assert_eq!(center_if_window_sized(рамка(), Size::from((220, 400))), None);
+        // Даже широкое меню (половина экрана) остаётся меню.
+        assert_eq!(center_if_window_sized(рамка(), Size::from((1200, 300))), None);
+    }
+
+    #[test]
+    fn просмотрщик_во_весь_экран_встаёт_по_центру() {
+        let loc = center_if_window_sized(рамка(), Size::from((2560, 1080)))
+            .expect("попап размером с экран должен центрироваться");
+        // Ровно рамка: центр совпадает с её углом, а не уезжает в угол экрана.
+        assert_eq!(loc, Point::from((-400, -250)));
+    }
+
+    #[test]
+    fn крупный_попап_ставится_серединой_в_середину_рамки() {
+        let requested = Size::from((2000, 900));
+        let loc = center_if_window_sized(рамка(), requested).expect("крупный");
+        let центр_попапа = (loc.x + requested.w / 2, loc.y + requested.h / 2);
+        let центр_рамки = (-400 + 2560 / 2, -250 + 1080 / 2);
+        assert_eq!(центр_попапа, центр_рамки);
+    }
+
+    #[test]
+    fn попап_больше_экрана_не_прижимается_к_углу() {
+        // На приближенном зуме видимая область меньше экрана — просмотрщик
+        // тогда крупнее рамки. Позиция обязана остаться отрицательной
+        // (окно шире рамки и торчит за оба края), а не быть углом рамки.
+        let узкая = Rectangle::new(Point::from((0, 0)), Size::from((1200, 600)));
+        let loc = center_if_window_sized(узкая, Size::from((2560, 1080))).expect("крупный");
+        assert_eq!(loc, Point::from((-680, -240)));
     }
 }
 

@@ -17,6 +17,13 @@ smithay = { git = "https://github.com/Smithay/smithay.git", rev = "5312d5caedd0c
     "backend_session_libseat",
     "backend_egl",
     "renderer_gl",
+    # Запасной путь отрисовки аппаратного слоя курсора. Быстрая дорожка у
+    # smithay умеет только побайтовое копирование буфера в bo слоя и сдаётся,
+    # как только у элемента есть масштаб, — а он появляется, когда мы ужимаем
+    # курсор клиента до cursor_client_max (см. udev.rs). Без pixman такой
+    # курсор просто не попал бы на слой и подмешивался бы в кадр, заставляя
+    # перерисовывать его на каждое движение мыши.
+    "renderer_pixman",
     "wayland_frontend",
     "desktop",
     "xwayland",

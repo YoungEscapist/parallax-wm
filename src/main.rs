@@ -241,6 +241,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // и тот же кадр, иначе видно промежуточное состояние (см.
         // fullscreen.rs).
         state.apply_pending_fullscreen();
+        // …а уже развёрнутому окну возвращается кадр, если его успел увести
+        // обзор или перелёт по столам (см. resync_fullscreen_frame).
+        state.resync_fullscreen_frame();
         // X11-клиенты должны узнать, куда мы их передвинули за этот тик
         // (раскладка, анимации, драг) — см. Dawn::sync_x11_geometry.
         state.sync_x11_geometry();

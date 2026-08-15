@@ -214,6 +214,31 @@ else
     echo "dwall не найден по пути $DWALL_BIN — обои не запустятся" >&2
 fi
 
+# ── История буфера обмена (Super+C) ─────────────────────────────────────────
+# cliphist сам ничего не слушает: за буфером следит wl-paste и складывает
+# каждое копирование в базу (~/.cache/cliphist/db). Два сторожа, а не один:
+# `wl-paste --watch` без --type берёт только ПРЕДПОЧТИТЕЛЬНЫЙ тип, и снимок
+# экрана (image/png) мимо текстового сторожа прошёл бы незамеченным — а он тут
+# главный жилец (PrtScr кладёт скрин ровно сюда).
+#
+# Ждём ту же строчку сокета, что и dwall: до неё композитора ещё нет, и
+# wl-paste просто вышел бы с ошибкой.
+if command -v cliphist >/dev/null 2>&1 && command -v wl-paste >/dev/null 2>&1; then
+    (
+        for _ in $(seq 1 100); do
+            grep -q "dawn socket:" "$LOG" 2>/dev/null && break
+            sleep 0.1
+        done
+        grep -q "dawn socket:" "$LOG" 2>/dev/null || exit 0
+        export WAYLAND_DISPLAY=wayland-1
+        unset DISPLAY
+        wl-paste --type text --watch cliphist store >/dev/null 2>&1 &
+        wl-paste --type image --watch cliphist store >/dev/null 2>&1 &
+        wait
+    ) &
+    CLIPHIST_PID=$!
+fi
+
 START_TIMEOUT="${DAWN_START_TIMEOUT:-25}"
 (
     for _ in $(seq 1 "$START_TIMEOUT"); do
@@ -238,6 +263,11 @@ cleanup() {
     [[ -n "${WATCHDOG_PID:-}" ]] && kill "$WATCHDOG_PID" 2>/dev/null || true
     [[ -n "${DWALL_PID:-}" ]] && kill -- -"$DWALL_PID" 2>/dev/null || kill "$DWALL_PID" 2>/dev/null || true
     pkill -f "$DWALL_BIN" 2>/dev/null || true
+    # Сторожа буфера тоже уводим с собой: без композитора им не за чем следить,
+    # а переживший сессию wl-paste цеплялся бы к мёртвому сокету.
+    [[ -n "${CLIPHIST_PID:-}" ]] && kill "$CLIPHIST_PID" 2>/dev/null || true
+    pkill -f "wl-paste --type text --watch cliphist" 2>/dev/null || true
+    pkill -f "wl-paste --type image --watch cliphist" 2>/dev/null || true
     # PipeWire гасим только тот, что подняли САМИ: если он уже работал до нас,
     # он общий для всей пользовательской сессии и не наш, чтобы его убивать.
     for pid in "${PIPEWIRE_PIDS[@]:-}"; do

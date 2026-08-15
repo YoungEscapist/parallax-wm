@@ -201,17 +201,37 @@ struct Node<T> {
     /// Доля первого ребёнка: размер = половина * split_ratio, 0.1..1.9.
     split_ratio: f32,
     b: FBox,
+    /// Минимальный размер клиента этого листа (0 — «ужмётся во что угодно»).
+    /// У внутренних узлов не используется: их запрос считается из детей,
+    /// см. [`DwindleTree::demands`].
+    min: (f64, f64),
 }
 
+#[derive(Clone)]
 pub struct DwindleTree<T = Window> {
     nodes: Vec<Option<Node<T>>>,
     free: Vec<usize>,
+    /// Для какого набора окон и минимумов дерево уже пересобирали
+    /// ([`Self::packed`]). Пересборка стоит ~256 мкс на пяти окнах — считать её
+    /// на каждый arrange нельзя: при перетаскивании их до 324 в секунду, это
+    /// 8% ядра впустую. Набор не менялся — результат будет тот же, и считать
+    /// его незачем. Заполняет и читает это поле `tiling::sync_dwindle_tree`.
+    pub packed_for: Option<u64>,
+}
+
+/// Запрос поддерева на место, по обеим осям: `hard` — минимум, ниже которого
+/// клиент просто не ужмётся, `soft` — размер, который поддерево получило бы,
+/// не будь ограничений. См. [`DwindleTree::demands`].
+#[derive(Clone, Copy, Default)]
+struct Demand {
+    hard: (f64, f64),
+    soft: (f64, f64),
 }
 
 // derive(Default) потребовал бы T: Default — у Window его нет.
 impl<T> Default for DwindleTree<T> {
     fn default() -> Self {
-        Self { nodes: Vec::new(), free: Vec::new() }
+        Self { nodes: Vec::new(), free: Vec::new(), packed_for: None }
     }
 }
 
@@ -300,6 +320,256 @@ impl<T: Leaf> DwindleTree<T> {
         self.node_of(window).map(|i| self.n(i).b)
     }
 
+    /// Собирает дерево с нуля «крупные первыми»: окно с самым большим минимумом
+    /// садится в ещё не разрезанный холст, следующее — в тот лист, где хватит
+    /// места обоим ([`Self::closest_fitting_node`]), и так далее.
+    ///
+    /// Зачем это поверх обычной вставки: дерево растёт по одному окну и про
+    /// СЕГОДНЯШНИЕ минимумы не знает — X11-клиент сообщает их после маппинга, а
+    /// Electron меняет на лету. К моменту, когда окно объявляет «меньше 1010 не
+    /// покажу», оно уже сидит в колонке 924 px, и разворотом оси такое не
+    /// лечится: виновата сама топология, а не деление узла (замер 12.08.2026 —
+    /// пять окон в четыре колонки, минимумы 2754 px при экране 2524).
+    ///
+    /// Точка вставки — центр рабочей области, а НЕ нынешние места окон: иначе
+    /// пересборка зависела бы от того, куда окна разъехались в прошлый раз, и
+    /// раскладка гуляла бы от каждого arrange (а при перетаскивании он зовётся
+    /// сотни раз в секунду — замер: 324 вызова за секунду). Так результат
+    /// зависит только от набора окон, их минимумов и размера экрана: повторный
+    /// вызов даёт то же самое дерево и ничего не переставляет.
+    pub fn packed(
+        windows: &[T],
+        area: Rectangle<i32, Logical>,
+        cfg: &DwindleConfig,
+        min_of: impl Fn(&T) -> (f64, f64),
+    ) -> Self {
+        let центр = Point::from((
+            area.loc.x as f64 + area.size.w as f64 / 2.0,
+            area.loc.y as f64 + area.size.h as f64 / 2.0,
+        ));
+        let mut порядок: Vec<&T> = windows.iter().collect();
+        порядок.sort_by(|a, b| {
+            let ((aw, ah), (bw, bh)) = (min_of(a), min_of(b));
+            (bw * bh).total_cmp(&(aw * ah))
+        });
+        let mut tree = Self::default();
+        for w in порядок {
+            tree.set_min_sizes(&min_of);
+            tree.recalc(area, cfg);
+            // Куда сажать — решаем ПРИМЕРКОЙ: каждый лист пробуется соседом, и
+            // берётся тот, после которого недостача по всему столу наименьшая.
+            //
+            // Без примерки (просто «ближайший подходящий, а если некуда — самый
+            // большой слот») выходило близоруко: третье окно садилось к первому
+            // просто потому, что его слот больше, и занимало место, которого
+            // потом не хватало четвёртому. На столе из жалобы это давало те же
+            // четыре колонки в ряд и недостачу 230 px вместо 8.
+            //
+            // Цена — по одному пересчёту на лист, то есть O(n²) на сборку. При
+            // десятке окон это доли миллисекунды, и платим мы её только когда
+            // минимумы уже не влезли (см. вызов в tiling::sync_dwindle_tree).
+            let листья: Vec<usize> = tree.nodes.iter().enumerate()
+                .filter(|(_, n)| n.as_ref().is_some_and(|n| n.children.is_none() && n.window.is_some()))
+                .map(|(i, _)| i)
+                .collect();
+            let mut лучшее: Option<(f64, Self)> = None;
+            for куда in листья.into_iter().map(Some).chain(std::iter::once(None)) {
+                let mut проба = tree.clone();
+                проба.insert(w.clone(), куда, центр, area, cfg, None);
+                проба.set_min_sizes(&min_of);
+                проба.recalc(area, cfg);
+                let недостача = проба.min_shortfall(&min_of);
+                if лучшее.as_ref().is_none_or(|(b, _)| недостача < *b) {
+                    лучшее = Some((недостача, проба));
+                }
+            }
+            if let Some((_, лучшая)) = лучшее {
+                tree = лучшая;
+            }
+        }
+        tree.set_min_sizes(&min_of);
+        tree.recalc(area, cfg);
+        tree.improve_by_swaps(area, cfg, &min_of);
+        tree
+    }
+
+    /// Доводка готового дерева обменом жильцов: два листа меняются окнами, и
+    /// обмен остаётся, если недостача по столу от него УМЕНЬШИЛАСЬ.
+    ///
+    /// Нужна потому, что сборка идёт по одному окну и будущих соседей не знает:
+    /// на столе из жалобы окно с минимумом 616 по высоте вставало в стопку с
+    /// окном на 520 (вместе 1136 при экране 1028), хотя рядом стоял терминал
+    /// без всяких требований — обмен этих двух местами убирает 100 из 108 px
+    /// недостачи. Ходов немного (пары листьев × круги), считаем только когда
+    /// минимумы и так не влезли.
+    fn improve_by_swaps(
+        &mut self,
+        area: Rectangle<i32, Logical>,
+        cfg: &DwindleConfig,
+        min_of: impl Fn(&T) -> (f64, f64),
+    ) {
+        let листья: Vec<usize> = self.nodes.iter().enumerate()
+            .filter(|(_, n)| n.as_ref().is_some_and(|n| n.children.is_none() && n.window.is_some()))
+            .map(|(i, _)| i)
+            .collect();
+        // Круги: удачный обмен меняет расстановку, и следующая пара считается
+        // уже по ней. Останавливаемся, как только круг не дал улучшения.
+        for _ in 0..4 {
+            let mut лучше = false;
+            let mut текущая = self.min_shortfall(&min_of);
+            if текущая <= 0.0 {
+                return;
+            }
+            for (k, &a) in листья.iter().enumerate() {
+                for &b in листья.iter().skip(k + 1) {
+                    self.swap_leaf_windows(a, b);
+                    self.set_min_sizes(&min_of);
+                    self.recalc(area, cfg);
+                    let новая = self.min_shortfall(&min_of);
+                    if новая + 0.5 < текущая {
+                        текущая = новая;
+                        лучше = true;
+                    } else {
+                        // Не помогло — возвращаем как было.
+                        self.swap_leaf_windows(a, b);
+                        self.set_min_sizes(&min_of);
+                        self.recalc(area, cfg);
+                    }
+                }
+            }
+            if !лучше {
+                return;
+            }
+        }
+    }
+
+    /// Меняет местами окна двух листьев вместе с их минимумами.
+    fn swap_leaf_windows(&mut self, a: usize, b: usize) {
+        if a == b || !self.alive(a) || !self.alive(b) {
+            return;
+        }
+        let (окно_a, мин_a) = (self.n(a).window.clone(), self.n(a).min);
+        let (окно_b, мин_b) = (self.n(b).window.clone(), self.n(b).min);
+        let na = self.nm(a);
+        na.window = окно_b;
+        na.min = мин_b;
+        let nb = self.nm(b);
+        nb.window = окно_a;
+        nb.min = мин_a;
+    }
+
+    /// Насколько раскладка НЕ дотянула до минимумов клиентов: сумма недостачи по
+    /// обеим осям, в пикселях. Ноль — влезли все.
+    ///
+    /// Это и есть мера перекрытия: окно, которому слот мал, не ужимается, а
+    /// остаётся своего размера и вылезает на соседа ровно на недостачу
+    /// (см. `tiling::fit_to_constraints`). По этому числу и выбирается лучшая из
+    /// раскладок, см. `tiling::repack_dwindle_tree`.
+    pub fn min_shortfall(&self, min_of: impl Fn(&T) -> (f64, f64)) -> f64 {
+        self.nodes
+            .iter()
+            .filter_map(|n| n.as_ref())
+            .filter(|n| n.children.is_none())
+            .filter_map(|n| n.window.as_ref().map(|w| (n.b, min_of(w))))
+            .map(|(b, (mw, mh))| (mw - b.w).max(0.0) + (mh - b.h).max(0.0))
+            .sum()
+    }
+
+    /// Половины, на которые распадётся слот `b` при следующем делении: ось
+    /// берётся из его пропорций, как в `recalcSizePosRecursive`.
+    fn split_halves(b: FBox, cfg: &DwindleConfig) -> (f64, f64) {
+        let split_top = b.h * cfg.split_width_multiplier as f64 > b.w;
+        if split_top {
+            (b.w, b.h / 2.0)
+        } else {
+            (b.w / 2.0, b.h)
+        }
+    }
+
+    /// Делится ли слот `b` так, чтобы обе половины кого-то устроили: новое окно
+    /// с минимумом `min` — в одну, нынешний жилец слота — в другую.
+    ///
+    /// Проверять обоих обязательно. Иначе окно, которому слот подобрали по
+    /// размеру, у себя же его и теряет: следующее окно приходит, делит этот
+    /// слот пополам — и крупный жилец снова не помещается (замер в песочнице
+    /// 11.08.2026: Discord садился в подходящий слот и всё равно оставался с
+    /// перекрытием в 152 тыс. px²).
+    fn halves_fit(b: FBox, new_min: (f64, f64), resident_min: (f64, f64), _cfg: &DwindleConfig) -> bool {
+        let need_w = new_min.0.max(resident_min.0);
+        let need_h = new_min.1.max(resident_min.1);
+        // Годность слота меряем по ЛУЧШЕЙ из осей, а не по той, что подсказали
+        // пропорции: если вдоль подсказанной минимумы не влезают, а поперёк
+        // влезают, узел развернётся при первом же пересчёте (см. rescue_axis),
+        // и слот на самом деле годится. Раньше такой слот отбраковывался, окно
+        // уезжало к другому соседу — и не помещалось уже там.
+        let лево_право = b.w / 2.0 >= need_w && b.h >= need_h;
+        let верх_низ = b.h / 2.0 >= need_h && b.w >= need_w;
+        лево_право || верх_низ
+    }
+
+    /// Ближайший к точке лист, в чью половину окно РЕАЛЬНО влезет: после
+    /// деления слот распадается пополам, и если эта половина меньше
+    /// минимального размера клиента, он её не примет — останется прежнего
+    /// размера и накроет соседа.
+    ///
+    /// `min_of` — минимальный размер уже разложенного окна: половина, которая
+    /// достанется ему, должна годиться и ему тоже.
+    ///
+    /// Ту же проверку делает Hyprland в `addTarget`
+    /// (`DwindleAlgorithm.cpp`: «first, check if OPENINGON isn't too big»),
+    /// только с обратной стороны — по `maxSize`, и окно, которому слот не
+    /// годится, там выкидывается во float. Здесь окно остаётся в раскладке, но
+    /// садится туда, где помещается.
+    ///
+    /// Если подходящих листьев нет вовсе, берём САМЫЙ БОЛЬШОЙ: перекрытие тогда
+    /// неизбежно, но оно будет наименьшим из возможных (а `resize_window_animated`
+    /// ещё и отцентрирует окно в слоте, см. Hyprland `misc:size_limits_tiled`).
+    pub fn closest_fitting_node(
+        &self,
+        p: Point<f64, Logical>,
+        min: (f64, f64),
+        cfg: &DwindleConfig,
+        skip: Option<&T>,
+        min_of: impl Fn(&T) -> (f64, f64),
+    ) -> Option<usize> {
+        let mut best: Option<(usize, f64)> = None;
+        let mut biggest: Option<(usize, f64)> = None;
+        for (i, node) in self.nodes.iter().enumerate() {
+            let Some(node) = node else { continue };
+            let Some(w) = node.window.as_ref() else { continue };
+            if node.children.is_some() {
+                continue;
+            }
+            if skip.map(|s| s.same(w)).unwrap_or(false) {
+                continue;
+            }
+            let area = node.b.w * node.b.h;
+            if biggest.map(|(_, a)| area > a).unwrap_or(true) {
+                biggest = Some((i, area));
+            }
+            if !Self::halves_fit(node.b, min, min_of(w), cfg) {
+                continue;
+            }
+            let d = node.b.dist_sq(p);
+            if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((i, d));
+            }
+        }
+        best.or(biggest).map(|(i, _)| i)
+    }
+
+    /// Влезут ли в половины слота `window` и новое окно (`min`), и он сам.
+    pub fn split_fits(
+        &self,
+        window: &T,
+        min: (f64, f64),
+        cfg: &DwindleConfig,
+        min_of: impl Fn(&T) -> (f64, f64),
+    ) -> bool {
+        let Some(b) = self.box_of(window) else { return false };
+        Self::halves_fit(b, min, min_of(window), cfg)
+    }
+
     /// Ближайший к точке лист (`getClosestNode`).
     pub fn closest_node(&self, p: Point<f64, Logical>, skip: Option<&T>) -> Option<usize> {
         let mut best: Option<(usize, f64)> = None;
@@ -329,9 +599,173 @@ impl<T: Leaf> DwindleTree<T> {
         self.recalc_from(root, cfg, false, false);
     }
 
+    /// Запоминает минимальные размеры клиентов: делитель в [`recalc_from`]
+    /// двигается так, чтобы каждой стороне досталось не меньше её запроса.
+    ///
+    /// Обновлять надо перед раскладкой: у X11-окон подсказки размера приходят
+    /// уже после маппинга, а Electron меняет их на лету.
+    pub fn set_min_sizes(&mut self, min_of: impl Fn(&T) -> (f64, f64)) {
+        for node in self.nodes.iter_mut().flatten() {
+            node.min = match node.window.as_ref() {
+                Some(w) if node.children.is_none() => min_of(w),
+                _ => (0.0, 0.0),
+            };
+        }
+    }
+
+    /// Меньше этого тайлинг окно не ужимает, даже если клиент согласен: сосед с
+    /// большим минимумом иначе съедал бы слот целиком (замер: Discord просит 940
+    /// из 1600, и соседнему окну в его половине оставалось 0 px).
+    const MIN_TILE_W: f64 = 200.0;
+    const MIN_TILE_H: f64 = 150.0;
+
+    /// Сколько места просит КАЖДОЕ поддерево — два числа на ось:
+    ///
+    /// * `hard` — ниже этого нельзя: минимум клиента (но не меньше
+    ///   [`Self::MIN_TILE_W`]×[`Self::MIN_TILE_H`]);
+    /// * `soft` — сколько хотелось бы: обычный, ничем не стеснённый размер из
+    ///   первого прохода, но не меньше `hard`.
+    ///
+    /// У узла оба складываются вдоль оси деления и берутся по максимуму поперёк.
+    ///
+    /// `soft` нужен, чтобы недостачу разделили ВСЕ окна, а не один сосед. Без
+    /// него запрос Discord'а (940 из 2524) целиком вычитался из соседней плитки:
+    /// та ужималась с 631 до 306, а две колонки слева стояли нетронутыми.
+    ///
+    /// Обход обратно прямому: в нём ребёнок всегда встречается раньше родителя,
+    /// значит к моменту расчёта узла его дети уже посчитаны.
+    fn demands(&self) -> Vec<Demand> {
+        let mut out = vec![Demand::default(); self.nodes.len()];
+        let mut order: Vec<usize> = Vec::new();
+        let mut stack: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.as_ref().is_some_and(|n| n.parent.is_none()))
+            .map(|(i, _)| i)
+            .collect();
+        while let Some(i) = stack.pop() {
+            order.push(i);
+            if let Some([c0, c1]) = self.n(i).children {
+                stack.push(c0);
+                stack.push(c1);
+            }
+        }
+        for &i in order.iter().rev() {
+            let node = self.n(i);
+            out[i] = match node.children {
+                None => {
+                    let hard = (
+                        node.min.0.max(Self::MIN_TILE_W),
+                        node.min.1.max(Self::MIN_TILE_H),
+                    );
+                    Demand { hard, soft: (hard.0.max(node.b.w), hard.1.max(node.b.h)) }
+                }
+                Some([c0, c1]) => {
+                    let (a, b) = (out[c0], out[c1]);
+                    if node.split_top {
+                        Demand {
+                            hard: (a.hard.0.max(b.hard.0), a.hard.1 + b.hard.1),
+                            soft: (a.soft.0.max(b.soft.0), a.soft.1 + b.soft.1),
+                        }
+                    } else {
+                        Demand {
+                            hard: (a.hard.0 + b.hard.0, a.hard.1.max(b.hard.1)),
+                            soft: (a.soft.0 + b.soft.0, a.soft.1.max(b.soft.1)),
+                        }
+                    }
+                }
+            };
+        }
+        out
+    }
+
+    /// Делитель: желаемая доля (`soft` первого от суммы `soft`), зажатая так,
+    /// чтобы обеим сторонам хватило на `hard`.
+    ///
+    /// Пока никто не стеснён, `soft` — это размеры первого прохода, их сумма
+    /// равна `total`, и делитель остаётся ровно там, где стоял. Кто-то просит
+    /// больше — сумма `soft` превышает `total`, и доли ужимаются
+    /// пропорционально: недостача расходится по всем окнам сразу.
+    ///
+    /// Если и `hard` не влезают (окон больше, чем помещается), делим по ним же
+    /// пропорционально: перекрытие тогда неизбежно, но достанется всем
+    /// понемногу, а не одному соседу целиком.
+    fn divider(total: f64, first: (f64, f64), second: (f64, f64)) -> f64 {
+        let ((hard_a, soft_a), (hard_b, soft_b)) = (first, second);
+        let share = |a: f64, b: f64| if a + b > 0.0 { total * a / (a + b) } else { total / 2.0 };
+        let lo = hard_a.min(total);
+        let hi = (total - hard_b).max(0.0);
+        if lo <= hi {
+            share(soft_a, soft_b).clamp(lo, hi)
+        } else {
+            share(hard_a, hard_b)
+        }
+    }
+
     /// Пересчёт поддерева от `idx` вниз, его собственный `b` уже задан.
     /// `h_override`/`v_override` действуют только на сам `idx` (как в Hyprland).
+    ///
+    /// Первый проход расставляет оси делений по пропорциям слота (они зависят
+    /// от геометрии), дальше идут проходы с оглядкой на минимумы клиентов.
+    ///
+    /// Проходов с минимумами несколько, потому что «спасательный» разворот оси
+    /// (см. [`Self::rescue_axis`]) меняет и сами запросы поддеревьев: они
+    /// складываются ВДОЛЬ оси узла, и перевёрнутый узел просит уже другое.
+    /// Поэтому после каждого прохода запросы пересчитываются, а проход
+    /// повторяется, пока оси не перестанут меняться. Обычно хватает двух
+    /// кругов; потолок — от зацикливания на патовых раскладках.
     fn recalc_from(&mut self, idx: usize, cfg: &DwindleConfig, h_override: bool, v_override: bool) {
+        self.geometry_pass(idx, cfg, h_override, v_override, None);
+        for _ in 0..4 {
+            let axes = self.axes();
+            let demands = self.demands();
+            self.geometry_pass(idx, cfg, h_override, v_override, Some(&demands));
+            if self.axes() == axes {
+                break;
+            }
+        }
+    }
+
+    /// Оси всех живых узлов — снимок для проверки «прошлый проход ничего не
+    /// перевернул, можно останавливаться».
+    fn axes(&self) -> Vec<bool> {
+        self.nodes.iter().map(|n| n.as_ref().is_some_and(|n| n.split_top)).collect()
+    }
+
+    /// Разворот узла поперёк, когда вдоль текущей оси минимумы детей не влезают,
+    /// а поперёк — влезают. Возвращает ось, которую надо взять.
+    ///
+    /// Зачем: ось выбирается по пропорциям слота и про минимумы клиентов не
+    /// знает вовсе. На столе Ярика (замер 12.08.2026, лог 15:22:21) это давало
+    /// четыре колонки в ряд при минимумах 380+940+1010+360 = 2690 px на экране
+    /// шириной 2524 — не влезает НИКАК, и делить оставалось только внахлёст.
+    /// А стопка из двух окон в одной колонке те же окна вмещает: 940 и 380 друг
+    /// над другом — это 940 в ширину и 1004 в высоту при экране 1028.
+    ///
+    /// Только спасение: пока минимумы вдоль текущей оси влезают, ось не
+    /// трогаем — иначе раскладка перекраивалась бы от каждого ресайза.
+    fn rescue_axis(split_top: bool, b: FBox, first: Demand, second: Demand) -> bool {
+        const EPS: f64 = 0.5;
+        let (a, c) = (first.hard, second.hard);
+        // Влезает вдоль оси И поперёк неё: у соседей поперёк общий размер слота.
+        let лево_право = a.0 + c.0 <= b.w + EPS && a.1.max(c.1) <= b.h + EPS;
+        let верх_низ = a.1 + c.1 <= b.h + EPS && a.0.max(c.0) <= b.w + EPS;
+        match split_top {
+            true if !верх_низ && лево_право => false,
+            false if !лево_право && верх_низ => true,
+            _ => split_top,
+        }
+    }
+
+    fn geometry_pass(
+        &mut self,
+        idx: usize,
+        cfg: &DwindleConfig,
+        h_override: bool,
+        v_override: bool,
+        demands: Option<&[Demand]>,
+    ) {
         let mut stack = vec![(idx, h_override, v_override)];
         while let Some((i, ho, vo)) = stack.pop() {
             if !self.alive(i) {
@@ -342,8 +776,22 @@ impl<T: Leaf> DwindleTree<T> {
 
             let split_top = {
                 let node = self.nm(i);
-                if !cfg.preserve_split {
+                // Во втором проходе оси НЕ пересчитываем: запросы поддеревьев
+                // сложены вдоль осей первого прохода, а раздвинутый под минимум
+                // слот меняет пропорции — узел перевернулся бы, и суммы поехали
+                // (замер: колонка 940×900 переворачивалась в лево/право, и окно
+                // с минимумом 940 получало 775).
+                if !cfg.preserve_split && demands.is_none() {
                     node.split_top = b.h * cfg.split_width_multiplier as f64 > b.w;
+                }
+                // Спасательный разворот — уже с запросами на руках. Он не
+                // «пересчёт оси по пропорциям», от которого предостерегает
+                // абзац выше: ось меняется, только если вдоль неё минимумы
+                // детей не влезают вовсе, а поперёк влезают. Такой узел
+                // обратно не перевернётся (иначе минимумы снова не влезут),
+                // поэтому круги в recalc_from сходятся.
+                if let Some(d) = demands {
+                    node.split_top = Self::rescue_axis(node.split_top, b, d[c0], d[c1]);
                 }
                 if vo {
                     node.split_top = true;
@@ -356,12 +804,18 @@ impl<T: Leaf> DwindleTree<T> {
 
             if !split_top {
                 // лево/право
-                let first = (b.w / 2.0 * ratio).clamp(0.0, b.w);
+                let mut first = (b.w / 2.0 * ratio).clamp(0.0, b.w);
+                if let Some(d) = demands {
+                    first = Self::divider(b.w, (d[c0].hard.0, d[c0].soft.0), (d[c1].hard.0, d[c1].soft.0));
+                }
                 self.nm(c0).b = FBox { x: b.x, y: b.y, w: first, h: b.h };
                 self.nm(c1).b = FBox { x: b.x + first, y: b.y, w: b.w - first, h: b.h };
             } else {
                 // верх/низ
-                let first = (b.h / 2.0 * ratio).clamp(0.0, b.h);
+                let mut first = (b.h / 2.0 * ratio).clamp(0.0, b.h);
+                if let Some(d) = demands {
+                    first = Self::divider(b.h, (d[c0].hard.1, d[c0].soft.1), (d[c1].hard.1, d[c1].soft.1));
+                }
                 self.nm(c0).b = FBox { x: b.x, y: b.y, w: b.w, h: first };
                 self.nm(c1).b = FBox { x: b.x, y: b.y + first, w: b.w, h: b.h - first };
             }
@@ -396,6 +850,7 @@ impl<T: Leaf> DwindleTree<T> {
             split_top: false,
             split_ratio: 1.0,
             b: FBox::from_rect(work_area),
+            min: (0.0, 0.0),
         });
 
         // Слот, который делим: живой лист, не сам вставляемый узел.
@@ -424,6 +879,7 @@ impl<T: Leaf> DwindleTree<T> {
             split_top: false,
             split_ratio: cfg.default_split_ratio.clamp(0.1, 1.9),
             b: op_box,
+            min: (0.0, 0.0),
         });
 
         // Пропорции слота решают ось деления (шире → лево/право).
@@ -756,9 +1212,7 @@ impl<T: Leaf> DwindleTree<T> {
     /// Размер, который получит следующее окно, если разделить слот `window`
     /// (`predictSizeForNewTarget`) — чтобы не слать клиенту лишний configure.
     pub fn predict_split_size(&self, window: &T, cfg: &DwindleConfig) -> Option<(f64, f64)> {
-        let b = self.box_of(window)?;
-        let split_top = b.h * cfg.split_width_multiplier as f64 > b.w;
-        Some(if split_top { (b.w, b.h / 2.0) } else { (b.w / 2.0, b.h) })
+        Some(Self::split_halves(self.box_of(window)?, cfg))
     }
 }
 
@@ -1008,6 +1462,261 @@ mod tests {
         }
         assert_eq!(t.leaf_rects().len(), 6);
     }
+
+    /// Окно с минимальным размером не должно садиться в слот, чья половина его
+    /// меньше: иначе клиент откажется ужаться и накроет соседа (Discord 940×500
+    /// в слоте 615 px, замер 11.08.2026).
+    #[test]
+    fn крупное_окно_садится_туда_куда_влезает() {
+        let cfg = DwindleConfig::default();
+        let mut t = DwindleTree::<W>::default();
+        add(&mut t, 1, None, p(0.0, 0.0));
+        add(&mut t, 2, Some(W(1)), p(1500.0, 450.0));
+        add(&mut t, 3, Some(W(2)), p(1500.0, 800.0));
+        // Слоты: 1 = 800x900, 2 и 3 = 800x450. Окно шириной 800 влезает только
+        // в половину слота 1 по вертикали (800x450), у 2 и 3 половина 800x225.
+        let on = t.closest_fitting_node(p(1500.0, 800.0), (800.0, 400.0), &cfg, None, |_| (0.0, 0.0));
+        assert_eq!(on, t.node_of(&W(1)), "выбран слот, в который окно не влезает");
+        t.insert(W(4), on, p(1500.0, 800.0), area(), &cfg, None);
+        t.recalc(area(), &cfg);
+        assert_eq!(rect_of(&t, 4).size, (800, 450).into());
+        assert_tiles_cover_area(&t);
+    }
+
+    /// Влезающих слотов нет вовсе — берём самый большой, а не первый попавшийся:
+    /// перекрытие тогда неизбежно, но наименьшее.
+    #[test]
+    fn когда_не_влезает_никуда_берём_самый_большой_слот() {
+        let cfg = DwindleConfig::default();
+        let mut t = DwindleTree::<W>::default();
+        add(&mut t, 1, None, p(0.0, 0.0));
+        add(&mut t, 2, Some(W(1)), p(1500.0, 450.0));
+        add(&mut t, 3, Some(W(2)), p(1500.0, 800.0));
+        // Слот 1 (800x900) — самый большой, но и его половины не хватает.
+        let on = t.closest_fitting_node(p(1500.0, 800.0), (5000.0, 5000.0), &cfg, None, |_| (0.0, 0.0));
+        assert_eq!(on, t.node_of(&W(1)));
+    }
+
+    /// Слот не дробится, если в оставшейся половине перестанет помещаться его
+    /// нынешний жилец: иначе окно, которому слот подобрали, тут же его теряет.
+    #[test]
+    fn слот_крупного_жильца_не_дробится() {
+        let cfg = DwindleConfig::default();
+        let mut t = DwindleTree::<W>::default();
+        add(&mut t, 1, None, p(0.0, 0.0));
+        add(&mut t, 2, Some(W(1)), p(1500.0, 450.0));
+        // Окно 1 (слот 800x900) требует 800x500 — делить его слот нельзя:
+        // половина вышла бы 800x450. Новичок без ограничений уходит к окну 2.
+        let min_of = |w: &W| if w.0 == 1 { (800.0, 500.0) } else { (0.0, 0.0) };
+        let on = t.closest_fitting_node(p(10.0, 10.0), (0.0, 0.0), &cfg, None, min_of);
+        assert_eq!(on, t.node_of(&W(2)), "разделили слот, где жилец больше не поместится");
+        assert!(!t.split_fits(&W(1), (0.0, 0.0), &cfg, min_of));
+        assert!(t.split_fits(&W(2), (0.0, 0.0), &cfg, min_of));
+    }
+
+    /// Без ограничений выбор не меняется: берётся ближайший лист, как и раньше.
+    #[test]
+    fn без_минимального_размера_выбор_прежний() {
+        let cfg = DwindleConfig::default();
+        let mut t = DwindleTree::<W>::default();
+        add(&mut t, 1, None, p(0.0, 0.0));
+        add(&mut t, 2, Some(W(1)), p(1500.0, 450.0));
+        add(&mut t, 3, Some(W(2)), p(1500.0, 800.0));
+        for focal in [p(10.0, 10.0), p(1500.0, 100.0), p(1500.0, 850.0)] {
+            assert_eq!(
+                t.closest_fitting_node(focal, (0.0, 0.0), &cfg, None, |_| (0.0, 0.0)),
+                t.closest_node(focal, None),
+                "фокус {focal:?}",
+            );
+        }
+    }
+
+    /// Главное свойство: делитель двигается ПОД минимум клиента. Четыре окна на
+    /// 1600 px дают колонки по 400, но окну с минимумом 940 достаётся 940, а
+    /// остальные ужимаются — раскладка по-прежнему без дыр и без перекрытий.
+    #[test]
+    fn минимум_клиента_раздвигает_делители() {
+        let cfg = DwindleConfig::default();
+        let mut t = DwindleTree::<W>::default();
+        add(&mut t, 1, None, p(0.0, 0.0));
+        add(&mut t, 2, Some(W(1)), p(1500.0, 450.0));
+        add(&mut t, 3, Some(W(1)), p(10.0, 10.0));
+        add(&mut t, 4, Some(W(2)), p(1500.0, 10.0));
+        t.set_min_sizes(|w| if w.0 == 4 { (940.0, 500.0) } else { (0.0, 0.0) });
+        t.recalc(area(), &cfg);
+        assert!(
+            rect_of(&t, 4).size.w >= 940,
+            "окну с минимумом 940 дали {:?}",
+            rect_of(&t, 4).size,
+        );
+        assert_tiles_cover_area(&t);
+    }
+
+    /// Запрос идёт ВВЕРХ по дереву: окно сидит на втором уровне, а раздвинуть
+    /// приходится корневой делитель — иначе его колонке взяться неоткуда.
+    #[test]
+    fn запрос_поднимается_до_корня() {
+        let cfg = DwindleConfig::default();
+        let mut t = DwindleTree::<W>::default();
+        add(&mut t, 1, None, p(0.0, 0.0));
+        add(&mut t, 2, Some(W(1)), p(1500.0, 450.0));
+        add(&mut t, 3, Some(W(2)), p(1500.0, 800.0));
+        // Слоты 2 и 3 — по 800x450 в правой половине. Окно 3 просит 800x700:
+        // его половину высоты можно взять только у соседа сверху.
+        t.set_min_sizes(|w| if w.0 == 3 { (800.0, 700.0) } else { (0.0, 0.0) });
+        t.recalc(area(), &cfg);
+        assert_eq!(rect_of(&t, 3).size, (800, 700).into());
+        assert_eq!(rect_of(&t, 2).size, (800, 200).into());
+        assert_tiles_cover_area(&t);
+    }
+
+    /// Минимумы не влезают на экран вовсе — место делится пропорционально
+    /// запросам: перекрытие неизбежно, но достаётся всем, а не одному соседу.
+    #[test]
+    fn когда_минимумы_не_влезают_делим_пропорционально() {
+        let cfg = DwindleConfig::default();
+        let mut t = DwindleTree::<W>::default();
+        add(&mut t, 1, None, p(0.0, 0.0));
+        add(&mut t, 2, Some(W(1)), p(1500.0, 450.0));
+        t.set_min_sizes(|w| if w.0 == 1 { (1000.0, 0.0) } else { (3000.0, 0.0) });
+        t.recalc(area(), &cfg);
+        assert_eq!(rect_of(&t, 1).size.w, 400); // 1600 * 1000/4000
+        assert_eq!(rect_of(&t, 2).size.w, 1200);
+        assert_tiles_cover_area(&t);
+    }
+
+    /// Без минимумов геометрия обязана быть прежней — новый расчёт не должен
+    /// шевелить обычную раскладку.
+    #[test]
+    fn без_минимумов_геометрия_прежняя() {
+        let cfg = DwindleConfig::default();
+        let mut t = DwindleTree::<W>::default();
+        for w in 1..=6u32 {
+            let focal = p((w as f64 * 137.0) % 1600.0, (w as f64 * 251.0) % 900.0);
+            let on = t.closest_node(focal, Some(&W(w)));
+            t.insert(W(w), on, focal, area(), &cfg, None);
+            t.recalc(area(), &cfg);
+        }
+        let before = t.leaf_rects();
+        t.set_min_sizes(|_| (0.0, 0.0));
+        t.recalc(area(), &cfg);
+        assert_eq!(before, t.leaf_rects());
+    }
+
+    /// Тот самый стол из жалобы 11.08.2026, числа из лога: экран 2560×1080,
+    /// рабочая область 2524×1044 (минус GAP_OUTER), четыре окна в колонках по
+    /// 631 (в логе — слот 615 после внутреннего зазора), одно из них Discord
+    /// с минимумом 940×500. Раньше он получал слот 615 и рисовался на 940,
+    /// накрывая двух соседей.
+    #[test]
+    fn стол_ярика_discord_получает_своё_и_никого_не_накрывает() {
+        const GAP: f64 = 16.0; // GAP_INNER из tiling.rs
+        let cfg = DwindleConfig::default();
+        let area = Rectangle::new((18, 18).into(), (2524, 1044).into());
+        let mut t = DwindleTree::<W>::default();
+        let insert = |t: &mut DwindleTree<W>, w: u32, on: Option<W>, focal| {
+            let node = on.and_then(|o| t.node_of(&o));
+            t.insert(W(w), node, focal, area, &cfg, None);
+            t.recalc(area, &cfg);
+        };
+        insert(&mut t, 1, None, p(0.0, 0.0));
+        insert(&mut t, 2, Some(W(1)), p(2000.0, 500.0));
+        insert(&mut t, 3, Some(W(1)), p(10.0, 500.0));
+        insert(&mut t, 4, Some(W(2)), p(2400.0, 500.0)); // Discord
+        for (w, r) in t.leaf_rects() {
+            assert_eq!(r.size.w, 631, "окно {w:?}: колонки должны быть по 631, {r:?}");
+        }
+
+        t.set_min_sizes(|w| if w.0 == 4 { (940.0 + GAP, 500.0 + GAP) } else { (0.0, 0.0) });
+        t.recalc(area, &cfg);
+
+        let rects = t.leaf_rects();
+        let discord = rects.iter().find(|(w, _)| w.0 == 4).unwrap().1;
+        assert!(
+            discord.size.w as f64 - GAP >= 940.0,
+            "Discord опять не получил свои 940: {discord:?}",
+        );
+        // Место отобрано у всех, а не у одного соседа: ни одна плитка не
+        // ужалась вдвое сильнее, чем в среднем нужно.
+        for (w, r) in &rects {
+            if w.0 != 4 {
+                assert!(r.size.w >= 450, "окно {w:?} ужали в {r:?} — слишком сильно");
+            }
+        }
+        let total: i64 = rects.iter().map(|(_, r)| r.size.w as i64 * r.size.h as i64).sum();
+        assert_eq!(total, 2524 * 1044, "раскладка перестала покрывать экран: {rects:?}");
+        for (i, (_, a)) in rects.iter().enumerate() {
+            for (_, b) in rects.iter().skip(i + 1) {
+                assert!(a.intersection(*b).is_none(), "окна пересекаются: {a:?} и {b:?}");
+            }
+        }
+    }
+
+    /// Стол Ярика из жалобы 12.08.2026. Числа взяты прямо из живого лога
+    /// (`dawn_native_20260812_140857.log`, 15:22:21): рабочая область
+    /// 2524×1028, пять окон, и у четырёх из них свой минимум —
+    /// 380×504, 940×500, 1010×600, 360×640 (в дерево они приходят с
+    /// прибавкой GAP_INNER, см. min_of в tiling.rs).
+    ///
+    /// В ряд эти минимумы не влезают никак: 396+956+1026+376 = 2754 при
+    /// экране 2524, и дерево честно делило внахлёст. Но раскладка, в которой
+    /// всё помещается, существует — надо лишь сложить два окна в колонку
+    /// (940 и 380 друг над другом: 1004 в высоту при 1028).
+    #[test]
+    fn стол_ярика_пять_окон_с_минимумами_не_налезают_друг_на_друга() {
+        const GAP: f64 = 16.0; // GAP_INNER из tiling.rs
+        let cfg = DwindleConfig::default();
+        let area = Rectangle::new((18, 26).into(), (2524, 1028).into());
+        let mut t = DwindleTree::<W>::default();
+        // Минимумы клиентов ровно из лога; окно 5 — обычный терминал без своих
+        // требований.
+        let min = |w: &W| match w.0 {
+            1 => (360.0 + GAP, 640.0 + GAP),
+            2 => (1010.0 + GAP, 600.0 + GAP),
+            3 => (940.0 + GAP, 500.0 + GAP),
+            4 => (380.0 + GAP, 504.0 + GAP),
+            _ => (0.0, 0.0),
+        };
+        let insert = |t: &mut DwindleTree<W>, w: u32, on: Option<W>, focal| {
+            let node = on.and_then(|o| t.node_of(&o));
+            t.insert(W(w), node, focal, area, &cfg, None);
+            t.set_min_sizes(&min);
+            t.recalc(area, &cfg);
+        };
+        insert(&mut t, 4, None, p(0.0, 0.0));
+        insert(&mut t, 3, Some(W(4)), p(1000.0, 500.0));
+        insert(&mut t, 2, Some(W(3)), p(1600.0, 500.0));
+        insert(&mut t, 5, Some(W(2)), p(1600.0, 200.0));
+        insert(&mut t, 1, Some(W(2)), p(2400.0, 500.0));
+        let выросло = t.min_shortfall(&min);
+        assert!(
+            выросло > 150.0,
+            "стол из жалобы должен не влезать (иначе тест ничего не проверяет), \
+             а недостача всего {выросло}",
+        );
+
+        // Пересборка: те же пять окон, но посаженные по минимумам.
+        let packed = DwindleTree::packed(
+            &[W(1), W(2), W(3), W(4), W(5)], area, &cfg, &min,
+        );
+        let собрано = packed.min_shortfall(&min);
+        assert_eq!(packed.leaf_rects().len(), 5, "при пересборке потерялось окно");
+        // Идеала здесь не существует: 396+956+1026+376 = 2754 в ряд при экране
+        // 2524, а лучшая из возможных раскладок (две колонки со стопкой) не
+        // дотягивает 8 px по высоте. Требуем именно её порядок величины, а не
+        // прежние две сотни.
+        assert!(
+            собрано <= 16.0,
+            "пересборка должна была уложить окна почти без нахлёста, \
+             а недостача {собрано} px: {:?}",
+            packed.leaf_rects(),
+        );
+        assert!(
+            собрано * 4.0 < выросло,
+            "пересборка не улучшила раскладку: было {выросло}, стало {собрано}",
+        );
+    }
+
 
     #[test]
     fn preserve_split_keeps_the_axis_a_toggle_put_there() {

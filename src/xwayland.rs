@@ -309,16 +309,20 @@ impl XwmHandler for Dawn {
     /// X11-клиент просит полный экран (_NET_WM_STATE_FULLSCREEN): игры,
     /// видеоплееры, полноэкранный режим браузера. Тот же путь, что и F11.
     fn fullscreen_request(&mut self, _xwm: XwmId, surface: X11Surface) {
+        // Лог именно здесь, а не только в set_fullscreen: игры переспрашивают
+        // полный экран сами (Source-движок делает это, теряя и возвращая
+        // фокус), и без отметки в логе череда «запрос — отказ — запрос»
+        // выглядит как самопроизвольные прыжки камеры.
+        tracing::info!("dawn/xwayland: клиент просит полный экран");
         if let Some(window) = self.window_for_x11(&surface) {
             self.set_fullscreen(&window);
         }
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, surface: X11Surface) {
-        let это_окно = self.window_for_x11(&surface)
-            .is_some_and(|w| self.fullscreen_requested(&w));
-        if это_окно {
-            self.unset_fullscreen();
+        tracing::info!("dawn/xwayland: клиент просит выйти из полного экрана");
+        if let Some(window) = self.window_for_x11(&surface) {
+            self.unset_fullscreen_window(&window);
         }
     }
 

@@ -212,6 +212,17 @@ impl Dawn {
             })
             .collect();
 
+        // Минимум клиента + внутренний зазор: слот ужимается на GAP_INNER (по
+        // половине с каждой стороны, см. apply_tile_layout), и окну достаётся
+        // именно столько.
+        let min_of = |w: &Window| {
+            let (min, _) = crate::xwin::size_constraints(w);
+            (
+                (min.w + GAP_INNER) as f64,
+                (min.h + GAP_INNER) as f64,
+            )
+        };
+
         let tree = self.dwindle_trees.entry(current_tags).or_default();
 
         for w in tree.windows() {
@@ -225,22 +236,93 @@ impl Dawn {
             .collect();
 
         if missing.len() == 1 {
+            tree.set_min_sizes(&min_of);
             tree.recalc(area, &cfg);
             let (w, _) = &missing[0];
-            let opening_on = focused
+            let min = min_of(w);
+            // Слот сфокусированного окна годится, только если новое окно в его
+            // половину влезает: иначе оно осталось бы своего размера и накрыло
+            // соседа. Не влезает — ищем ближайший подходящий.
+            let opening_on = match focused
                 .as_ref()
                 .filter(|f| !crate::dwindle::same_window(f, w))
-                .and_then(|f| tree.node_of(f))
-                .or_else(|| tree.closest_node(mouse, Some(w)));
+            {
+                Some(f) if tree.split_fits(f, min, &cfg, min_of) => tree.node_of(f),
+                _ => None,
+            }
+            .or_else(|| tree.closest_fitting_node(mouse, min, &cfg, Some(w), min_of));
             tree.insert(w.clone(), opening_on, mouse, area, &cfg, None);
         } else {
+            // «Сборка» (Win+D, возврат на тег): окна приходят пачкой и каждое
+            // садится к ближайшему по своей позиции соседу. Крупные — те, что
+            // не умеют ужиматься, — берём ПЕРВЫМИ: пока дерево мелко не
+            // порезано, им есть куда сесть, а мелкие потом влезут куда угодно.
+            let mut missing = missing;
+            missing.sort_by(|(a, _), (b, _)| {
+                let (aw, ah) = min_of(a);
+                let (bw, bh) = min_of(b);
+                (bw * bh).total_cmp(&(aw * ah))
+            });
             for (w, center) in missing {
+                tree.set_min_sizes(&min_of);
                 tree.recalc(area, &cfg);
-                let opening_on = tree.closest_node(center, Some(&w));
+                let opening_on =
+                    tree.closest_fitting_node(center, min_of(&w), &cfg, Some(&w), min_of);
                 tree.insert(w, opening_on, center, area, &cfg, None);
             }
         }
+        // Ещё раз, уже со всеми вставленными окнами: делители в recalc двигаются
+        // по минимумам, а у только что вставленного листа их ещё не было.
+        tree.set_min_sizes(&min_of);
         tree.recalc(area, &cfg);
+
+        // Минимумы влезли не все — значит нынешнее дерево кто-то накроет.
+        // Пробуем пересобрать его целиком и оставляем ту раскладку, где
+        // недостача меньше (см. repack_dwindle_tree).
+        // Подпись набора: окна, их минимумы и рабочая область. Пока она та же,
+        // пересобирать нечего — результат вышел бы тот же самый (см.
+        // DwindleTree::packed, он не зависит ни от чего другого).
+        let подпись = (tree.min_shortfall(&min_of) > 0.0)
+            .then(|| Self::dwindle_signature(&visible, area, &min_of));
+        if let Some(подпись) = подпись.filter(|п| tree.packed_for != Some(*п)) {
+            let собранное = crate::dwindle::DwindleTree::packed(&visible, area, &cfg, &min_of);
+            let было = tree.min_shortfall(&min_of);
+            let стало = собранное.min_shortfall(&min_of);
+            if стало + 1.0 < было {
+                tracing::debug!(
+                    "dawn/tile: дерево пересобрано, недостача {было:.0} → {стало:.0} px",
+                );
+                *tree = собранное;
+            }
+            tree.packed_for = Some(подпись);
+        }
+    }
+
+    /// Отпечаток набора окон для [`crate::dwindle::DwindleTree::packed`]: сами
+    /// окна, их минимумы и рабочая область. Минимумы входят обязательно — их
+    /// клиент присылает когда захочет (X11 — после маппинга, Electron — на
+    /// лету), и «те же окна» с новыми требованиями это уже другая задача.
+    fn dwindle_signature(
+        windows: &[Window],
+        area: Rectangle<i32, Logical>,
+        min_of: impl Fn(&Window) -> (f64, f64),
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut отпечатки: Vec<(u64, u64, u64)> = windows.iter()
+            .map(|w| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                w.hash(&mut h);
+                let (mw, mh) = min_of(w);
+                (h.finish(), mw.to_bits(), mh.to_bits())
+            })
+            .collect();
+        // Порядок окон в visible зависит от порядка появления — сортируем,
+        // иначе одна и та же расстановка давала бы разные подписи.
+        отпечатки.sort_unstable();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        отпечатки.hash(&mut h);
+        (area.loc.x, area.loc.y, area.size.w, area.size.h).hash(&mut h);
+        h.finish()
     }
 
     pub fn apply_tile_layout(&mut self) {
@@ -327,6 +409,52 @@ impl Dawn {
         self.resize_window_animated(window, rect, true);
     }
 
+    /// Приводит слот к тому, что клиент СОГЛАСЕН принять.
+    ///
+    /// Слот считает дерево, но у окна бывает свой минимум (Discord — 940×500,
+    /// замер 11.08.2026) и максимум. Клиент, которому слот мал, просто
+    /// оставляет прежний размер — а мы до сих пор ставили его углом в слот, и
+    /// весь излишек уходил вправо-вниз, накрывая соседа. Именно так Discord в
+    /// слоте 615 px рисовался на 940 и закрывал два окна справа.
+    ///
+    /// Делаем как Hyprland (`misc:size_limits_tiled`,
+    /// `layout/target/WindowTarget.cpp`): зажимаем размер в [min, max],
+    /// ЦЕНТРИРУЕМ окно в слоте (перекос делится поровну на обе стороны, а не
+    /// валится на одного соседа) и не даём вылезти за рабочую область.
+    fn fit_to_constraints(
+        &self,
+        window: &Window,
+        slot: Rectangle<i32, Logical>,
+    ) -> Rectangle<i32, Logical> {
+        let (min, max) = crate::xwin::size_constraints(window);
+        // Ноль в max — «без ограничения» (так это устроено и в xdg_shell, и в
+        // приведённых к нему подсказках X11; см. xwin::size_constraints).
+        let max_w = if max.w <= 0 { i32::MAX } else { max.w };
+        let max_h = if max.h <= 0 { i32::MAX } else { max.h };
+        // Порядок важен: при min > max побеждает min — окно, которое не может
+        // ни ужаться, ни растянуться, всё равно должно получить свой размер.
+        let w = slot.size.w.min(max_w).max(min.w).max(1);
+        let h = slot.size.h.min(max_h).max(min.h).max(1);
+        if w == slot.size.w && h == slot.size.h {
+            return slot;
+        }
+        let mut loc = Point::from((
+            slot.loc.x + (slot.size.w - w) / 2,
+            slot.loc.y + (slot.size.h - h) / 2,
+        ));
+        // За край экрана окно не пускаем: там его не достать ни мышью, ни
+        // глазом. Если оно шире самой рабочей области — прижимаем к её началу.
+        if let Some(area) = self.tile_work_area() {
+            loc.x = loc.x.clamp(area.loc.x, (area.loc.x + area.size.w - w).max(area.loc.x));
+            loc.y = loc.y.clamp(area.loc.y, (area.loc.y + area.size.h - h).max(area.loc.y));
+        }
+        tracing::debug!(
+            "dawn/tile: слот {:?} не по клиенту (min {:?} max {:?}) → {:?} в {:?}",
+            slot.size, min, max, Size::<i32, Logical>::from((w, h)), loc,
+        );
+        Rectangle::new(loc, (w, h).into())
+    }
+
     pub fn resize_window_animated(
         &mut self,
         window: &Window,
@@ -345,6 +473,7 @@ impl Dawn {
         {
             return;
         }
+        let rect = self.fit_to_constraints(window, rect);
         crate::xwin::set_size(window, Some(rect.size), crate::xwin::Tiled::Set);
         crate::xwin::configure(window);
         // Размер применяется сразу (клиент сам не умеет анимировать resize),
@@ -1220,6 +1349,9 @@ impl Dawn {
             tw.float_position = new_loc;
             tw.float_position_set = true;
         }
+        // Окно увели с места руками — если оно из созвездия, гроздь растащена
+        // (та же метка, что и при драге мышью, см. grabs/move_grab.rs).
+        self.mark_constellation_torn(&w);
     }
 
     /// Меняет местами два тайловых окна — общая точка для перетаскивания мышью

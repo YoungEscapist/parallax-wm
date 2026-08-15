@@ -196,6 +196,7 @@ impl Dawn {
         self.momentum.stop();
         self.camera_anim = None;
         self.zoom_anim = None;
+        self.zoom_glide = None;
         if let Some(mask) = switch_to {
             self.view_tag(mask);
             // Обзор (overview_layout) сдвигает окна в сетку и сжимает их, а
@@ -208,6 +209,7 @@ impl Dawn {
             if matches!(self.tile_config.layout, Layout::Tile | Layout::Monocle) {
                 self.camera_anim = None;
                 self.zoom_anim = None;
+                self.zoom_glide = None;
                 self.viewport.zoom = 1.0;
                 self.viewport.cam_x = 0.0;
                 self.viewport.cam_y = 0.0;
@@ -466,6 +468,7 @@ impl Dawn {
         self.momentum.stop();
         self.camera_anim = None;
         self.zoom_anim = None;
+        self.zoom_glide = None;
 
         // Сеточный обзор: каждый стол = ячейка сетки со своими окнами (dwindle),
         // камера вписывает все столы (overview_fit_all). Лента (Columns) сюда не
@@ -600,6 +603,12 @@ impl Dawn {
                 let matches = in_tree.len() == n
                     && in_tree.iter().all(|w| wins.iter().any(|v| same_window(v, w)));
                 matches.then(|| {
+                    // Полоса обзора — это миниатюры, а не окна: минимумы
+                    // клиентов тут не действуют (иначе в узкой полосе они
+                    // перевесили бы пропорции и превью перестало бы совпадать
+                    // с настоящей раскладкой). Обратно их поставит
+                    // sync_dwindle_tree на выходе из обзора.
+                    tree.set_min_sizes(|_| (0.0, 0.0));
                     tree.recalc(band, &cfg);
                     tree.leaf_rects()
                 })
@@ -745,6 +754,9 @@ impl Dawn {
         let Some(area) = self.overview_window_area(to) else { return };
         let cfg = self.lua_config.dwindle;
         let tree = self.dwindle_trees.entry(to).or_default();
+        // Как и выше: место в дереве выбирается по МИНИАТЮРАМ в полосе обзора,
+        // минимумы клиентов к этому масштабу отношения не имеют.
+        tree.set_min_sizes(|_| (0.0, 0.0));
         tree.recalc(area, &cfg);
         let opening_on = tree.closest_node(focal, Some(window));
         tree.insert(window.clone(), opening_on, focal, area, &cfg, None);
@@ -919,6 +931,7 @@ impl Dawn {
         self.momentum.stop();
         self.camera_anim = None;
         self.zoom_anim = None;
+        self.zoom_glide = None;
         self.overview_order = self.overview_strip_tags();
 
         // Кадр обзора: вся лента с небольшим полем по краям. Берём и габариты
@@ -982,6 +995,7 @@ impl Dawn {
         // прокрутки посчитались бы не туда.
         self.camera_anim = None;
         self.zoom_anim = None;
+        self.zoom_glide = None;
         self.viewport.zoom = prev_zoom;
         self.viewport.cam_x = prev_cam.x;
         self.viewport.cam_y = prev_cam.y;
@@ -1048,6 +1062,7 @@ impl Dawn {
         self.columns_drop_window_on_ws(window, target, pos.x);
         self.camera_anim = None;
         self.zoom_anim = None;
+        self.zoom_glide = None;
         self.viewport.cam_x = cam.0;
         self.viewport.cam_y = cam.1;
         self.viewport.zoom = cam.2;

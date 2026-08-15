@@ -9,7 +9,8 @@ use smithay::{
         keyboard::{FilterResult, keysyms},
         pointer::{AxisFrame, ButtonEvent, Focus, GrabStartData, MotionEvent, RelativeMotionEvent},
     },
-    utils::{Point, Rectangle, SERIAL_COUNTER},
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
 };
 
 use crate::{
@@ -46,6 +47,44 @@ impl Dawn {
             return true;
         }
         !matches!(self.tile_config.layout, Layout::Tile | Layout::Columns)
+    }
+
+    /// Sloppy focus: фокус идёт за курсором (как `sloppyfocus=1` в dwl).
+    ///
+    /// Три случая, когда он ОБЯЗАН молчать, — и раньше они были разбросаны по
+    /// двум веткам движения, каждая со своим неполным набором:
+    ///
+    ///   * **Columns** — вид ездит по полосе от клавиш и жестов, курсор при
+    ///     этом стоит на месте экрана, и под стрелкой оказывается чужая
+    ///     колонка. Первое же шевеление мыши перебрасывало фокус туда, куда
+    ///     человек не смотрел. У niri focus-follows-mouse выключен по той же
+    ///     причине.
+    ///   * **Меню клиента держит захват** (XdgShellHandler::grab). Перевод
+    ///     фокуса сорвал бы захват и закрыл меню — этим болели меню Steam.
+    ///   * **Клавиатуру держит слой** — открыт fuzzel (лаунчер, строка поиска
+    ///     dwall, меню его фильтров). Иначе первое же движение мыши отдаёт
+    ///     ввод окну под курсором, слой теряет клавиатуру и ЗАКРЫВАЕТСЯ:
+    ///     «строка поиска пропадает, стоит подвинуть мышь». В меню фильтров
+    ///     dwall это выглядело как «фильтры не применяются» — выбрать пункт
+    ///     мышью было физически нельзя, меню исчезало по дороге к нему.
+    ///
+    /// Проверка на слой стояла только в ветке АБСОЛЮТНОГО ввода (планшет, VM),
+    /// а обычная мышь ходит через относительную — там её не было. Теперь
+    /// правило одно на оба пути.
+    fn sloppy_focus(&mut self, pos: Point<f64, Logical>, under: Option<&WlSurface>) {
+        if self.tile_config.layout == Layout::Columns
+            || self.layer_keyboard.is_some()
+            || self.seat.get_keyboard().is_some_and(|k| k.is_grabbed())
+        {
+            return;
+        }
+        let Some(surface) = under else { return };
+        if self.focused_surface().as_ref() == Some(surface) {
+            return;
+        }
+        if let Some((window, _)) = self.space.element_under(pos).map(|(w, l)| (w.clone(), l)) {
+            crate::xwin::focus(self, &window);
+        }
     }
 
     pub(crate) fn kill_focused(&mut self) {
@@ -376,7 +415,7 @@ impl Dawn {
                        // бы уехать холстом из-под игры прямо во время игры.
                        // Пока фуллскрин держит экран, камера стоит.
                        if self.tile_config.layout == Layout::Float
-                           && self.fullscreen.is_none()
+                           && !self.fullscreen_here()
                        {
                            let over_x = sx - csx;
                            let over_y = sy - csy;
@@ -419,20 +458,7 @@ impl Dawn {
                // XdgShellHandler::grab). Перевод фокуса под курсором в этот
                // момент сорвал бы захват и закрыл меню — ровно то, чем болели
                // меню Steam (там причина была та же, но по стороне X11).
-               let меню_захватило = self.seat.get_keyboard().is_some_and(|k| k.is_grabbed());
-               let sloppy = self.tile_config.layout != Layout::Columns && !меню_захватило;
-               if sloppy {
-                   if let Some((surface, _)) = &under {
-                       let same = self.focused_surface().as_ref() == Some(surface);
-                       if !same {
-                           if let Some((window, _)) = self.space
-                               .element_under(pos).map(|(w, l)| (w.clone(), l))
-                           {
-                               crate::xwin::focus(self, &window);
-                           }
-                       }
-                   }
-               }
+               self.sloppy_focus(pos, under.as_ref().map(|(s, _)| s));
                // Surface-local всегда в логическом пространстве — клиент сам
                // умножает на scale (wl_output.scale / wp_fractional_scale),
                // чтобы получить пиксель буфера. zoom_adjusted_location_motion
@@ -489,26 +515,7 @@ impl Dawn {
                 let pointer = self.seat.get_pointer().unwrap();
                 let under = self.surface_under(pos);
 
-                // sloppyfocus: focus follows cursor (как в dwl sloppyfocus=1).
-                // В Columns выключен — см. подробный комментарий в ветке
-                // PointerMotion выше.
-                // Пока клавиатуру держит слой (открыт лаунчер), sloppy-focus
-                // молчит: иначе первое же движение мыши отдавало бы ввод окну
-                // под курсором, и лаунчер снова оставался немым.
-                if self.tile_config.layout != Layout::Columns && self.layer_keyboard.is_none() {
-                    if let Some((surface, _)) = &under {
-                    let same = self.focused_surface().as_ref() == Some(surface);
-                    if !same {
-                        // Найти окно под курсором и активировать
-                        if let Some((window, _)) = self.space
-                            .element_under(pos)
-                            .map(|(w, l)| (w.clone(), l))
-                        {
-                            crate::xwin::focus(self, &window);
-                        }
-                    }
-                    }
-                }
+                self.sloppy_focus(pos, under.as_ref().map(|(s, _)| s));
 
                 pointer.motion(self, under, &MotionEvent {
                     location: pos, serial, time: event.time_msec(),
@@ -1127,22 +1134,12 @@ impl Dawn {
 
                 // В обзоре столов колесо мыши ЗУМИТ (в обычном tiling zoom нельзя).
                 if self.overview_active && v != 0.0 && source != AxisSource::Finger {
-                    let cursor_canvas = self.pointer_location;
-                    let old_zoom = self.viewport.zoom;
-                    let screen_x = (cursor_canvas.x - self.viewport.cam_x) * old_zoom;
-                    let screen_y = (cursor_canvas.y - self.viewport.cam_y) * old_zoom;
+                    // Щелчок двигает цель, доезд делает anim::ZoomGlide. Камера
+                    // при этом пересчитывается ОТ курсора, поэтому его экранная
+                    // точка не меняется — лишнего motion клиенту не уходит
+                    // (см. pointer_warped в тике доезда).
                     let factor = if v < 0.0 { 1.1_f64 } else { 0.9_f64 };
-                    let new_zoom = (old_zoom * factor).clamp(0.05, 5.0);
-                    self.viewport.zoom = new_zoom;
-                    self.viewport.cam_x = cursor_canvas.x - screen_x / new_zoom;
-                    self.viewport.cam_y = cursor_canvas.y - screen_y / new_zoom;
-                    self.apply_camera();
-                    // Камера пересчитана ОТ курсора — его экранная точка не
-                    // изменилась по построению. Помечаем как намеренную, иначе
-                    // sync_pointer_to_camera увидит уехавшую камеру и на каждый
-                    // щелчок колеса пошлёт клиенту лишний motion.
-                    self.pointer_warped();
-                    self.request_redraw();
+                    self.zoom_step_at_cursor(factor);
                     return;
                 }
 
@@ -1161,30 +1158,14 @@ impl Dawn {
 
                 // Alt+Scroll (колесо мыши) → zoom (только в Float режиме)
                 if alt_held && v != 0.0 && self.tile_config.layout == Layout::Float {
-                    let cursor_canvas = self.pointer_location;
-
-                    let old_zoom = self.viewport.zoom;
-
-                    // Screen position of cursor (pixels on screen)
-                    // screen = (canvas - camera) * zoom
-                    let screen_x = (cursor_canvas.x - self.viewport.cam_x) * old_zoom;
-                    let screen_y = (cursor_canvas.y - self.viewport.cam_y) * old_zoom;
-
-                    // v120 > 0 = scroll up = zoom IN
-                    // scroll up (v>0) = zoom in = увеличить zoom
+                    // v120 > 0 = колесо вниз = отдаляем.
                     let factor = if v < 0.0 { 1.1_f64 } else { 0.9_f64 };
-                    let new_zoom = (old_zoom * factor).clamp(0.05, 5.0);
-                    self.viewport.zoom = new_zoom;
-
-                    // New camera: anchor canvas point stays at same screen pixel
-                    // camera = canvas - screen / new_zoom
-                    self.viewport.cam_x = cursor_canvas.x - screen_x / new_zoom;
-                    self.viewport.cam_y = cursor_canvas.y - screen_y / new_zoom;
-
-                    self.apply_camera();
-                    self.request_redraw();
-                    tracing::debug!("dawn/canvas: zoom={:.3} cam=({:.1},{:.1})",
-                        new_zoom, self.viewport.cam_x, self.viewport.cam_y);
+                    self.zoom_step_at_cursor(factor);
+                    tracing::debug!(
+                        "dawn/canvas: цель зума={:.3} (сейчас {:.3})",
+                        self.zoom_glide.as_ref().map(|g| g.target).unwrap_or(self.viewport.zoom),
+                        self.viewport.zoom,
+                    );
                     return;
                 }
 
@@ -1299,6 +1280,10 @@ impl Dawn {
 
                 let cursor = self.pointer_location;
 
+                // Щипок непрерывен сам по себе — сглаживать его нечем и незачем,
+                // но начатый колесом доезд надо снять, иначе он тянул бы зум к
+                // своей цели поверх пальцев.
+                self.zoom_glide = None;
                 let old_zoom = self.viewport.zoom;
                 let new_zoom = (old_zoom * factor).clamp(0.05, 5.0);
                 self.viewport.zoom = new_zoom;

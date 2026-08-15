@@ -210,6 +210,77 @@ impl PosAnim {
     }
 }
 
+/// Плавный зум колесом.
+///
+/// Щелчок колеса — мультипликативный шаг (×1.1), и раньше он применялся
+/// мгновенно: каждый щелчок был скачком на 10%, отсюда рваное ощущение.
+/// Теперь щелчки двигают ЦЕЛЬ, а масштаб подтягивается к ней экспоненциально,
+/// поэтому поток щелчков сливается в одно непрерывное движение.
+///
+/// Интерполяция идёт по логарифму масштаба: шаги колеса умножают зум, и
+/// линейное приближение шло бы заметно быстрее на дальнем конце диапазона,
+/// чем у единицы.
+pub struct ZoomGlide {
+    pub target: f64,
+    /// Точка холста под курсором и её место на экране. Держатся неподвижными
+    /// весь доезд — поэтому зум идёт «в курсор», а не в центр экрана.
+    pub anchor_canvas: Point<f64, Logical>,
+    pub anchor_screen: Point<f64, Logical>,
+    last: Instant,
+}
+
+/// Скорость подтягивания зума к цели (1/с). При 18 расхождение съедается
+/// примерно за 0.2 с — глазу это уже непрерывное движение, а руке ещё не
+/// кажется, что интерфейс отстаёт от колеса.
+pub const ZOOM_GLIDE_OMEGA: f64 = 18.0;
+/// Ниже этого расхождения по логарифму (≈0.05% масштаба) доезд закончен.
+const ZOOM_GLIDE_EPS: f64 = 5e-4;
+
+impl ZoomGlide {
+    pub fn new(
+        target: f64,
+        anchor_canvas: Point<f64, Logical>,
+        anchor_screen: Point<f64, Logical>,
+    ) -> Self {
+        Self { target, anchor_canvas, anchor_screen, last: Instant::now() }
+    }
+
+    /// Новый щелчок колеса: цель и якорь меняются, доезд не перезапускается —
+    /// скорость остаётся непрерывной.
+    pub fn retarget(
+        &mut self,
+        target: f64,
+        anchor_canvas: Point<f64, Logical>,
+        anchor_screen: Point<f64, Logical>,
+    ) {
+        self.target = target;
+        self.anchor_canvas = anchor_canvas;
+        self.anchor_screen = anchor_screen;
+    }
+
+    /// Шаг доезда. Возвращает новый масштаб, положение камеры, удерживающее
+    /// якорь, и признак завершения.
+    pub fn advance(&mut self, now: Instant, zoom: f64) -> (f64, Point<f64, Logical>, bool) {
+        let dt = now.saturating_duration_since(self.last).as_secs_f64().min(0.1);
+        self.last = now;
+        let camera_for = |z: f64| crate::canvas::zoom_anchor_camera(
+            self.anchor_canvas,
+            self.anchor_screen,
+            z,
+        );
+        if dt <= 0.0 {
+            return (zoom, camera_for(zoom), false);
+        }
+        let diff = self.target.ln() - zoom.ln();
+        if diff.abs() < ZOOM_GLIDE_EPS {
+            return (self.target, camera_for(self.target), true);
+        }
+        let t = 1.0 - (-ZOOM_GLIDE_OMEGA * dt).exp();
+        let next = (zoom.ln() + diff * t).exp();
+        (next, camera_for(next), false)
+    }
+}
+
 /// Zoom fly-to that keeps a canvas anchor point pinned to a screen point
 /// throughout the animation (e.g. hold-to-zoom keeps the screen center fixed).
 pub struct ZoomAnim {
@@ -597,6 +668,25 @@ pub fn tick(state: &mut Dawn) {
         }
     }
 
+    // Доезд зума колесом. Читаем текущий масштаб заранее: внутри as_mut()
+    // состояние уже занято изменяемой ссылкой на сам доезд.
+    let zoom_now = state.viewport.zoom;
+    let glide = state.zoom_glide.as_mut().map(|g| g.advance(now, zoom_now));
+    if let Some((zoom, cam, done)) = glide {
+        state.viewport.zoom = zoom;
+        state.viewport.cam_x = cam.x;
+        state.viewport.cam_y = cam.y;
+        // Экранная точка курсора по построению не изменилась (камера считается
+        // ОТ якоря под ним). Помечаем как намеренную, иначе
+        // sync_pointer_to_camera увидит уехавшую камеру и будет слать клиенту
+        // лишний motion каждый кадр доезда.
+        state.pointer_warped();
+        dirty = true;
+        if done {
+            state.zoom_glide = None;
+        }
+    }
+
     // Появление окна "с ростом" (Hyprland-style, только Float — см. new_toplevel).
     if !state.window_open_anims.is_empty() {
         let mut finished = Vec::new();
@@ -698,5 +788,154 @@ pub fn tick(state: &mut Dawn) {
             state.pin_pointer_after_camera(screen);
         }
         state.request_redraw();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Бросок выделения: окна, отпущенные с одной скоростью и одной ω, обязаны
+    /// сохранять взаимное расположение на ВСЁМ доезде, а не только в конечной
+    /// точке. Иначе группа, которая весь драг ехала как целое, разваливается в
+    /// момент отпускания — окно под курсором улетает по инерции одно
+    /// (см. grabs/move_grab.rs, button()).
+    #[test]
+    fn бросок_сохраняет_строй_группы() {
+        let v = Point::<f64, Logical>::from((900.0, -400.0));
+        let speed = (v.x * v.x + v.y * v.y).sqrt();
+        let omega = glide_omega(speed);
+
+        let a_from = Point::<f64, Logical>::from((100.0, 100.0));
+        let b_from = Point::<f64, Logical>::from((520.0, 260.0));
+        let offset = (b_from.x - a_from.x, b_from.y - a_from.y);
+
+        // Цель считается так же, как в Dawn::fling_window: from + v/ω.
+        let target = |f: Point<f64, Logical>| {
+            Point::<f64, Logical>::from((f.x + v.x / omega, f.y + v.y / omega))
+        };
+        let mut a = PosAnim::with_velocity(a_from, target(a_from), v, omega);
+        let mut b = PosAnim::with_velocity(b_from, target(b_from), v, omega);
+
+        let start = Instant::now();
+        for step in 1..=150u64 {
+            // Общий `now` на кадр — ровно так их продвигает цикл анимации.
+            let now = start + Duration::from_millis(step * 8);
+            a.advance(now);
+            b.advance(now);
+            let dx = (b.pos.x - a.pos.x) - offset.0;
+            let dy = (b.pos.y - a.pos.y) - offset.1;
+            // Порог — доли пикселя, а не ноль: каждая пружина запоминает свой
+            // Instant в момент создания, и первый кадр они интегрируют по dt,
+            // различающимся на микросекунды между двумя вызовами fling_window.
+            // Это даёт расхождение ~5e-5 px — на порядки ниже целочисленной
+            // сетки, в которой окна и раскладываются.
+            assert!(
+                dx.abs() < 0.01 && dy.abs() < 0.01,
+                "строй распался на шаге {step}: расхождение ({dx}, {dy})"
+            );
+            // То, что реально видит глаз: округлённые позиции держат строй точно.
+            let ai: Point<i32, Logical> = a.pos.to_i32_round();
+            let bi: Point<i32, Logical> = b.pos.to_i32_round();
+            assert_eq!(
+                (bi.x - ai.x, bi.y - ai.y),
+                (offset.0 as i32, offset.1 as i32),
+                "на шаге {step} разъехались уже в пикселях"
+            );
+        }
+
+        // Проверка не должна быть пустой: окна обязаны реально доехать.
+        let path = ((a.pos.x - a_from.x).powi(2) + (a.pos.y - a_from.y).powi(2)).sqrt();
+        assert!(path > 100.0, "окно почти не сдвинулось: путь {path}");
+        assert!(path <= MAX_GLIDE + 1.0, "доезд длиннее потолка: {path} > {MAX_GLIDE}");
+        assert!(a.is_done() && b.is_done(), "пружины не остановились за 1.2 с");
+    }
+
+    /// Зум колесом должен быть непрерывным. Меряем самый резкий шаг за кадр
+    /// по логарифму масштаба: старый код применял щелчок мгновенно, и один
+    /// кадр из пяти менял зум на ln(1.1)=0.095 — это и есть дёрганость.
+    /// Доезд обязан размазать ту же величину по кадрам.
+    #[test]
+    fn зум_колесом_идёт_без_рывков() {
+        let anchor_canvas = Point::<f64, Logical>::from((800.0, 400.0));
+        let anchor_screen = Point::<f64, Logical>::from((1280.0, 540.0));
+        let шаг = 1.1_f64;
+        let щелчков = 5;
+
+        let mut zoom = 1.0_f64;
+        let mut glide = ZoomGlide::new(zoom, anchor_canvas, anchor_screen);
+        let start = Instant::now();
+
+        let mut самый_резкий: f64 = 0.0;
+        // Кадры по 8 мс; щелчок колеса — каждые 40 мс (быстрый прокрут).
+        for кадр in 1..=150u64 {
+            if кадр <= щелчков * 5 && кадр % 5 == 1 {
+                let цель = (glide.target * шаг).clamp(0.05, 5.0);
+                glide.retarget(цель, anchor_canvas, anchor_screen);
+            }
+            let now = start + Duration::from_millis(кадр * 8);
+            let (новый, cam, _done) = glide.advance(now, zoom);
+            самый_резкий = самый_резкий.max((новый.ln() - zoom.ln()).abs());
+            zoom = новый;
+
+            // Якорь обязан стоять на месте весь доезд, иначе зум «уползает»
+            // из-под курсора.
+            let screen_x = (anchor_canvas.x - cam.x) * zoom;
+            let screen_y = (anchor_canvas.y - cam.y) * zoom;
+            assert!(
+                (screen_x - anchor_screen.x).abs() < 1e-6
+                    && (screen_y - anchor_screen.y).abs() < 1e-6,
+                "якорь уехал на кадре {кадр}: ({screen_x}, {screen_y})"
+            );
+        }
+
+        let рывок_старого = шаг.ln(); // 0.0953 — весь щелчок за один кадр
+        assert!(
+            самый_резкий < рывок_старого / 3.0,
+            "шаг за кадр {самый_резкий:.4} — не лучше мгновенного {рывок_старого:.4}"
+        );
+        // И при этом доезжаем ровно туда, куда накрутили колесом.
+        let цель = шаг.powi(щелчков as i32);
+        assert!(
+            (zoom / цель - 1.0).abs() < 0.005,
+            "не доехали до цели: {zoom:.4} против {цель:.4}"
+        );
+    }
+
+    /// Та же постановка, но по-старому: инерцию получает только окно под
+    /// курсором, а второе окно выделения остаётся стоять. Тест закрепляет
+    /// саму поломку — он же доказывает, что проверка выше не пустая: если бы
+    /// расхождение не возникало, чинить было бы нечего.
+    #[test]
+    fn без_броска_группы_окно_улетает_одно() {
+        let v = Point::<f64, Logical>::from((900.0, -400.0));
+        let speed = (v.x * v.x + v.y * v.y).sqrt();
+        let omega = glide_omega(speed);
+
+        let a_from = Point::<f64, Logical>::from((100.0, 100.0));
+        let b_from = Point::<f64, Logical>::from((520.0, 260.0));
+        let offset = (b_from.x - a_from.x, b_from.y - a_from.y);
+
+        let mut a = PosAnim::with_velocity(
+            a_from,
+            Point::<f64, Logical>::from((a_from.x + v.x / omega, a_from.y + v.y / omega)),
+            v,
+            omega,
+        );
+        // b никуда не летит — ровно то, что делал старый код.
+        let b_pos = b_from;
+
+        let start = Instant::now();
+        for step in 1..=150u64 {
+            a.advance(start + Duration::from_millis(step * 8));
+        }
+
+        let dx = (b_pos.x - a.pos.x) - offset.0;
+        let dy = (b_pos.y - a.pos.y) - offset.1;
+        let разъезд = (dx * dx + dy * dy).sqrt();
+        assert!(
+            разъезд > 100.0,
+            "старое поведение обязано разваливать строй, а разъезд всего {разъезд}"
+        );
     }
 }
