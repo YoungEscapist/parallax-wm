@@ -358,15 +358,24 @@ fn push_colliding_windows(
     }
 }
 
-impl PointerGrab<Dawn> for MoveSurfaceGrab {
-    fn motion(
-        &mut self,
-        data: &mut Dawn,
-        handle: &mut PointerInnerHandle<'_, Dawn>,
-        _focus: Option<(WlSurface, Point<f64, Logical>)>,
-        event: &MotionEvent,
-    ) {
-        handle.motion(data, None, event);
+impl MoveSurfaceGrab {
+    /// Один шаг перетаскивания: окно (и его группа) переезжает под точку
+    /// `cursor`, тайловые раскладки при этом свапаются, лента показывает шов
+    /// вставки.
+    ///
+    /// Вынесено из `PointerGrab::motion` целиком, чтобы этим же кодом можно
+    /// было двигать окно НЕ мышью. Жест «Super + два пальца» раньше имел
+    /// собственную, куда более бедную реализацию прямо в input.rs: она умела
+    /// только свободный перенос и потому в Tile и Columns просто отказывалась
+    /// работать (см. `плавающее` в старой ветке). Теперь у мыши и у тачпада
+    /// один и тот же код, а значит и одно и то же поведение.
+    pub fn drag_to(&mut self, data: &mut Dawn, cursor: Point<f64, Logical>, time: u32) {
+        let event = MotionEvent {
+            location: cursor,
+            serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+            time,
+        };
+        let event = &event;
 
         // Пока идёт драг, окно принадлежит мыши: анимации (в т.ч. толчок от
         // прилетевшего по инерции соседа) его не двигают — см. Dawn::dragged_window.
@@ -391,7 +400,14 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
         if is_tiled && data.tile_config.layout == Layout::Columns {
             data.columns_drag_hint = Some(event.location.x);
             let delta = event.location - self.start_data.location;
-            let loc = (self.initial_window_location.to_f64() + delta).to_i32_round();
+            let mut loc = (self.initial_window_location.to_f64() + delta).to_i32_round();
+            // Выше первого этажа и ниже последнего ленты нет — туда окно не
+            // пускаем (см. columns_clamp_to_strip). Между этажами ходить можно:
+            // это и есть перенос окна на соседний стол, он применяется на
+            // отпускании в finish().
+            if let Some(size) = data.space.element_geometry(&self.window).map(|g| g.size) {
+                loc.y = data.columns_clamp_to_strip(loc.y, size.h);
+            }
             data.space.map_element(self.window.clone(), loc, true);
             data.request_redraw();
             return;
@@ -451,6 +467,16 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
                     if let Some(size) = data.space.element_geometry(&self.window).map(|g| g.size) {
                         free_loc = data.overview_clamp_loc(mask, free_loc, size);
                     }
+                }
+            }
+
+            // Лента: ПЛАВАЮЩЕЕ окно тоже принадлежит этажам, а не пустоте между
+            // ними. Тайловое зажимается веткой выше, но окно, сделанное
+            // плавающим руками (Super+V), приходило сюда и улетало за ленту
+            // ровно так же.
+            if data.tile_config.layout == Layout::Columns && !data.overview_active {
+                if let Some(size) = data.space.element_geometry(&self.window).map(|g| g.size) {
+                    free_loc.y = data.columns_clamp_to_strip(free_loc.y, size.h);
                 }
             }
 
@@ -528,6 +554,161 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
         }
     }
 
+    /// Посадка окна на отпускании: тот же код и для мыши, и для жеста.
+    ///
+    /// Здесь живёт всё, что делает драг завершённым, — перенос на стол в
+    /// обзоре, вставка в ленту, доводка тайловой раскладки, магнитирование и
+    /// инерция. Раньше это было телом `PointerGrab::button`, и тачпадному
+    /// жесту не доставалось ничего из перечисленного.
+    pub fn finish(&mut self, data: &mut Dawn) {
+        // Драг кончился — окно снова принадлежит анимациям (в пути мыши это
+        // делает PointerGrab::unset, но жест туда не заходит).
+        data.dragged_window = None;
+
+        // В обзоре столов: отпустили перетаскивание → окно переезжает на
+        // воркспейс того бэнда, куда попало (вверх/вниз меняет стол).
+        if data.overview_active {
+            data.overview_reassign(&self.window);
+            return;
+        }
+
+        let is_tiled_win = data.tile_config.layout != Layout::Float
+            && data.tagged_windows.iter().any(|tw| {
+                !tw.floating
+                    && tw.window == self.window
+            });
+
+        // Columns/niri: вставляем окно туда, куда показывала подсказка.
+        //
+        // Стол выбираем по ЭТАЖУ, на котором окно отпустили: вертикаль ленты —
+        // это и есть переключение столов, и перетаскивание обязано её
+        // учитывать. Раньше тут стоял безусловный `columns_drop_window`, то
+        // есть окно ВСЕГДА возвращалось на текущий стол, куда бы его ни увели.
+        if is_tiled_win && data.tile_config.layout == Layout::Columns {
+            let x = data.columns_drag_hint.take().unwrap_or(data.pointer_location.x);
+            let y = data.space.element_geometry(&self.window)
+                .map(|g| (g.loc.y + g.size.h / 2) as f64)
+                .unwrap_or(data.pointer_location.y);
+            match data.columns_tag_at_y(y) {
+                Some(tag) => data.columns_drop_window_on_ws(&self.window, tag, x),
+                None => data.columns_drop_window(&self.window, x),
+            }
+            data.request_plane_reset();
+            return;
+        }
+        data.columns_drag_hint = None;
+
+        // Тайловое окно: свапы уже применены в motion, осталось только
+        // дать раскладке доехать. Магнитирование и инерция — это про
+        // свободный холст, тайловое окно они сдвинули бы со слота.
+        if is_tiled_win {
+            data.arrange();
+            data.request_plane_reset();
+            data.request_redraw();
+            return;
+        }
+
+        // Окно созвездия увели руками — гроздь «растащена», и следующий
+            // Super+D по ней должен собрать её заново, а не разбирать (см.
+            // TaggedWindow::constellation_torn). Тащили всё созвездие целиком
+            // (оно попало в выделение) — взаимное расположение не нарушено,
+            // метку не ставим.
+        let утащили_часть = {
+            let ехали: Vec<Window> = self.group_initial.iter()
+                .map(|(w, _)| w.clone())
+                .chain(std::iter::once(self.window.clone()))
+                .collect();
+            data.constellation_members_excluding(&self.window)
+                .iter()
+                .any(|m| !ехали.contains(m))
+        };
+        if утащили_часть {
+            data.mark_constellation_torn(&self.window);
+        }
+
+        // Магнитирование (2.1): один раз при отпускании подравниваем край
+        // к ближайшему соседу в пределах SNAP_DISTANCE, если коллизия включена.
+        let riding: Vec<Window> = self.group_initial.iter().map(|(w, _)| w.clone()).collect();
+        let mut snapped_applied = false;
+        if data.is_snapping_enabled {
+            if let Some(loc) = data.space.element_geometry(&self.window).map(|g| g.loc) {
+                if let Some(snapped) = find_snap_target(data, &self.window, loc, &riding) {
+                    data.space.map_element(self.window.clone(), snapped, true);
+                    if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
+                        tw.window == self.window
+                    }) {
+                        tw.float_position = snapped;
+                    }
+                    // Группа держит строй и на посадке: остальных двигаем
+                    // ровно тем же сдвигом, иначе примагниченное окно
+                    // уезжало из группы на величину подравнивания.
+                    self.shift_group(data, snapped - loc);
+                    snapped_applied = true;
+                }
+            }
+        }
+
+        // Инерция перетаскивания: окно доезжает по инерции после отпускания
+        // (не применяется, если сработало магнитирование — там нужна
+        // точная посадка на край соседа).
+        if !snapped_applied {
+            let v = self.velocity.launch_velocity(); // px/сек в canvas
+            let speed = (v.x * v.x + v.y * v.y).sqrt();
+            const MIN_FLING: f64 = 120.0;  // ниже — считаем что окно просто положили
+            if speed > MIN_FLING {
+                // Пружина стартует ровно с той скоростью, с какой курсор
+                // отпустил окно, и тормозит экспоненциально. Раньше тут был
+                // ease-out на фиксированную дистанцию: его стартовая
+                // скорость (3·d/dur) не совпадала со скоростью драга, и в
+                // момент отпускания окно заметно «дёргалось» вперёд.
+                // ω поднимаем на быстрых бросках, чтобы путь доезда
+                // (|v|/ω) не превышал MAX_GLIDE.
+                let omega = crate::anim::glide_omega(speed);
+                let target = data.fling_window(&self.window, v, omega);
+                if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
+                    tw.window == self.window
+                }) {
+                    tw.float_position = target;
+                    tw.position = target;
+                    tw.float_position_set = true;
+                }
+                // Выделение доезжает тем же броском. Одинаковые скорость и
+                // ω дают одинаковый путь (|v|/ω) и одинаковую кривую, так
+                // что взаимное расположение сохраняется. Без этого инерцию
+                // получало только окно под курсором — и оно улетало из
+                // группы, хотя весь драг они ехали вместе.
+                for (member, _) in &self.group_initial {
+                    let member_target = data.fling_window(member, v, omega);
+                    if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
+                        &tw.window == member
+                    }) {
+                        tw.float_position = member_target;
+                        tw.position = member_target;
+                        tw.float_position_set = true;
+                    }
+                }
+            }
+        }
+
+        // Сброс plane-кэша на границе драга — сглаживает возможный
+        // "хвост"/тень от предыдущей позиции на некоторых DRM-планах.
+        data.request_plane_reset();
+        data.request_redraw();
+    }
+}
+
+impl PointerGrab<Dawn> for MoveSurfaceGrab {
+    fn motion(
+        &mut self,
+        data: &mut Dawn,
+        handle: &mut PointerInnerHandle<'_, Dawn>,
+        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &MotionEvent,
+    ) {
+        handle.motion(data, None, event);
+        self.drag_to(data, event.location, event.time);
+    }
+
     fn relative_motion(
         &mut self,
         data: &mut Dawn,
@@ -548,128 +729,8 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
         const BTN_LEFT: u32 = 0x110;
         if !handle.current_pressed().contains(&BTN_LEFT) {
             handle.unset_grab(self, data, event.serial, event.time, true);
-
-            // В обзоре столов: отпустили перетаскивание → окно переезжает на
-            // воркспейс того бэнда, куда попало (вверх/вниз меняет стол).
-            if data.overview_active {
-                data.overview_reassign(&self.window);
-                handle.frame(data);
-                return;
-            }
-
-            let is_tiled_win = data.tile_config.layout != Layout::Float
-                && data.tagged_windows.iter().any(|tw| {
-                    !tw.floating
-                        && tw.window == self.window
-                });
-
-            // Columns/niri: вставляем окно туда, куда показывала подсказка.
-            if is_tiled_win && data.tile_config.layout == Layout::Columns {
-                let x = data.columns_drag_hint.take().unwrap_or(data.pointer_location.x);
-                data.columns_drop_window(&self.window, x);
-                data.request_plane_reset();
-                handle.frame(data);
-                return;
-            }
-            data.columns_drag_hint = None;
-
-            // Тайловое окно: свапы уже применены в motion, осталось только
-            // дать раскладке доехать. Магнитирование и инерция — это про
-            // свободный холст, тайловое окно они сдвинули бы со слота.
-            if is_tiled_win {
-                data.arrange();
-                data.request_plane_reset();
-                data.request_redraw();
-                handle.frame(data);
-                return;
-            }
-
-            // Окно созвездия увели руками — гроздь «растащена», и следующий
-            // Super+D по ней должен собрать её заново, а не разбирать (см.
-            // TaggedWindow::constellation_torn). Тащили всё созвездие целиком
-            // (оно попало в выделение) — взаимное расположение не нарушено,
-            // метку не ставим.
-            let утащили_часть = {
-                let ехали: Vec<Window> = self.group_initial.iter()
-                    .map(|(w, _)| w.clone())
-                    .chain(std::iter::once(self.window.clone()))
-                    .collect();
-                data.constellation_members_excluding(&self.window)
-                    .iter()
-                    .any(|m| !ехали.contains(m))
-            };
-            if утащили_часть {
-                data.mark_constellation_torn(&self.window);
-            }
-
-            // Магнитирование (2.1): один раз при отпускании подравниваем край
-            // к ближайшему соседу в пределах SNAP_DISTANCE, если коллизия включена.
-            let riding: Vec<Window> = self.group_initial.iter().map(|(w, _)| w.clone()).collect();
-            let mut snapped_applied = false;
-            if data.is_snapping_enabled {
-                if let Some(loc) = data.space.element_geometry(&self.window).map(|g| g.loc) {
-                    if let Some(snapped) = find_snap_target(data, &self.window, loc, &riding) {
-                        data.space.map_element(self.window.clone(), snapped, true);
-                        if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                            tw.window == self.window
-                        }) {
-                            tw.float_position = snapped;
-                        }
-                        // Группа держит строй и на посадке: остальных двигаем
-                        // ровно тем же сдвигом, иначе примагниченное окно
-                        // уезжало из группы на величину подравнивания.
-                        self.shift_group(data, snapped - loc);
-                        snapped_applied = true;
-                    }
-                }
-            }
-
-            // Инерция перетаскивания: окно доезжает по инерции после отпускания
-            // (не применяется, если сработало магнитирование — там нужна
-            // точная посадка на край соседа).
-            if !snapped_applied {
-                let v = self.velocity.launch_velocity(); // px/сек в canvas
-                let speed = (v.x * v.x + v.y * v.y).sqrt();
-                const MIN_FLING: f64 = 120.0;  // ниже — считаем что окно просто положили
-                if speed > MIN_FLING {
-                    // Пружина стартует ровно с той скоростью, с какой курсор
-                    // отпустил окно, и тормозит экспоненциально. Раньше тут был
-                    // ease-out на фиксированную дистанцию: его стартовая
-                    // скорость (3·d/dur) не совпадала со скоростью драга, и в
-                    // момент отпускания окно заметно «дёргалось» вперёд.
-                    // ω поднимаем на быстрых бросках, чтобы путь доезда
-                    // (|v|/ω) не превышал MAX_GLIDE.
-                    let omega = crate::anim::glide_omega(speed);
-                    let target = data.fling_window(&self.window, v, omega);
-                    if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                        tw.window == self.window
-                    }) {
-                        tw.float_position = target;
-                        tw.position = target;
-                        tw.float_position_set = true;
-                    }
-                    // Выделение доезжает тем же броском. Одинаковые скорость и
-                    // ω дают одинаковый путь (|v|/ω) и одинаковую кривую, так
-                    // что взаимное расположение сохраняется. Без этого инерцию
-                    // получало только окно под курсором — и оно улетало из
-                    // группы, хотя весь драг они ехали вместе.
-                    for (member, _) in &self.group_initial {
-                        let member_target = data.fling_window(member, v, omega);
-                        if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                            &tw.window == member
-                        }) {
-                            tw.float_position = member_target;
-                            tw.position = member_target;
-                            tw.float_position_set = true;
-                        }
-                    }
-                }
-            }
-
-            // Сброс plane-кэша на границе драга — сглаживает возможный
-            // "хвост"/тень от предыдущей позиции на некоторых DRM-планах.
-            data.request_plane_reset();
-            data.request_redraw();
+            self.finish(data);
+            handle.frame(data);
         }
     }
 

@@ -569,6 +569,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
  "calloop 0.14.4",
+ "drm-ffi",
  "libc",
  "libspa",
  "mlua",

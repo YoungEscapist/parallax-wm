@@ -594,6 +594,51 @@ const FRAME_DT: Duration = Duration::from_millis(16);
 /// «телепортировать» камеру одним гигантским dt.
 const MAX_DT: Duration = Duration::from_millis(100);
 
+/// Как часто тикать, пока что-то движется, и как редко — пока всё стоит.
+///
+/// Раньше интервал был один: 16 мс всегда. Плюс главный цикл в main.rs ждал
+/// события ровно столько же. На неподвижном экране это 120 пробуждений в
+/// секунду ради работы, которой нет: ни анимаций, ни инерции, ни кадров. Для
+/// настольной машины это незаметно, а для ноутбука — процессор, которому не
+/// дают уйти в глубокий сон, и он не уходит туда НИКОГДА, даже когда экран
+/// статичен часами.
+///
+/// Медленный интервал не добавляет задержек. Любое событие — ввод, коммит
+/// клиента, VBlank, D-Bus — будит цикл немедленно, и тик считается сразу за
+/// ним (см. main.rs). А непрерывную анимацию везёт цепочка VBlank, которая
+/// тикает ровно в такт монитору. Таймер здесь — только страховка на случай,
+/// если цепочка оборвалась.
+pub const TICK_ACTIVE: Duration = Duration::from_millis(16);
+pub const TICK_IDLE: Duration = Duration::from_millis(250);
+
+impl Dawn {
+    /// Движется ли на экране хоть что-то, чему нужен тик 60 Гц.
+    ///
+    /// Список ровно по тому, что двигает [`tick`] ниже, плюс доводка курсора у
+    /// края тачпада: она — единственное, что обязано идти при ПОЛНОМ отсутствии
+    /// событий (пальцы прижаты и стоят, libinput молчит, см. input.rs), и
+    /// проспать её нельзя.
+    pub fn anim_busy(&self) -> bool {
+        self.camera_anim.is_some()
+            || self.zoom_anim.is_some()
+            || self.zoom_glide.is_some()
+            || self.momentum.coasting
+            || !self.window_open_anims.is_empty()
+            || !self.window_pos_anims.is_empty()
+            || self.focus_aura_anim.is_some()
+            || self.edge_drift.is_some()
+            || self.needs_redraw
+            || self.portal_cast.is_some()
+            || self.tray.as_ref().is_some_and(|t| t.armed.is_some())
+    }
+
+    /// Пауза до следующего тика: такт кадра, пока что-то движется, и заметно
+    /// более редкий опрос, пока всё стоит.
+    pub fn tick_interval(&self) -> Duration {
+        if self.anim_busy() { TICK_ACTIVE } else { TICK_IDLE }
+    }
+}
+
 /// Advances momentum coasting and any active camera/zoom LERP by one frame.
 /// Called from the ~60Hz timer in main.rs. No-ops (cheaply) when nothing is
 /// animating, so it's safe to run unconditionally forever.
@@ -617,6 +662,12 @@ pub fn tick(state: &mut Dawn) {
         .map(|prev| now.saturating_duration_since(prev).min(MAX_DT))
         .unwrap_or(FRAME_DT);
     state.anim_last_tick = Some(now);
+
+    // Пальцы упёрлись в край тачпада, а жест не закончен — ведём курсор дальше
+    // сами (см. EdgeDrift в input.rs). Место именно здесь: пока пальцы стоят,
+    // событий ввода нет вовсе, и продолжить движение больше неоткуда — этот
+    // тик единственный, кто вообще идёт на неподвижном экране.
+    state.edge_drift_tick(dt);
 
     // Инерция панорамирования применяется ТОЛЬКО когда нет активной анимации
     // камеры/зума. Иначе после конца camera_anim (например перелёта в (0,0) при

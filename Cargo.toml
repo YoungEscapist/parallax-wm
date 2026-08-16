@@ -32,6 +32,10 @@ smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git", rev = "53
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 calloop = { version = "0.14", features = ["signals"] }
+# Сырая drm_mode_modeinfo: из неё собирается режим, которого нет в EDID
+# (см. src/mode.rs). Крейт `drm` её тип не реэкспортирует, а версия здесь та же,
+# что тянет сам `drm` — новых зависимостей в дерево не добавляется.
+drm-ffi = "0.9"
 xcursor = "0.3"
 libc = "0.2"
 bitflags = "2"

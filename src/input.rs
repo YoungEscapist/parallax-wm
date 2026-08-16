@@ -13,7 +13,10 @@ use smithay::{
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
 };
 
+use std::time::{Duration, Instant};
+
 use crate::{
+    canvas::VelocityTracker,
     grabs::{move_grab::MoveSurfaceGrab, resize_grab::{ResizeEdge, ResizeSurfaceGrab}},
     state::Dawn,
     tiling::Layout,
@@ -21,6 +24,215 @@ use crate::{
 
 const BTN_LEFT:  u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+
+/// Скорость переноса: единицы скролла тачпада мельче пиксельной дельты мыши.
+const TOUCHPAD_MOVE_SPEED: f64 = 2.5;
+
+/// Пауза, после которой кадры тачпада считаются РАЗНЫМИ жестами. Внутри одного
+/// жеста libinput шлёт кадры каждые ~7 мс, так что запас здесь двадцатикратный.
+const TOUCHPAD_GESTURE_GAP: Duration = Duration::from_millis(150);
+
+// ── Доводка курсора у края тачпада (edge motion) ─────────────────────────────
+//
+// Тачпад кончается раньше, чем экран: окно едет к дальнему краю, пальцы
+// упираются в бортик панели, и перенос обрывается на полпути. Приходится
+// отпускать, возвращать пальцы и начинать заново — а в раскладках, где отпускание
+// что-то ЗАВЕРШАЕТ (вставка в ленту, обмен местами в тайлинге), ещё и с риском
+// уронить окно не туда.
+//
+// Лечится это тем, что в X11 называлось EdgeMotion (драйвер xf86-input-synaptics,
+// опции EdgeMotionMinSpeed/MaxSpeed/UseAlways): «когда палец доходит до края
+// тачпада, указатель продолжает двигаться, пока палец не поднят», причём по
+// умолчанию — только во время перетаскивания, чтобы не мешать обычной работе.
+// libinput этой возможности не унаследовал, поэтому здесь она своя.
+//
+// Чего нам не хватает по сравнению с synaptics: тот видел АБСОЛЮТНУЮ позицию
+// пальца на панели и её нажим, и потому просто проверял «палец в краевой зоне».
+// Для скролла двумя пальцами libinput отдаёт одни лишь дельты — ни координат, ни
+// давления в этих событиях нет. Значит, упор надо узнавать по косвенным
+// признакам, и вот они:
+//
+//   * жест НЕ закончен — кадра с нулевой амплитудой, которым libinput отмечает
+//     отпускание пальцев, ещё не было;
+//   * до этого пальцы ехали быстро (см. `peak`) — то есть человек вёл окно, а
+//     не подкручивал его по пикселю;
+//   * а сейчас движение прекратилось: либо событий нет вовсе, либо приходит
+//     мелкая дрожь от прижатого к бортику пальца.
+
+/// Сколько «неподвижности» внутри идущего жеста считаем упором в край панели.
+const EDGE_IDLE: Duration = Duration::from_millis(80);
+/// Ниже этой скорости (canvas-px/с) кадр жеста считается не движением, а
+/// дрожанием прижатого пальца: упор в бортик почти никогда не даёт чистого нуля,
+/// палец продолжает елозить по последним миллиметрам панели.
+///
+/// Именно на этом доводка и ломалась раньше. Порог был один на всё, скорость
+/// бралась из скользящего окна последних 80 мс, и эта самая дрожь вытесняла из
+/// окна быстрые кадры: в логе 20260816_131327 видно, как за полсекунды упора
+/// скорость сползает 352 → 253 и проваливается под порог, а каждый такой кадр
+/// вдобавок сбрасывал разгон в ноль. Доводка успевала прожить один кадр из
+/// шестидесяти — со стороны «не работает вообще».
+const EDGE_MOVING: f64 = 200.0;
+/// Кадр короче этого (canvas-px) не может считаться движением, какой бы скорость
+/// ни показывало окно выборки.
+///
+/// Нужен ради отзывчивости, а не ради правильности. Окно выборки длиной 80 мс
+/// после остановки пальца ещё столько же помнит быстрые кадры, и без этой
+/// проверки упор замечался бы только через 80 мс окна + 80 мс простоя. С ней
+/// дрожь отсекается сразу, и доводка трогается ровно через [`EDGE_IDLE`].
+const EDGE_JITTER_STEP: f64 = 0.5;
+/// Каким быстрым должен быть жест, чтобы доводка вообще включилась.
+const EDGE_MIN_PEAK: f64 = 300.0;
+/// Сколько холста жест обязан пройти до упора. Отсекает короткий тычок: у него
+/// пиковая скорость бывает высокой, а вести после него нечего.
+const EDGE_MIN_TRAVEL: f64 = 24.0;
+/// Пик скорости живёт не дольше этого — иначе разгон в начале длинного жеста
+/// задавал бы темп доводки через минуту после того, как человек замедлился.
+const EDGE_PEAK_TTL: Duration = Duration::from_millis(500);
+/// С какой скорости доводка стартует и за сколько разгоняется до пиковой.
+/// Оба порога — прямой аналог EdgeMotionMinSpeed/MaxSpeed у synaptics; там темп
+/// рос с нажимом пальца, здесь — со временем упора, потому что нажима нам не
+/// показывают.
+const EDGE_START_SPEED: f64 = 250.0;
+const EDGE_RAMP: Duration = Duration::from_millis(200);
+/// Потолок скорости доводки, canvas-px/с.
+const EDGE_MAX_SPEED: f64 = 1200.0;
+/// Предохранитель: дольше этого одна доводка не едет.
+///
+/// Конец жеста мы узнаём из кадра с нулевой амплитудой, который libinput шлёт
+/// на отпускание пальцев. Если такой кадр по какой-то причине не придёт
+/// (жест оборвали, устройство переоткрыли), доводка иначе тянула бы окно по
+/// холсту бесконечно — а остановить её было бы уже нечем.
+const EDGE_MAX_RUN: Duration = Duration::from_secs(5);
+
+/// Продолжение жеста, когда пальцы упёрлись в край тачпада и дальше не едут.
+pub struct EdgeDrift {
+    /// Скорость жеста по последним кадрам.
+    vel: VelocityTracker,
+    /// Самая высокая скорость, замеченная за последние [`EDGE_PEAK_TTL`], и
+    /// направление в тот момент. Именно они задают темп и курс доводки.
+    ///
+    /// Пик, а не текущая скорость: у бортика палец физически ТОРМОЗИТ, и брать
+    /// темп из последних кадров — значит брать его из самого торможения. Курс
+    /// оттуда же и по той же причине: последние миллиметры палец ёрзает, и
+    /// направление в них случайное.
+    peak: f64,
+    peak_dir: Point<f64, Logical>,
+    peak_at: Instant,
+    /// Когда пальцы в последний раз ДВИГАЛИСЬ (скорость выше [`EDGE_MOVING`]).
+    moving_at: Instant,
+    /// Сколько холста жест прошёл суммарно — против случайного тычка.
+    travel: f64,
+    /// Когда доводка фактически началась — от неё считается разгон.
+    started: Option<Instant>,
+    /// Про этот простой уже отчитались в лог — чтобы не сыпать 60 строк в
+    /// секунду, пока пальцы стоят. Сбрасывается движением пальцев.
+    reported: bool,
+}
+
+impl EdgeDrift {
+    fn new(now: Instant) -> Self {
+        Self {
+            vel: VelocityTracker::new(),
+            peak: 0.0,
+            peak_dir: Point::from((0.0, 0.0)),
+            peak_at: now,
+            moving_at: now,
+            travel: 0.0,
+            started: None,
+            reported: false,
+        }
+    }
+
+    /// Учесть очередной кадр жеста.
+    ///
+    /// Ключевое здесь — что делает МЕДЛЕННЫЙ кадр. Он копится в скорости и в
+    /// пройденном пути, но не объявляет пальцы движущимися и не сбрасывает
+    /// разгон: у бортика панели палец не замирает намертво, он продолжает
+    /// елозить, и если считать эту дрожь движением, доводка не проживёт ни
+    /// одного кадра (см. EDGE_MOVING).
+    ///
+    /// `time` — отметка libinput в мс (не время обработки, см. VelocityTracker),
+    /// `now` — часы для порогов простоя; в тестах оба задаются вручную.
+    fn note(&mut self, step: Point<f64, Logical>, time: u32, now: Instant) {
+        self.vel.push(time, step);
+        let длина = (step.x * step.x + step.y * step.y).sqrt();
+        self.travel += длина;
+        // Дрожь прижатого пальца в скорость идёт (жест ею и заканчивается), а
+        // движением не считается — см. EDGE_JITTER_STEP.
+        if длина < EDGE_JITTER_STEP {
+            return;
+        }
+
+        let v = self.vel.launch_velocity();
+        let speed = (v.x * v.x + v.y * v.y).sqrt();
+        if speed < EDGE_MOVING {
+            return;
+        }
+
+        // Пальцы реально едут: доводка не нужна, а если шла — обрывается.
+        self.moving_at = now;
+        self.started = None;
+        self.reported = false;
+        // Пик обновляем либо когда побит, либо когда протух: иначе разгон в
+        // начале длинного жеста задавал бы темп доводки через минуту после
+        // того, как человек замедлился.
+        if speed >= self.peak || now.duration_since(self.peak_at) > EDGE_PEAK_TTL {
+            self.peak = speed;
+            self.peak_dir = Point::from((v.x / speed, v.y / speed));
+            self.peak_at = now;
+        }
+    }
+
+    /// Что доводка хочет сделать в этот тик: шаг по холсту либо ничего.
+    fn advance(&mut self, dt: Duration, now: Instant) -> Option<Point<f64, Logical>> {
+        // Пальцы ещё едут сами — доводка не нужна.
+        if now.duration_since(self.moving_at) < EDGE_IDLE {
+            return None;
+        }
+        // Жест был слишком вялым или слишком коротким, чтобы его продолжать:
+        // человек возит окно по мелочи или только коснулся панели.
+        if self.peak < EDGE_MIN_PEAK || self.travel < EDGE_MIN_TRAVEL {
+            // Один раз на простой, иначе это 60 строк в секунду.
+            if !self.reported {
+                self.reported = true;
+                tracing::debug!(
+                    "ДОВОДКА нет: простой={}мс пик={:.0} (нужно {}) путь={:.0} (нужно {})",
+                    now.duration_since(self.moving_at).as_millis(),
+                    self.peak, EDGE_MIN_PEAK, self.travel, EDGE_MIN_TRAVEL,
+                );
+            }
+            return None;
+        }
+        let fresh = self.started.is_none();
+        let started = *self.started.get_or_insert(now);
+        if fresh {
+            tracing::debug!(
+                "ДОВОДКА старт: простой={}мс пик={:.0} курс=({:.2},{:.2}) путь={:.0}",
+                now.duration_since(self.moving_at).as_millis(),
+                self.peak, self.peak_dir.x, self.peak_dir.y, self.travel,
+            );
+        }
+        let держится = now.duration_since(started);
+        if держится > EDGE_MAX_RUN {
+            if !self.reported {
+                self.reported = true;
+                tracing::debug!("ДОВОДКА стоп: предохранитель {:?}", EDGE_MAX_RUN);
+            }
+            return None;
+        }
+        // Плавный разгон от EDGE_START_SPEED к пиковой: рывка в момент упора
+        // быть не должно, но и ползти после быстрого жеста доводка не обязана.
+        let ramp = (держится.as_secs_f64() / EDGE_RAMP.as_secs_f64()).clamp(0.0, 1.0);
+        let цель = self.peak.min(EDGE_MAX_SPEED);
+        let speed = EDGE_START_SPEED + (цель - EDGE_START_SPEED).max(0.0) * ramp;
+        let want = speed * dt.as_secs_f64();
+        let step = Point::from((self.peak_dir.x * want, self.peak_dir.y * want));
+        if step.x == 0.0 && step.y == 0.0 {
+            return None;
+        }
+        Some(step)
+    }
+}
 
 impl Dawn {
     /// Можно ли сейчас двигать камеру жестами тачпада (пан и зум щипком).
@@ -85,6 +297,106 @@ impl Dawn {
         if let Some((window, _)) = self.space.element_under(pos).map(|(w, l)| (w.clone(), l)) {
             crate::xwin::focus(self, &window);
         }
+    }
+
+    /// Начать перетаскивание окна под курсором жестом «Super + два пальца».
+    ///
+    /// Собираем ровно тот же `MoveSurfaceGrab`, что и Win+ЛКМ (см. ветку
+    /// Super+ЛКМ в PointerButton), поэтому дальше жест ведёт себя во всех
+    /// раскладках так же, как мышь: в Tile меняет окна местами, в Columns
+    /// показывает шов вставки и переносит между столами, во Float возит
+    /// свободно и толкает соседей.
+    fn start_touchpad_drag(&mut self) {
+        let pos = self.pointer_location;
+        let Some((window, loc)) = self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
+        else {
+            return;
+        };
+        // Снимаем анимации с окна и со всех, кто поедет с ним: недоигранный
+        // доезд от прошлого действия иначе каждый тик тянет окно на свою
+        // траекторию, и под пальцами оно «резинится».
+        self.freeze_window_anim(&window);
+        let members = self.group_drag_members_excluding(&window);
+        let mut group_initial = Vec::with_capacity(members.len());
+        for m in members {
+            self.freeze_window_anim(&m);
+            if let Some(l) = self.space.element_location(&m) {
+                group_initial.push((m, l));
+            }
+        }
+        let focus = crate::xwin::surface(&window).map(|s| (s, loc.to_f64()));
+        self.touchpad_drag = Some(MoveSurfaceGrab::new(
+            GrabStartData { focus, button: BTN_LEFT, location: pos },
+            window,
+            loc,
+            group_initial,
+        ));
+        self.request_plane_reset();
+    }
+
+    /// Запомнить шаг жеста для доводки у края (см. [`EdgeDrift::note`]).
+    fn note_gesture_step(&mut self, step: Point<f64, Logical>, time: u32) {
+        let now = Instant::now();
+        self.edge_drift
+            .get_or_insert_with(|| EdgeDrift::new(now))
+            .note(step, time, now);
+    }
+
+    /// Продвинуть активный жест на `step` canvas-пикселей: курсор едет, а вместе
+    /// с ним — перетаскиваемое окно или рамка выделения.
+    ///
+    /// Курсор ведём ЗА окном намеренно: жест таскает окно, и стрелка обязана
+    /// оставаться в той же его точке, как при обычном драге мышью. Иначе окно
+    /// уезжает из-под курсора, и следующий клик цепляет уже не его.
+    fn gesture_advance(&mut self, step: Point<f64, Logical>, time: u32) {
+        let want = Point::from((
+            self.pointer_location.x + step.x,
+            self.pointer_location.y + step.y,
+        ));
+        // Во Float курсор у края экрана «переливается» в камеру — ровно тем же
+        // правилом, что и при движении настоящей мыши (см. PointerMotion).
+        // Без этого жест упирался бы в границу экрана там, где мышь продолжает
+        // тянуть холст из-под окна. В ленте и тайлинге камера принадлежит
+        // раскладке, и трогать её жест не должен.
+        if self.tile_config.layout == Layout::Float
+            && !self.overview_active
+            && !self.fullscreen_here()
+        {
+            let vis = self.visible_canvas_size();
+            let sx = want.x - self.viewport.cam_x;
+            let sy = want.y - self.viewport.cam_y;
+            let over_x = sx - sx.clamp(0.0, vis.w);
+            let over_y = sy - sy.clamp(0.0, vis.h);
+            if over_x != 0.0 || over_y != 0.0 {
+                let zoom = self.viewport.zoom;
+                self.viewport.cam_x += over_x * 0.6 / zoom;
+                self.viewport.cam_y += over_y * 0.6 / zoom;
+                self.apply_camera();
+            }
+        }
+        self.warp_pointer(want);
+        let cursor = self.pointer_location;
+        // take/вернуть: drag_to берёт весь Dawn, а grab лежит внутри него.
+        if let Some(mut grab) = self.touchpad_drag.take() {
+            grab.drag_to(self, cursor, time);
+            self.touchpad_drag = Some(grab);
+        } else if let Some(start) = self.touchpad_select_start {
+            self.selection_drag = Some(crate::grabs::rect_from_points(start, cursor));
+        }
+        self.request_redraw();
+    }
+
+    /// Один шаг доводки курсора у края тачпада. Зовётся из `anim::tick` (~60 Гц).
+    pub fn edge_drift_tick(&mut self, dt: Duration) {
+        // Доводить нечего: ни окна на пальцах, ни рамки выделения.
+        if self.touchpad_drag.is_none() && self.touchpad_select_start.is_none() {
+            self.edge_drift = None;
+            return;
+        }
+        let Some(drift) = self.edge_drift.as_mut() else { return };
+        let Some(step) = drift.advance(dt, Instant::now()) else { return };
+        let time = self.start_time.elapsed().as_millis() as u32;
+        self.gesture_advance(step, time);
     }
 
     pub(crate) fn kill_focused(&mut self) {
@@ -960,112 +1272,74 @@ impl Dawn {
                         self.request_redraw();
                         return;
                     }
-                    const TOUCHPAD_MOVE_SPEED: f64 = 2.5;
+                    // Жест ведёт ТОТ ЖЕ grab, что и Win+ЛКМ, поэтому и работает
+                    // он теперь одинаково во всех раскладках.
+                    //
+                    // Раньше здесь лежала собственная, куда более бедная
+                    // реализация: она умела только свободный сдвиг и потому
+                    // явно отказывалась работать со всем, что не плавает, —
+                    // в Tile и в ленте Columns жест молча выходил, ничего не
+                    // сделав. Отсюда и «в тайлинге и niri окна двумя пальцами
+                    // не таскаются». Свап соседей, шов вставки в ленте, перенос
+                    // между столами и возврат в слот — всё это живёт в
+                    // MoveSurfaceGrab (drag_to/finish), и дублировать его здесь
+                    // во второй раз было бы ровно тем же самым багом заново.
                     if h == 0.0 && v == 0.0 {
-                        // Финальный кадр амплитуды 0 = пальцы отпущены → снимаем латч.
-                        // В обзоре — переносим окно на воркспейс бэнда, куда попало.
-                        if let Some(w) = self.touchpad_move_window.take() {
-                            if self.overview_active {
-                                self.overview_reassign(&w);
-                            }
+                        // Финальный кадр амплитуды 0 = пальцы отпущены. Это
+                        // единственный конец жеста, который нам показывают, —
+                        // и он же единственное, что останавливает доводку
+                        // (ровно как EdgeMotion у synaptics вёл указатель
+                        // «пока палец не поднят»).
+                        tracing::debug!(
+                            "ЖЕСТ: нулевой кадр, простой перед ним={}мс, окно={}",
+                            self.edge_drift.as_ref()
+                                .map(|d| d.moving_at.elapsed().as_millis())
+                                .unwrap_or(0),
+                            self.touchpad_drag.is_some(),
+                        );
+                        self.edge_drift = None;
+                        self.touchpad_drag_empty = None;
+                        if let Some(mut grab) = self.touchpad_drag.take() {
+                            grab.finish(self);
                         }
                         return;
                     }
                     // Латчим окно на первом кадре жеста: даже с курсором,
-                    // который едет следом (ниже), у края экрана он упирается в
+                    // который едет следом, у края экрана он упирается в
                     // границу и окно из-под него всё равно выскользнуло бы —
                     // поэтому двигаем именно залатченное окно, пока пальцы не
                     // отпущены.
-                    let window = match self.touchpad_move_window.clone() {
-                        Some(w) => Some(w),
-                        None => {
-                            let w = self.space.element_under(self.pointer_location)
-                                .map(|(w, _)| w.clone());
-                            // Снимаем анимации с окна И со всех, кто поедет с
-                            // ним (выделение, созвездие). Иначе недоигранный
-                            // доезд от прошлого действия каждый тик тянет окно
-                            // на свою траекторию, и под пальцами оно
-                            // «резинится» — то самое ощущение инерции.
-                            //
-                            // При перетаскивании мышью это уже делалось (см.
-                            // ветку Super+ЛКМ), а тачпадный жест был забыт.
-                            if let Some(ref w) = w {
-                                self.freeze_window_anim(w);
-                                for m in self.group_drag_members_excluding(w) {
-                                    self.freeze_window_anim(&m);
-                                }
-                            }
-                            self.touchpad_move_window = w.clone();
-                            tracing::debug!(
-                                "ЖЕСТ: Super+2пальца → перенос окна, окно под курсором={} \
-                                 выделено={}",
-                                w.is_some(),
-                                w.as_ref().map(|w| self.is_selected(w)).unwrap_or(false),
-                            );
-                            w
-                        }
-                    };
-                    if let Some(window) = window {
-                        // Свободно возить окно можно ТОЛЬКО когда оно и так
-                        // плавающее: либо вся раскладка Float, либо окно
-                        // сделали плавающим руками (Super+V, float_selected).
-                        //
-                        // Раньше проверки не было вовсе, а ниже стояло
-                        // `tw.floating = true` — жест молча вырывал окно из
-                        // тайлинга в любой раскладке. В Tile и в ленте Columns
-                        // это ломало саму модель: раскладка перестаёт быть
-                        // раскладкой, если любое случайное движение двумя
-                        // пальцами выкидывает из неё окно.
-                        let плавающее = self.tile_config.layout == Layout::Float
-                            || self.tagged_windows.iter()
-                                .find(|tw| tw.window == window)
-                                .map(|tw| tw.floating)
-                                .unwrap_or(false);
-                        if !плавающее {
-                            self.touchpad_move_window = None;
-                            return;
-                        }
-                        let zoom = self.viewport.zoom;
-                        let dx = (h * TOUCHPAD_MOVE_SPEED / zoom).round() as i32;
-                        let dy = (v * TOUCHPAD_MOVE_SPEED / zoom).round() as i32;
-                        if let Some(geo) = self.space.element_geometry(&window) {
-                            let new_loc = smithay::utils::Point::from((geo.loc.x + dx, geo.loc.y + dy));
-                            self.space.map_element(window.clone(), new_loc, true);
-                            if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                                tw.window == window
-                            }) {
-                                tw.float_position = new_loc;
-                                tw.position = new_loc;
-                                tw.float_position_set = true;
-                                // floating НЕ ставим: до сюда доходят только уже
-                                // плавающие окна (см. проверку выше).
-                            }
-                            // Выделение едет вместе с окном — тем же смещением
-                            // (см. group_drag_members_excluding).
-                            for w in self.group_drag_members_excluding(&window) {
-                                let Some(g) = self.space.element_geometry(&w) else { continue };
-                                let loc = smithay::utils::Point::from((g.loc.x + dx, g.loc.y + dy));
-                                self.space.map_element(w.clone(), loc, false);
-                                if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| tw.window == w) {
-                                    tw.float_position = loc;
-                                    tw.position = loc;
-                                    tw.float_position_set = true;
-                                    // floating НЕ ставим — по той же причине.
-                                }
-                            }
-                            // Курсор едет ЗА окном: жест таскает окно, и стрелка
-                            // должна оставаться в той же его точке, как при
-                            // обычном драге мышью. Иначе окно уезжает из-под
-                            // курсора, а следующий клик/жест цепляет уже не его.
-                            self.warp_pointer(Point::from((
-                                self.pointer_location.x + dx as f64,
-                                self.pointer_location.y + dy as f64,
-                            )));
-                            // Режим коллизии (Super+S): расталкиваем задетые окна.
-                            self.push_colliding_windows(&window);
-                            self.request_redraw();
-                        }
+                    //
+                    // Промах латчим тоже: под курсором может не быть окна, и
+                    // тогда пробовать заново на КАЖДОМ кадре бессмысленно —
+                    // курсор при этом жесте стоит на месте, ответ не изменится.
+                    // Раньше без этого один жест по пустому месту давал сотню
+                    // hit-тестов и сотню строк в логе (20260816_131327, 10:14:25
+                    // — 30 строк за 200 мс подряд).
+                    let пусто_недавно = self.touchpad_drag_empty
+                        .is_some_and(|t| t.elapsed() < TOUCHPAD_GESTURE_GAP);
+                    if self.touchpad_drag.is_none() && !пусто_недавно {
+                        self.start_touchpad_drag();
+                        tracing::debug!(
+                            "ЖЕСТ: Super+2пальца → перенос окна, окно под курсором={}",
+                            self.touchpad_drag.is_some(),
+                        );
                     }
+                    if self.touchpad_drag.is_none() {
+                        // Под курсором нет окна — таскать нечего. Отметку
+                        // освежаем каждым кадром: пока жест идёт, кадры сыплются
+                        // чаще, чем протухает пауза, а как только он кончился —
+                        // отметка отмирает сама, чем бы жест ни завершился.
+                        self.touchpad_drag_empty = Some(Instant::now());
+                        return;
+                    }
+                    let zoom = self.viewport.zoom;
+                    let step = Point::from((
+                        h * TOUCHPAD_MOVE_SPEED / zoom,
+                        v * TOUCHPAD_MOVE_SPEED / zoom,
+                    ));
+                    self.note_gesture_step(step, event.time_msec());
+                    self.gesture_advance(step, event.time_msec());
                     return;
                 }
 
@@ -1129,6 +1403,52 @@ impl Dawn {
                         self.momentum.launch();
                         self.pan_log_left = 60;
                     }
+                    return;
+                }
+
+                // ── Голые два пальца по ПУСТОМУ холсту во Float → выделение ──
+                //
+                // Тот же жест, что ЛКМ по пустому месту (см. SelectGrab): рамка
+                // тянется за курсором, на отпускании выделяются все задетые
+                // окна. Условие «под курсором пусто» здесь не придирка, а суть:
+                // два пальца без модификаторов — это обычная прокрутка, и
+                // отнимать её у окна под курсором нельзя. Ровно поэтому и
+                // ЛКМ-выделение начинается только с пустого холста.
+                let сюда_можно_выделять = !alt_held
+                    && !logo_held
+                    && self.tile_config.layout == Layout::Float
+                    && !self.overview_active
+                    && self.space.element_under(self.pointer_location).is_none()
+                    && !self.курсор_над_слоем(self.pointer_location);
+                // Проверка на тачпад — снаружи скобок: начатое выделение не
+                // должно перехватывать ещё и колесо мыши, если по нему крутнули
+                // прямо посреди жеста.
+                if source == AxisSource::Finger
+                    && (self.touchpad_select_start.is_some() || сюда_можно_выделять)
+                {
+                    if h == 0.0 && v == 0.0 {
+                        // Пальцы отпущены — применяем рамку.
+                        self.edge_drift = None;
+                        if self.touchpad_select_start.take().is_some() {
+                            let rect = self.selection_drag.take();
+                            self.select_windows_in_rect(rect);
+                            self.request_plane_reset();
+                            self.request_redraw();
+                        }
+                        return;
+                    }
+                    if self.touchpad_select_start.is_none() {
+                        self.clear_selection();
+                        self.touchpad_select_start = Some(self.pointer_location);
+                        tracing::debug!("ЖЕСТ: 2 пальца по пустому холсту → выделение");
+                    }
+                    let zoom = self.viewport.zoom;
+                    let step = Point::from((
+                        h * TOUCHPAD_MOVE_SPEED / zoom,
+                        v * TOUCHPAD_MOVE_SPEED / zoom,
+                    ));
+                    self.note_gesture_step(step, event.time_msec());
+                    self.gesture_advance(step, event.time_msec());
                     return;
                 }
 
@@ -1406,5 +1726,151 @@ impl Dawn {
 
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Кадры жеста: `шаг` canvas-пикселей каждые `период` мс, `сколько` штук.
+    /// Возвращает время последнего кадра.
+    fn кадры(
+        drift: &mut EdgeDrift,
+        t0: Instant,
+        мс: u32,
+        шаг: f64,
+        период: u32,
+        сколько: u32,
+    ) -> u32 {
+        let mut t = мс;
+        for _ in 0..сколько {
+            drift.note(
+                Point::from((шаг, 0.0)),
+                t,
+                t0 + Duration::from_millis(t as u64),
+            );
+            t += период;
+        }
+        t - период
+    }
+
+    /// Главная регрессия: палец упёрся в бортик и продолжает елозить по нему
+    /// мелкими шагами. Раньше эта дрожь вытесняла быстрые кадры из окна выборки
+    /// и сбрасывала разгон — в логе 20260816_131327 скорость сползала 352 → 253
+    /// и проваливалась под порог, доводка жила один кадр из шестидесяти.
+    /// Теперь она обязана начаться и НЕ прерваться.
+    #[test]
+    fn дрожь_у_бортика_не_отменяет_доводку() {
+        let t0 = Instant::now();
+        let mut d = EdgeDrift::new(t0);
+
+        // Полноценный жест: 6 px за кадр каждые 8 мс ≈ 750 canvas-px/с.
+        let t = кадры(&mut d, t0, 0, 6.0, 8, 30);
+        // Палец в бортике: те же кадры, но по 0.2 px.
+        let t = кадры(&mut d, t0, t + 8, 0.2, 8, 20);
+
+        let простой = t + 8 + EDGE_IDLE.as_millis() as u32 + 1;
+        let now = t0 + Duration::from_millis(простой as u64);
+        let шаг = d
+            .advance(Duration::from_millis(16), now)
+            .expect("доводка обязана начаться после упора");
+        assert!(шаг.x > 0.0 && шаг.y == 0.0, "курс доводки не тот: {шаг:?}");
+
+        // И продолжиться: следующие кадры дрожи её не гасят.
+        let t = кадры(&mut d, t0, простой, 0.2, 8, 10);
+        let now = t0 + Duration::from_millis((t + 8 + EDGE_IDLE.as_millis() as u32) as u64);
+        assert!(
+            d.advance(Duration::from_millis(16), now).is_some(),
+            "дрожь прижатого пальца оборвала доводку",
+        );
+    }
+
+    /// Разгон: сразу после упора доводка идёт медленно и лишь потом выходит на
+    /// скорость жеста. Рывок в момент упора читается как «окно выстрелило».
+    #[test]
+    fn доводка_разгоняется_плавно() {
+        let t0 = Instant::now();
+        let mut d = EdgeDrift::new(t0);
+        let t = кадры(&mut d, t0, 0, 8.0, 8, 30);
+
+        let старт = t + 8 + EDGE_IDLE.as_millis() as u32 + 1;
+        let dt = Duration::from_millis(16);
+        let первый = d
+            .advance(dt, t0 + Duration::from_millis(старт as u64))
+            .expect("доводка не началась");
+        let поздний = d
+            .advance(
+                dt,
+                t0 + Duration::from_millis((старт + EDGE_RAMP.as_millis() as u32) as u64),
+            )
+            .expect("доводка оборвалась на разгоне");
+        assert!(
+            поздний.x > первый.x * 1.5,
+            "разгона нет: первый шаг {:.2}, поздний {:.2}",
+            первый.x, поздний.x,
+        );
+    }
+
+    /// Человек просто остановился посреди медленного жеста — вести окно дальше
+    /// нельзя, он его именно ставит. Это тот самый случай, ради которого нужен
+    /// порог по скорости: у упора в бортик скорость до него высокая, у
+    /// осмысленной остановки — нет.
+    #[test]
+    fn медленный_жест_не_едет_сам() {
+        let t0 = Instant::now();
+        let mut d = EdgeDrift::new(t0);
+        // 1 px за кадр ≈ 125 canvas-px/с — ниже EDGE_MIN_PEAK.
+        let t = кадры(&mut d, t0, 0, 1.0, 8, 40);
+        let now = t0 + Duration::from_millis((t + 8 + 500) as u64);
+        assert!(d.advance(Duration::from_millis(16), now).is_none());
+    }
+
+    /// Короткий тычок: скорость высокая, а вести после него нечего — окно
+    /// уехало бы само от одного касания панели.
+    #[test]
+    fn короткий_тычок_не_едет() {
+        let t0 = Instant::now();
+        let mut d = EdgeDrift::new(t0);
+        let t = кадры(&mut d, t0, 0, 6.0, 8, 3);
+        assert!(d.travel < EDGE_MIN_TRAVEL, "тычок вышел слишком длинным");
+        let now = t0 + Duration::from_millis((t + 8 + 500) as u64);
+        assert!(d.advance(Duration::from_millis(16), now).is_none());
+    }
+
+    /// Пальцы поехали снова — доводка обязана уступить живому вводу и начать
+    /// разгон заново, а не складываться с ним.
+    #[test]
+    fn возобновлённое_движение_обрывает_доводку() {
+        let t0 = Instant::now();
+        let mut d = EdgeDrift::new(t0);
+        let t = кадры(&mut d, t0, 0, 6.0, 8, 30);
+        let старт = t + 8 + EDGE_IDLE.as_millis() as u32 + 1;
+        assert!(d
+            .advance(Duration::from_millis(16), t0 + Duration::from_millis(старт as u64))
+            .is_some());
+
+        let t = кадры(&mut d, t0, старт, 6.0, 8, 10);
+        let now = t0 + Duration::from_millis((t + 8) as u64);
+        assert!(
+            d.advance(Duration::from_millis(16), now).is_none(),
+            "доводка едет поверх живого жеста",
+        );
+    }
+
+    /// Предохранитель: без финального кадра libinput доводка не должна тянуть
+    /// окно по холсту вечно.
+    #[test]
+    fn предохранитель_останавливает_бесконечную_доводку() {
+        let t0 = Instant::now();
+        let mut d = EdgeDrift::new(t0);
+        let t = кадры(&mut d, t0, 0, 6.0, 8, 30);
+        let старт = t + 8 + EDGE_IDLE.as_millis() as u32 + 1;
+        let dt = Duration::from_millis(16);
+        assert!(d
+            .advance(dt, t0 + Duration::from_millis(старт as u64))
+            .is_some());
+        let поздно = старт as u64 + EDGE_MAX_RUN.as_millis() as u64 + 100;
+        assert!(d.advance(dt, t0 + Duration::from_millis(поздно)).is_none());
     }
 }

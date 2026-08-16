@@ -648,6 +648,55 @@ pub struct Row {
     pub device: usize,
 }
 
+/// Что делает кнопка в подвале меню.
+///
+/// Раньше подвал был ОДНОЙ строкой текста — «Enter connect  D disconnect …» —
+/// то есть шпаргалкой, а не управлением: мышь по ней не работала вовсе (в
+/// `bt_click` разбирались только строки устройств, всё остальное считалось
+/// «мимо меню» и меню просто закрывалось). Отсюда и «кнопки не работают»:
+/// нажимать было нечего, там был текст.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Enter по выбранному: сопрячь / подключить / отключить — по состоянию.
+    Activate,
+    /// D — отключить, не забывая сопряжение.
+    Disconnect,
+    /// F — забыть устройство.
+    Forget,
+    /// S — начать или остановить поиск.
+    Scan,
+    /// P — питание адаптера.
+    Power,
+    /// Esc — закрыть меню.
+    Close,
+}
+
+/// Кнопка подвала: прямоугольник на экране, действие и то, как её рисовать.
+#[derive(Clone, Debug)]
+pub struct Button {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub action: Action,
+    /// Подпись клавиши («Enter», «P», …) — рисуется акцентом слева.
+    pub key: &'static str,
+    /// Что кнопка делает сейчас: «connect» / «disconnect» / «power off»…
+    pub label: String,
+    /// Действие сейчас невозможно (нет устройства, адаптер выключен) —
+    /// кнопка тусклая и клик по ней ничего не делает.
+    pub enabled: bool,
+}
+
+impl Button {
+    pub fn hit(&self, x: f64, y: f64) -> bool {
+        x >= self.x as f64
+            && x < (self.x + self.w) as f64
+            && y >= self.y as f64
+            && y < (self.y + self.h) as f64
+    }
+}
+
 /// Всё, что композитор знает о блютузе: последний снимок, канал команд и
 /// состояние меню.
 pub struct BtUi {
@@ -663,6 +712,8 @@ pub struct BtUi {
     pub confirm: Option<Confirm>,
     /// Геометрия строк последнего кадра (экранные пиксели) — для мыши.
     pub rows: Vec<Row>,
+    /// Кнопки подвала последнего кадра — тоже для мыши (см. Button).
+    pub buttons: Vec<Button>,
 }
 
 pub struct Confirm {
@@ -684,6 +735,7 @@ impl BtUi {
             notice: None,
             confirm: None,
             rows: Vec::new(),
+            buttons: Vec::new(),
         }
     }
 
@@ -696,6 +748,63 @@ impl BtUi {
 
     pub fn selected(&self) -> Option<&Device> {
         self.snap.devices.get(self.sel)
+    }
+
+    /// Из чего собрать подвал: действие, подпись клавиши, подпись действия и
+    /// доступно ли оно СЕЙЧАС.
+    ///
+    /// Одно место на всё: отрисовка берёт отсюда и подписи, и активность, а
+    /// `bt_action` выполняет ровно те же действия по тем же правилам. Пока
+    /// подвал был текстовой строкой, подписи жили отдельно от поведения и
+    /// разъезжались с ним — строка обещала «D disconnect» и для неподключённого
+    /// устройства.
+    pub fn button_specs(&self) -> Vec<(Action, &'static str, String, bool)> {
+        let dev = self.selected();
+        let powered = self.snap.powered;
+        let has_adapter = self.snap.adapter.is_some();
+
+        // Что сделает Enter — зависит от состояния выбранного устройства, ровно
+        // как в bt_activate.
+        let (activate_label, activate_on) = match dev {
+            Some(d) if d.connected => ("disconnect", true),
+            Some(d) if d.paired => ("connect", true),
+            Some(_) => ("pair", true),
+            None => ("connect", false),
+        };
+
+        vec![
+            (
+                Action::Activate,
+                "Enter",
+                activate_label.to_string(),
+                activate_on && powered,
+            ),
+            (
+                Action::Disconnect,
+                "D",
+                "disconnect".to_string(),
+                dev.is_some_and(|d| d.connected),
+            ),
+            (
+                Action::Forget,
+                "F",
+                "forget".to_string(),
+                dev.is_some_and(|d| d.paired),
+            ),
+            (
+                Action::Scan,
+                "S",
+                if self.snap.discovering { "stop scan" } else { "scan" }.to_string(),
+                powered,
+            ),
+            (
+                Action::Power,
+                "P",
+                if powered { "power off" } else { "power on" }.to_string(),
+                has_adapter,
+            ),
+            (Action::Close, "Esc", "close".to_string(), true),
+        ]
     }
 }
 
@@ -783,24 +892,19 @@ impl crate::state::Dawn {
             return true;
         }
 
+        // Клавиши и кнопки подвала делают одно и то же одним и тем же кодом
+        // (см. bt_action и BtUi::button_specs) — подпись на кнопке не может
+        // разойтись с тем, что произойдёт по её клавише.
         let count = self.bt.as_ref().map(|b| b.snap.devices.len()).unwrap_or(0);
         match keysym {
-            keysyms::KEY_Escape => self.bt_toggle_menu(),
+            keysyms::KEY_Escape => self.bt_action(Action::Close),
             keysyms::KEY_Down | keysyms::KEY_j => self.bt_move_sel(1, count),
             keysyms::KEY_Up | keysyms::KEY_k => self.bt_move_sel(-1, count),
-            keysyms::KEY_Return | keysyms::KEY_KP_Enter => self.bt_activate(),
-            keysyms::KEY_d => self.bt_cmd_for_selected(|d| Some(Cmd::Disconnect(d.path.clone()))),
-            keysyms::KEY_f | keysyms::KEY_Delete => {
-                self.bt_cmd_for_selected(|d| Some(Cmd::Forget(d.path.clone())))
-            }
-            keysyms::KEY_s => {
-                let scanning = self.bt.as_ref().is_some_and(|b| b.snap.discovering);
-                self.bt_send(Cmd::Discovery(!scanning));
-            }
-            keysyms::KEY_p => {
-                let on = self.bt.as_ref().is_some_and(|b| b.snap.powered);
-                self.bt_send(Cmd::Power(!on));
-            }
+            keysyms::KEY_Return | keysyms::KEY_KP_Enter => self.bt_action(Action::Activate),
+            keysyms::KEY_d => self.bt_action(Action::Disconnect),
+            keysyms::KEY_f | keysyms::KEY_Delete => self.bt_action(Action::Forget),
+            keysyms::KEY_s => self.bt_action(Action::Scan),
+            keysyms::KEY_p => self.bt_action(Action::Power),
             _ => {}
         }
         true
@@ -847,12 +951,51 @@ impl crate::state::Dawn {
         self.request_redraw();
     }
 
+    /// Выполнить действие подвала. Одна точка входа и для мыши, и для клавиш —
+    /// см. BtUi::button_specs.
+    pub fn bt_action(&mut self, action: Action) {
+        match action {
+            Action::Activate => self.bt_activate(),
+            Action::Disconnect => {
+                self.bt_cmd_for_selected(|d| Some(Cmd::Disconnect(d.path.clone())))
+            }
+            Action::Forget => self.bt_cmd_for_selected(|d| Some(Cmd::Forget(d.path.clone()))),
+            Action::Scan => {
+                let scanning = self.bt.as_ref().is_some_and(|b| b.snap.discovering);
+                self.bt_send(Cmd::Discovery(!scanning));
+            }
+            Action::Power => {
+                let on = self.bt.as_ref().is_some_and(|b| b.snap.powered);
+                self.bt_send(Cmd::Power(!on));
+            }
+            Action::Close => self.bt_toggle_menu(),
+        }
+    }
+
     /// Клик мышью при открытом меню. `true` — клик съеден меню.
     /// `pos` — ЭКРАННЫЕ пиксели (меню приклеено к экрану, как панель).
     pub fn bt_click(&mut self, pos: smithay::utils::Point<f64, smithay::utils::Physical>) -> bool {
         if !self.bt_menu_open() {
             return false;
         }
+
+        // Кнопки подвала — раньше их тут не было вовсе, и клик по ним попадал в
+        // ветку «мимо меню», то есть закрывал меню. Со стороны это выглядело
+        // ровно как «кнопки не работают».
+        let кнопка = self.bt.as_ref().and_then(|b| {
+            b.buttons.iter()
+                .find(|btn| btn.hit(pos.x, pos.y))
+                .map(|btn| (btn.action, btn.enabled))
+        });
+        if let Some((action, enabled)) = кнопка {
+            // Недоступную кнопку не выполняем, но клик всё равно съедаем: он
+            // предназначался меню, и «проваливать» его в окно под меню нельзя.
+            if enabled {
+                self.bt_action(action);
+            }
+            return true;
+        }
+
         let hit = self.bt.as_ref().and_then(|b| {
             b.rows.iter().find(|r| {
                 pos.x >= r.x as f64 && pos.x < (r.x + r.w) as f64
@@ -860,11 +1003,24 @@ impl crate::state::Dawn {
             }).map(|r| r.device)
         });
         match hit {
+            // Первый клик по строке ВЫДЕЛЯЕТ её, повторный по уже выделенной —
+            // выполняет (подключить/отключить/сопрячь).
+            //
+            // Раньше любой клик подключал сразу же, и это делало кнопки
+            // «отключить» и «забыть» бесполезными для мыши: чтобы навести их на
+            // устройство, его надо было сперва выделить, а выделение как раз и
+            // означало подключение. Теперь выбор и действие разведены, а
+            // одно-кликовое подключение никуда не делось — оно во втором клике.
             Some(idx) => {
+                let было = self.bt.as_ref().map(|b| b.sel);
                 if let Some(bt) = self.bt.as_mut() {
                     bt.sel = idx;
                 }
-                self.bt_activate();
+                if было == Some(idx) {
+                    self.bt_activate();
+                } else {
+                    self.request_redraw();
+                }
             }
             // Клик мимо меню закрывает его — привычнее, чем ловить Esc.
             None => self.bt_toggle_menu(),

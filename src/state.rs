@@ -440,10 +440,32 @@ pub struct Dawn {
     pub overview_exit_pending: bool,
     /// Если Some — после завершения exit-анимации переключиться на этот стол.
     pub overview_exit_target_ws: Option<u32>,
-    /// Окно, которое таскает жест Super+2-пальца (тачпад-скролл source=Finger):
-    /// латчится на первом кадре жеста и едет, пока пальцы не отпущены, даже
-    /// если "выскользнуло" из-под неподвижного курсора (см. input.rs).
-    pub touchpad_move_window: Option<Window>,
+    /// Перетаскивание окна жестом «Super + два пальца» (тачпад-скролл
+    /// source=Finger): латчится на первом кадре жеста и живёт, пока пальцы не
+    /// отпущены, даже если окно «выскользнуло» из-под курсора.
+    ///
+    /// Держим целиком `MoveSurfaceGrab`, а не одно только окно: жест ходит по
+    /// тому же коду, что и Win+ЛКМ (`drag_to`/`finish`), и поэтому одинаково
+    /// работает во всех раскладках. Прежнее поле хранило только `Option<Window>`
+    /// рядом с собственной, куда более бедной реализацией переноса — она умела
+    /// лишь свободный сдвиг и в Tile/Columns просто выходила, ничего не сделав.
+    pub touchpad_drag: Option<crate::grabs::move_grab::MoveSurfaceGrab>,
+    /// Жест Super+2 пальца начался там, где окна нет, — и до конца жеста
+    /// переносить нечего. Курсор в этом жесте стоит на месте, поэтому ответ
+    /// «под курсором пусто» не изменится, и повторять hit-тест на каждом кадре
+    /// незачем (см. input.rs).
+    ///
+    /// Хранится момент последнего кадра такого жеста, а не голый флаг: конец
+    /// жеста нам показывают только кадром нулевой амплитуды, а он приходит в ту
+    /// ветку, которая разбирает жест СЕЙЧАС. Отпустил человек Super раньше
+    /// пальцев — и нулевой кадр уедет в другую ветку, флаг остался бы взведён
+    /// навсегда, а следующий Super+2 пальца молча ничего не переносил бы.
+    /// Отметка времени протухает сама (см. TOUCHPAD_GESTURE_GAP).
+    pub touchpad_drag_empty: Option<std::time::Instant>,
+    /// Начало rubber-band выделения двумя пальцами во Float (см. input.rs).
+    pub touchpad_select_start: Option<Point<f64, Logical>>,
+    /// Доводка курсора, когда пальцы упёрлись в край тачпада (см. input.rs).
+    pub edge_drift: Option<crate::input::EdgeDrift>,
     /// Layout до входа в niri-режим (Columns). При повторном Win+N восстановить
     /// его, а не всегда Tile.
     pub prev_layout_before_niri: crate::tiling::Layout,
@@ -772,7 +794,10 @@ impl Dawn {
             overview_saved_geo: Vec::new(),
             overview_exit_pending: false,
             overview_exit_target_ws: None,
-            touchpad_move_window: None,
+            touchpad_drag: None,
+            touchpad_drag_empty: None,
+            touchpad_select_start: None,
+            edge_drift: None,
             prev_layout_before_niri: crate::tiling::Layout::Tile,
             shadow_ids: Vec::new(),
             super_tap_shift: false,

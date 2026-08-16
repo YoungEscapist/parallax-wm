@@ -21,6 +21,9 @@ pkgs.mkShell {
     libgbm
     xwayland
     libdisplay-info
+    # smithay линкует renderer через -lpixman-1; без пакета mold падает на
+    # «library not found: pixman-1» уже после успешной компиляции всех крейтов.
+    pixman
     gcc
   ];
 
@@ -36,5 +39,6 @@ pkgs.mkShell {
     seatd
     udev
     libinput
+    pixman
   ];
 }

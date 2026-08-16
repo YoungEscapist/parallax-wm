@@ -99,8 +99,29 @@ fi
 # не запускал ни его, ни wireplumber. В итоге сессия оставалась совсем без
 # звука: сокета pipewire-0 нет, устройств нет, `pactl` отвечает Connection
 # refused, меню звука dawn пишет «no output device» (разобрано 05.08.2026).
+#
+# Где аудио держит systemd (NixOS с services.pipewire), руками не лезем ВООБЩЕ:
+# юниты стартуют параллельно с этим скриптом, и проверка «жив ли» неизбежно
+# гоняется с ними. У pipewire/pipewire-pulse гонку гасят сокеты (systemd делает
+# их заранее, socket activation), а у wireplumber сокета нет — и `pgrep -x` ниже
+# в одну и ту же секунду не видел ещё не стартовавший юнит и поднимал ВТОРОЙ
+# экземпляр. Два сессионных менеджера на одном ядре дерутся за устройства, граф
+# встаёт колом: `pw-dump` и `wpctl status` висят по таймауту, аудио-узлов нет
+# ни одного, `pactl` отвечает Timeout, и меню звука dawn снова пустое —
+# ровно тот же симптом, что и от осиротевшего моста, но причина обратная
+# (разобрано 15.08.2026: PID 974 от скрипта против PID 981 от systemd).
+#
+# `systemctl --user start` идемпотентен и ЖДЁТ готовности юнитов, поэтому он
+# и гонку снимает, и заменяет собой весь ручной путь. Ручной путь остаётся для
+# машин без systemd (портативная сборка, Void) — там юнитов просто нет.
 PIPEWIRE_PIDS=()
-if [[ -z "${DAWN_NO_PIPEWIRE:-}" ]]; then
+if [[ -z "${DAWN_NO_PIPEWIRE:-}" ]] \
+   && command -v systemctl >/dev/null \
+   && systemctl --user cat wireplumber.service >/dev/null 2>&1; then
+    echo "PipeWire: аудио под systemd — поднимаю юнитами, руками не трогаю"
+    systemctl --user start pipewire.service wireplumber.service pipewire-pulse.service \
+        >/dev/null 2>&1 || true
+elif [[ -z "${DAWN_NO_PIPEWIRE:-}" ]]; then
     # Ядра нет — значит всё, что осталось от прошлой сессии, мёртвый груз, и
     # к тому же держит сокет pulse, куда иначе не встанет новый мост.
     if [[ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]]; then

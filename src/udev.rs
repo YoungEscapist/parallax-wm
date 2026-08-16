@@ -580,10 +580,22 @@ fn add_surface(
         .find(|m| m.name == connector_name || m.name == model || m.name == output_name)
         .cloned();
 
+    // Режим, который коннектор предлагает сам: PREFERRED, иначе первый. Он же
+    // страховка, если наш собственный режим железо не примет.
+    let родной = connector.modes().iter()
+        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+        .or_else(|| connector.modes().first())
+        .copied()
+        .ok_or("no modes")?;
+
     // Режим: если в конфиге задан размер/частота — берём ТОЧНОЕ совпадение,
     // иначе ближайший по частоте среди подходящих по размеру. Без конфига —
     // прежнее поведение (PREFERRED, затем первый).
-    let mode_info = match &mon_cfg {
+    //
+    // Флаг «синтетический» = режим придуман нами и в EDID его нет. Такой режим
+    // единственный, который вправе не подойти железу, — и только для него ниже
+    // предусмотрен откат на `родной`.
+    let (mode_info, синтетический) = match &mon_cfg {
         Some(cfg) if cfg.width > 0 && cfg.height > 0 => {
             let подходящие: Vec<_> = connector.modes().iter()
                 .filter(|m| m.size().0 as i32 == cfg.width && m.size().1 as i32 == cfg.height)
@@ -603,40 +615,82 @@ fn add_surface(
                         "dawn/udev: {}: режим из конфига {}x{}@{}Hz",
                         connector_name, m.size().0, m.size().1, m.vrefresh(),
                     );
-                    *m
+                    (*m, false)
+                }
+                // Такого режима у коннектора нет — строим его сами.
+                //
+                // Раньше здесь был warn и молчаливый возврат на PREFERRED, и на
+                // встроенной панели это означало «FullHD получить нельзя»:
+                // eDP отдаёт РОВНО один режим, свой родной, и никакой другой в
+                // списке не появится никогда. Между тем меньший режим панель
+                // прекрасно показывает — его растягивает панельный скейлер в
+                // самом дисплейном контроллере, и композитору достаётся вчетверо
+                // меньше пикселей (см. src/mode.rs).
+                //
+                // Вверх не масштабируем: больше физической матрицы всё равно не
+                // покажешь, и такой режим железо просто отвергнет — незачем
+                // тратить на это модесет.
+                None if cfg.width <= родной.size().0 as i32
+                     && cfg.height <= родной.size().1 as i32 => {
+                    // Частоту, если её не задали, берём у родного режима: панель
+                    // всё равно работает на своей, и рассинхрон в логе только
+                    // путал бы.
+                    let hz = if cfg.refresh > 0 { cfg.refresh as f64 } else { родной.vrefresh() as f64 };
+                    let свой = crate::mode::cvt(cfg.width as u16, cfg.height as u16, hz);
+                    tracing::info!(
+                        "dawn/udev: {}: режима {}x{} в EDID нет — синтезирую CVT {}x{}@{}Hz \
+                         (панель {}x{} растянет его сама)",
+                        connector_name, cfg.width, cfg.height,
+                        свой.size().0, свой.size().1, свой.vrefresh(),
+                        родной.size().0, родной.size().1,
+                    );
+                    (свой, true)
                 }
                 None => {
                     tracing::warn!(
-                        "dawn/udev: {}: режим {}x{}@{}Hz из конфига не поддерживается, беру PREFERRED",
-                        connector_name, cfg.width, cfg.height, cfg.refresh,
+                        "dawn/udev: {}: {}x{} больше физической матрицы {}x{}, беру PREFERRED",
+                        connector_name, cfg.width, cfg.height,
+                        родной.size().0, родной.size().1,
                     );
-                    connector.modes().iter()
-                        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-                        .or_else(|| connector.modes().first())
-                        .copied()
-                        .ok_or("no modes")?
+                    (родной, false)
                 }
             }
         }
         // Задана только частота: тот же размер, что у PREFERRED, но с нужным Hz.
         Some(cfg) if cfg.refresh > 0 => {
-            let базовый = connector.modes().iter()
-                .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-                .or_else(|| connector.modes().first())
-                .copied()
-                .ok_or("no modes")?;
-            connector.modes().iter()
-                .filter(|m| m.size() == базовый.size())
+            let м = connector.modes().iter()
+                .filter(|m| m.size() == родной.size())
                 .min_by_key(|m| (m.vrefresh() as i32 - cfg.refresh).abs())
                 .copied()
-                .unwrap_or(базовый)
+                .unwrap_or(родной);
+            (м, false)
         }
-        _ => connector.modes().iter()
-            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-            .or_else(|| connector.modes().first())
-            .copied()
-            .ok_or("no modes")?,
+        _ => (родной, false),
     };
+
+    // Модесет пробуем ЗДЕСЬ, до создания wl_output: только теперь известно,
+    // какой режим железо действительно приняло, а объявлять клиентам режим,
+    // которого не будет, нельзя.
+    //
+    // Синтетический режим — единственный, который может не подойти: ядро
+    // прогоняет его через drm_mode_validate_* и atomic TEST_ONLY, и отказ здесь
+    // штатный исход, а не ошибка запуска. Молча возвращаемся на родной, иначе
+    // одна строка в config.lua оставляла бы человека без экрана вовсе.
+    let (mode_info, drm_surface) =
+        match device.drm.create_surface(crtc, mode_info, &[connector.handle()]) {
+            Ok(s) => (mode_info, s),
+            Err(e) if синтетический => {
+                tracing::warn!(
+                    "dawn/udev: {}: железо отвергло синтезированный {}x{} ({:?}) — \
+                     возвращаюсь на родной {}x{}@{}Hz",
+                    connector_name, mode_info.size().0, mode_info.size().1, e,
+                    родной.size().0, родной.size().1, родной.vrefresh(),
+                );
+                let s = device.drm.create_surface(crtc, родной, &[connector.handle()])?;
+                (родной, s)
+            }
+            Err(e) => return Err(e.into()),
+        };
 
     let wl_mode = Mode {
         size: (mode_info.size().0 as i32, mode_info.size().1 as i32).into(),
@@ -656,6 +710,34 @@ fn add_surface(
     let position: smithay::utils::Point<i32, smithay::utils::Logical> =
         mon_cfg.as_ref().map(|c| (c.x, c.y)).unwrap_or((0, 0)).into();
 
+    // scale = ... из monitor{}: логический размер стола делится на масштаб, то
+    // есть на 4K-панели scale = 2.0 даёт стол 1920×1080 — «FullHD» по размеру
+    // интерфейса при родном режиме 3840×2160. Сканаут при этом остаётся 4K.
+    //
+    // Раньше это поле парсилось в config.rs и никем не читалось: масштаб выхода
+    // был занят зумом холста. Зум с него снят (см. apply_camera в state.rs —
+    // «ЗУМ БОЛЬШЕ НЕ ЕДЕТ ЧЕРЕЗ МАСШТАБ ВЫХОДА», теперь он только в
+    // RescaleRenderElement при отрисовке), так что scale снова отвечает за DPI
+    // и только за него — умножать на зум ничего не надо.
+    //
+    // Целые значения отдаём как Integer: wl_output и так умеет только целые, а
+    // Fractional(2.0) вдобавок к тому же числу заставил бы клиентов тянуть
+    // wp_fractional_scale ради ровно того же результата.
+    let scale_val = mon_cfg.as_ref().map(|c| c.scale).unwrap_or(1.0);
+    let scale = if scale_val.fract() == 0.0 {
+        smithay::output::Scale::Integer(scale_val as i32)
+    } else {
+        smithay::output::Scale::Fractional(scale_val)
+    };
+    if scale_val != 1.0 {
+        tracing::info!(
+            "dawn/udev: {}: масштаб выхода {} → логический стол {}×{}",
+            connector_name, scale_val,
+            (wl_mode.size.w as f64 / scale_val).round() as i32,
+            (wl_mode.size.h as f64 / scale_val).round() as i32,
+        );
+    }
+
     let output = Output::new(output_name.clone(), PhysicalProperties {
         size: connector.size().map(|(w,h)| (w as i32, h as i32)).unwrap_or((0,0)).into(),
         subpixel: Subpixel::Unknown,
@@ -664,7 +746,7 @@ fn add_surface(
         serial_number: "Unknown".into(),
     });
     let _global = output.create_global::<Dawn>(&state.display_handle);
-    output.change_current_state(Some(wl_mode), Some(transform), None, Some(position));
+    output.change_current_state(Some(wl_mode), Some(transform), Some(scale), Some(position));
     output.set_preferred(wl_mode);
     state.space.map_output(&output, position);
 
@@ -707,7 +789,6 @@ fn add_surface(
     );
     let exporter = GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into());
     let color_formats = [Fourcc::Xrgb8888, Fourcc::Argb8888];
-    let drm_surface = device.drm.create_surface(crtc, mode_info, &[connector.handle()])?;
 
     let compositor = DrmCompositor::new(
         &output, drm_surface, None, allocator, exporter,
@@ -2820,7 +2901,22 @@ const BT_TEXT: i32 = 2;
 /// Высота строки устройства.
 const BT_ROW_H: i32 = 34;
 /// Ширина панели меню.
-const BT_MENU_W: i32 = 760;
+///
+/// Было 760 — и подвал в неё не влезал: строка подсказки
+/// «Enter connect  D disconnect  F forget  S scan  P power  Esc» это 58
+/// символов, при BT_TEXT=2 (7 px на глиф, см. text::GLYPH_W) — 812 px, то
+/// есть шире всей панели. Хвост уезжал за край и обрезался. Теперь подвал
+/// собран из кнопок с переносом по строкам (см. build_bluetooth_elements), а
+/// панель заодно стала шире, чтобы перенос случался пореже.
+const BT_MENU_W: i32 = 900;
+/// Поле панели слева и справа.
+const BT_SIDE: i32 = 16;
+/// Кнопка подвала: высота, зазор между соседними, внутреннее поле по бокам.
+const BT_BTN_H: i32 = 30;
+const BT_BTN_GAP: i32 = 8;
+const BT_BTN_PAD: i32 = 12;
+/// Зазор между подписью клавиши и подписью действия внутри кнопки.
+const BT_KEY_GAP: i32 = 8;
 
 /// Нарисовать строку текста одним элементом (см. text.rs). Возвращает ширину.
 fn draw_text(
@@ -2871,11 +2967,39 @@ fn build_bluetooth_elements(
     let notice = bt.notice_text().map(|s| s.to_string());
     let confirm = bt.confirm.as_ref().map(|c| (c.name.clone(), c.passkey));
 
-    // Высота: шапка + строки + подсказка. Список режем по экрану, а не по
-    // числу устройств: при поиске их набегает десяток за минуту.
+    // ── Подвал: кнопки, а не строка подсказки ────────────────────────────────
+    // Раскладываем слева направо и переносим на новую строку, как только
+    // очередная кнопка не влезает в ширину панели. Поэтому подписи любой длины
+    // помещаются ВСЕГДА — в отличие от прежней однострочной шпаргалки, которая
+    // при шести действиях просто уезжала за край панели (см. BT_MENU_W).
+    let specs = bt.button_specs();
+    let text_h = crate::text::GLYPH_H * BT_TEXT;
+    let avail = BT_MENU_W - 2 * BT_SIDE;
+    // (смещение по X внутри строки, номер строки, ширина кнопки)
+    let mut plan: Vec<(i32, i32, i32)> = Vec::with_capacity(specs.len());
+    let mut cx = 0;
+    let mut btn_line = 0;
+    for (_, key, label, _) in &specs {
+        let bw = 2 * BT_BTN_PAD
+            + crate::text::width(key, BT_TEXT)
+            + BT_KEY_GAP
+            + crate::text::width(label, BT_TEXT);
+        if cx > 0 && cx + bw > avail {
+            btn_line += 1;
+            cx = 0;
+        }
+        plan.push((cx, btn_line, bw));
+        cx += bw + BT_BTN_GAP;
+    }
+    let btn_lines = btn_line + 1;
+
+    // Высота: шапка + строки + подвал (строка состояния и ряды кнопок).
+    // Список режем по экрану, а не по числу устройств: при поиске их набегает
+    // десяток за минуту.
     let head_h = 46;
-    let foot_h = 30;
-    let max_rows = (((mode.size.h - 200) / BT_ROW_H).max(3) as usize).min(12);
+    // Строка состояния (подсказка/код сопряжения) + ряды кнопок + поля.
+    let foot_h = text_h + 10 + btn_lines * BT_BTN_H + (btn_lines - 1) * BT_BTN_GAP + 14;
+    let max_rows = (((mode.size.h - 200 - foot_h) / BT_ROW_H).max(3) as usize).min(12);
     let shown = devices.len().min(max_rows);
     let menu_h = head_h + (shown.max(1) as i32) * BT_ROW_H + foot_h + 12;
     let x = (mode.size.w - BT_MENU_W) / 2;
@@ -2891,6 +3015,9 @@ fn build_bluetooth_elements(
     const DIM: [f32; 4] = [0.60, 0.62, 0.68, 1.0];
     const ACCENT: [f32; 4] = [0.35, 0.75, 0.95, 1.0];
     const WARN: [f32; 4] = [0.95, 0.55, 0.30, 1.0];
+    /// Подложка кнопки подвала: доступной и недоступной.
+    const BTN_BG: [f32; 4] = [0.105, 0.145, 0.205, 0.95];
+    const BTN_BG_OFF: [f32; 4] = [0.055, 0.058, 0.075, 0.90];
 
     let mut idx = 0usize;
     let mut pool = std::mem::take(&mut state.bt_ids);
@@ -2901,10 +3028,11 @@ fn build_bluetooth_elements(
     rounded_solid(&mut pool, &mut idx, x + 18, y + 16, 14, 14, 7, dot_color, &mut els);
     state.bt_ids = pool;
 
+    // Про клавиши в шапке больше не пишем: они подписаны на кнопках подвала.
     let head = if !has_adapter {
         "BLUETOOTH - no adapter".to_string()
     } else if !powered {
-        "BLUETOOTH - off, press P".to_string()
+        "BLUETOOTH - off".to_string()
     } else if discovering {
         "BLUETOOTH - scanning...".to_string()
     } else {
@@ -2973,33 +3101,74 @@ fn build_bluetooth_elements(
     }
 
     if devices.is_empty() {
-        let text = if powered { "no devices - press S to scan" } else { "adapter is off - press P" };
+        let text = if powered { "no devices found yet" } else { "adapter is off" };
         draw_text(state, renderer, x + 44, y + head_h + 8, text, BT_TEXT, DIM, slot, &mut els);
         slot += 1;
     }
 
-    // Подвал: либо подсказка о результате команды, либо шпаргалка по клавишам.
+    // ── Подвал ───────────────────────────────────────────────────────────────
+    // Сверху строка состояния: код сопряжения, результат последней команды или
+    // имя выбранного устройства. Под ней — ряды кнопок.
     let foot_y = y + menu_h - foot_h + 2;
     match (&confirm, &notice) {
         (Some((name, passkey)), _) => {
             let text = if *passkey > 0 {
-                format!("pairing code {passkey:06}: Enter confirm, Esc reject ({name})")
+                format!("pairing code {passkey:06} - confirm with Enter, reject with Esc ({name})")
             } else {
-                format!("allow pairing? Enter yes, Esc no ({name})")
+                format!("allow pairing with {name}?")
             };
-            draw_text(state, renderer, x + 20, foot_y, &text, BT_TEXT, WARN, slot, &mut els);
+            draw_text(state, renderer, x + BT_SIDE, foot_y, &text, BT_TEXT, WARN, slot, &mut els);
         }
         (None, Some(text)) => {
-            draw_text(state, renderer, x + 20, foot_y, text, BT_TEXT, ACCENT, slot, &mut els);
+            draw_text(state, renderer, x + BT_SIDE, foot_y, text, BT_TEXT, ACCENT, slot, &mut els);
         }
+        // Нечего сообщить — показываем, на что подействуют кнопки. Раньше здесь
+        // стояла шпаргалка по клавишам, но теперь клавиши подписаны на самих
+        // кнопках, и повторять их незачем.
         (None, None) => {
-            let text = "Enter connect  D disconnect  F forget  S scan  P power  Esc";
-            draw_text(state, renderer, x + 20, foot_y, text, BT_TEXT, DIM, slot, &mut els);
+            let text = devices
+                .get(sel)
+                .map(|d| format!("selected: {}", d.name.chars().take(46).collect::<String>()))
+                .unwrap_or_else(|| "no device selected".to_string());
+            draw_text(state, renderer, x + BT_SIDE, foot_y, &text, BT_TEXT, DIM, slot, &mut els);
         }
+    }
+    slot += 1;
+
+    // Кнопки. Клик по ним разбирает bt_click по этим же прямоугольникам —
+    // поэтому геометрия и складывается здесь, в момент отрисовки.
+    let btn_y0 = foot_y + text_h + 10;
+    let mut buttons = Vec::with_capacity(specs.len());
+    for ((action, key, label, enabled), (dx, ln, bw)) in specs.iter().zip(plan.iter()) {
+        let bx = x + BT_SIDE + dx;
+        let by = btn_y0 + ln * (BT_BTN_H + BT_BTN_GAP);
+        let mut pool = std::mem::take(&mut state.bt_ids);
+        rounded_solid(
+            &mut pool, &mut idx, bx, by, *bw, BT_BTN_H, 8,
+            if *enabled { BTN_BG } else { BTN_BG_OFF }, &mut els,
+        );
+        state.bt_ids = pool;
+
+        let ty = by + (BT_BTN_H - text_h) / 2;
+        let key_color = if *enabled { ACCENT } else { DIM };
+        let kw = draw_text(state, renderer, bx + BT_BTN_PAD, ty, key, BT_TEXT, key_color, slot, &mut els);
+        slot += 1;
+        let label_color = if *enabled { WHITE } else { DIM };
+        draw_text(
+            state, renderer, bx + BT_BTN_PAD + kw + BT_KEY_GAP, ty, label,
+            BT_TEXT, label_color, slot, &mut els,
+        );
+        slot += 1;
+
+        buttons.push(crate::bluetooth::Button {
+            x: bx, y: by, w: *bw, h: BT_BTN_H,
+            action: *action, key, label: label.clone(), enabled: *enabled,
+        });
     }
 
     if let Some(bt) = state.bt.as_mut() {
         bt.rows = rows;
+        bt.buttons = buttons;
     }
     // Список кадра идёт ОТ ПЕРЕДНЕГО ПЛАНА К ЗАДНЕМУ (см. render_surface), а
     // собирали мы естественно: фон, подсветка, текст. Без разворота фон панели

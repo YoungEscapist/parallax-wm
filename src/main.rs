@@ -11,6 +11,7 @@ mod fullscreen;
 mod grabs;
 mod handlers;
 mod input;
+mod mode;
 mod overview;
 mod portal;
 mod portal_stream;
@@ -213,7 +214,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Анимационный тик (~60Hz): двигает камеру/zoom пока есть активные
     // LERP-анимации или инерция скролла; когда всё осело — просто быстро
     // возвращается без рендера (дешёвая проверка нескольких Option/bool).
-    let anim_timer = Timer::from_duration(std::time::Duration::from_millis(16));
+    // Шаг таймера — не константа: пока всё стоит, будиться 60 раз в секунду
+    // незачем (см. anim::tick_interval).
+    let anim_timer = Timer::from_duration(crate::anim::TICK_ACTIVE);
     event_loop.handle().insert_source(anim_timer, |_, _, state| {
         crate::anim::tick(state);
         // Пока идёт демонстрация экрана, кадр нужен РОВНО по расписанию.
@@ -224,16 +227,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if state.portal_cast.as_ref().is_some_and(|c| c.due()) {
             state.request_redraw();
         }
-        TimeoutAction::ToDuration(std::time::Duration::from_millis(16))
+        TimeoutAction::ToDuration(state.tick_interval())
     })?;
 
     // Как в anvil — dispatch с timeout чтобы seatd не голодал
     loop {
-        let result = event_loop.dispatch(
-            Some(std::time::Duration::from_millis(16)),
-            &mut state,
-        );
+        // Ждать дольше можно ровно настолько, насколько нечего показывать:
+        // событие всё равно будит цикл немедленно, а тик стоит сразу за
+        // dispatch — то есть анимация, начатая любым событием, трогается с
+        // места в той же итерации и медленный таймер её не задерживает.
+        let result = event_loop.dispatch(Some(state.tick_interval()), &mut state);
         if result.is_err() { break; }
+        // Тик здесь, а не только по таймеру: он и делает редкий таймер
+        // безопасным (см. anim::TICK_IDLE). Считается по Instant, поэтому
+        // лишний вызов ничего не ломает — он просто сэмплирует анимацию.
+        crate::anim::tick(&mut state);
         state.space.refresh();
         state.popups.cleanup();
         // Переход в полный экран доигрывается СТРОГО до отрисовки: кадр

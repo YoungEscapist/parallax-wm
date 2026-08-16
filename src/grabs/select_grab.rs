@@ -20,7 +20,9 @@ pub struct SelectGrab {
     pub start_pos: Point<f64, Logical>,
 }
 
-fn rect_from_points(a: Point<f64, Logical>, b: Point<f64, Logical>) -> Rectangle<i32, Logical> {
+/// Прямоугольник по двум углам — им же тянется рамка выделения двумя пальцами
+/// (см. input.rs), чтобы мышь и тачпад считали её одинаково.
+pub fn rect_from_points(a: Point<f64, Logical>, b: Point<f64, Logical>) -> Rectangle<i32, Logical> {
     let x0 = a.x.min(b.x) as i32;
     let y0 = a.y.min(b.y) as i32;
     let x1 = a.x.max(b.x) as i32;
