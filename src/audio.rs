@@ -17,6 +17,10 @@ use smithay::reexports::calloop::channel;
 
 const POLL_IDLE: Duration = Duration::from_millis(1200);
 const POLL_MENU: Duration = Duration::from_millis(800);
+/// Пока ни полка, ни меню не открыты, громкость всё равно нужна: её показывает
+/// панель (см. bar.rs). Опрос идёт редко — каждый заход это запуск `pactl`,
+/// и раз в секунду ради процентов в баре запускать процесс незачем.
+const POLL_BG: Duration = Duration::from_millis(5000);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Device {
@@ -82,17 +86,13 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
     let mut next_poll = Instant::now();
 
     loop {
-        let cmd = if tray || menu {
-            match rx.recv_timeout(next_poll.saturating_duration_since(Instant::now())) {
-                Ok(cmd) => Some(cmd),
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-            }
-        } else {
-            match rx.recv() {
-                Ok(cmd) => Some(cmd),
-                Err(_) => return,
-            }
+        // Поток больше НЕ засыпает насовсем: проценты громкости висят в панели
+        // постоянно (см. bar.rs), и раньше они там застывали намертво — пока
+        // полку не открыли, снимков просто не было.
+        let cmd = match rx.recv_timeout(next_poll.saturating_duration_since(Instant::now())) {
+            Ok(cmd) => Some(cmd),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
         };
 
         if let Some(cmd) = cmd {
@@ -114,14 +114,17 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
                     let _ = to_dawn.send(Event::Notice(text));
                 }
             }
-            next_poll = Instant::now();
-            if !(tray || menu) {
-                continue;
-            }
         }
 
         let snap = read_state();
-        next_poll = Instant::now() + if menu { POLL_MENU } else { POLL_IDLE };
+        next_poll = Instant::now()
+            + if menu {
+                POLL_MENU
+            } else if tray {
+                POLL_IDLE
+            } else {
+                POLL_BG
+            };
         if last.as_ref() != Some(&snap) {
             last = Some(snap.clone());
             if to_dawn.send(Event::State(snap)).is_err() {

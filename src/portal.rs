@@ -51,8 +51,13 @@ const RESPONSE_FAILED: u32 = 2;
 /// Что пользователь выбрал в меню.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Source {
-    /// Весь экран (у dawn один выход).
-    Output,
+    /// Целый монитор — по его номеру в `Dawn::мониторы`.
+    ///
+    /// Номер здесь появился 31.08.2026 вместе со вторым монитором. Раньше
+    /// вариант назывался просто «весь экран» и означал «тот выход, который
+    /// первым дорисуется», — а дорисовываются оба, и в один поток вперемешку
+    /// уезжали кадры двух разных экранов.
+    Output(usize),
     /// Конкретное окно — по индексу в `tagged_windows` на момент выбора.
     Window(usize),
 }
@@ -367,10 +372,15 @@ pub struct Pick {
     reply: mpsc::Sender<Option<Source>>,
 }
 
-/// Что выбрано и будет показано: конкретное окно или весь экран.
+/// Что выбрано и будет показано: конкретное окно или конкретный монитор.
+///
+/// Монитор держим самим `Output`, а не номером в `Dawn::мониторы`: список
+/// переупорядочивается при подключении и отключении экранов (см.
+/// [[dawn-two-monitors]] — порядок выходов не постоянен), а идущий поток
+/// обязан остаться на том же физическом мониторе.
 #[derive(Clone)]
 pub enum Capture {
-    Output,
+    Output(smithay::output::Output),
     Window(smithay::desktop::Window),
 }
 
@@ -412,9 +422,14 @@ impl crate::state::Dawn {
         // Размер кадра фиксируется на всю сессию: PipeWire согласует формат
         // один раз. Для окна берём его экранный размер на момент старта.
         let (w, h, source_type) = match &source {
-            Capture::Output => {
-                let s = self.screen_size();
-                (s.w as u32, s.h as u32, SOURCE_MONITOR)
+            Capture::Output(output) => {
+                // Размер берём у ВЫБРАННОГО выхода, а не у активного монитора:
+                // мониторы у Ярика разного размера (1920×1280 и 2560×1080), и
+                // `screen_size()` отдавал бы размер того, где в этот миг стоит
+                // стрелка. Поток при этом снимается с другого — кадр не сходился
+                // бы с согласованным форматом ни по ширине, ни по высоте.
+                let mode = output.current_mode()?;
+                (mode.size.w as u32, mode.size.h as u32, SOURCE_MONITOR)
             }
             Capture::Window(window) => {
                 let zoom = self.viewport.zoom;
@@ -436,7 +451,8 @@ impl crate::state::Dawn {
     }
 
     /// Клик во время выбора: окно под курсором — его и показываем, пустой
-    /// холст — весь экран. Возвращает true, если клик съеден выбором.
+    /// холст — МОНИТОР, на котором стоит стрелка. Возвращает true, если клик
+    /// съеден выбором.
     pub fn portal_pick_click(&mut self, cancel: bool) -> bool {
         let Some(pick) = self.portal_pick.take() else { return false };
         if cancel {
@@ -444,27 +460,110 @@ impl crate::state::Dawn {
             self.request_redraw();
             return true;
         }
-        let window = self.space.element_under(self.pointer_location).map(|(w, _)| w.clone());
+        // Клиент вправе просить только мониторы (так делает OBS: `типы=1`).
+        // Раньше `types` не смотрели вовсе, и клик по окну отдавал ему окно —
+        // источник типа, которого он не запрашивал.
+        let окна_можно = pick.types & SOURCE_WINDOW != 0;
+        let window = окна_можно
+            .then(|| self.space.element_under(self.pointer_location).map(|(w, _)| w.clone()))
+            .flatten();
         let source = match &window {
             Some(w) => {
                 let idx = self.tagged_windows.iter().position(|tw| &tw.window == w).unwrap_or(0);
                 Source::Window(idx)
             }
-            None => Source::Output,
+            None => Source::Output(self.курсор_монитор),
         };
         // Окно держим у себя: индекс в списке — только для протокола, а кадры
         // потом брать по самому окну.
-        self.portal_capture = Some(match window {
-            Some(w) => Capture::Window(w),
-            None => Capture::Output,
-        });
+        let capture = match window {
+            Some(w) => Some(Capture::Window(w)),
+            None => self.выход_монитора(self.курсор_монитор).map(Capture::Output),
+        };
+        let Some(capture) = capture else {
+            tracing::warn!("dawn/portal: у монитора {} нет выхода", self.курсор_монитор + 1);
+            let _ = pick.reply.send(None);
+            self.request_redraw();
+            return true;
+        };
+        self.portal_capture = Some(capture);
         let _ = pick.reply.send(Some(source));
         self.request_redraw();
         true
     }
 
+    /// Поднять меню выбора источника БЕЗ клиента на шине — для харнесса.
+    ///
+    /// В headless портал не запускается вовсе (`main.rs`: ни файлов, ни потока
+    /// zbus), поэтому подсветку выбора нечем было увидеть иначе как на живом
+    /// сеансе, то есть выгнав человека из-за машины. Ответ уходит в канал,
+    /// приёмник которого тут же выбрасывается: `send` на закрытом канале просто
+    /// вернёт ошибку, а её все вызывающие и так игнорируют.
+    pub fn portal_pick_debug(&mut self, types: u32) {
+        let (reply, _) = mpsc::channel();
+        if let Some(prev) = self.portal_pick.take() {
+            let _ = prev.reply.send(None);
+        }
+        self.portal_pick = Some(Pick { app_id: "ctl".into(), types, reply });
+        tracing::info!("dawn/portal: выбор источника поднят из ctl (типы={})", types);
+        self.request_redraw();
+    }
+
+    /// Цифра во время выбора: показать монитор `n` (с нуля) целиком.
+    ///
+    /// Ткнуть в пустой холст мышью можно только на своём экране, а показать
+    /// собеседнику нередко нужно соседний — на нём как раз и открыто то, что
+    /// показывают. Клавиша делает это, не заставляя перевозить стрелку.
+    pub fn portal_pick_monitor(&mut self, n: usize) -> bool {
+        if self.portal_pick.is_none() {
+            return false;
+        }
+        let Some(output) = self.выход_монитора(n) else { return false };
+        let pick = self.portal_pick.take().expect("проверено выше");
+        self.portal_capture = Some(Capture::Output(output));
+        let _ = pick.reply.send(Some(Source::Output(n)));
+        tracing::info!("dawn/portal: выбран монитор {} клавишей", n + 1);
+        self.request_redraw();
+        true
+    }
+
+    /// wl_output монитора по номеру. Без таблицы мониторов (winit, headless) —
+    /// единственный выход, который есть.
+    fn выход_монитора(&self, n: usize) -> Option<smithay::output::Output> {
+        if self.мониторы.is_empty() {
+            return self.space.outputs().next().cloned();
+        }
+        self.мониторы.get(n).map(|m| m.output.clone())
+    }
+
     /// Идёт ли выбор источника прямо сейчас.
     pub fn portal_picking(&self) -> bool {
         self.portal_pick.is_some()
+    }
+
+    /// Какие типы источников запросил клиент (маска спецификации: 1 — монитор,
+    /// 2 — окно). Нужна отрисовке подсветки: при `типы=1` подсвечивать окна
+    /// незачем, их всё равно не отдадим.
+    pub fn portal_pick_types(&self) -> u32 {
+        self.portal_pick.as_ref().map(|p| p.types).unwrap_or(0)
+    }
+
+    /// Тот ли это выход, с которого идёт демонстрация. По нему цикл отрисовки
+    /// решает, отдавать ли кадр в поток (см. `udev::push_cast_frame`).
+    pub fn cast_output_matches(&self, output: &smithay::output::Output) -> bool {
+        match self.portal_capture.as_ref() {
+            Some(Capture::Output(o)) => o == output,
+            // Окно снимается с того монитора, на чьём холсте оно лежит: кадр
+            // вырезается из экранного снимка, и снимок обязан быть тем самым.
+            Some(Capture::Window(w)) => self
+                .space
+                .element_geometry(w)
+                .and_then(|g| self.монитор_по_точке(g.loc))
+                .and_then(|i| self.мониторы.get(i))
+                .map(|m| m.output == *output)
+                // Мониторов нет (winit/headless) — выход один, он и подходит.
+                .unwrap_or(self.мониторы.is_empty()),
+            None => false,
+        }
     }
 }

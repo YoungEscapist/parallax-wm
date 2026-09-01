@@ -10,8 +10,10 @@
 //! Своё у полки одно — батарея: её отдаёт `/sys/class/power_supply`, никакой
 //! шины и никакого отдельного модуля ради двух файлов не нужно.
 //!
-//! Опрос всех троих идёт, только пока полка (или соответствующее меню)
-//! открыта, — см. `sync_watch`.
+//! Опрос вайфая и блютуза идёт, только пока полка (или соответствующее меню)
+//! открыта, — см. `sync_watch`. Заряд и звук опрашиваются ВСЕГДА, просто редко:
+//! их показывает панель сверху (см. bar.rs), и застывший на панели процент
+//! выглядит как сломанный индикатор.
 
 use std::process::Command;
 use std::sync::mpsc;
@@ -21,6 +23,10 @@ use smithay::reexports::calloop::channel;
 
 /// Как часто перечитываем заряд, пока полка открыта.
 const POLL: Duration = Duration::from_millis(2000);
+/// И как часто — пока закрыта. Заряд теперь показывает панель (см. bar.rs),
+/// то есть он нужен всегда; но два файла в /sys ради процента, который за
+/// полминуты меняется на единицу, чаще читать незачем.
+const POLL_BG: Duration = Duration::from_secs(30);
 /// Сколько кнопка питания остаётся взведённой до второго клика.
 const ARM_TTL: Duration = Duration::from_secs(4);
 /// Сколько держим сообщение о результате команды.
@@ -95,18 +101,13 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
     let mut next_poll = Instant::now();
 
     loop {
-        // Пока полка закрыта — ждём команду без таймаута: поток спит.
-        let cmd = if watching {
-            match rx.recv_timeout(next_poll.saturating_duration_since(Instant::now())) {
-                Ok(cmd) => Some(cmd),
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-            }
-        } else {
-            match rx.recv() {
-                Ok(cmd) => Some(cmd),
-                Err(_) => return,
-            }
+        // Насовсем поток больше не засыпает: заряд висит в панели постоянно, а
+        // раньше при закрытой полке снимков не было вовсе — процент застывал
+        // на том, что успели прочитать при последнем открытии.
+        let cmd = match rx.recv_timeout(next_poll.saturating_duration_since(Instant::now())) {
+            Ok(cmd) => Some(cmd),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
         };
 
         if let Some(cmd) = cmd {
@@ -120,14 +121,10 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
                     let _ = to_dawn.send(Event::Notice(text));
                 }
             }
-            next_poll = Instant::now();
-            if !watching {
-                continue;
-            }
         }
 
         let snap = Snapshot { battery: read_battery() };
-        next_poll = Instant::now() + POLL;
+        next_poll = Instant::now() + if watching { POLL } else { POLL_BG };
         if last.as_ref() != Some(&snap) {
             last = Some(snap.clone());
             if to_dawn.send(Event::State(snap)).is_err() {
@@ -194,27 +191,12 @@ fn read_battery() -> Option<Battery> {
 // ею. Держать вторую копию геометрии в хит-тесте — ровно тот способ, каким уже
 // однажды разъехались клики по окнам: на экране одно, в проверке другое.
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
-}
-
-impl Rect {
-    pub fn hit(&self, x: f64, y: f64) -> bool {
-        x >= self.x as f64
-            && x < (self.x + self.w) as f64
-            && y >= self.y as f64
-            && y < (self.y + self.h) as f64
-    }
-}
+/// Прямоугольник экрана. Один на панель и полку — они соседи и считаются
+/// одними и теми же долями высоты (см. `crate::bar`).
+pub use crate::bar::Rect;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CellKind {
-    /// Сама полосочка: клик открывает и закрывает полку.
-    Handle,
     Bluetooth,
     Wifi,
     /// Значок звука: слева — меню устройств, справа — немота.
@@ -239,21 +221,43 @@ pub struct Layout {
 
 /// Ячейки полки для экрана шириной `screen_w`.
 ///
-/// Все размеры — доли от высоты панели столов (`udev::BAR_H`), поэтому полка
-/// уменьшается вместе с баром и не требует отдельной настройки.
-pub fn layout(open: bool, has_battery: bool, screen_w: i32) -> Layout {
-    let h = crate::udev::BAR_H;
-    let y = crate::udev::BAR_TOP;
-    let gap = h / 6; // зазор между ячейками и от бара
+/// Полка выезжает ВНИЗ из правого острова панели и прижата к тому же правому
+/// краю. Раньше она выезжала вбок от центральной таблетки, но с тех пор бар
+/// разъехался на три острова (см. `crate::bar`), правый из которых сам стоит у
+/// края: вбок ей теперь просто некуда — там край экрана.
+///
+/// Полосочки-хвата здесь больше нет: она живёт в правом острове как обычная
+/// ячейка панели (`bar::Cell::Handle`), потому что панель и полка не должны
+/// спорить за один и тот же клик.
+///
+/// Все размеры — доли от высоты острова (`bar::H`), поэтому полка уменьшается
+/// вместе с панелью и не требует отдельной настройки.
+/// `hide` — доля убранности ПАНЕЛИ (см. `bar::island_y`). Полка висит под
+/// панелью и обязана уезжать вместе с ней: иначе при входе в обзор столов
+/// панель уходит вверх, а её полка остаётся висеть в пустоте.
+pub fn layout(open: bool, has_battery: bool, screen_w: i32, hide: f64, выезд: f64) -> Layout {
+    let h = crate::bar::H;
+    let gap = h / 6; // зазор между ячейками
     let pad = h / 6; // поля внутри выехавшего ряда
-    let handle_w = (h / 3).max(6);
     let slider_w = h * 2;
+    // Строка полки — под панелью, с тем же зазором, что и внутри неё.
+    //
+    // `выезд` (0..1, ведёт anim::tick) поднимает её обратно ПОД панель: на нуле
+    // ряд стоит ровно там, где остров, то есть спрятан за ним — полка уезжает
+    // туда, откуда её открыли, а не пропадает с экрана одним кадром. Ход равен
+    // h + gap, ровно расстоянию от низа панели до места полки.
+    //
+    // Считается ЗДЕСЬ, а не в отрисовке, намеренно: этой же раскладкой ловит
+    // клики `tray_click`, и разъехаться им нельзя — иначе полдороги кнопки
+    // нажимались бы не там, где нарисованы.
+    let выезд = выезд.clamp(0.0, 1.0);
+    let сдвиг = ((1.0 - выезд) * (h + gap) as f64).round() as i32;
+    let y = crate::bar::island_y(hide) + crate::bar::H + gap - сдвиг;
 
-    let bar_right = (screen_w - crate::udev::BAR_W) / 2 + crate::udev::BAR_W;
-    let handle = Rect { x: bar_right + gap, y, w: handle_w, h };
-
-    let mut cells = vec![Cell { kind: CellKind::Handle, rect: handle }];
-    if !open {
+    let mut cells: Vec<Cell> = Vec::new();
+    // Пока полка ЕДЕТ (выезд > 0), она обязана быть в раскладке, даже если
+    // тумблер уже выключен: иначе закрытие срезало бы её мгновенно.
+    if !open && выезд <= 0.0 {
         return Layout { panel: None, cells };
     }
 
@@ -273,9 +277,9 @@ pub fn layout(open: bool, has_battery: bool, screen_w: i32) -> Layout {
 
     let inner: i32 = kinds.iter().map(|(_, w)| w).sum::<i32>() + gap * (kinds.len() as i32 - 1);
     let panel_w = inner + pad * 2;
-    // На узком экране ряд упёрся бы в правый край — прижимаем его к краю, а
-    // не даём уехать за него.
-    let panel_x = (handle.x + handle_w + gap).min(screen_w - panel_w - gap).max(0);
+    // Прижата к правому краю, под своим островом. На узком экране (ряд шире
+    // экрана) не уезжаем за левый край — там его вовсе не достать мышью.
+    let panel_x = (screen_w - crate::bar::EDGE - panel_w).max(0);
     let panel = Rect { x: panel_x, y, w: panel_w, h };
 
     let mut cx = panel_x + pad;
@@ -392,7 +396,10 @@ impl crate::state::Dawn {
         right: bool,
     ) -> bool {
         let Some(tray) = self.tray.as_ref() else { return false };
-        let cells = layout(tray.open, tray.snap.battery.is_some(), self.screen_size().w).cells;
+        let cells = layout(
+            tray.open, tray.snap.battery.is_some(), self.screen_size().w, self.bar_hide,
+            self.shelf_anim,
+        ).cells;
         let Some(cell) = cells.into_iter().find(|c| c.rect.hit(pos.x, pos.y)) else {
             // Клик мимо открытой полки закрывает её, но НЕ съедается: человек
             // целился в окно, и окно должно получить свой клик.
@@ -409,7 +416,6 @@ impl crate::state::Dawn {
         }
 
         match cell.kind {
-            CellKind::Handle => self.tray_toggle(),
             // Меню большие и живут по центру экрана — полку под ними
             // закрываем, чтобы не спорили за клики.
             CellKind::Bluetooth => {

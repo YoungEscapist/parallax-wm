@@ -260,7 +260,20 @@ where
 
     // Свежий damage tracker на каждый снимок + age=0 → полная перерисовка:
     // буфер только что создан, никакой истории повреждений у него нет.
-    let mut dt = OutputDamageTracker::from_output(output);
+    //
+    // Размер берём ЗАПРОШЕННЫЙ, а не выходной, и это не косметика.
+    // `from_output` ставит трекеру размер режима монитора, а `render_output`
+    // по нему выставляет вьюпорт GL. Проси мы буфер меньше выхода — сцена
+    // рисовалась бы в полном размере в маленький буфер, то есть обрезалась
+    // углом, а не ужималась. Ровно на это опиралось ограничение «кадр всем
+    // гостям в разрешении хозяйского выхода» (см. `share::Раздача::кадр`).
+    // Совпадает с выходом — поведение прежнее, ни один существующий вызов не
+    // меняется.
+    let mut dt = OutputDamageTracker::new(
+        smithay::utils::Size::<i32, smithay::utils::Physical>::from((size.w, size.h)),
+        output.current_scale().fractional_scale(),
+        output.current_transform(),
+    );
     if let Err(e) = dt.render_output(renderer, &mut fb, 0, elements, [0.1f32, 0.1, 0.1, 1.0]) {
         tracing::warn!("dawn/screencopy: render_output: {:?}", e);
         return None;
