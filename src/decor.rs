@@ -1,5 +1,6 @@
-//! Плитки декораций: тень окна и маска скруглённого угла — текстурами, а не
-//! сотнями однопиксельных полосок.
+//! Плитки декораций: тень окна текстурами, а не сотнями однопиксельных
+//! полосок. Скруглением углов модуль больше не занимается — форму окна режет
+//! шейдер (`rounded.rs`), см. `Proto::new`.
 //!
 //! Как было: тень строилась пятью слоями, каждый слой — построчно по уравнению
 //! окружности, то есть `2 × радиус` полосок высотой в 1 пиксель на слой, плюс
@@ -74,7 +75,7 @@ fn push_black(buf: &mut Vec<u8>, alpha: f32) {
     buf.extend_from_slice(&[0, 0, 0, a]);
 }
 
-/// Цвет фона с premultiplied-альфой (для маски угла).
+/// Цвет с premultiplied-альфой.
 fn push_color(buf: &mut Vec<u8>, rgb: [f32; 3], alpha: f32) {
     let a = alpha.clamp(0.0, 1.0);
     buf.extend_from_slice(&[
@@ -105,16 +106,13 @@ fn flip(src: &[u8], w: i32, h: i32, horiz: bool, vert: bool) -> Vec<u8> {
 struct Proto {
     /// Сторона угловой плитки тени: радиус + самая широкая растушёвка.
     corner_px: i32,
-    /// Сторона угловой плитки маски = радиус.
-    mask_px: i32,
     shadow_corner: [Vec<u8>; 4],
     /// Кромки: верх/низ — 1×SPREAD, лево/право — SPREAD×1 (растягиваются вдоль).
     shadow_edge: [Vec<u8>; 4],
-    mask_corner: [Vec<u8>; 4],
 }
 
 impl Proto {
-    fn new(radius: i32, bg: [f32; 3]) -> Self {
+    fn new(radius: i32) -> Self {
         let r = radius.max(1);
         let n = r + SPREAD;
 
@@ -175,36 +173,13 @@ impl Proto {
         let right = flip(&left, SPREAD, 1, true, false);
         let shadow_edge = [top, bottom, left, right];
 
-        // ── Маска угла ───────────────────────────────────────────────────────
-        // Закрашивает фоном то, что ВНЕ окружности радиуса r с центром (r, r),
-        // — то есть срезает прямой угол окна. Частичное покрытие по краю даёт
-        // сглаженную дугу (раньше был ступенчатый край).
-        let mut mask_tl = Vec::with_capacity((r * r * 4) as usize);
-        for y in 0..r {
-            for x in 0..r {
-                let mut acc = 0.0f32;
-                for sy in 0..SS {
-                    for sx in 0..SS {
-                        let px = x as f64 + (sx as f64 + 0.5) / SS as f64;
-                        let py = y as f64 + (sy as f64 + 0.5) / SS as f64;
-                        let dx = px - r as f64;
-                        let dy = py - r as f64;
-                        if (dx * dx + dy * dy).sqrt() > r as f64 {
-                            acc += 1.0;
-                        }
-                    }
-                }
-                push_color(&mut mask_tl, bg, acc / (SS * SS) as f32);
-            }
-        }
-        let mask_corner = [
-            mask_tl.clone(),
-            flip(&mask_tl, r, r, true, false),
-            flip(&mask_tl, r, r, false, true),
-            flip(&mask_tl, r, r, true, true),
-        ];
-
-        Proto { corner_px: n, mask_px: r, shadow_corner, shadow_edge, mask_corner }
+        // Плиток-МАСКИ здесь больше нет намеренно. Угол окна когда-то не
+        // вырезался, а закрашивался плиткой цвета фона — допущение «под окном
+        // обычно просто холст», неверное под обоями: там свой цвет в каждом
+        // пикселе, и угол выходил чёрным куском. Форму окна теперь режет
+        // шейдер (см. `rounded.rs`), который гасит АЛЬФУ, а не красит; цвет
+        // фона для этого не нужен вовсе.
+        Proto { corner_px: n, shadow_corner, shadow_edge }
     }
 }
 
@@ -216,11 +191,9 @@ fn buffer_from(pixels: &[u8], w: i32, h: i32) -> MemoryRenderBuffer {
 /// заметку про Id в шапке модуля).
 pub struct DecorCache {
     radius: i32,
-    bg: [f32; 3],
     proto: Option<Proto>,
     shadow_corner: [Vec<MemoryRenderBuffer>; 4],
     shadow_edge: [Vec<MemoryRenderBuffer>; 4],
-    mask_corner: [Vec<MemoryRenderBuffer>; 4],
     parallax_w: i32,
     parallax_proto: Vec<u8>,
     parallax_row: Vec<MemoryRenderBuffer>,
@@ -230,41 +203,35 @@ impl DecorCache {
     pub fn new() -> Self {
         Self {
             radius: 0,
-            bg: [0.0; 3],
             proto: None,
             shadow_corner: Default::default(),
             shadow_edge: Default::default(),
-            mask_corner: Default::default(),
             parallax_w: 0,
             parallax_proto: Vec::new(),
             parallax_row: Vec::new(),
         }
     }
 
-    /// Пересобрать плитки, если сменился радиус (Tile ↔ Float) или цвет фона.
+    /// Пересобрать плитки, если сменился радиус (Tile ↔ Float).
     /// Пулы при этом сбрасываются: в них лежат буферы со старыми пикселями.
-    pub fn ensure(&mut self, radius: i32, bg: [f32; 3]) {
-        let same_bg = self.bg.iter().zip(bg.iter()).all(|(a, b)| (a - b).abs() < 1e-6);
-        if self.proto.is_some() && self.radius == radius && same_bg {
+    ///
+    /// Цвета фона тут больше нет: он нужен был только плиткам-маске, а
+    /// скругление ушло в шейдер (см. `Proto::new`). Заодно ушла и пересборка
+    /// ВСЕХ плиток при смене фона — тени от него никогда не зависели.
+    pub fn ensure(&mut self, radius: i32) {
+        if self.proto.is_some() && self.radius == radius {
             return;
         }
         tracing::debug!("dawn/decor: пересборка плиток, радиус={} px", radius);
         self.radius = radius;
-        self.bg = bg;
-        self.proto = Some(Proto::new(radius, bg));
+        self.proto = Some(Proto::new(radius));
         self.shadow_corner = Default::default();
         self.shadow_edge = Default::default();
-        self.mask_corner = Default::default();
     }
 
     /// Сторона угловой плитки тени (логические px).
     pub fn corner_px(&self) -> i32 {
         self.proto.as_ref().map(|p| p.corner_px).unwrap_or(0)
-    }
-
-    /// Сторона плитки маски = радиус (логические px).
-    pub fn mask_px(&self) -> i32 {
-        self.proto.as_ref().map(|p| p.mask_px).unwrap_or(0)
     }
 
     // Ниже во всех трёх: обращение к прототипу только когда слот РЕАЛЬНО надо
@@ -292,18 +259,6 @@ impl DecorCache {
             }
         }
         &self.shadow_edge[edge][slot]
-    }
-
-    pub fn mask_corner(&mut self, corner: usize, slot: usize) -> &MemoryRenderBuffer {
-        if self.mask_corner[corner].len() <= slot {
-            let proto = self.proto.as_ref().expect("ensure() не звали");
-            let r = proto.mask_px;
-            let px = &proto.mask_corner[corner];
-            while self.mask_corner[corner].len() <= slot {
-                self.mask_corner[corner].push(buffer_from(px, r, r));
-            }
-        }
-        &self.mask_corner[corner][slot]
     }
 
     /// Полоса параллакс-фона: точки вдоль X с шагом `spacing`, высотой `dot`.
