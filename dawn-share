@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""dawn-share — раздать свой рабочий стол гостям, из терминала.
+
+    dawn-share              показать состояние (код, адреса, кто подключён)
+    dawn-share start [порт] включить раздачу (порт по умолчанию 7373)
+    dawn-share stop         выключить
+    dawn-share watch        то же, что status, но обновлять каждую секунду
+
+Гость подключается программой dshare — строку с адресом и кодом эта команда
+печатает готовой, её и надо продиктовать.
+
+Сокет ищется сам: `DAWN_CTL_SOCKET`, иначе $XDG_RUNTIME_DIR/dawn-<дисплей>.ctl.
+Отдельная команда, а не `ctl.py 'action share_start'`, потому что действие
+умеет ответить только «ok» — а человеку нужен КОД и АДРЕС.
+"""
+import glob
+import os
+import socket
+import sys
+import time
+
+
+def найти_сокет():
+    явный = os.environ.get("DAWN_CTL_SOCKET")
+    if явный:
+        return явный
+    каталог = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    дисплей = os.environ.get("WAYLAND_DISPLAY")
+    if дисплей:
+        путь = os.path.join(каталог, f"dawn-{дисплей}.ctl")
+        if os.path.exists(путь):
+            return путь
+    # Запустили из чужого окружения (tty, ssh, cron) — берём единственный
+    # сокет, какой есть. Двух живых dawn на одной машине не бывает: второй не
+    # получил бы DRM-мастера.
+    найденные = sorted(glob.glob(os.path.join(каталог, "dawn-*.ctl")))
+    if len(найденные) == 1:
+        return найденные[0]
+    if not найденные:
+        return None
+    print("dawn-share: несколько сессий, укажи DAWN_CTL_SOCKET:", file=sys.stderr)
+    for п in найденные:
+        print(f"  {п}", file=sys.stderr)
+    sys.exit(2)
+
+
+def спросить(сокет, команда):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(сокет)
+    s.sendall((команда + "\n").encode())
+    s.shutdown(socket.SHUT_WR)
+    данные = b""
+    while True:
+        кусок = s.recv(65536)
+        if not кусок:
+            break
+        данные += кусок
+    s.close()
+    return данные.decode(errors="replace").rstrip("\n")
+
+
+def main():
+    сокет = найти_сокет()
+    if not сокет:
+        print(
+            "dawn-share: не нашёл управляющий сокет dawn.\n"
+            "  dawn не запущен? Или запусти из его сеанса, либо задай\n"
+            "  DAWN_CTL_SOCKET=/run/user/1000/dawn-wayland-1.ctl",
+            file=sys.stderr,
+        )
+        return 1
+
+    доводы = sys.argv[1:]
+    if доводы and доводы[0] in ("-h", "--help", "помощь"):
+        print(__doc__)
+        return 0
+
+    if доводы and доводы[0] == "watch":
+        try:
+            while True:
+                ответ = спросить(сокет, "share status")
+                # \033[2J\033[H — очистить экран и увести курсор в угол:
+                # обновление на месте, без ленты одинаковых блоков.
+                print("\033[2J\033[H" + ответ, flush=True)
+                time.sleep(1)
+        except KeyboardInterrupt:
+            return 0
+
+    команда = "share " + " ".join(доводы) if доводы else "share status"
+    ответ = спросить(сокет, команда)
+    print(ответ)
+    return 1 if ответ.startswith("ошибка") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
