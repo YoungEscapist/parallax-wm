@@ -61,6 +61,15 @@ impl XdgShellHandler for Dawn {
     /// приходит от клиента ПОСЛЕ new_toplevel (первого коммита ещё не было),
     /// поэтому ждём именно этот колбэк, а не new_toplevel.
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        // Значок для чипа в панели ищем ЗДЕСЬ по той же причине, по которой
+        // здесь же восстанавливается позиция: на `new_toplevel` app_id ещё
+        // пустой, а без него искать нечего (см. Dawn::ensure_chip_icon).
+        if let Some(window) = self.tagged_windows.iter()
+            .find(|tw| crate::xwin::is_surface(&tw.window, surface.wl_surface()))
+            .map(|tw| tw.window.clone())
+        {
+            self.ensure_chip_icon(&window);
+        }
         let app_id = match crate::session::toplevel_app_id(&surface) {
             Some(id) => id,
             None => return,

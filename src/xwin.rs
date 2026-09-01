@@ -29,6 +29,7 @@ use smithay::{
 
 use crate::state::{Dawn, TaggedWindow};
 use crate::tiling::Layout;
+use std::cell::Cell;
 
 // ── Идентификация ────────────────────────────────────────────────────────────
 
@@ -105,6 +106,25 @@ pub enum Tiled {
 pub fn set_size(window: &Window, size: Option<Size<i32, Logical>>, tiled: Tiled) {
     match window.underlying_surface() {
         WindowSurface::Wayland(t) => {
+            // Запоминаем, что именно ПОПРОСИЛИ — отдельно от того, что клиент
+            // реально нарисует (window.geometry().size). Нужно рендеру
+            // (см. udev::render_surface, поиск "нужен_кроп"): клиент, у
+            // которого есть свой внутренний минимум (GTK/Electron это умеют
+            // и Wayland-протокол им такого не запрещает — configure тут
+            // ПРОСЬБА, а не приказ), просто не подтвердит размер меньше
+            // своего. Раньше (правки 23–24.08) это означало «у окна всё ещё
+            // есть минимум»: тайлинг и ресайз давно ужимают СЛОТ до чего
+            // угодно, но на экране оставался старый, слишком большой кадр.
+            // Жалоба Ярика 24.08.2026 ночью: «сжимаются до предела и дальше
+            // просто не ресайзятся». Здесь только запись; резка — в рендере.
+            if let Some(sz) = size {
+                smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
+                    states.data_map.insert_if_missing(|| Cell::new(None::<Size<i32, Logical>>));
+                    if let Some(cell) = states.data_map.get::<Cell<Option<Size<i32, Logical>>>>() {
+                        cell.set(Some(sz));
+                    }
+                });
+            }
             t.with_pending_state(|state| {
                 state.size = size;
                 match tiled {
@@ -225,6 +245,24 @@ pub fn size_constraints(window: &Window) -> (Size<i32, Logical>, Size<i32, Logic
     }
 }
 
+/// Последний размер, который у окна ЗАПРАШИВАЛ dawn через [`set_size`] — в
+/// отличие от `window.geometry().size` (что клиент реально подтвердил
+/// коммитом). У X11 отдельного хранилища нет и не нужно: там `set_size`
+/// применяется через `ConfigureWindow` немедленно, и `window.geometry()`
+/// станет запрошенным размером за один такт X-сервера, а не «когда клиент
+/// согласится» — см. рендер (udev.rs, поиск "нужен_кроп").
+pub fn requested_size(window: &Window) -> Option<Size<i32, Logical>> {
+    match window.underlying_surface() {
+        WindowSurface::Wayland(t) => {
+            smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
+                states.data_map.get::<Cell<Option<Size<i32, Logical>>>>()
+                    .and_then(|c| c.get())
+            })
+        }
+        WindowSurface::X11(_) => None,
+    }
+}
+
 /// Размер буфера, прикреплённого к поверхности (в логических пикселях).
 /// Нужен для курсоров клиентов: их картинку мы приводим к своему размеру.
 pub fn surface_buffer_size(surface: &WlSurface) -> Option<Size<i32, Logical>> {
@@ -240,6 +278,48 @@ pub fn surface_buffer_size(surface: &WlSurface) -> Option<Size<i32, Logical>> {
 /// Размер, который окно занимает сейчас (по последнему буферу/геометрии).
 pub fn current_size(window: &Window) -> Size<i32, Logical> {
     window.geometry().size
+}
+
+/// Есть ли у окна ПРОЗРАЧНЫЕ места — то есть стоит ли подкладывать под него
+/// размытый фон (`udev::build_blur_patch`).
+///
+/// Спрашиваем не клиента, а рендер: smithay держит у поверхности НЕПРОЗРАЧНЫЕ
+/// области (`RendererSurfaceState::opaque_regions`) — их считает сам композитор
+/// по формату буфера и по `wl_surface.set_opaque_region`. Пусто или None значит
+/// «сквозь окно что-то видно»; прямоугольники, покрывающие всю поверхность, —
+/// «окно глухое, подкладывать под него нечего».
+///
+/// Осторожно в сторону «лишний раз размыть»: клиент с буфером ARGB, который
+/// на деле рисует непрозрачно, но области не выставил, попадёт в прозрачные.
+/// Цена ошибки — одна невидимая заплата под окном; цена обратной (посчитать
+/// прозрачное окно глухим) — блюр не работает там, где его и просили.
+pub fn has_transparency(window: &Window) -> bool {
+    let Some(surface) = (match window.underlying_surface() {
+        WindowSurface::Wayland(t) => Some(t.wl_surface().clone()),
+        WindowSurface::X11(s) => s.wl_surface(),
+    }) else {
+        return false;
+    };
+    let geo = window.geometry();
+    if geo.size.w <= 0 || geo.size.h <= 0 {
+        return false;
+    }
+    smithay::wayland::compositor::with_states(&surface, |states| {
+        let Some(data) = states
+            .data_map
+            .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+        else {
+            return true;
+        };
+        let Ok(сост) = data.lock() else { return true };
+        let Some(области) = сост.opaque_regions() else { return true };
+        // Площадь непрозрачного против площади окна. Пересечений у областей не
+        // бывает (smithay отдаёт их разбитыми), поэтому достаточно суммы.
+        let непрозрачно: i64 = области.iter()
+            .map(|r| r.size.w.max(0) as i64 * r.size.h.max(0) as i64)
+            .sum();
+        непрозрачно < geo.size.w as i64 * geo.size.h as i64
+    })
 }
 
 /// Попросить клиента закрыться.
@@ -284,6 +364,26 @@ pub fn focus(state: &mut Dawn, window: &Window) {
     // Наверх такие окна поднимать тоже не нужно: они и так замаплены последними
     // (mapped_override_redirect_window), то есть уже поверх всего.
     if is_override_redirect(window) {
+        return;
+    }
+    // ── Режим Minecraft ─────────────────────────────────────────────────────
+    //
+    // Пока мод на связи, верх стопки и хозяйская клавиатура принадлежат ИГРЕ, а
+    // всё прочее человек видит панелями внутри неё. Обычный фокус здесь делает
+    // ровно две вредных вещи разом: кладёт окно ПОВЕРХ развёрнутого Minecraft
+    // (окно мелькает на рабочем столе, пока мод не нарисует его панелью) и
+    // забирает у игры клавиатуру — то есть новый терминал, открытый Super+Enter
+    // прямо из игры, выкидывает игрока из неё.
+    //
+    // Окно при этом не остаётся ничьим: активным оно становится как обычно, а
+    // фокус получает МЕСТО МОДА — то самое «окно, с которым сейчас работают»
+    // для биндов (см. `Dawn::focused_surface`). Дальше фокус, как всегда в
+    // режиме, поедет за взглядом.
+    if crate::mine::панель_а_не_игра(state, window) {
+        window.set_activated(true);
+        configure(window);
+        crate::mine::фокус_панели(state, window);
+        crate::mine::игру_наверх(state);
         return;
     }
     let serial = smithay::utils::SERIAL_COUNTER.next_serial();
@@ -422,6 +522,7 @@ impl Dawn {
                 float_pinned: floating,
                 folded: false,
                 pre_constellation: None,
+                pre_constellation_size: None,
                 constellation_torn: false,
             },
         );
@@ -455,7 +556,7 @@ impl Dawn {
                 crate::anim::OpenAnim::new(
                     center,
                     (size.w as f64, size.h as f64),
-                    std::time::Duration::from_millis(260),
+                    crate::anim::дуг::открытие_окна(),
                 ),
             ));
         }
@@ -474,6 +575,12 @@ impl Dawn {
             size.h,
         );
 
+        // Значок приложения для чипа в панели. Здесь он находится только у
+        // X11-окон (WM_CLASS известен сразу); у wayland-клиентов app_id
+        // приходит позже, и там же зовётся ещё раз — см.
+        // XdgShellHandler::app_id_changed.
+        self.ensure_chip_icon(&window);
+
         // map_element сам по себе экран не обновляет — если VBlank-цепочка
         // рендера к этому моменту уже остановилась (нет изменений с прошлого
         // кадра), новое окно так и останется невидимым до явного рендера.
@@ -484,6 +591,9 @@ impl Dawn {
     /// выделение, созвездия, анимации. Общее для xdg (`toplevel_destroyed`) и
     /// X11 (`destroyed_window`/`unmapped_window`).
     pub fn forget_window(&mut self, window: &Window) {
+        // Снимок ДО всех удалений: дальше окна не будет ни в space, ни в
+        // tagged_windows, и снимать станет нечего и неоткуда взять место.
+        self.начать_уход(window);
         // niri: соседа и признак «закрыли именно активное окно» считаем ДО
         // всех удалений — после них окна уже нет ни в полосе, ни в фокусе.
         let (сосед, был_в_фокусе) = if self.tile_config.layout == Layout::Columns {
@@ -522,5 +632,40 @@ impl Dawn {
         self.columns_after_close(сосед, был_в_фокусе);
         self.request_plane_reset();
         self.request_redraw();
+    }
+
+    /// Завести спокойное угасание закрытого окна (см. close.rs).
+    ///
+    /// Тихо ничего не делает, когда снимать нечего или некуда: на winit-бэкенде
+    /// (отладочное окно) рендерера здесь нет вовсе, а у окна на чужом столе или
+    /// далеко за краем экрана анимация всё равно никому не видна. Отказ мягкий:
+    /// окно просто исчезает сразу, как исчезало до этой правки.
+    fn начать_уход(&mut self, window: &Window) {
+        if !self.lua_config.close_anim {
+            return;
+        }
+        // Окна невидимого стола не гасим: там некому смотреть, а буфер под
+        // снимок вполне настоящий.
+        let свой_стол = self.tagged_windows.iter().any(|tw| {
+            &tw.window == window && tw.tags & self.viewport.current_tags() != 0
+        });
+        if !свой_стол {
+            return;
+        }
+        let Some(rect) = self.space.element_geometry(window) else { return };
+        let окно = window.clone();
+        let уход = crate::udev::with_primary_renderer(self, |_state, renderer| {
+            crate::close::снять(renderer, &окно, rect, crate::anim::дуг::закрытие_окна())
+        });
+        if let Some(Some(уход)) = уход {
+            // Копиться им незачем: закрыть подряд можно и десяток, а каждый
+            // держит буфер размером с окно. Самые старые всё равно почти
+            // догорели.
+            const ОДНОВРЕМЕННО: usize = 6;
+            if self.закрытия.len() >= ОДНОВРЕМЕННО {
+                self.закрытия.remove(0);
+            }
+            self.закрытия.push(уход);
+        }
     }
 }

@@ -24,8 +24,46 @@ impl SeatHandler for Dawn {
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
     fn seat_state(&mut self) -> &mut SeatState<Dawn> { &mut self.seat_state }
-    fn cursor_image(&mut self, _seat: &Seat<Self>, image: smithay::input::pointer::CursorImageStatus) {
+    fn cursor_image(&mut self, seat: &Seat<Self>, image: smithay::input::pointer::CursorImageStatus) {
+        // ЧУЖОЕ МЕСТО СВОЮ ФОРМУ КУРСОРА НАМ НЕ НАЗНАЧАЕТ. Мест в dawn больше
+        // одного: своё у каждого гостя раздачи (`share/seat.rs`) и своё у мода
+        // Minecraft (`mine/seat.rs`). Клиент ставит форму НА МЕСТО, а здесь она
+        // молча записывалась в одну общую переменную — и стрелка хозяина
+        // менялась от того, что кто-то другой навёл указку на терминал.
+        //
+        // Живьём это и была жалоба 01.09.2026 «нажал в игре — на экране dawn
+        // появился курсор»: клик по панели уводил фокус клиенту, тот ставил
+        // курсор месту `dmine`, и спрятанная Minecraft'ом стрелка (Xwayland
+        // держит её `Hidden`, пока курсор захвачен) вылезала обратно поверх
+        // игры. Гости раздачи рисуют свои стрелки сами (`build_guest_cursors`),
+        // мод — свою у себя в мире; хозяйскую задаёт только хозяйское место.
+        if seat != &self.seat {
+            return;
+        }
+        // Разбор жалобы «иногда курсор не меняется» (Dota 2, 29.08.2026).
+        // Пишем ТОЛЬКО смену вида: клиент шлёт set_cursor редко, а строка на
+        // каждый кадр когда-то раздула лог до 775 МБ (см. КУРСОР КЛИЕНТА).
+        //
+        // Что здесь видно: `клиент` значит форму дал клиент (Xwayland отдаёт
+        // сюда картинку игры), `тема "имя"` — форму дали МЫ или клиент через
+        // wp_cursor_shape_v1. Стрелка вместо прицела в игре различается прямо
+        // по этой строке: `тема "default"` — потеряли форму сами, `клиент` —
+        // её прислал Xwayland, и разбираться надо на его стороне.
+        let вид = |с: &smithay::input::pointer::CursorImageStatus| match с {
+            smithay::input::pointer::CursorImageStatus::Surface(_) => "клиент".to_string(),
+            smithay::input::pointer::CursorImageStatus::Named(i) => format!("тема {:?}", i),
+            smithay::input::pointer::CursorImageStatus::Hidden => "скрыт".to_string(),
+        };
+        let (было, стало) = (вид(&self.cursor_status), вид(&image));
+        if было != стало {
+            tracing::debug!("dawn/курсор: {} → {}", было, стало);
+        }
         self.cursor_status = image;
+        // Без этого новая форма курсора не доедет до экрана, пока что-нибудь
+        // ДРУГОЕ не попросит кадр: dawn рисует по изменениям, а смена формы —
+        // изменение ничем не хуже прочих. На неподвижном экране (меню игры,
+        // пауза, статичное окно) это ровно «курсор не поменялся».
+        self.request_redraw();
     }
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
         let dh = &self.display_handle;

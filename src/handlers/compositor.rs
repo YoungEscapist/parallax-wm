@@ -124,18 +124,44 @@ impl Dawn {
         if self.layer_keyboard.as_ref() == Some(surface) {
             return; // уже отдали
         }
-        let Some(output) = self.layer_output.clone()
-            .or_else(|| self.space.outputs().next().cloned()) else { return };
+        // Карту слоёв ищем ПО САМОЙ ПОВЕРХНОСТИ, а не у активного монитора:
+        // слой мог приехать на второй монитор (dwall создаёт обои на каждый
+        // wl_output), и спрашивать его у первого значит не найти вовсе.
+        let Some(output) = self.слои_с_поверхностью(surface) else { return };
         let слой = {
             let map = layer_map_for_output(&output);
             map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL).cloned()
         };
         let Some(слой) = слой else { return };
+        // ТОЛЬКО Exclusive. По протоколу wlr-layer-shell `on_demand` значит
+        // «фокус даётся по клику, как обычному окну», а `exclusive` — «весь
+        // ввод мой, пока я живу». Раньше мы отдавали клавиатуру и по OnDemand,
+        // прямо на коммите: dwall заводит поверхность меню обоев при старте и
+        // держит её всегда (закрытое меню — прозрачный кадр), и весь ввод
+        // уходил в невидимое меню. См. парную правку в dwall.
         let хочет = matches!(
             слой.cached_state().keyboard_interactivity,
-            KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand,
+            KeyboardInteractivity::Exclusive,
         );
         if !хочет { return; }
+        // ...и слой ДЕЙСТВИТЕЛЬНО показан, то есть прислал буфер.
+        //
+        // dwall заводит поверхность меню обоев сразу при старте — пустую, без
+        // буфера, с OnDemand: иначе Esc в открытом меню было бы нечем поймать.
+        // Мы же отдавали ей клавиатуру на первом же коммите, и весь ввод
+        // уходил в невидимое меню: на десктопе это не видно (первый же клик по
+        // окну возвращает фокус), а на свежем входе в ноут кликать не по чему —
+        // сеанс выглядит как намертво зависший, хотя обои играют и мышь ездит
+        // (замер 31.08.2026, «клавиатура отдана layer-поверхности» последней
+        // строкой в логе).
+        //
+        // Буфер здесь — ровно та граница, которая отделяет «меню открыто» от
+        // «меню создано на будущее»: fuzzel, лаунчер и открытое меню dwall
+        // присылают его в том же коммите, где просят клавиатуру.
+        let показан = smithay::backend::renderer::utils::with_renderer_surface_state(
+            surface, |s| s.surface_size(),
+        ).flatten().is_some();
+        if !показан { return; }
         if let Some(kb) = self.seat.get_keyboard() {
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             let цель = crate::focus::KeyboardFocusTarget::Wayland(surface.clone());
@@ -181,8 +207,10 @@ impl Dawn {
             return;
         }
 
-        let Some(output) = self.layer_output.clone()
-            .or_else(|| self.space.outputs().next().cloned()) else { return };
+        // Карту слоёв ищем ПО САМОЙ ПОВЕРХНОСТИ, а не у активного монитора:
+        // слой мог приехать на второй монитор (dwall создаёт обои на каждый
+        // wl_output), и спрашивать его у первого значит не найти вовсе.
+        let Some(output) = self.слои_с_поверхностью(surface) else { return };
         let layer = {
             let mut map = layer_map_for_output(&output);
             // Единственный arrange — перед ПЕРВЫМ configure: до него клиент
@@ -212,8 +240,10 @@ impl Dawn {
     /// каждый commit. Клиент с постоянным set_size (меню dwall) проходит
     /// через эту ветку ровно один раз.
     fn relayout_if_client_resized(&mut self, surface: &WlSurface) {
-        let Some(output) = self.layer_output.clone()
-            .or_else(|| self.space.outputs().next().cloned()) else { return };
+        // Карту слоёв ищем ПО САМОЙ ПОВЕРХНОСТИ, а не у активного монитора:
+        // слой мог приехать на второй монитор (dwall создаёт обои на каждый
+        // wl_output), и спрашивать его у первого значит не найти вовсе.
+        let Some(output) = self.слои_с_поверхностью(surface) else { return };
 
         // Слой достаём под замком LayerMap, а его cached_state читаем уже
         // после — вложение «замок карты + замок данных поверхности» здесь ни
@@ -223,6 +253,31 @@ impl Dawn {
             map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL).cloned()
         };
         let Some(layer) = layer else { return };
+
+        // Отметка «обои живые»: фоновый слой прислал кадр. Место именно
+        // здесь — карта слоёв по этому коммиту уже поднята, отдельного обхода
+        // не нужно. По свежести отметки главный цикл держит частый тик и
+        // будит обои кадровым callback'ом на неподвижном экране (см.
+        // Dawn::будить_фоновые_слои).
+        if matches!(
+            layer.layer(),
+            smithay::wayland::shell::wlr_layer::Layer::Background
+                | smithay::wayland::shell::wlr_layer::Layer::Bottom
+        ) {
+            self.фон_коммит = Some(std::time::Instant::now());
+            // Новый кадр обоев. Бесконечные обои рисуются НЕ поверхностью
+            // клиента, а своим TextureRenderElement с постоянным Id, и damage
+            // tracker о смене картинки внутри текстуры не знает: у статического
+            // элемента счётчик коммитов стоит на месте, damage пуст — и на
+            // неподвижной камере со сцены переписывается всё, кроме обоев.
+            // Ролик от этого шёл только под пан и зум (там меняется geometry
+            // элемента, и повреждение находится само) — ровно жалоба Ярика
+            // 29.08.2026. Сброс мешка = «повреждено всё» (`damage_since` вернёт
+            // None), обои полностью перерисовываются на ближайшем кадре.
+            self.wallpaper_damage.reset();
+            self.request_redraw();
+        }
+
         let запрошен = layer.cached_state().size;
 
         let изменился = with_states(surface, |states| {

@@ -22,13 +22,31 @@ impl WlrLayerShellHandler for Dawn {
         _layer: Layer,
         _namespace: String,
     ) {
-        // Берём первый (и пока единственный) output из space.
-        // Слои кладём на выход-призрак с масштабом 1 (см. Dawn::layer_output).
-        let output = self.layer_output.clone().unwrap_or_else(|| {
-            self.space.outputs().next()
-                .expect("dawn: layer-surface without any output")
-                .clone()
-        });
+        // Клиент ВПРАВЕ назвать выход (`zwlr_layer_shell_v1.get_layer_surface`
+        // первым аргументом), и обои с панелями им пользуются: dwall создаёт по
+        // поверхности на каждый wl_output. Раньше этот аргумент отбрасывался —
+        // все слои валились в карту одного выхода, и обои на втором мониторе
+        // получить было нельзя в принципе.
+        //
+        // Слои кладём на выход-призрак с масштабом 1 (см. Монитор::layer_output).
+        let индекс = _output.as_ref()
+            .and_then(|wl| self.монитор_по_wl(wl))
+            // Клиент выход не назвал — «на усмотрение композитора»: даём
+            // активный, ровно как это делает hyprland.
+            .unwrap_or(self.активный);
+        let output = self.мониторы.get(индекс)
+            .map(|m| m.layer_output.clone())
+            .or_else(|| self.layer_output.clone())
+            .unwrap_or_else(|| {
+                self.space.outputs().next()
+                    .expect("dawn: layer-surface without any output")
+                    .clone()
+            });
+        tracing::debug!(
+            "dawn/layer: «{}» ({:?}) → монитор {} ({})",
+            _namespace, _layer, индекс,
+            self.мониторы.get(индекс).map(|m| m.коннектор.as_str()).unwrap_or("—"),
+        );
         let layer_surface = smithay::desktop::LayerSurface::new(surface, _namespace);
         {
             let mut map = layer_map_for_output(&output);
@@ -61,8 +79,10 @@ impl WlrLayerShellHandler for Dawn {
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        // Собираем output-ы ДО заимствований.
-        let outputs: Vec<_> = self.layer_output.clone().into_iter()
+        // Собираем output-ы ДО заимствований. Карты слоёв ВСЕХ мониторов, а не
+        // одного: слой мог жить на втором мониторе, и раньше он оставался в
+        // карте навсегда — обои снятого dwall продолжали рисоваться.
+        let outputs: Vec<_> = self.все_слои().into_iter()
             .chain(self.space.outputs().cloned())
             .collect();
         for output in &outputs {
