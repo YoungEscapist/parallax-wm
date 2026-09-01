@@ -1,4 +1,3 @@
-use std::time::Duration;
 
 use smithay::{
     desktop::Window,
@@ -55,19 +54,33 @@ impl Dawn {
     /// Кого тащить и масштабировать ВМЕСТЕ с `window` — это ВЫДЕЛЕНИЕ, а не
     /// созвездие.
     ///
-    /// Созвездие (Super+G) больше не двигается целиком: оно фиксирует взаимное
-    /// расположение окон, но хвататься за одно окно и утаскивать всю группу
-    /// оказалось неожиданно — тянешь одно, едут пять. Групповой драг/ресайз
-    /// теперь ровно там, где его просят явно: если окно входит в выделение
-    /// (рамкой по Super+ЛКМ), едет всё выделение; если нет — едет только оно.
+    /// Едет ВЫДЕЛЕНИЕ (рамка по Super+ЛКМ) и СОЗВЕЗДИЕ (Super+G), в котором
+    /// состоит окно, — по базе, то есть сохраняя взаимное расположение.
+    ///
+    /// **История решения.** Сначала созвездие тащилось целиком, и это оказалось
+    /// неожиданным: хватаешь одно окно — едут пять, без единого намёка, что так
+    /// будет. Тогда групповой драг оставили только выделению, а созвездие
+    /// свелось к «метке о родстве». Но фиксировать взаимное расположение и не
+    /// двигаться вместе — это ровно половина смысла: за тем его и собирают.
+    ///
+    /// Поэтому созвездие снова едет целиком, а неожиданность лечится не
+    /// отключением, а ПОКАЗОМ: пока идёт драг, dawn рисует, куда встанут
+    /// остальные (см. `Dawn::призраки_группы` и `udev::build_ghost_elements`).
+    /// Видимое намерение — не сюрприз.
     pub fn group_drag_members_excluding(&self, window: &Window) -> Vec<Window> {
-        if !self.is_selected(window) {
-            return Vec::new();
+        let mut члены: Vec<Window> = Vec::new();
+        if self.is_selected(window) {
+            члены.extend(self.selected_windows.iter().cloned());
         }
-        self.selected_windows.iter()
-            .filter(|w| !same_window(w, window))
-            .cloned()
-            .collect()
+        члены.extend(self.constellation_members_excluding(window));
+        // Одно и то же окно может прийти обоими путями (выделено И в созвездии).
+        let mut итог: Vec<Window> = Vec::new();
+        for w in члены {
+            if !same_window(&w, window) && !итог.iter().any(|x| same_window(x, &w)) {
+                итог.push(w);
+            }
+        }
+        итог
     }
 
     /// Остальные окна из "созвездия" данного окна (без самого `window`).
@@ -108,11 +121,59 @@ impl Dawn {
         tracing::info!("dawn: constellation formed ({} windows)", group.len());
     }
 
-    /// Super+D при активном выделении: магнитно стянуть выделенные окна в
-    /// компактную "гроздь" вокруг их общего центра и зафиксировать как
-    /// созвездие (дальше двигается/ресайзится как единое целое). В отличие от
-    /// group_selected_into_constellation (просто фиксирует группу на месте),
-    /// здесь окна реально съезжаются вместе плавным LERP.
+    /// Рамка, в которой собирается гроздь: то место, которое выделенные окна
+    /// занимают ПРЯМО СЕЙЧАС, — их общий bbox.
+    ///
+    /// У halley рамка кластера — это границы поля, то есть монитор целиком:
+    /// там кластер и есть отдельное рабочее место. В dawn холст бесконечный и
+    /// гроздей на нём может лежать сколько угодно рядом, поэтому «полем» здесь
+    /// служит площадь самого выделения: гроздь перестраивается ровно там, где
+    /// её обвели, и не отбирает экран у соседей.
+    ///
+    /// Пол по обеим сторонам — чтобы гроздь из окон-полосок не выродилась.
+    fn constellation_bounds(&self, окна: &[Window]) -> Option<Rectangle<i32, Logical>> {
+        let mut итог: Option<Rectangle<i32, Logical>> = None;
+        for w in окна {
+            let Some(g) = self.space.element_geometry(w) else { continue };
+            итог = Some(match итог {
+                None => g,
+                Some(r) => {
+                    let x0 = r.loc.x.min(g.loc.x);
+                    let y0 = r.loc.y.min(g.loc.y);
+                    let x1 = (r.loc.x + r.size.w).max(g.loc.x + g.size.w);
+                    let y1 = (r.loc.y + r.size.h).max(g.loc.y + g.size.h);
+                    Rectangle::new(Point::from((x0, y0)), Size::from((x1 - x0, y1 - y0)))
+                }
+            });
+        }
+        let r = итог?;
+        const ПОЛ: i32 = 240;
+        if r.size.w >= ПОЛ && r.size.h >= ПОЛ {
+            return Some(r);
+        }
+        // Слишком тесно — раздвигаем от центра, не сдвигая его.
+        let w = r.size.w.max(ПОЛ);
+        let h = r.size.h.max(ПОЛ);
+        Some(Rectangle::new(
+            Point::from((r.loc.x + (r.size.w - w) / 2, r.loc.y + (r.size.h - h) / 2)),
+            Size::from((w, h)),
+        ))
+    }
+
+    /// Win+D по выделению: собрать выделенные окна в созвездие — по-halley,
+    /// раскладкой «мастер и стопка» (см. constellation.rs).
+    ///
+    /// **Чем это отличается от прежней сборки.** Раньше окна просто съезжались
+    /// в компактную сетку, СОХРАНЯЯ свои размеры: получалась кучка
+    /// разнокалиберных плиток с дырами между ними, и «целая» гроздь от
+    /// растащенной отличалась на глаз едва-едва. У halley в кластере есть
+    /// порядок и роли: мастер занимает 60% ширины во всю высоту, остальные
+    /// делят правую колонку. Гроздь от этого читается как одна вещь, а не как
+    /// несколько окон, оказавшихся рядом.
+    ///
+    /// Мастером становится сфокусированное окно, если оно в выделении, иначе
+    /// самое большое: у halley мастер — это `члены[0]`, а кто им станет,
+    /// решает тот, кто кластер собирает.
     pub fn gather_selected_into_constellation(&mut self) {
         if self.selected_windows.len() < 2 {
             return;
@@ -123,94 +184,84 @@ impl Dawn {
             self.set_layout(crate::tiling::Layout::Float);
         }
 
-        // Размеры выделенных окон.
-        let items: Vec<(Window, i32, i32)> = self.selected_windows.iter()
-            .filter_map(|w| self.space.element_geometry(w).map(|g| (w.clone(), g.size.w, g.size.h)))
+        // Только те, что реально лежат на холсте: у окна без геометрии нет ни
+        // места, ни размера, и класть его в гроздь некуда.
+        let mut члены: Vec<Window> = self.selected_windows.iter()
+            .filter(|w| self.space.element_geometry(w).is_some())
+            .cloned()
             .collect();
-        if items.len() < 2 {
+        if члены.len() < 2 {
             return;
         }
 
-        // Центр тяжести текущих позиций — вокруг него собираем гроздь.
-        let (mut cx, mut cy) = (0.0f64, 0.0f64);
-        for w in &self.selected_windows {
-            if let Some(g) = self.space.element_geometry(w) {
-                cx += g.loc.x as f64 + g.size.w as f64 / 2.0;
-                cy += g.loc.y as f64 + g.size.h as f64 / 2.0;
-            }
-        }
-        let n = items.len() as f64;
-        cx /= n;
-        cy /= n;
-
-        // Компактная сетка: cols ≈ sqrt(n), окна кладём построчно с зазором,
-        // выравнивая по высоте строки. Затем блок центрируем на (cx, cy).
-        const GAP: i32 = 12;
-        let cols = (items.len() as f64).sqrt().ceil() as usize;
-        let rows: Vec<&[(Window, i32, i32)]> = items.chunks(cols).collect();
-
-        // Высота каждой строки и её ширина.
-        let row_heights: Vec<i32> = rows.iter()
-            .map(|row| row.iter().map(|(_, _, h)| *h).max().unwrap_or(0))
-            .collect();
-        let row_widths: Vec<i32> = rows.iter()
-            .map(|row| row.iter().map(|(_, w, _)| *w).sum::<i32>() + GAP * (row.len().saturating_sub(1)) as i32)
-            .collect();
-        let block_h: i32 = row_heights.iter().sum::<i32>() + GAP * (rows.len().saturating_sub(1)) as i32;
-        let block_w: i32 = row_widths.iter().copied().max().unwrap_or(0);
-
-        let start_x = (cx - block_w as f64 / 2.0).round() as i32;
-        let mut y = (cy - block_h as f64 / 2.0).round() as i32;
-
-        let mut targets: Vec<(Window, Point<i32, Logical>)> = Vec::new();
-        for (ri, row) in rows.iter().enumerate() {
-            // Центрируем строку по горизонтали внутри блока.
-            let mut x = start_x + (block_w - row_widths[ri]) / 2;
-            for (w, ww, _) in row.iter() {
-                targets.push((w.clone(), Point::from((x, y))));
-                x += ww + GAP;
-            }
-            y += row_heights[ri] + GAP;
+        // Кто мастер. Фокус главнее размера: человек смотрит на то окно,
+        // которое ему сейчас нужно крупным.
+        let мастер = self.focused_window()
+            .filter(|f| члены.iter().any(|w| same_window(w, f)))
+            .or_else(|| {
+                члены.iter()
+                    .filter_map(|w| self.space.element_geometry(w).map(|g| (w.clone(), g)))
+                    .max_by_key(|(_, g)| g.size.w as i64 * g.size.h as i64)
+                    .map(|(w, _)| w)
+            });
+        if let Some(m) = мастер {
+            crate::constellation::в_мастера(&mut члены, &m);
         }
 
-        // Куда окно вернётся при разборке. Запоминаем ДО переезда и только если
+        let Some(bounds) = self.constellation_bounds(&члены) else { return };
+        let места = crate::constellation::раскладка(
+            bounds,
+            crate::constellation::зазор(),
+            члены.len(),
+        );
+
+        // Куда окно вернётся при роспуске. Запоминаем ДО переезда и только если
         // ещё не запомнили: собрать уже собранное созвездие (или собрать его
         // заново после переноса) не должно стирать исходное место — иначе
         // «вернуть как было» возвращало бы в предыдущую гроздь.
-        let прежние: Vec<(Window, Point<i32, Logical>)> = targets.iter()
-            .filter_map(|(w, _)| self.space.element_geometry(w).map(|g| (w.clone(), g.loc)))
+        //
+        // Размер запоминаем ТЕПЕРЬ ТОЖЕ: halley-раскладка окна ещё и ресайзит,
+        // а роспуск обязан быть обратной операцией — вернуть одну позицию
+        // значило бы оставить окна навсегда в размерах грозди.
+        let прежние: Vec<(Window, Point<i32, Logical>, Size<i32, Logical>)> = члены.iter()
+            .filter_map(|w| self.space.element_geometry(w).map(|g| (w.clone(), g.loc, g.size)))
             .collect();
-        for (w, было) in прежние {
+        for (w, место, размер) in прежние {
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| tw.window == w) {
-                tw.pre_constellation.get_or_insert(было);
+                if tw.pre_constellation.is_none() {
+                    tw.pre_constellation = Some(место);
+                    tw.pre_constellation_size = Some(размер);
+                }
             }
         }
 
-        for (w, pos) in &targets {
-            self.animate_window_to_dur(w, *pos, std::time::Duration::from_millis(260));
-            if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                &tw.window == w
-            }) {
+        for место in &места {
+            let Some(w) = члены.get(место.индекс).cloned() else { continue };
+            let pos = место.rect.loc;
+            crate::xwin::set_size(&w, Some(место.rect.size), crate::xwin::Tiled::Keep);
+            crate::xwin::configure(&w);
+            self.animate_window_to_dur(&w, pos, crate::anim::дуг::созвездие());
+            if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| tw.window == w) {
                 tw.floating = true;
-                tw.float_position = *pos;
-                tw.position = *pos;
+                tw.float_position = pos;
+                tw.position = pos;
                 tw.float_position_set = true;
+                tw.float_size = Some(место.rect.size);
             }
         }
 
         // Фиксируем как созвездие (двигается/ресайзится как целое).
-        let group: Vec<Window> = targets.iter().map(|(w, _)| w.clone()).collect();
-        for w in &group {
+        for w in &члены {
             if let Some(idx) = self.constellation_index_of(w) {
                 self.constellations[idx].retain(|x| !same_window(x, w));
             }
         }
         self.constellations.retain(|g| g.len() > 1);
-        self.constellations.push(group.clone());
+        self.constellations.push(члены.clone());
         // Гроздь снова сложена нами — метка «растащено» снимается, и следующий
-        // Super+D по ней будет означать «разобрать».
-        self.clear_constellation_torn(&group);
-        tracing::info!("dawn: constellation gathered ({} windows)", targets.len());
+        // Win+D по ней будет означать «распустить».
+        self.clear_constellation_torn(&члены);
+        tracing::info!("dawn: созвездие собрано ({} окон) в {:?}", члены.len(), bounds);
         // Выделение больше не нужно — созвездие зафиксировано.
         self.selected_windows.clear();
         self.request_plane_reset();
@@ -289,6 +340,18 @@ impl Dawn {
         }
     }
 
+    /// Win+D по собранному созвездию: распустить его.
+    ///
+    /// Обратная операция сборке, и потому возвращает не только МЕСТО, но и
+    /// РАЗМЕР: halley-раскладка грозди окна ресайзит (см.
+    /// `gather_selected_into_constellation`), и вернуть одну позицию значило бы
+    /// распустить гроздь наполовину — окна разъехались бы, оставшись в чужих
+    /// пропорциях.
+    ///
+    /// Прежнее место известно не всегда: созвездие могло пережить перезапуск
+    /// раскладки, или окно попало в него не через сборку. На такой случай
+    /// остаётся разлёт от общего центра — не идеально, но лучше, чем оставить
+    /// окна стопкой друг на друге.
     pub fn scatter_selected_constellation(&mut self) {
         let idx = match self.selected_windows.first().and_then(|w| self.constellation_index_of(w)) {
             Some(i) => i,
@@ -312,14 +375,6 @@ impl Dawn {
         cx /= n;
         cy /= n;
 
-        // Каждое окно возвращается ТУДА, ОТКУДА ЕГО СОБРАЛИ (см.
-        // TaggedWindow::pre_constellation). Разборка — обратная операция сборке,
-        // и «вернуть как было» — единственное её осмысленное поведение.
-        //
-        // Прежнее место известно не всегда: созвездие могло пережить
-        // перезапуск раскладки, или окно попало в него не через gather. На
-        // такой случай остаётся старый разлёт от центра — не идеально, но
-        // лучше, чем оставить окна лежать стопкой друг на друге.
         const SCATTER: f64 = 2.4;
         const MIN_PUSH: f64 = 320.0;
         let count = group.len();
@@ -328,9 +383,18 @@ impl Dawn {
                 Some(g) => g,
                 None => continue,
             };
-            let было = self.tagged_windows.iter()
+            let (было, размер) = self.tagged_windows.iter()
                 .find(|tw| &tw.window == w)
-                .and_then(|tw| tw.pre_constellation);
+                .map(|tw| (tw.pre_constellation, tw.pre_constellation_size))
+                .unwrap_or((None, None));
+            // Размер возвращаем ПЕРВЫМ: разлёт от центра ниже считается от
+            // размеров окна, и посчитать его по старым, а применить новые
+            // значило бы промахнуться на разницу.
+            if let Some(размер) = размер {
+                crate::xwin::set_size(w, Some(размер), crate::xwin::Tiled::Keep);
+                crate::xwin::configure(w);
+            }
+            let итоговый = размер.unwrap_or(g.size);
             let pos = match было {
                 Some(p) => p,
                 None => {
@@ -343,50 +407,99 @@ impl Dawn {
                         dy = a.sin() * MIN_PUSH;
                     }
                     Point::from((
-                        (cx + dx - g.size.w as f64 / 2.0).round() as i32,
-                        (cy + dy - g.size.h as f64 / 2.0).round() as i32,
+                        (cx + dx - итоговый.w as f64 / 2.0).round() as i32,
+                        (cy + dy - итоговый.h as f64 / 2.0).round() as i32,
                     ))
                 }
             };
-            self.animate_window_to_dur(w, pos, Duration::from_millis(320));
-            if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                &tw.window == w
-            }) {
+            self.animate_window_to_dur(w, pos, crate::anim::дуг::созвездие());
+            if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| &tw.window == w) {
                 tw.floating = true;
                 tw.float_position = pos;
                 tw.position = pos;
                 tw.float_position_set = true;
-                // Созвездия больше нет — и метка «откуда собрали» тоже не
-                // нужна: следующая сборка запишет её заново, от текущего места.
+                tw.float_size = Some(итоговый);
+                // Созвездия больше нет — и метки «откуда собрали» тоже не
+                // нужны: следующая сборка запишет их заново, от текущего места.
                 tw.pre_constellation = None;
+                tw.pre_constellation_size = None;
                 tw.constellation_torn = false;
             }
         }
 
         self.constellations.retain(|g| g.len() > 1);
         self.clear_selection();
-        tracing::info!("dawn: constellation scattered ({} windows)", count);
+        tracing::info!("dawn: созвездие распущено ({count} окон)");
         self.request_plane_reset();
         self.request_redraw();
     }
 
-    /// Super+Shift+G: разбить созвездие, в котором состоит сфокусированное окно.
+    /// Super+Shift+G: распустить созвездие. Окна остаются там, где лежат, —
+    /// этим роспуск и отличается от разборки (`scatter_selected_constellation`),
+    /// которая ещё и возвращает окна на прежние места.
+    ///
+    /// **Почему здесь три способа найти созвездие, а не один.** Раньше был
+    /// ровно один: взять сфокусированную ПОВЕРХНОСТЬ и поискать окно с ней в
+    /// `tagged_windows`. Обе половины этого способа отваливаются походя —
+    /// фокуса может не быть вовсе (кликнули по холсту, по панели, окно только
+    /// что закрылось), а сфокусированной может оказаться дочерняя поверхность
+    /// (меню, popup), которую `is_surface` с окном не сводит. В обоих случаях
+    /// функция молча выходила, ничего не делая. Снаружи это ровно та жалоба,
+    /// что роспуск «иногда не срабатывает, но срабатывает потом»: потом —
+    /// это когда фокус случайно оказался на подходящем окне.
+    ///
+    /// Поэтому теперь ищем по очереди: выделение (человек его для того и
+    /// обвёл), затем фокус, затем — если на текущем столе созвездие ровно
+    /// одно — его. Неоднозначности здесь нет: два созвездия на столе без
+    /// выделения и фокуса распустить нечем, и мы честно ничего не делаем,
+    /// сказав об этом в лог.
     pub fn ungroup_focused_constellation(&mut self) {
-        let focused = match self.focused_surface() {
-            Some(f) => f,
-            None => return,
+        let по_выделению = self.selected_windows.iter()
+            .find_map(|w| self.constellation_index_of(w));
+
+        let по_фокусу = || -> Option<usize> {
+            let focused = self.focused_surface()?;
+            let window = self.tagged_windows.iter()
+                .find(|tw| crate::xwin::is_surface(&tw.window, &focused))
+                .map(|tw| tw.window.clone())?;
+            self.constellation_index_of(&window)
         };
-        let window = match self.tagged_windows.iter()
-            .find(|tw| crate::xwin::is_surface(&tw.window, &focused))
-            .map(|tw| tw.window.clone())
-        {
-            Some(w) => w,
-            None => return,
+
+        let единственное_здесь = || -> Option<usize> {
+            let tags = self.viewport.current_tags();
+            let здесь: Vec<usize> = self.constellations.iter().enumerate()
+                .filter(|(_, g)| g.iter().any(|w| {
+                    self.tagged_windows.iter()
+                        .any(|tw| same_window(&tw.window, w) && (tw.tags == 0 || tw.tags & tags != 0))
+                }))
+                .map(|(i, _)| i)
+                .collect();
+            (здесь.len() == 1).then(|| здесь[0])
         };
-        if let Some(idx) = self.constellation_index_of(&window) {
-            self.constellations.remove(idx);
-            tracing::info!("dawn: constellation disbanded");
+
+        let Some(idx) = по_выделению.or_else(по_фокусу).or_else(единственное_здесь) else {
+            tracing::info!("dawn: роспуск: созвездия не нашлось (ни в выделении, ни под фокусом)");
+            return;
+        };
+
+        let group = self.constellations.remove(idx);
+        // Метки чистим обязательно. `constellation_torn` пережил бы роспуск и
+        // сбил бы Super+D по СЛЕДУЮЩЕМУ созвездию из этих же окон (он решает
+        // «собрать или разобрать» именно по ней), а `pre_constellation`
+        // отправил бы окна на позиции из прошлой жизни при первой же разборке.
+        for tw in self.tagged_windows.iter_mut() {
+            if group.iter().any(|w| same_window(w, &tw.window)) {
+                tw.constellation_torn = false;
+                tw.pre_constellation = None;
+                tw.pre_constellation_size = None;
+            }
         }
+        self.constellations.retain(|g| g.len() > 1);
+        tracing::info!("dawn: созвездие распущено на месте ({} окон)", group.len());
+        // Роспуск ничего не двигает, но рисует: подсветка принадлежности к
+        // грозди пропадает. Без этого запроса кадр не перерисовался бы вовсе,
+        // и роспуск снова выглядел бы как «не сработал».
+        self.request_redraw();
     }
 
     /// Закрыть все выделенные окна разом; если выделения нет — обычное
@@ -493,7 +606,7 @@ impl Dawn {
 
             crate::xwin::set_size(w, Some(size), crate::xwin::Tiled::Unset);
             crate::xwin::configure(w);
-            self.animate_window_to_dur(w, pos, Duration::from_millis(200));
+            self.animate_window_to_dur(w, pos, crate::anim::дуг::толчок_соседа());
             if let Some(tw) = self.tagged_windows.iter_mut()
                 .find(|tw| same_window(&tw.window, w))
             {

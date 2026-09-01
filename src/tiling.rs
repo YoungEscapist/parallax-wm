@@ -68,60 +68,6 @@ impl Default for TileConfig {
     }
 }
 
-// ── Dwindle-цепочка: рекурсивный split по счётчику окон ───────────────────────
-// Раскладка Layout::Tile этим БОЛЬШЕ НЕ пользуется — там настоящее BSP-дерево
-// (dwindle.rs). Осталось для обзора столов (overview.rs), где нужна разумная
-// сетка миниатюр для стола, у которого своего дерева ещё нет.
-// n=1: [  A  ]
-// n=2: [ A ][ B ]   ← горизонтальный split (лево/право)
-// n=3: [ A ][ B ]   ← B делится вертикально (верх/низ)
-//           [ C ]
-// n=4: [ A ][ B ]   ← C делится горизонтально
-//           [C][D]
-// Чередуем горизонталь/вертикаль на каждом уровне
-
-pub fn dwindle_rects(
-    rect: Rectangle<i32, Logical>,
-    n: usize,
-    split_horizontal: bool, // true = лево/право, false = верх/низ
-) -> Vec<Rectangle<i32, Logical>> {
-    if n == 0 { return vec![]; }
-    if n == 1 { return vec![rect]; }
-
-    let (first, rest) = if split_horizontal {
-        // Делим лево/право
-        let w_first = (rect.size.w as f32 * 0.5).round() as i32;
-        let w_rest  = rect.size.w - w_first;
-        let first = Rectangle::new(
-            rect.loc,
-            (w_first, rect.size.h).into(),
-        );
-        let rest = Rectangle::new(
-            (rect.loc.x + w_first, rect.loc.y).into(),
-            (w_rest, rect.size.h).into(),
-        );
-        (first, rest)
-    } else {
-        // Делим верх/низ
-        let h_first = (rect.size.h as f32 * 0.5).round() as i32;
-        let h_rest  = rect.size.h - h_first;
-        let first = Rectangle::new(
-            rect.loc,
-            (rect.size.w, h_first).into(),
-        );
-        let rest = Rectangle::new(
-            (rect.loc.x, rect.loc.y + h_first).into(),
-            (rect.size.w, h_rest).into(),
-        );
-        (first, rest)
-    };
-
-    let mut result = vec![first];
-    // Следующий уровень — противоположное направление
-    result.extend(dwindle_rects(rest, n - 1, !split_horizontal));
-    result
-}
-
 impl Dawn {
     pub fn arrange(&mut self) {
         // В обзоре столов ленту раскладывает overview.rs — обычный arrange
@@ -156,7 +102,23 @@ impl Dawn {
     /// посчитанная при зуме 0.45, растягивалась на 5689×2400 — окна улетали за
     /// правый край экрана и уже не возвращались (см. exit_overview_immediate).
     /// Тайлинг обязан считать по экрану: в него он и попадает.
+    /// Прямоугольник холста, в котором собираются столы АКТИВНОГО монитора.
+    ///
+    /// В dawn все рабочие столы лежат в ОДНОМ прямоугольнике (см. `слайд_столов`
+    /// в state.rs): между столами нет пространственного отношения, их разводят
+    /// теги. Двум мониторам одного прямоугольника мало — каждый получает свой,
+    /// начинающийся с его «дома» (`monitors::ШАГ_ДОМА`). Отсюда и берётся то,
+    /// что монитор физически не может нарисовать чужие окна: отсечение в
+    /// `udev::собрать_элементы` идёт по видимой части холста, а до чужого дома
+    /// миллион пикселей.
+    ///
+    /// Раньше здесь стоял «первый выход, прямоугольник от (0,0)» — с двумя
+    /// мониторами это значило, что тайлинг на втором раскладывает окна поверх
+    /// окон первого.
     pub(crate) fn screen_area(&self) -> Option<Rectangle<i32, Logical>> {
+        if let Some(m) = self.монитор() {
+            return Some(Rectangle::new(m.дом, m.размер));
+        }
         let output = self.space.outputs().next()?;
         let size = match output.current_mode() {
             Some(m) => Size::from((m.size.w, m.size.h)),
@@ -212,17 +174,14 @@ impl Dawn {
             })
             .collect();
 
-        // Минимум клиента + внутренний зазор: слот ужимается на GAP_INNER (по
-        // половине с каждой стороны, см. apply_tile_layout), и окну достаётся
-        // именно столько.
-        let min_of = |w: &Window| {
-            let (min, _) = crate::xwin::size_constraints(w);
-            (
-                (min.w + GAP_INNER) as f64,
-                (min.h + GAP_INNER) as f64,
-            )
-        };
-
+        // Минимальные размеры клиентов тайлинг НЕ учитывает: окно получает
+        // ровно свой слот, каким бы маленьким тот ни был. Дерево такое умеет
+        // (см. DwindleTree::set_min_sizes и demands), но мы ему минимумов не
+        // сообщаем — у листьев они остаются нулевыми.
+        //
+        // Цена решения известна и выбрана осознанно: клиент, который ужиматься
+        // не умеет (Discord — 940×500), нарисуется больше слота и накроет
+        // соседа, как это было до правок 11–12.08.2026.
         let tree = self.dwindle_trees.entry(current_tags).or_default();
 
         for w in tree.windows() {
@@ -236,93 +195,25 @@ impl Dawn {
             .collect();
 
         if missing.len() == 1 {
-            tree.set_min_sizes(&min_of);
             tree.recalc(area, &cfg);
             let (w, _) = &missing[0];
-            let min = min_of(w);
-            // Слот сфокусированного окна годится, только если новое окно в его
-            // половину влезает: иначе оно осталось бы своего размера и накрыло
-            // соседа. Не влезает — ищем ближайший подходящий.
-            let opening_on = match focused
+            // Делим слот сфокусированного окна; сторону выбирает курсор.
+            let opening_on = focused
                 .as_ref()
                 .filter(|f| !crate::dwindle::same_window(f, w))
-            {
-                Some(f) if tree.split_fits(f, min, &cfg, min_of) => tree.node_of(f),
-                _ => None,
-            }
-            .or_else(|| tree.closest_fitting_node(mouse, min, &cfg, Some(w), min_of));
+                .and_then(|f| tree.node_of(f))
+                .or_else(|| tree.closest_node(mouse, Some(w)));
             tree.insert(w.clone(), opening_on, mouse, area, &cfg, None);
         } else {
             // «Сборка» (Win+D, возврат на тег): окна приходят пачкой и каждое
-            // садится к ближайшему по своей позиции соседу. Крупные — те, что
-            // не умеют ужиматься, — берём ПЕРВЫМИ: пока дерево мелко не
-            // порезано, им есть куда сесть, а мелкие потом влезут куда угодно.
-            let mut missing = missing;
-            missing.sort_by(|(a, _), (b, _)| {
-                let (aw, ah) = min_of(a);
-                let (bw, bh) = min_of(b);
-                (bw * bh).total_cmp(&(aw * ah))
-            });
+            // садится к ближайшему по своей позиции соседу.
             for (w, center) in missing {
-                tree.set_min_sizes(&min_of);
                 tree.recalc(area, &cfg);
-                let opening_on =
-                    tree.closest_fitting_node(center, min_of(&w), &cfg, Some(&w), min_of);
+                let opening_on = tree.closest_node(center, Some(&w));
                 tree.insert(w, opening_on, center, area, &cfg, None);
             }
         }
-        // Ещё раз, уже со всеми вставленными окнами: делители в recalc двигаются
-        // по минимумам, а у только что вставленного листа их ещё не было.
-        tree.set_min_sizes(&min_of);
         tree.recalc(area, &cfg);
-
-        // Минимумы влезли не все — значит нынешнее дерево кто-то накроет.
-        // Пробуем пересобрать его целиком и оставляем ту раскладку, где
-        // недостача меньше (см. repack_dwindle_tree).
-        // Подпись набора: окна, их минимумы и рабочая область. Пока она та же,
-        // пересобирать нечего — результат вышел бы тот же самый (см.
-        // DwindleTree::packed, он не зависит ни от чего другого).
-        let подпись = (tree.min_shortfall(&min_of) > 0.0)
-            .then(|| Self::dwindle_signature(&visible, area, &min_of));
-        if let Some(подпись) = подпись.filter(|п| tree.packed_for != Some(*п)) {
-            let собранное = crate::dwindle::DwindleTree::packed(&visible, area, &cfg, &min_of);
-            let было = tree.min_shortfall(&min_of);
-            let стало = собранное.min_shortfall(&min_of);
-            if стало + 1.0 < было {
-                tracing::debug!(
-                    "dawn/tile: дерево пересобрано, недостача {было:.0} → {стало:.0} px",
-                );
-                *tree = собранное;
-            }
-            tree.packed_for = Some(подпись);
-        }
-    }
-
-    /// Отпечаток набора окон для [`crate::dwindle::DwindleTree::packed`]: сами
-    /// окна, их минимумы и рабочая область. Минимумы входят обязательно — их
-    /// клиент присылает когда захочет (X11 — после маппинга, Electron — на
-    /// лету), и «те же окна» с новыми требованиями это уже другая задача.
-    fn dwindle_signature(
-        windows: &[Window],
-        area: Rectangle<i32, Logical>,
-        min_of: impl Fn(&Window) -> (f64, f64),
-    ) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut отпечатки: Vec<(u64, u64, u64)> = windows.iter()
-            .map(|w| {
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                w.hash(&mut h);
-                let (mw, mh) = min_of(w);
-                (h.finish(), mw.to_bits(), mh.to_bits())
-            })
-            .collect();
-        // Порядок окон в visible зависит от порядка появления — сортируем,
-        // иначе одна и та же расстановка давала бы разные подписи.
-        отпечатки.sort_unstable();
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        отпечатки.hash(&mut h);
-        (area.loc.x, area.loc.y, area.size.w, area.size.h).hash(&mut h);
-        h.finish()
     }
 
     pub fn apply_tile_layout(&mut self) {
@@ -409,32 +300,29 @@ impl Dawn {
         self.resize_window_animated(window, rect, true);
     }
 
-    /// Приводит слот к тому, что клиент СОГЛАСЕН принять.
+    /// Приводит слот к тому, что клиент СОГЛАСЕН принять — теперь только
+    /// сверху: остаётся максимум (окно, которое не умеет растягиваться,
+    /// центрируется в слоте и не вылезает за рабочую область).
     ///
-    /// Слот считает дерево, но у окна бывает свой минимум (Discord — 940×500,
-    /// замер 11.08.2026) и максимум. Клиент, которому слот мал, просто
-    /// оставляет прежний размер — а мы до сих пор ставили его углом в слот, и
-    /// весь излишек уходил вправо-вниз, накрывая соседа. Именно так Discord в
-    /// слоте 615 px рисовался на 940 и закрывал два окна справа.
-    ///
-    /// Делаем как Hyprland (`misc:size_limits_tiled`,
-    /// `layout/target/WindowTarget.cpp`): зажимаем размер в [min, max],
-    /// ЦЕНТРИРУЕМ окно в слоте (перекос делится поровну на обе стороны, а не
-    /// валится на одного соседа) и не даём вылезти за рабочую область.
+    /// Минимума здесь больше нет: тайлинг ужимает окно до любого размера,
+    /// даже если клиент просил больше (Discord — 940×500, замер 11.08.2026).
+    /// Такой клиент просто нарисуется поверх соседа — сознательный размен.
     fn fit_to_constraints(
         &self,
         window: &Window,
         slot: Rectangle<i32, Logical>,
     ) -> Rectangle<i32, Logical> {
-        let (min, max) = crate::xwin::size_constraints(window);
+        let (_, max) = crate::xwin::size_constraints(window);
         // Ноль в max — «без ограничения» (так это устроено и в xdg_shell, и в
         // приведённых к нему подсказках X11; см. xwin::size_constraints).
         let max_w = if max.w <= 0 { i32::MAX } else { max.w };
         let max_h = if max.h <= 0 { i32::MAX } else { max.h };
-        // Порядок важен: при min > max побеждает min — окно, которое не может
-        // ни ужаться, ни растянуться, всё равно должно получить свой размер.
-        let w = slot.size.w.min(max_w).max(min.w).max(1);
-        let h = slot.size.h.min(max_h).max(min.h).max(1);
+        // Минимум клиента НЕ учитываем: окно получает свой слот целиком, каким
+        // бы маленьким он ни был. Клиенту уходит configure на этот размер; не
+        // умеет ужиматься — нарисуется больше и накроет соседа, это принятая
+        // цена (см. sync_dwindle_tree).
+        let w = slot.size.w.min(max_w).max(1);
+        let h = slot.size.h.min(max_h).max(1);
         if w == slot.size.w && h == slot.size.h {
             return slot;
         }
@@ -449,8 +337,8 @@ impl Dawn {
             loc.y = loc.y.clamp(area.loc.y, (area.loc.y + area.size.h - h).max(area.loc.y));
         }
         tracing::debug!(
-            "dawn/tile: слот {:?} не по клиенту (min {:?} max {:?}) → {:?} в {:?}",
-            slot.size, min, max, Size::<i32, Logical>::from((w, h)), loc,
+            "dawn/tile: слот {:?} не по клиенту (max {:?}) → {:?} в {:?}",
+            slot.size, max, Size::<i32, Logical>::from((w, h)), loc,
         );
         Rectangle::new(loc, (w, h).into())
     }
@@ -589,9 +477,7 @@ impl Dawn {
     }
 
     fn animate_window_to(&mut self, window: &Window, target: Point<i32, Logical>) {
-        // Сокращено с 240ms→180ms — snappy, без ощущения "подлагивания"
-        // при сборке/разлёте окон. Ещё короче — будет заметно глазу.
-        self.animate_window_to_dur(window, target, Duration::from_millis(180));
+        self.animate_window_to_dur(window, target, crate::anim::дуг::сборка_тайлинга());
     }
 
     /// Смена раскладки ПО КОМАНДЕ пользователя (Win+D/Win+T/Win+N): окна
@@ -688,6 +574,11 @@ impl Dawn {
                     self.momentum.stop();
                     self.camera_anim = None;
                     self.zoom_anim = None;
+                    // См. симметричную правку в ветке tiling ниже — zoom_glide
+                    // это отдельный, третий, механизм анимации зума (доезд
+                    // колеса), и он тоже обязан быть погашен здесь, иначе
+                    // следующий тик сам пересчитает camera от старого якоря.
+                    self.zoom_glide = None;
                     self.viewport.zoom = zoom;
                     self.viewport.cam_x = cam_x;
                     self.viewport.cam_y = cam_y;
@@ -788,10 +679,20 @@ impl Dawn {
                 }
             }
             // Переход в tiling/columns ПО КОМАНДЕ (Win+D/Win+T/Win+N): камера в
-            // (0,0), zoom=1, arrange раскладывает окна. Окна плывут от текущей
-            // позиции к тайловой через window_pos_anims (animate_window_to,
-            // 180ms). Без slide-in (N map_element на кадр + пустой кадр выброса
-            // влево).
+            // угол СВОЕГО монитора, zoom=1, arrange раскладывает окна. Окна
+            // плывут от текущей позиции к тайловой через window_pos_anims
+            // (animate_window_to, 180ms). Без slide-in (N map_element на кадр +
+            // пустой кадр выброса влево).
+            //
+            // **Угол монитора, а не (0,0) холста.** Тайлинг раскладывает окна в
+            // прямоугольнике `screen_area()`, а он начинается в ДОМЕ монитора
+            // (`monitors::Монитор::дом`); у второго монитора это (1 000 000, 0)
+            // — см. `monitors::ШАГ_ДОМА`. Пока здесь стоял жёсткий ноль, Win+D
+            // на втором мониторе уводил камеру на миллион пикселей от только что
+            // разложенных окон: экран оставался с одними обоями, хотя чипы окон
+            // в панели были на месте. Замер 26.08.2026 на двухмониторном
+            // харнессе: после Win+D камера=(0,0), а окно в слоте 1000026,26.
+            // Это и есть «Win+D работает криво».
             //
             // При ПЕРЕХОДЕ НА СТОЛ (restore_layout, move_windows = false) камеру
             // не трогаем вовсе: у стола свой запомненный кадр — камера И зум, —
@@ -800,19 +701,30 @@ impl Dawn {
             // нулями, а потом view_tag для тайловых столов и вовсе выходил
             // раньше восстановления. Отсюда и «камера остаётся на одном месте».
             if move_windows {
+                let дом = self.монитор_дом();
                 self.momentum.stop();
                 self.camera_anim = None;
                 self.zoom_anim = None;
+                // Доезд колеса (zoom_glide) — ТРЕТЬЯ, отдельная от двух выше
+                // анимация: она держит на месте точку холста под курсором и
+                // на каждом тике САМА пересчитывает camera из своего якоря
+                // (см. ZoomGlide::advance). Без сброса здесь она переживала
+                // Win+D и на первом же anim::tick после него утаскивала
+                // камеру обратно от дома монитора к своему старому якорю —
+                // «Win+D во время зума ставит камеру не в (0,0)».
+                self.zoom_glide = None;
                 self.viewport.zoom = 1.0;
-                self.viewport.cam_x = 0.0;
-                // В ленте начало холста — не (0,0), а ЭТАЖ этого стола: столы там
-                // стоят друг под другом (стол N на высоте N × экран). Камера в
-                // нулевую точку показала бы первый этаж ленты вместо того стола, на
-                // котором её включили.
+                self.viewport.cam_x = дом.x as f64;
+                // В ленте начало холста — не верх стола, а ЭТАЖ этого стола:
+                // столы там стоят друг под другом (стол N на высоте N × экран).
+                // Камера в верхнюю точку показала бы первый этаж ленты вместо
+                // того стола, на котором её включили. `columns_ws_y` уже
+                // отсчитывает этажи от дома монитора, поэтому второй раз его
+                // прибавлять не нужно.
                 self.viewport.cam_y = if layout == Layout::Columns {
                     self.columns_cur_y()
                 } else {
-                    0.0
+                    дом.y as f64
                 };
                 self.columns_float_cam = (self.viewport.cam_x, self.viewport.cam_y);
                 self.apply_camera();
@@ -909,9 +821,12 @@ impl Dawn {
                     let k = (предел_w as f64 / желаемый.w.max(1) as f64)
                         .min(предел_h as f64 / желаемый.h.max(1) as f64)
                         .min(1.0);
+                    // Пол — 1 px: если окно уходило в тайлинг крошечным, во
+                    // Float оно обязано остаться таким же. Прежние 200×150
+                    // раздували его обратно — тот самый «лимит по размеру».
                     let win_size: Size<i32, Logical> = (
-                        ((желаемый.w as f64 * k).round() as i32).max(200),
-                        ((желаемый.h as f64 * k).round() as i32).max(150),
+                        ((желаемый.w as f64 * k).round() as i32).max(1),
+                        ((желаемый.h as f64 * k).round() as i32).max(1),
                     ).into();
                     // Куда бы окно ни просилось — оно обязано остаться В КАДРЕ.
                     // Кольцо разлёта считается от центра и не знает про размеры
@@ -959,7 +874,7 @@ impl Dawn {
             crate::xwin::configure(window);
             // Плавный "разлёт" в кольцо вместо мгновенного прыжка (см. anim::tick) —
             // подольше и заметнее, чем сборка в тайлинг ("красивая" анимация).
-            self.animate_window_to_dur(window, *pos, Duration::from_millis(600));
+            self.animate_window_to_dur(window, *pos, crate::anim::дуг::разлёт_во_флоат());
         }
 
         // Обновляем tagged_windows
@@ -1002,6 +917,9 @@ impl Dawn {
             None => return,
         };
 
+        // Начало полосы колонок — угол СВОЕГО монитора, а не ноль холста:
+        // столы второго монитора живут в его доме (см. `monitors::ШАГ_ДОМА`).
+        let дом = self.монитор_дом();
         let (to_x, to_y) = match self.tile_config.layout {
             Layout::Float => (
                 geo.loc.x as f64 + geo.size.w as f64 / 2.0 - out_geo.size.w as f64 / 2.0,
@@ -1015,8 +933,8 @@ impl Dawn {
                 let mut cam_x = self.viewport.cam_x;
                 if right > cam_x + view_w { cam_x = right - view_w; }
                 if left < cam_x { cam_x = left; }
-                if cam_x < 0.0 { cam_x = 0.0; }
-                (cam_x, 0.0) // колонки на всю высоту от y=0
+                if cam_x < дом.x as f64 { cam_x = дом.x as f64; }
+                (cam_x, дом.y as f64) // колонки на всю высоту от верха стола
             }
             _ => return,
         };
@@ -1024,7 +942,7 @@ impl Dawn {
         let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
         let to = Point::from((to_x, to_y));
         if (to.x - from.x).abs() > 0.5 || (to.y - from.y).abs() > 0.5 {
-            self.camera_anim = Some(CameraAnim::new(from, to, Duration::from_millis(220)));
+            self.camera_anim = Some(CameraAnim::new(from, to, crate::anim::дуг::прыжок_к_окну()));
         }
     }
 
@@ -1112,11 +1030,16 @@ impl Dawn {
         // разложили бы стол поверх соседей.
         if self.overview_active {
             let Some(mask) = self.overview_mask_of_window(window) else { return };
-            let Some(area) = self.overview_window_area(mask) else { return };
+            // Дерево стола считается в ДОМАШНЕЙ рабочей области (экран от 0,0) —
+            // и в обзоре тоже: обзор только сдвигает готовый стол в его ячейку
+            // (см. overview_layout). Раньше дерево пересчитывалось прямо в
+            // рамку ячейки, из-за чего раскладка обзора расходилась с настоящей.
+            let Some(area) = self.tile_work_area() else { return };
             let cfg = self.lua_config.dwindle;
             if let Some(tree) = self.dwindle_trees.get_mut(&mask) {
                 tree.resize(window, delta, corner, area, &cfg);
             }
+            self.overview_apply_tree(mask);
             if let Some((w, h)) = self.overview_band_size() {
                 self.overview_layout(w, h);
             }
@@ -1478,8 +1401,10 @@ impl Dawn {
             Some(w) => w, None => return,
         };
         let cur = crate::xwin::current_size(&w);
-        let new_w = (cur.w + dw).max(50);
-        let new_h = (cur.h + dh).max(50);
+        // Пол — 1 px, а не «удобные» 50: своего нижнего порога у dawn больше
+        // нет нигде (см. tiling::fit_to_constraints и dwindle::RATIO_MIN).
+        let new_w = (cur.w + dw).max(1);
+        let new_h = (cur.h + dh).max(1);
         crate::xwin::set_size(&w, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
         crate::xwin::configure(&w);
     }

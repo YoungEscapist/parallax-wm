@@ -20,8 +20,6 @@
 //! финализируется выход (восстановление layout/зума). При выходе на тот же
 //! стол → просто выход (без анимации).
 
-use std::collections::HashMap;
-use std::time::Duration;
 
 use smithay::{
     desktop::Window,
@@ -30,14 +28,13 @@ use smithay::{
 
 use crate::anim::CameraAnim;
 use crate::state::Dawn;
-use crate::tiling::{dwindle_rects, GAP_INNER, GAP_OUTER, Layout};
+use crate::tiling::{GAP_INNER, GAP_OUTER, Layout};
 
 /// Зазор между ячейками сетки столов (canvas px).
 const BAND_GAP: i32 = 140;
 /// Уровень отдаления в обзоре.
 const OVERVIEW_ZOOM: f64 = 0.5;
 /// Длительность анимации перелёта между столами.
-const OVERVIEW_FLY_MS: u64 = 280;
 
 fn same_window(a: &Window, b: &Window) -> bool {
     a == b
@@ -135,7 +132,7 @@ impl Dawn {
             let slot = *self.overview_slots.get(&target_mask).unwrap_or(&(0, 0));
             let target_cam = self.center_cam_on_slot(slot, w, h);
             let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
-            self.camera_anim = Some(CameraAnim::new(from, target_cam, Duration::from_millis(OVERVIEW_FLY_MS)));
+            self.camera_anim = Some(CameraAnim::new(from, target_cam, crate::anim::дуг::обзор()));
             self.overview_exit_pending = true;
             self.overview_exit_target_ws = Some(target_mask);
         } else {
@@ -204,15 +201,22 @@ impl Dawn {
             // Tile/Monocle view_tag посещённого стола НЕ вызывает arrange и
             // улетает камерой к устаревшей per-tag позиции → на экране одно
             // мелкое окно под курсором вместо всего стола. Показываем стол
-            // ЦЕЛИКОМ как собран: стандартный кадр (zoom 1, cam 0,0) + переразметка.
+            // ЦЕЛИКОМ как собран: стандартный кадр (zoom 1, камера в углу стола)
+            // + переразметка.
             // Columns раскладывается из своей модели прямо в view_tag — не трогаем.
             if matches!(self.tile_config.layout, Layout::Tile | Layout::Monocle) {
+                // Угол СВОЕГО монитора, а не ноль холста: стол мог оказаться на
+                // втором мониторе (его дом — (1 000 000, 0), см.
+                // `monitors::ШАГ_ДОМА`), и нулевая камера показала бы пустоту
+                // вместо стола. Дом спрашиваем ПОСЛЕ view_tag: он мог сменить
+                // активный монитор вместе со столом.
+                let дом = self.монитор_дом();
                 self.camera_anim = None;
                 self.zoom_anim = None;
                 self.zoom_glide = None;
                 self.viewport.zoom = 1.0;
-                self.viewport.cam_x = 0.0;
-                self.viewport.cam_y = 0.0;
+                self.viewport.cam_x = дом.x as f64;
+                self.viewport.cam_y = дом.y as f64;
                 self.apply_camera();
                 self.arrange();
             }
@@ -265,24 +269,44 @@ impl Dawn {
     /// стола в сетке — размером с экран, так что размеры в обзоре настоящие,
     /// а не масштабированные.
     pub fn overview_note_resize(&mut self, window: &Window, size: Size<i32, Logical>) {
+        // Тянуть можно и за левый/верхний край — тогда вместе с размером
+        // поехала позиция. Обзор показывает окна сдвигом от дома, так что
+        // не записанный дом на следующей же переразметке вернул бы окно назад.
+        let mask = self.overview_mask_of_window(window);
+        let loc = match (mask, self.space.element_geometry(window)) {
+            (Some(mask), Some(g)) => Some(g.loc - self.overview_offset(mask)),
+            _ => None,
+        };
         if let Some(e) = self.overview_saved_geo.iter_mut()
             .find(|(w, _, _)| same_window(w, window))
         {
             e.2 = size;
+            if let Some(loc) = loc {
+                e.1 = loc;
+            }
         }
     }
 
     /// Физический размер output'а = размер одной ячейки стола.
     pub fn overview_band_size(&self) -> Option<(i32, i32)> {
-        let output = self.space.outputs().next()?;
-        let mode = output.current_mode()?;
-        Some((mode.size.w, mode.size.h))
+        let экран = self.screen_size();
+        Some((экран.w, экран.h))
     }
 
     /// Canvas-прямоугольник стола по его слоту (ячейке сетки).
-    fn slot_rect(slot: (i32, i32), w: i32, h: i32) -> Rectangle<i32, Logical> {
+    ///
+    /// Сетка строится от ДОМА своего монитора, а не от нуля холста: столы
+    /// принадлежат мониторам и лежат в их прямоугольниках (см.
+    /// `monitors::ШАГ_ДОМА` и `tiling::screen_area`). Пока здесь стоял голый
+    /// ноль, обзор на втором мониторе уводил камеру к столам первого — замер
+    /// 26.08.2026: тап Super при камере 1 000 000 давал камеру (−111, −47).
+    fn slot_rect(&self, slot: (i32, i32), w: i32, h: i32) -> Rectangle<i32, Logical> {
+        let дом = self.монитор_дом();
         Rectangle::new(
-            (slot.0 * (w + BAND_GAP), slot.1 * (h + BAND_GAP)).into(),
+            (
+                дом.x + slot.0 * (w + BAND_GAP),
+                дом.y + slot.1 * (h + BAND_GAP),
+            ).into(),
             (w, h).into(),
         )
     }
@@ -334,7 +358,7 @@ impl Dawn {
     /// Canvas-прямоугольник стола `mask` (вся его рамка).
     pub fn overview_band_rect(&self, mask: u32) -> Option<Rectangle<i32, Logical>> {
         let (w, h) = self.overview_band_size()?;
-        Some(Self::slot_rect(*self.overview_slots.get(&mask).unwrap_or(&(0, 0)), w, h))
+        Some(self.slot_rect(*self.overview_slots.get(&mask).unwrap_or(&(0, 0)), w, h))
     }
 
     /// Область ВНУТРИ стола, в которой разрешено находиться окну: рамка минус
@@ -391,7 +415,7 @@ impl Dawn {
     /// будущий (обзорный) зум, а не под текущий — на момент расчёта viewport
     /// ещё держит доовзорный (см. enter_overview).
     fn center_cam_on_slot_zoom(&self, slot: (i32, i32), w: i32, h: i32, zoom: f64) -> Point<f64, Logical> {
-        let rect = Self::slot_rect(slot, w, h);
+        let rect = self.slot_rect(slot, w, h);
         let cx = rect.loc.x as f64 + w as f64 / 2.0;
         let cy = rect.loc.y as f64 + h as f64 / 2.0;
         Point::from((
@@ -408,7 +432,7 @@ impl Dawn {
         let (mut max_x, mut max_y) = (i32::MIN, i32::MIN);
         for m in &self.overview_order {
             let slot = *self.overview_slots.get(m).unwrap_or(&(0, 0));
-            let r = Self::slot_rect(slot, w, h);
+            let r = self.slot_rect(slot, w, h);
             min_x = min_x.min(r.loc.x);
             min_y = min_y.min(r.loc.y);
             max_x = max_x.max(r.loc.x + w);
@@ -500,6 +524,18 @@ impl Dawn {
                 if m == cur || !self.tagged_windows.iter().any(|tw| tw.tags & m != 0) {
                     continue;
                 }
+                // ТОЛЬКО СВОИ столы. Стол принадлежит монитору
+                // (`Dawn::монитор_стола`), а обзор раскладывает окна по ячейкам
+                // сетки на холсте СВОЕГО монитора: взяв сюда чужой стол, он
+                // физически утаскивал окна соседнего экрана к себе — за миллион
+                // пикселей от их дома, — и после выхода они там и оставались.
+                // Замер 29.08.2026 (двухмониторный харнесс): удержание Super на
+                // мониторе 1 давало «overview on (2 workspaces)», а окно стола 2
+                // уезжало из `1000026,26` в `3374,18`. Ничейные столы (ещё не
+                // закреплённые) считаем своими — их закрепит первый же заход.
+                if self.монитор_стола(m).is_some_and(|i| i != self.активный) {
+                    continue;
+                }
                 // Ленточные (свой обзор) и ПЛАВАЮЩИЕ (обзор им не нужен вовсе,
                 // см. overview_is_float_tag) столы в сетку не берём.
                 if !self.columns_is_strip_tag(m) && !self.overview_is_float_tag(m) {
@@ -559,76 +595,137 @@ impl Dawn {
         self.camera_anim = None;
         self.zoom_anim = Some(crate::anim::ZoomAnim::new_pan(
             prev_cam, target_cam, prev_zoom, fit_zoom,
-            Duration::from_millis(OVERVIEW_FLY_MS),
+            crate::anim::дуг::обзор(),
         ));
         self.request_plane_reset();
         self.request_redraw();
         tracing::info!("dawn: overview on ({} workspaces, fit_zoom={:.3})", order.len(), fit_zoom);
     }
 
-    /// Раскладывает окна каждого стола (dwindle) в его ячейке сетки (по слоту).
+    /// «Домашняя» геометрия окна: где и какого размера оно стоит на СВОЁМ столе,
+    /// в координатах холста от (0,0) — там же, где раскладка собирает столы
+    /// (см. tiling::screen_area). Источник — снимок, снятый при входе в обзор;
+    /// у окна, появившегося уже в обзоре, снимка нет, и он заводится на месте.
+    fn overview_home(&mut self, win: &Window) -> (Point<i32, Logical>, Size<i32, Logical>) {
+        if let Some((_, loc, size)) = self.overview_saved_geo.iter()
+            .find(|(w, _, _)| same_window(w, win))
+        {
+            return (*loc, *size);
+        }
+        let loc = self.tagged_windows.iter()
+            .find(|tw| same_window(&tw.window, win))
+            .map(|tw| tw.position)
+            .unwrap_or_default();
+        let size = win.geometry().size;
+        self.overview_saved_geo.push((win.clone(), loc, size));
+        (loc, size)
+    }
+
+    /// Переписать домашнюю геометрию окна. Зовётся, когда окно ПЕРЕЕХАЛО прямо
+    /// в обзоре (бросок на другой стол, обмен местами, ресайз): дом — источник
+    /// правды и для показа, и для восстановления на выходе.
+    fn overview_set_home(
+        &mut self,
+        win: &Window,
+        loc: Point<i32, Logical>,
+        size: Option<Size<i32, Logical>>,
+    ) {
+        self.overview_home(win); // гарантирует наличие записи
+        if let Some(e) = self.overview_saved_geo.iter_mut()
+            .find(|(w, _, _)| same_window(w, win))
+        {
+            e.1 = loc;
+            if let Some(s) = size {
+                e.2 = s;
+            }
+        }
+    }
+
+    /// Сдвиг, который переносит стол `mask` из дома в его ячейку сетки.
+    fn overview_offset(&self, mask: u32) -> Point<i32, Logical> {
+        self.overview_band_rect(mask).map(|r| r.loc).unwrap_or_default()
+    }
+
+    /// Разложить дерево стола `mask` в ДОМАШНЕЙ рабочей области и записать
+    /// результат в дома его окон (плюс отдать клиентам новые размеры).
+    /// Так правки тайловой раскладки, сделанные в обзоре, живут в тех же
+    /// координатах, что и вне его, — обзору остаётся только сдвиг.
+    pub(crate) fn overview_apply_tree(&mut self, mask: u32) {
+        let Some(area) = self.tile_work_area() else { return };
+        let cfg = self.lua_config.dwindle;
+        let rects = match self.dwindle_trees.get_mut(&mask) {
+            Some(tree) => {
+                tree.recalc(area, &cfg);
+                tree.leaf_rects()
+            }
+            None => return,
+        };
+        for (win, rect) in rects {
+            let loc: Point<i32, Logical> = (
+                rect.loc.x + GAP_INNER / 2,
+                rect.loc.y + GAP_INNER / 2,
+            ).into();
+            let size: Size<i32, Logical> = (
+                (rect.size.w - GAP_INNER).max(1),
+                (rect.size.h - GAP_INNER).max(1),
+            ).into();
+            crate::xwin::set_size(&win, Some(size), crate::xwin::Tiled::Set);
+            crate::xwin::configure(&win);
+            self.overview_set_home(&win, loc, Some(size));
+        }
+    }
+
+    /// Расставляет окна по ячейкам столов — КАК ЕСТЬ.
+    ///
+    /// Раньше обзор пересобирал каждый стол сам: тайловое дерево пересчитывалось
+    /// в узкую полосу ячейки, а стол без дерева (monocle, стол с окнами,
+    /// поднятыми в плавающий слой через Super+V) раскладывался запасной
+    /// dwindle-цепочкой. То есть обзор показывал не столы, а СВОЮ версию столов:
+    /// плавающие окна теряли своё место и вставали плитками наравне с
+    /// тайловыми, а monocle притворялся тайлингом.
+    ///
+    /// Теперь окна не перекладываются и не меняют размер вовсе. Все столы
+    /// собираются в одном и том же прямоугольнике холста — экран от (0,0)
+    /// (см. tiling::screen_area), поэтому «показать стол в его ячейке» — это
+    /// ровно СДВИГ на `overview_offset(mask)`, одинаковый для всех его окон.
+    /// Взаимное расположение, пропорции и размеры при этом сохраняются точно, а
+    /// миниатюрами столы делает отъезд камеры (OVERVIEW_ZOOM), а не сжатие окон.
     pub fn overview_layout(&mut self, w: i32, h: i32) {
-        let all: Vec<Window> = self.tagged_windows.iter().map(|tw| tw.window.clone()).collect();
-        for win in &all {
+        let _ = (w, h); // ячейку даёт overview_band_rect по слоту стола
+        // Снимаем с холста только СВОИ окна. Обзор — событие одного монитора:
+        // на соседнем экране в этот же момент открыт обычный стол, и его окна
+        // обязаны остаться на месте (см. `refresh_tags` и `видимые_теги`, где
+        // ровно та же логика). Пока здесь стояли «все окна», вход в обзор
+        // сдувал второй экран в пустые обои.
+        let свои: Vec<Window> = self.tagged_windows.iter()
+            .filter(|tw| !self.монитор_стола(tw.tags).is_some_and(|i| i != self.активный))
+            .map(|tw| tw.window.clone())
+            .collect();
+        for win in &свои {
             self.space.unmap_elem(win);
         }
         self.window_pos_anims.clear();
 
         let order = self.overview_order.clone();
-        let slots: HashMap<u32, (i32, i32)> = self.overview_slots.clone();
         let mut placed: Vec<Window> = Vec::new();
         for mask in order {
-            let slot = *slots.get(&mask).unwrap_or(&(0, 0));
-            let brect = Self::slot_rect(slot, w, h);
+            let off = self.overview_offset(mask);
             let wins: Vec<Window> = self.tagged_windows.iter()
                 .filter(|tw| tw.tags & mask != 0)
                 .map(|tw| tw.window.clone())
                 .filter(|win| !placed.iter().any(|p| same_window(p, win)))
                 .collect();
-            let n = wins.len();
-            if n == 0 {
-                continue;
-            }
-            let band = Rectangle::new(
-                (brect.loc.x + GAP_OUTER, brect.loc.y + GAP_OUTER).into(),
-                ((w - GAP_OUTER * 2).max(1), (h - GAP_OUTER * 2).max(1)).into(),
-            );
-            // Стол показываем ТАК, КАК ОН СОБРАН: если у этого набора тегов
-            // есть BSP-дерево (Tile, см. dwindle.rs) и оно описывает ровно эти
-            // окна — раскладываем миниатюры по нему. Иначе (стол ни разу не
-            // тайлился, часть окон плавающие) — простой dwindle-цепочкой.
-            let cfg = self.lua_config.dwindle;
-            let tree_rects = self.dwindle_trees.get_mut(&mask).and_then(|tree| {
-                let in_tree = tree.windows();
-                let matches = in_tree.len() == n
-                    && in_tree.iter().all(|w| wins.iter().any(|v| same_window(v, w)));
-                matches.then(|| {
-                    // Полоса обзора — это миниатюры, а не окна: минимумы
-                    // клиентов тут не действуют (иначе в узкой полосе они
-                    // перевесили бы пропорции и превью перестало бы совпадать
-                    // с настоящей раскладкой). Обратно их поставит
-                    // sync_dwindle_tree на выходе из обзора.
-                    tree.set_min_sizes(|_| (0.0, 0.0));
-                    tree.recalc(band, &cfg);
-                    tree.leaf_rects()
-                })
-            });
-            let pairs: Vec<(Window, Rectangle<i32, Logical>)> = match tree_rects {
-                Some(v) => v,
-                None => wins.iter().cloned().zip(dwindle_rects(band, n, true)).collect(),
-            };
-            for (win, rect) in &pairs {
-                let loc: Point<i32, Logical> = (
-                    rect.loc.x + GAP_INNER / 2,
-                    rect.loc.y + GAP_INNER / 2,
-                ).into();
-                let size = ((rect.size.w - GAP_INNER).max(1), (rect.size.h - GAP_INNER).max(1));
-                crate::xwin::set_size(win, Some(size.into()), crate::xwin::Tiled::Set);
-                crate::xwin::configure(win);
+            for win in wins {
+                let (home, size) = self.overview_home(&win);
+                // Кламп нужен только тем, кого руками утащили далеко за пределы
+                // экрана своего стола (плавающий слой на бесконечном холсте):
+                // иначе такое окно въехало бы в чужую ячейку. Тайловые и так
+                // лежат внутри рабочей области.
+                let loc = self.overview_clamp_loc(mask, home + off, size);
                 // Только маппим для отрисовки; tw.position НЕ трогаем (иначе после
                 // выхода refresh_tags вернёт окна в позиции обзора).
                 self.space.map_element(win.clone(), loc, false);
-                placed.push(win.clone());
+                placed.push(win);
             }
         }
     }
@@ -650,7 +747,7 @@ impl Dawn {
         };
         self.overview_order.iter()
             .map(|&m| {
-                let r = Self::slot_rect(*self.overview_slots.get(&m).unwrap_or(&(0, 0)), w, h);
+                let r = self.slot_rect(*self.overview_slots.get(&m).unwrap_or(&(0, 0)), w, h);
                 (r, empty(m))
             })
             .collect()
@@ -664,7 +761,7 @@ impl Dawn {
         }
         let (w, h) = self.overview_band_size()?;
         for &m in &self.overview_order {
-            let r = Self::slot_rect(*self.overview_slots.get(&m).unwrap_or(&(0, 0)), w, h);
+            let r = self.slot_rect(*self.overview_slots.get(&m).unwrap_or(&(0, 0)), w, h);
             if pos.x >= r.loc.x as f64 && pos.x <= (r.loc.x + w) as f64
                 && pos.y >= r.loc.y as f64 && pos.y <= (r.loc.y + h) as f64
             {
@@ -687,7 +784,7 @@ impl Dawn {
         let mut best: Option<u32> = None;
         let mut best_d = f64::MAX;
         for &m in &self.overview_order {
-            let r = Self::slot_rect(*self.overview_slots.get(&m).unwrap_or(&(0, 0)), w, h);
+            let r = self.slot_rect(*self.overview_slots.get(&m).unwrap_or(&(0, 0)), w, h);
             let cx = r.loc.x as f64 + w as f64 / 2.0;
             let cy = r.loc.y as f64 + h as f64 / 2.0;
             let d = (pos.x - cx).powi(2) + (pos.y - cy).powi(2);
@@ -725,15 +822,17 @@ impl Dawn {
             }
             ok
         });
-        if !in_tree {
-            // У стола нет BSP-дерева (плавающий или ни разу не тайлившийся): в
-            // обзоре его миниатюры раскладываются dwindle-цепочкой по порядку
-            // tagged_windows — значит и местами они меняются в этом списке.
-            let ia = self.tagged_windows.iter().position(|tw| same_window(&tw.window, a));
-            let ib = self.tagged_windows.iter().position(|tw| same_window(&tw.window, b));
-            if let (Some(ia), Some(ib)) = (ia, ib) {
-                self.tagged_windows.swap(ia, ib);
-            }
+        if in_tree {
+            self.overview_apply_tree(mask);
+        } else {
+            // Окна вне дерева (плавающий слой, monocle) обзор показывает там,
+            // где они стоят, — значит и «поменять местами» для них означает
+            // обменяться МЕСТАМИ, а не позициями в списке tagged_windows, по
+            // которому раньше строилась запасная dwindle-цепочка.
+            let (la, _) = self.overview_home(a);
+            let (lb, _) = self.overview_home(b);
+            self.overview_set_home(a, lb, None);
+            self.overview_set_home(b, la, None);
         }
     }
 
@@ -751,22 +850,35 @@ impl Dawn {
         if let Some(tree) = self.dwindle_trees.get_mut(&from) {
             tree.remove(window);
         }
-        let Some(area) = self.overview_window_area(to) else { return };
+        // Деревья живут в ДОМАШНИХ координатах (экран от 0,0) — там же, где их
+        // считает раскладка вне обзора. Точку броска, снятую с холста обзора,
+        // переводим домой тем же сдвигом, каким обзор показывает стол.
+        let Some(area) = self.tile_work_area() else { return };
+        let off = self.overview_offset(to);
+        let focal = Point::<f64, Logical>::from((
+            focal.x - off.x as f64,
+            focal.y - off.y as f64,
+        ));
         let cfg = self.lua_config.dwindle;
         let tree = self.dwindle_trees.entry(to).or_default();
-        // Как и выше: место в дереве выбирается по МИНИАТЮРАМ в полосе обзора,
-        // минимумы клиентов к этому масштабу отношения не имеют.
-        tree.set_min_sizes(|_| (0.0, 0.0));
         tree.recalc(area, &cfg);
         let opening_on = tree.closest_node(focal, Some(window));
         tree.insert(window.clone(), opening_on, focal, area, &cfg, None);
-        tree.recalc(area, &cfg);
+        self.overview_apply_tree(to);
+        if let Some(tree) = self.dwindle_trees.get(&from) {
+            if !tree.windows().is_empty() {
+                self.overview_apply_tree(from);
+            }
+        }
     }
 
     /// В обзоре: отпустили перетаскивание окна.
     ///  · бросили на ДРУГОЙ стол → окно переезжает на него (и в его дерево);
     ///  · бросили на СОСЕДА по своему столу → окна меняются местами;
-    ///  · бросили на пустое место своего стола → окно возвращается в сетку.
+    ///  · бросили на пустое место своего стола → тайловое окно возвращается в
+    ///    свой слот раскладки, а плавающее (Super+V) остаётся ровно там, куда
+    ///    его положили: обзор показывает стол как есть, а значит и правит его
+    ///    как есть.
     /// Стол ищем ближайший (не строгое попадание): иначе перенос срабатывает
     /// «через раз», когда окно отпущено в зазоре между столами.
     pub fn overview_reassign(&mut self, window: &Window) {
@@ -774,6 +886,10 @@ impl Dawn {
             self.overview_reassign_strip(window);
             return;
         }
+        let dropped = match self.space.element_geometry(window) {
+            Some(g) => g.loc,
+            None => return,
+        };
         let pos = match self.space.element_geometry(window) {
             Some(g) => Point::<f64, Logical>::from((
                 (g.loc.x + g.size.w / 2) as f64,
@@ -794,6 +910,12 @@ impl Dawn {
             Some(old) if old == target => {
                 if let Some(other) = self.overview_window_at(pos, target, window) {
                     self.overview_swap_windows(target, window, &other);
+                } else if floating {
+                    // Плавающее окно бросили на пустое место своего стола — это
+                    // и есть его новое место. Дом считаем от ячейки стола, в
+                    // которой оно сейчас лежит.
+                    let off = self.overview_offset(target);
+                    self.overview_set_home(window, dropped - off, None);
                 }
             }
             old => {
@@ -806,6 +928,11 @@ impl Dawn {
                 }
                 if let (Some(old), false) = (old, floating) {
                     self.overview_move_in_trees(old, target, window, pos);
+                } else {
+                    // Плавающее окно переезжает на другой стол «как лежит»:
+                    // сохраняем его место ОТНОСИТЕЛЬНО нового стола.
+                    let off = self.overview_offset(target);
+                    self.overview_set_home(window, dropped - off, None);
                 }
             }
         }
@@ -872,8 +999,12 @@ impl Dawn {
     pub fn overview_strip_floor_rect(&self, tag: u32) -> Option<Rectangle<i32, Logical>> {
         let (w, h) = self.overview_band_size()?;
         let y = self.columns_ws_y(tag).round() as i32;
-        let mut min_x = 0;
-        let mut max_x = w;
+        // Полоса этажа начинается в доме СВОЕГО монитора, а не в нуле холста:
+        // на втором мониторе рамка иначе тянулась бы через весь шаг между
+        // домами (см. monitors::ШАГ_ДОМА).
+        let дом_x = self.монитор_дом().x;
+        let mut min_x = дом_x;
+        let mut max_x = дом_x + w;
         for tw in self.tagged_windows.iter().filter(|tw| tw.tags & tag != 0) {
             if let Some(g) = self.space.element_geometry(&tw.window) {
                 min_x = min_x.min(g.loc.x);
@@ -938,7 +1069,7 @@ impl Dawn {
         // колонок, и рамки этажей — иначе пустой этаж снизу (куда бросают окно
         // ради нового стола) остался бы за кадром.
         let mut bbox = self.columns_strip_bbox()
-            .unwrap_or_else(|| Rectangle::new((0, 0).into(), (w, h).into()));
+            .unwrap_or_else(|| Rectangle::new(self.монитор_дом(), (w, h).into()));
         for m in self.overview_order.clone() {
             if let Some(r) = self.overview_strip_floor_rect(m) {
                 bbox = bbox.merge(r);
@@ -958,7 +1089,7 @@ impl Dawn {
         let to_cam = Point::from((cx - w as f64 / (2.0 * zoom), cy - h as f64 / (2.0 * zoom)));
 
         self.zoom_anim = Some(crate::anim::ZoomAnim::new_pan(
-            prev_cam, to_cam, prev_zoom, zoom, Duration::from_millis(OVERVIEW_FLY_MS),
+            prev_cam, to_cam, prev_zoom, zoom, crate::anim::дуг::обзор(),
         ));
         self.request_plane_reset();
         self.request_redraw();
@@ -1034,7 +1165,7 @@ impl Dawn {
         self.viewport.cam_y = cur_cam.y;
         self.columns_float_cam = (cur_cam.x, cur_cam.y);
         self.zoom_anim = Some(crate::anim::ZoomAnim::new_pan(
-            cur_cam, to_cam, cur_zoom, prev_zoom, Duration::from_millis(OVERVIEW_FLY_MS),
+            cur_cam, to_cam, cur_zoom, prev_zoom, crate::anim::дуг::обзор(),
         ));
         self.apply_camera();
         self.request_plane_reset();

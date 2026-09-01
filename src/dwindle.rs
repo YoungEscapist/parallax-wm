@@ -24,6 +24,18 @@
 use smithay::desktop::Window;
 use smithay::utils::{Logical, Point, Rectangle};
 
+/// Пределы `split_ratio` узла. Доля первого ребёнка — `ratio/2`, то есть
+/// `RATIO_MIN = 0.002` даёт ему 0.1% слота (на экране 2560 — 2 px), а
+/// `RATIO_MAX` — столько же второму.
+///
+/// Раньше здесь стояло 0.1..1.9, то есть плитка не могла стать уже 5% экрана
+/// (128 px на 2560) — ровно то, что Ярик 24.08.2026 назвал «лимит по размеру
+/// окон всё ещё есть»: тянешь делитель, а он упирается в невидимую стену.
+/// Нуля тут быть не может по другой причине: слот нулевой ширины — это
+/// поверхность нулевого размера, а такую протокол запрещает.
+pub const RATIO_MIN: f64 = 0.002;
+pub const RATIO_MAX: f64 = 2.0 - RATIO_MIN;
+
 /// Сравнение окон. `Window` — это `Arc<WindowInner>` с внутренним id, поэтому
 /// PartialEq корректен и для клонов, и для X11-окон (у которых нет
 /// xdg-toplevel, и сравнение «по wl_surface» всегда давало false).
@@ -613,16 +625,11 @@ impl<T: Leaf> DwindleTree<T> {
         }
     }
 
-    /// Меньше этого тайлинг окно не ужимает, даже если клиент согласен: сосед с
-    /// большим минимумом иначе съедал бы слот целиком (замер: Discord просит 940
-    /// из 1600, и соседнему окну в его половине оставалось 0 px).
-    const MIN_TILE_W: f64 = 200.0;
-    const MIN_TILE_H: f64 = 150.0;
-
     /// Сколько места просит КАЖДОЕ поддерево — два числа на ось:
     ///
-    /// * `hard` — ниже этого нельзя: минимум клиента (но не меньше
-    ///   [`Self::MIN_TILE_W`]×[`Self::MIN_TILE_H`]);
+    /// * `hard` — ниже этого нельзя: минимум листа, как его задал
+    ///   [`Self::set_min_sizes`] (ноль — значит ужимать можно до чего угодно;
+    ///   своего нижнего порога у тайлинга больше нет);
     /// * `soft` — сколько хотелось бы: обычный, ничем не стеснённый размер из
     ///   первого прохода, но не меньше `hard`.
     ///
@@ -655,10 +662,7 @@ impl<T: Leaf> DwindleTree<T> {
             let node = self.n(i);
             out[i] = match node.children {
                 None => {
-                    let hard = (
-                        node.min.0.max(Self::MIN_TILE_W),
-                        node.min.1.max(Self::MIN_TILE_H),
-                    );
+                    let hard = node.min;
                     Demand { hard, soft: (hard.0.max(node.b.w), hard.1.max(node.b.h)) }
                 }
                 Some([c0, c1]) => {
@@ -877,7 +881,7 @@ impl<T: Leaf> DwindleTree<T> {
             children: None,
             window: None,
             split_top: false,
-            split_ratio: cfg.default_split_ratio.clamp(0.1, 1.9),
+            split_ratio: cfg.default_split_ratio.clamp(RATIO_MIN as f32, RATIO_MAX as f32),
             b: op_box,
             min: (0.0, 0.0),
         });
@@ -1003,7 +1007,7 @@ impl<T: Leaf> DwindleTree<T> {
         // Для второго ребёнка «увеличить себя» = уменьшить долю первого.
         let first = self.n(parent).children.map(|c| c[0] == idx).unwrap_or(true);
         let signed = if first { delta } else { -delta };
-        let new = (self.n(parent).split_ratio + signed).clamp(0.1, 1.9);
+        let new = (self.n(parent).split_ratio + signed).clamp(RATIO_MIN as f32, RATIO_MAX as f32);
         self.nm(parent).split_ratio = new;
         true
     }
@@ -1163,7 +1167,7 @@ impl<T: Leaf> DwindleTree<T> {
         if let Some(outer) = ph_outer {
             let p = self.n(outer).parent.expect("dwindle: outer без родителя");
             let pw = self.n(p).b.w.max(1.0);
-            let ratio = (self.n(p).split_ratio as f64 + mv.x * 2.0 / pw).clamp(0.1, 1.9);
+            let ratio = (self.n(p).split_ratio as f64 + mv.x * 2.0 / pw).clamp(RATIO_MIN, RATIO_MAX);
             self.nm(p).split_ratio = ratio as f32;
 
             if let Some(inner) = ph_inner {
@@ -1177,7 +1181,7 @@ impl<T: Leaf> DwindleTree<T> {
                 } else {
                     2.0 - (original + mv.x) / ipw * 2.0
                 };
-                self.nm(ip).split_ratio = ratio.clamp(0.1, 1.9) as f32;
+                self.nm(ip).split_ratio = ratio.clamp(RATIO_MIN, RATIO_MAX) as f32;
                 self.recalc_from(ip, cfg, false, false);
             } else {
                 self.recalc_from(p, cfg, false, false);
@@ -1187,7 +1191,7 @@ impl<T: Leaf> DwindleTree<T> {
         if let Some(outer) = pv_outer {
             let p = self.n(outer).parent.expect("dwindle: outer без родителя");
             let ph = self.n(p).b.h.max(1.0);
-            let ratio = (self.n(p).split_ratio as f64 + mv.y * 2.0 / ph).clamp(0.1, 1.9);
+            let ratio = (self.n(p).split_ratio as f64 + mv.y * 2.0 / ph).clamp(RATIO_MIN, RATIO_MAX);
             self.nm(p).split_ratio = ratio as f32;
 
             if let Some(inner) = pv_inner {
@@ -1201,7 +1205,7 @@ impl<T: Leaf> DwindleTree<T> {
                 } else {
                     2.0 - (original + mv.y) / iph * 2.0
                 };
-                self.nm(ip).split_ratio = ratio.clamp(0.1, 1.9) as f32;
+                self.nm(ip).split_ratio = ratio.clamp(RATIO_MIN, RATIO_MAX) as f32;
                 self.recalc_from(ip, cfg, false, false);
             } else {
                 self.recalc_from(p, cfg, false, false);
@@ -1528,6 +1532,37 @@ mod tests {
                 t.closest_node(focal, None),
                 "фокус {focal:?}",
             );
+        }
+    }
+
+    /// Своего нижнего порога у тайлинга нет: на тесном столе плитка ужимается
+    /// сколь угодно сильно (раньше её держал пол в 200×150 — и окна начинали
+    /// налезать друг на друга, вместо того чтобы просто стать мелкими).
+    #[test]
+    fn плитка_ужимается_меньше_чем_200x150() {
+        let cfg = DwindleConfig::default();
+        let area = Rectangle::new((0, 0).into(), (320, 240).into());
+        let mut t = DwindleTree::<W>::default();
+        for w in 1..=6u32 {
+            let focal = p((w as f64 * 37.0) % 320.0, (w as f64 * 53.0) % 240.0);
+            let on = t.closest_node(focal, Some(&W(w)));
+            t.insert(W(w), on, focal, area, &cfg, None);
+            t.recalc(area, &cfg);
+        }
+        let rects = t.leaf_rects();
+        assert_eq!(rects.len(), 6);
+        for (w, r) in &rects {
+            assert!(
+                r.size.w < 200 && r.size.h < 150,
+                "окно {w:?} упёрлось в старый пол: {r:?}",
+            );
+        }
+        let total: i64 = rects.iter().map(|(_, r)| r.size.w as i64 * r.size.h as i64).sum();
+        assert_eq!(total, 320 * 240, "раскладка перестала покрывать стол: {rects:?}");
+        for (i, (_, a)) in rects.iter().enumerate() {
+            for (_, b) in rects.iter().skip(i + 1) {
+                assert!(a.intersection(*b).is_none(), "окна пересекаются: {a:?} и {b:?}");
+            }
         }
     }
 
