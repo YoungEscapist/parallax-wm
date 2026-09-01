@@ -15,8 +15,6 @@ use smithay::{
 };
 use std::time::{Duration, Instant};
 
-const PUSH_ANIM_DURATION: Duration = Duration::from_millis(140);
-
 /// Минимальная пауза между двумя свапами тайловых окон в одном драге.
 /// Без неё свап срабатывал на КАЖДОМ motion-событии, пока курсор висит над
 /// соседом (сотни раз в секунду): раскладка пересобиралась быстрее, чем окна
@@ -73,6 +71,11 @@ fn tiled_swap_target(data: &Dawn, dragged: &Window, cursor: Point<f64, Logical>)
 /// Порог примагничивания (2.1): при отпускании кнопки край окна подравнивается
 /// к соседнему, если оказался в пределах этой дистанции.
 const SNAP_DISTANCE: i32 = 20;
+
+/// Скорость отпускания (px/сек), выше которой магнитирование НЕ применяется:
+/// окно бросили, а не положили, и прилипание к случайно оказавшемуся рядом
+/// краю съело бы весь бросок (см. finish()).
+const SNAP_MAX_SPEED: f64 = 600.0;
 
 pub struct MoveSurfaceGrab {
     pub start_data: PointerGrabStartData<Dawn>,
@@ -171,7 +174,7 @@ fn stitch_ribbon_gap(
     for (w, new_loc) in &to_shift {
         // Не телепорт, а тот же пружинный доезд, что и у остальных сдвигов —
         // «сшивание» ленты рывком выбивалось из общего ощущения.
-        data.animate_window_to_dur(w, *new_loc, Duration::from_millis(220));
+        data.animate_window_to_dur(w, *new_loc, crate::anim::дуг::толчок_соседа());
         if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
             &tw.window == w
         }) {
@@ -348,7 +351,7 @@ fn push_colliding_windows(
         }
         // Плавный LERP вместо телепорта — ощущается как инерция толчка
         // (переанимируется на каждый кадр, пока коллизия продолжается).
-        data.animate_window_to_dur(&other, geo.loc, PUSH_ANIM_DURATION);
+        data.animate_window_to_dur(&other, geo.loc, crate::anim::дуг::толчок_соседа());
         if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
             tw.window == other
         }) {
@@ -549,9 +552,43 @@ impl MoveSurfaceGrab {
                             tw.float_position_set = true;
                         }
                     }
+                    self.обновить_призраков(data);
                 }
             }
         }
+    }
+
+    /// Пересобрать подсказку «куда встанут остальные».
+    ///
+    /// Группа (выделение + созвездие) едет по базе и уже стоит на своих местах —
+    /// казалось бы, показывать нечего. Но именно этого и не хватало: пока
+    /// тащишь одно окно, остальные могут быть за краем экрана, под чужими
+    /// окнами или в другом углу холста, и «едут пять» ощущается как рывок
+    /// вслепую. Тонкий контур по каждому члену ПЛЮС общая рамка вокруг всей
+    /// грозди показывают её целиком — рамка видна даже тогда, когда сами окна
+    /// не видны: она пересекает экран.
+    fn обновить_призраков(&self, data: &mut Dawn) {
+        let mut рамки: Vec<Rectangle<i32, Logical>> = Vec::new();
+        for (member, _) in &self.group_initial {
+            if let Some(g) = data.space.element_geometry(member) {
+                рамки.push(g);
+            }
+        }
+        if рамки.is_empty() {
+            data.призраки_группы.clear();
+            return;
+        }
+        // Общая рамка считается и по самому перетаскиваемому окну: гроздь — это
+        // всё, что едет, а не только «остальные».
+        let mut объединение = data.space.element_geometry(&self.window)
+            .into_iter()
+            .chain(рамки.iter().copied())
+            .reduce(|a, b| a.merge(b));
+        if let Some(общая) = объединение.take() {
+            рамки.push(общая);
+        }
+        data.призраки_группы = рамки;
+        data.request_redraw();
     }
 
     /// Посадка окна на отпускании: тот же код и для мыши, и для жеста.
@@ -564,6 +601,13 @@ impl MoveSurfaceGrab {
         // Драг кончился — окно снова принадлежит анимациям (в пути мыши это
         // делает PointerGrab::unset, но жест туда не заходит).
         data.dragged_window = None;
+        // Подсказка живёт ровно на время драга. Чистить её надо ЗДЕСЬ, в общей
+        // точке завершения: и мышь, и тачпадный жест приходят сюда, а вот
+        // PointerGrab::unset жест не зовёт вовсе.
+        if !data.призраки_группы.is_empty() {
+            data.призраки_группы.clear();
+            data.request_redraw();
+        }
 
         // В обзоре столов: отпустили перетаскивание → окно переезжает на
         // воркспейс того бэнда, куда попало (вверх/вниз меняет стол).
@@ -627,10 +671,19 @@ impl MoveSurfaceGrab {
         }
 
         // Магнитирование (2.1): один раз при отпускании подравниваем край
-        // к ближайшему соседу в пределах SNAP_DISTANCE, если коллизия включена.
+        // к ближайшему соседу в пределах SNAP_DISTANCE. Со своим тумблером
+        // (Super+M) — раньше висело на флаге коллизии, и включить расталкивание
+        // без прилипания было нельзя.
         let riding: Vec<Window> = self.group_initial.iter().map(|(w, _)| w.clone()).collect();
         let mut snapped_applied = false;
-        if data.is_snapping_enabled {
+        // Скорость отпускания решает, ЧТО это было: медленно подведённое к
+        // соседу окно кладут (магнитим), брошенное — бросают. Раньше магнит
+        // побеждал всегда, и бросок мимо окна, случайно прошедший в 20 px от
+        // чужого края, глох на месте: летел-летел и прилип. На холсте, где
+        // окон много, под такой край попадаешь постоянно.
+        let бросок = self.velocity.launch_velocity();
+        let скорость_броска = (бросок.x * бросок.x + бросок.y * бросок.y).sqrt();
+        if data.is_magnetism_enabled && скорость_броска < SNAP_MAX_SPEED {
             if let Some(loc) = data.space.element_geometry(&self.window).map(|g| g.loc) {
                 if let Some(snapped) = find_snap_target(data, &self.window, loc, &riding) {
                     data.space.map_element(self.window.clone(), snapped, true);
@@ -652,17 +705,20 @@ impl MoveSurfaceGrab {
         // (не применяется, если сработало магнитирование — там нужна
         // точная посадка на край соседа).
         if !snapped_applied {
-            let v = self.velocity.launch_velocity(); // px/сек в canvas
-            let speed = (v.x * v.x + v.y * v.y).sqrt();
-            const MIN_FLING: f64 = 120.0;  // ниже — считаем что окно просто положили
+            let v = бросок; // px/сек в canvas
+            let speed = скорость_броска;
+            // Ниже — окно просто положили. Порог опущен со 120: на 120 px/сек
+            // рука уже отчётливо ведёт окно, и обрубать доезд на этой границе
+            // значит терять самые частые, короткие подбросы.
+            const MIN_FLING: f64 = 60.0;
             if speed > MIN_FLING {
                 // Пружина стартует ровно с той скоростью, с какой курсор
                 // отпустил окно, и тормозит экспоненциально. Раньше тут был
                 // ease-out на фиксированную дистанцию: его стартовая
                 // скорость (3·d/dur) не совпадала со скоростью драга, и в
                 // момент отпускания окно заметно «дёргалось» вперёд.
-                // ω поднимаем на быстрых бросках, чтобы путь доезда
-                // (|v|/ω) не превышал MAX_GLIDE.
+                // ω считается от скорости так, что путь доезда растёт вместе
+                // с ней до anim::fling_distance() (см. glide_omega).
                 let omega = crate::anim::glide_omega(speed);
                 let target = data.fling_window(&self.window, v, omega);
                 if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {

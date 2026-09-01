@@ -135,10 +135,8 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
                 // старта (база захватывается на первом motion) — без накопления
                 // и без скролла камеры (иначе «разгон» и дёрганье вида).
                 let win = self.window.clone();
-                let (out_w, out_h) = data.space.outputs().next()
-                    .and_then(|o| data.space.output_geometry(o))
-                    .map(|g| (g.size.w as f64, g.size.h as f64))
-                    .unwrap_or((1920.0, 1080.0));
+                let экран = data.screen_size();
+                let (out_w, out_h) = (экран.w as f64, экран.h as f64);
                 let avail_h = (out_h - (crate::tiling::GAP_OUTER * 2) as f64).max(1.0);
                 let base_w = match self.col_resize_base {
                     Some(b) => b,
@@ -156,7 +154,13 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
                         b
                     }
                 };
-                let width_factor = (base_w + delta.x / out_w).clamp(0.15, 1.0);
+                // Потолок общий с клавиатурным путём (см. columns::MAX_WIDTH_FACTOR):
+                // мышью колонка растягивается ровно настолько же, насколько
+                // Super+клавишами, а не до края экрана.
+                let width_factor = (base_w + delta.x / out_w).clamp(
+                    crate::columns::MIN_SIZE_FACTOR,
+                    crate::columns::MAX_WIDTH_FACTOR,
+                );
                 let row_fraction = base_h + delta.y / avail_h; // клампится в set_row_fraction
                 data.columns_resize_of_window(&win, width_factor, row_fraction);
             }
@@ -178,20 +182,28 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
             new_h = (self.initial_rect.size.h as f64 + delta.y) as i32;
         }
 
-        let (min_size, max_size) = crate::xwin::size_constraints(&self.window);
-
-        let min_w = min_size.w.max(1);
-        let min_h = min_size.h.max(1);
-        let max_w = if max_size.w == 0 { i32::MAX } else { max_size.w };
-        let max_h = if max_size.h == 0 { i32::MAX } else { max_size.h };
-
-        // Рамкой стола ресайз в обзоре больше НЕ ограничен: плавающее окно
+        // МИНИМУМ клиента здесь больше не применяется — ровно тот же размен,
+        // что и в тайлинге (см. tiling::fit_to_constraints): окно ужимается до
+        // чего угодно, а клиент, который не умеет, просто нарисуется больше
+        // рамки. Раньше Discord (min 940×500) упирался на середине потяга — это
+        // и было «у окон всё ещё есть лимит на размер». Пол — 1 px: нулевой
+        // размер поверхности недопустим.
+        //
+        // МАКСИМУМ остаётся: это не наше ограничение, а физика клиента (окно с
+        // max 800 шире 800 не нарисуется никогда). Без него мы слали бы
+        // configure на размер, который клиент заведомо не примет, и потяг за
+        // левый край уезжал бы мимо — позиция X11-окна ниже считается ровно от
+        // last_window_size.
+        //
+        // Рамкой стола ресайз в обзоре тоже НЕ ограничен: плавающее окно
         // тянется там ровно так же, как вне обзора (у остальных ресайз идёт
         // тайловой веткой выше).
-
+        let (_, max_size) = crate::xwin::size_constraints(&self.window);
+        let max_w = if max_size.w <= 0 { i32::MAX } else { max_size.w };
+        let max_h = if max_size.h <= 0 { i32::MAX } else { max_size.h };
         self.last_window_size = Size::from((
-            new_w.min(max_w).max(min_w),
-            new_h.min(max_h).max(min_h),
+            new_w.clamp(1, max_w),
+            new_h.clamp(1, max_h),
         ));
 
         crate::xwin::set_resizing(&self.window, true);
@@ -230,8 +242,8 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
                 self.initial_rect.loc.y
             };
             for (member, geo) in self.group_initial.clone() {
-                let new_w = ((geo.size.w as f64) * scale_x).round().max(50.0) as i32;
-                let new_h = ((geo.size.h as f64) * scale_y).round().max(50.0) as i32;
+                let new_w = ((geo.size.w as f64) * scale_x).round().max(1.0) as i32;
+                let new_h = ((geo.size.h as f64) * scale_y).round().max(1.0) as i32;
                 let new_x = (anchor_x as f64 + (geo.loc.x - anchor_x) as f64 * scale_x).round() as i32;
                 let new_y = (anchor_y as f64 + (geo.loc.y - anchor_y) as f64 * scale_y).round() as i32;
                 crate::xwin::set_size(&member, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
@@ -321,13 +333,13 @@ impl PointerGrab<Dawn> for ResizeSurfaceGrab {
                         self.initial_rect.loc.y
                     };
                     for (member, geo) in self.group_initial.clone() {
-                        let new_w = ((geo.size.w as f64) * scale_x).round().max(50.0) as i32;
-                        let new_h = ((geo.size.h as f64) * scale_y).round().max(50.0) as i32;
+                        let new_w = ((geo.size.w as f64) * scale_x).round().max(1.0) as i32;
+                        let new_h = ((geo.size.h as f64) * scale_y).round().max(1.0) as i32;
                         let new_x = (anchor_x as f64 + (geo.loc.x - anchor_x) as f64 * scale_x).round() as i32;
                         let new_y = (anchor_y as f64 + (geo.loc.y - anchor_y) as f64 * scale_y).round() as i32;
                         crate::xwin::set_size(&member, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
                         crate::xwin::configure(&member);
-                        data.animate_window_to_dur(&member, (new_x, new_y).into(), std::time::Duration::from_millis(180));
+                        data.animate_window_to_dur(&member, (new_x, new_y).into(), crate::anim::дуг::сборка_тайлинга());
                         if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
                             tw.window == member
                         }) {

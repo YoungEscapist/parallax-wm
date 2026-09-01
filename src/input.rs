@@ -1,7 +1,7 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event,
-        GesturePinchUpdateEvent,
+        GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent,
         GestureSwipeUpdateEvent, InputBackend, InputEvent,
         KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
@@ -24,6 +24,8 @@ use crate::{
 
 const BTN_LEFT:  u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+/// Средний клик по значку трея — SecondaryActivate (см. sni.rs).
+const BTN_MIDDLE: u32 = 0x112;
 
 /// Скорость переноса: единицы скролла тачпада мельче пиксельной дельты мыши.
 const TOUCHPAD_MOVE_SPEED: f64 = 2.5;
@@ -103,6 +105,18 @@ const EDGE_MAX_SPEED: f64 = 1200.0;
 /// (жест оборвали, устройство переоткрыли), доводка иначе тянула бы окно по
 /// холсту бесконечно — а остановить её было бы уже нечем.
 const EDGE_MAX_RUN: Duration = Duration::from_secs(5);
+
+/// «1»…«9» → номер монитора с нуля. Берём и цифровой ряд, и цифры на
+/// дополнительной клавиатуре: выбор монитора для демонстрации экрана делается
+/// одной клавишей, и от того, включён ли NumLock, он зависеть не должен.
+fn цифра_монитора(raw: u32) -> Option<usize> {
+    let n = match raw {
+        keysyms::KEY_1..=keysyms::KEY_9 => raw - keysyms::KEY_1,
+        keysyms::KEY_KP_1..=keysyms::KEY_KP_9 => raw - keysyms::KEY_KP_1,
+        _ => return None,
+    };
+    Some(n as usize)
+}
 
 /// Продолжение жеста, когда пальцы упёрлись в край тачпада и дальше не едут.
 pub struct EdgeDrift {
@@ -235,6 +249,23 @@ impl EdgeDrift {
 }
 
 impl Dawn {
+    /// Забирает ли окно в фокусе себе всю клавиатуру
+    /// (`set{ keyboard_grab_apps = {...} }`).
+    ///
+    /// Сравнение без учёта регистра: класс окна пишут кто во что горазд, а
+    /// человек в конфиге напишет так, как читает в заголовке.
+    pub fn клавиши_забирает_окно(&self) -> bool {
+        if self.lua_config.keyboard_grab_apps.is_empty() {
+            return false;
+        }
+        let Some(окно) = self.focused_window() else { return false };
+        let Some(класс) = crate::xwin::app_id(&окно) else { return false };
+        self.lua_config
+            .keyboard_grab_apps
+            .iter()
+            .any(|имя| имя.eq_ignore_ascii_case(&класс))
+    }
+
     /// Можно ли сейчас двигать камеру жестами тачпада (пан и зум щипком).
     ///
     /// Запрещено в двух раскладках, где камера принадлежит не пользователю, а
@@ -254,7 +285,7 @@ impl Dawn {
     ///
     /// Мышь живёт по своим правилам и здесь не участвует: Alt+колесо зумит
     /// только во Float, Alt+ЛКМ панит во Float и в обзоре — те ветки не тронуты.
-    fn touchpad_camera_allowed(&self) -> bool {
+    pub(crate) fn touchpad_camera_allowed(&self) -> bool {
         if self.overview_active || self.zoom_nav_mode {
             return true;
         }
@@ -279,13 +310,20 @@ impl Dawn {
     ///     «строка поиска пропадает, стоит подвинуть мышь». В меню фильтров
     ///     dwall это выглядело как «фильтры не применяются» — выбрать пункт
     ///     мышью было физически нельзя, меню исчезало по дороге к нему.
+    ///   * **Курсор над картой окон** — 25.08.2026, вместе с переездом карты из
+    ///     угла в карточку во весь стол. Карта лежит ПОВЕРХ окон, и под ней
+    ///     всегда чьё-то окно: без этой оговорки простое ведение мыши по карте
+    ///     перебрасывало фокус на всё, над чем она проехала, — а рамка фокуса
+    ///     на самой карте прыгала следом. Маленькая панель 320×200 в углу этим
+    ///     почти не болела, большая карточка болеет постоянно.
     ///
     /// Проверка на слой стояла только в ветке АБСОЛЮТНОГО ввода (планшет, VM),
     /// а обычная мышь ходит через относительную — там её не было. Теперь
     /// правило одно на оба пути.
-    fn sloppy_focus(&mut self, pos: Point<f64, Logical>, under: Option<&WlSurface>) {
+    pub(crate) fn sloppy_focus(&mut self, pos: Point<f64, Logical>, under: Option<&WlSurface>) {
         if self.tile_config.layout == Layout::Columns
             || self.layer_keyboard.is_some()
+            || self.minimap_hit().is_some()
             || self.seat.get_keyboard().is_some_and(|k| k.is_grabbed())
         {
             return;
@@ -449,184 +487,7 @@ impl Dawn {
                     serial,
                     time,
                     |state, modifiers, handle| {
-                        let sym = handle.modified_sym();
-                        let raw = sym.raw();
-
-                        // Трекаем Super по keysym + детект "тапа" (обзор столов)
-                        if raw == SUPER_L || raw == SUPER_R {
-                            state.logo_held = pressed;
-                            if pressed {
-                                // Кандидат на тап — сбросится любым другим вводом.
-                                state.super_tap = true;
-                                state.super_tap_shift = modifiers.shift;
-                            } else {
-                                if state.super_tap {
-                                    // Обзор открывает чистый тап Super в ЛЮБОЙ
-                                    // раскладке. В Columns дополнительно
-                                    // работает и Shift+Super — тап с Shift тоже
-                                    // считается тапом (см. ветку Shift ниже),
-                                    // так что обе комбинации ведут в обзор.
-                                    state.toggle_overview();
-                                }
-                                state.super_tap = false;
-                                state.super_tap_shift = false;
-                            }
-                            return FilterResult::Forward;
-                        }
-
-                        // Shift, нажатый ВО ВРЕМЯ удержания Super, тап не
-                        // отменяет — он его модификатор (Shift+Super в
-                        // Columns). Любая другая клавиша отменяет как раньше.
-                        const SHIFT_L: u32 = keysyms::KEY_Shift_L;
-                        const SHIFT_R: u32 = keysyms::KEY_Shift_R;
-                        if raw == SHIFT_L || raw == SHIFT_R {
-                            if pressed && state.super_tap {
-                                state.super_tap_shift = true;
-                            }
-                            return FilterResult::Forward;
-                        }
-
-                        // Отпустили Alt — перебор стопки (Alt+Tab) закончен, и
-                        // следующий Tab начнёт новую стопку с текущего окна.
-                        // Ловим ДО общего `if !pressed`: отпускание клавиши
-                        // ниже никуда не доходит.
-                        const ALT_L: u32 = keysyms::KEY_Alt_L;
-                        const ALT_R: u32 = keysyms::KEY_Alt_R;
-                        const META_L: u32 = keysyms::KEY_Meta_L;
-                        const META_R: u32 = keysyms::KEY_Meta_R;
-                        if matches!(raw, ALT_L | ALT_R | META_L | META_R) && !pressed {
-                            state.cycle_stack_end();
-                            return FilterResult::Forward;
-                        }
-
-                        // Любое другое нажатие клавиши отменяет ожидающий тап Super
-                        // (Super+D, Super+1 и т.п. — это не тап).
-                        if pressed {
-                            state.super_tap = false;
-                        }
-
-                        // ── Super+Space (тумблер) → режим лупы (zoom-nav) ──
-                        // Настраивается через set{bird_eye_key=...} (по умолчанию space).
-                        // Раньше это был hold-жест bird's-eye; теперь тумблер: вкл —
-                        // зум к центру, стрелки панорамируют, повторный Super+Space
-                        // сбрасывает (см. Dawn::toggle_zoom_nav).
-                        if raw == state.lua_config.bird_eye_key {
-                            if pressed && state.logo_held {
-                                state.toggle_zoom_nav();
-                            }
-                            if state.logo_held {
-                                return FilterResult::Intercept(());
-                            }
-                            return FilterResult::Forward;
-                        }
-
-                        if !pressed { return FilterResult::Forward; }
-
-                        // Escape во время выбора источника для демонстрации
-                        // экрана — отмена (см. portal.rs). Перехватываем до
-                        // всех биндов и до клиента: пока идёт выбор, клавиша
-                        // принадлежит выбору.
-                        if state.portal_picking() && raw == keysyms::KEY_Escape {
-                            state.portal_pick_click(true);
-                            return FilterResult::Intercept(());
-                        }
-
-                        let alt   = modifiers.alt;
-                        let shift = modifiers.shift;
-                        let ctrl  = modifiers.ctrl;
-                        let logo  = modifiers.logo || state.logo_held;
-
-                        // Для layout-independence: берём latin sym если отличается
-                        // (важно теперь вдвойне — с несколькими XKB-раскладками
-                        // биндинги должны срабатывать независимо от активной)
-                        let raw_latin = handle.raw_latin_sym_or_raw_current_sym()
-                            .map(|s| s.raw())
-                            .unwrap_or(raw);
-
-                        tracing::debug!(
-                            "KEY: key={} alt={} shift={} ctrl={} logo={}", raw_latin, alt, shift, ctrl, logo
-                        );
-
-                        // Режим лупы (Super+Space): голые стрелки панорамируют
-                        // увеличенный вид — перехватываем раньше обычных биндов
-                        // (focus_direction), чтобы не уводить фокус.
-                        if state.zoom_nav_mode {
-                            let step = if raw_latin == keysyms::KEY_Left {
-                                Some((-1.0, 0.0))
-                            } else if raw_latin == keysyms::KEY_Right {
-                                Some((1.0, 0.0))
-                            } else if raw_latin == keysyms::KEY_Up {
-                                Some((0.0, -1.0))
-                            } else if raw_latin == keysyms::KEY_Down {
-                                Some((0.0, 1.0))
-                            } else {
-                                None
-                            };
-                            if let Some((dx, dy)) = step {
-                                state.zoom_nav_pan(dx, dy);
-                                return FilterResult::Intercept(());
-                            }
-                        }
-
-                        // Открытый поиск окон (Super+F) — это поле ввода: пока
-                        // он на экране, ГОЛЫЕ клавиши принадлежат ему целиком,
-                        // включая буквы, Enter, Tab и Backspace. Комбинации с
-                        // модификаторами не трогаем — тем же Super+F поиск и
-                        // закрывается, и переключение стола из него работает.
-                        //
-                        // Символ берём из ТЕКУЩЕЙ раскладки (modified_sym), а не
-                        // из латинской: в поле ввода буква — это буква, и
-                        // русское имя окна надо уметь набрать по-русски.
-                        if state.search_open() && !logo && !ctrl && !alt {
-                            let ch = handle.modified_sym().key_char();
-                            if state.search_key(raw_latin, ch) {
-                                return FilterResult::Intercept(());
-                            }
-                        }
-
-                        // Открытое меню блютуза забирает ГОЛЫЕ клавиши: стрелки,
-                        // Enter и буквы действий принадлежат ему, а не клиенту
-                        // под курсором (см. bluetooth.rs). Комбинации с
-                        // модификаторами не трогаем — иначе тот же Super+Shift+B,
-                        // которым меню открыли, не смог бы его закрыть, а вместе
-                        // с ним отвалились бы и переключение стола, и VT.
-                        // Раскладка латинская: в русской иначе не сработали бы
-                        // D/F/S/P.
-                        if state.bt_menu_open() && !logo && !ctrl && !alt {
-                            if state.bt_key(raw_latin) {
-                                return FilterResult::Intercept(());
-                            }
-                        }
-
-                        // Меню вайфая и звука — как блютузное: голые клавиши
-                        // принадлежат им. Вайфаю нужен ещё и СИМВОЛ: в поле
-                        // пароля буквы это буквы, а не команды.
-                        if state.wifi_menu_open() && !logo && !ctrl && !alt {
-                            let ch = handle.modified_sym().key_char();
-                            if state.wifi_key(raw_latin, ch) {
-                                return FilterResult::Intercept(());
-                            }
-                        }
-                        if state.audio_menu_open() && !logo && !ctrl && !alt {
-                            if state.audio_key(raw_latin) {
-                                return FilterResult::Intercept(());
-                            }
-                        }
-
-                        // Открытая полка забирает только Esc — остальные
-                        // клавиши ей не нужны, и отнимать их у клиента незачем.
-                        if !logo && !ctrl && !alt && state.tray_key(raw_latin) {
-                            return FilterResult::Intercept(());
-                        }
-
-                        // ── Биндинги из Lua-конфига (см. src/config.rs, default_config.lua) ──
-                        let mods = crate::config::ModMask { ctrl, alt, shift, logo };
-                        if let Some(action) = state.lua_config.find_action(mods, raw_latin) {
-                            state.dispatch_action(action);
-                            return FilterResult::Intercept(());
-                        }
-
-                        FilterResult::Forward
+                        разобрать_клавишу(state, modifiers, handle, pressed, false)
                     },
                 );
                 // Любое нажатие клавиши → обновляем экран (переключение тегов не лагает)
@@ -665,6 +526,53 @@ impl Dawn {
                        pointer.frame(self);
                        return;
                    }
+               }
+
+               // Что под курсором на панели — от этого зависит предпросмотр.
+               // Считается до всех веток: панель обязана гасить подсказку и
+               // тогда, когда курсор просто проехал мимо неё дальше.
+               //
+               // Позиция берётся БУДУЩАЯ (с уже прибавленной дельтой), а не
+               // текущая. Раньше сюда шла `pointer_screen_physical()` до сдвига
+               // ниже, и наведение отставало ровно на одно событие мыши: замер
+               // 24.08.2026 синтетическим вводом (одно событие на прыжок)
+               // показал это в чистом виде — курсор стоит на чипе окна, а
+               // панель отвечает «значок стола», то есть подсказка соответствует
+               // ПРЕДЫДУЩЕЙ точке. С живой мышью событий сотни в секунду, и
+               // отставание видно лишь на кромке ячейки (предпросмотр моргал
+               // при въезде на чип), но это тот же баг.
+               // Экран здесь = (холст − камера) × зум, поэтому дельта попадает
+               // в экранные пиксели как есть, а зажим повторяет тот, что ниже
+               // делает сам курсор.
+               {
+                   let сейчас = self.pointer_screen_physical();
+                   let экран = self.screen_size();
+                   self.bar_hover_update(smithay::utils::Point::from((
+                       (сейчас.x + delta.x).clamp(0.0, экран.w as f64),
+                       (сейчас.y + delta.y).clamp(0.0, экран.h as f64),
+                   )));
+               }
+
+               // Драг по карточке предпросмотра и по карте окон — их
+               // собственный пан. Стоит РАНЬШЕ пана холста: обе живут отдельно
+               // от камеры, и их драг не имеет права заодно уносить холст.
+               //
+               // Курсор при этом ЕДЕТ ВМЕСТЕ с содержимым (26.08.2026, прямая
+               // жалоба «курсор при пане миникарты остаётся на месте и
+               // статичен»). Раньше здесь стоял голый `return`: позиция курсора
+               // ниже по функции не менялась вовсе, стрелка примерзала к экрану,
+               // а карта уезжала из-под неё — схваченный кусок мира убегал от
+               // руки. У обычного пана холста (Alt+ЛКМ ниже) поведение ровно
+               // обратное: `pan_camera_by` двигает камеру, оставляя стрелку на
+               // той же точке ХОЛСТА, то есть на экране она идёт за рукой.
+               // Здесь то же самое, только «холст» — содержимое мини-копии.
+               if self.preview_drag_motion(delta.x, delta.y) {
+                   self.drag_pointer_by_screen(delta.x, delta.y);
+                   return;
+               }
+               if self.minimap_drag_motion(delta.x, delta.y) {
+                   self.drag_pointer_by_screen(delta.x, delta.y);
+                   return;
                }
 
                // Alt+LMB pan (Float) / ЛКМ-пан в обзоре столов: курсор стоит,
@@ -713,6 +621,72 @@ impl Dawn {
                        let sx = self.pointer_location.x - self.viewport.cam_x;
                        let sy = self.pointer_location.y - self.viewport.cam_y;
                        let vis = self.visible_canvas_size();
+                       // ── Переход на соседний монитор ───────────────────────
+                       // Вышли за край, а с той стороны стоит другой монитор —
+                       // значит это не «упёрлись в стену», а переезд. Раньше
+                       // здесь был только зажим, и на второй монитор курсор не
+                       // попадал в принципе: он останавливался у кромки
+                       // первого.
+                       //
+                       // Сторону выбираем по БОЛЬШЕМУ выходу за край: по
+                       // диагонали к углу вылезают обе оси сразу, и без этого
+                       // правила переход зависел бы от порядка проверок.
+                       //
+                       // Пока держится кнопка — не переходим вовсе (жалоба
+                       // Ярика 26.08.2026: «курсор при удержании в одном
+                       // приложении улетает на другой монитор»). Начатый жест
+                       // принадлежит одному окну: выделение текста, ползунок,
+                       // перетаскивание. Уехавшая за край стрелка меняет
+                       // активный монитор и уводит клавиатурный фокус
+                       // (`перевести_курсор` зовёт `refocus_visible`) — жест
+                       // рвётся на середине, а окно так и остаётся с зажатой
+                       // кнопкой. Вместо перехода курсор зажимается краем,
+                       // как у одного монитора; отпустил — край снова
+                       // проходной.
+                       //
+                       // Confine клиента (RTS-игры вроде Dota 2 гоняют камеру
+                       // краем экрана мышью — им это ОБЯЗАН быть именно
+                       // confine, а не lock) отменяет переход целиком: иначе
+                       // курсор, доехав до края игрового окна, перепрыгивал
+                       // на второй монитор раньше, чем строка 856 успевала
+                       // проверить `захват.holds` — переход через
+                       // `перевести_курсор` завершается ранним `return`, и
+                       // проверка confine ниже попросту не выполнялась.
+                       // Исключение из правила «под кнопкой не переходим» —
+                       // перетаскивание ОКНА (`dragged_window`). Здесь зажатая
+                       // кнопка означает ровно обратное: жест не рвётся краем, а
+                       // им и заканчивается — окно переносят на соседний экран.
+                       // Само окно переезжает на стол нового монитора в
+                       // `перевести_курсор`.
+                       if !self.мониторы.is_empty()
+                           && (self.кнопок_нажато == 0 || self.dragged_window.is_some())
+                           && !захват.confined
+                       {
+                           let вылет = [
+                               (crate::monitors::Сторона::Слева,  -sx),
+                               (crate::monitors::Сторона::Справа, sx - vis.w),
+                               (crate::monitors::Сторона::Сверху, -sy),
+                               (crate::monitors::Сторона::Снизу,  sy - vis.h),
+                           ];
+                           let худший = вылет.iter()
+                               .filter(|(_, d)| *d > 0.0)
+                               .max_by(|a, b| a.1.total_cmp(&b.1))
+                               .map(|(с, _)| *с);
+                           if let Some(сторона) = худший {
+                               let доля = match сторона {
+                                   crate::monitors::Сторона::Слева
+                                   | crate::monitors::Сторона::Справа => sy / vis.h.max(1.0),
+                                   _ => sx / vis.w.max(1.0),
+                               };
+                               if self.перевести_курсор(сторона, доля) {
+                                   // Стрелка уже переставлена и motion разослан
+                                   // самим переводом — здесь больше нечего
+                                   // делать, иначе зажим ниже вернул бы её на
+                                   // покинутый монитор.
+                                   return;
+                               }
+                           }
+                       }
                        let ow = vis.w;
                        let oh = vis.h;
                        let csx = sx.clamp(0.0, ow);
@@ -751,6 +725,17 @@ impl Dawn {
                // ровно то поведение, которого ждёт клиент — «дальше некуда».
                if захват.confined && !захват.holds(self, self.pointer_location) {
                    self.pointer_location = было;
+               }
+
+               // Пока тянется рамка снимка, движение никому не рассылается:
+               // клиенту оно не нужно (кнопка у выделения), а sloppy focus на
+               // ходу переключал бы окна под затемнением. Позиция уже
+               // обновлена выше — её и читает отрисовка рамки, отдельного
+               // состояния «докуда дотянули» для этого не нужно.
+               if self.snip_идёт() {
+                   self.pointer_warped();
+                   self.request_redraw();
+                   return;
                }
 
                let pos = self.pointer_location;
@@ -849,6 +834,18 @@ impl Dawn {
                 let kb_mods = keyboard.modifier_state();
                 let alt_held = kb_mods.alt;
 
+                // Счётчик удерживаемых кнопок — ДО любых ранних выходов: ниже
+                // клик перехватывают меню, полка и обзор, и после каждого из
+                // них стоит `return`. Считать позже значило бы, что нажатие,
+                // съеденное компоновщиком, навсегда оставит счётчик
+                // рассогласованным (кнопку-то отпустят). По нему запрещён
+                // переход курсора на соседний монитор — см. движение мыши.
+                if ButtonState::Pressed == btn_state {
+                    self.кнопок_нажато += 1;
+                } else {
+                    self.кнопок_нажато = self.кнопок_нажато.saturating_sub(1);
+                }
+
                 tracing::debug!(
                     "PTR: button={} state={:?} logo_held={} kb_logo={} kb_alt={}",
                     button,
@@ -884,6 +881,20 @@ impl Dawn {
                 let съел = |кто: &str, s: smithay::utils::Point<f64, smithay::utils::Physical>| {
                     tracing::info!("КЛИК СЪЕДЕН: {} экран=({:.0},{:.0})", кто, s.x, s.y);
                 };
+
+                // Выделение области для снимка экрана — ПЕРВЫМ и без оглядки на
+                // `курсор_у_клиента`: пока рамка тянется, мышь целиком
+                // принадлежит ей. Это единственный оверлей, который человек
+                // включает сам и ровно на один жест, поэтому отдавать кнопку
+                // ни окну, ни панели нельзя — иначе протяжка по окну заодно
+                // выделила бы в нём текст. См. snip.rs.
+                if self.snip_идёт() {
+                    let нажата = ButtonState::Pressed == btn_state;
+                    if self.snip_click(button == BTN_LEFT, нажата) {
+                        съел("выделение снимка", self.pointer_screen_physical());
+                        return;
+                    }
+                }
 
                 if ButtonState::Pressed == btn_state && !курсор_у_клиента && self.bt_menu_open() {
                     let screen = self.pointer_screen_physical();
@@ -924,13 +935,18 @@ impl Dawn {
                     }
                 }
 
-                // Панель столов приклеена к экрану так же, как полка рядом:
-                // клик по столбику переводит на этот стол. Мимо панели клик не
-                // съедается — окно под ней получит его как обычно.
-                if ButtonState::Pressed == btn_state && !курсор_у_клиента && button == BTN_LEFT {
+                // Панель приклеена к экрану так же, как полка рядом: клик по
+                // столу переводит на него, по значку трея — будит приложение.
+                // Мимо панели клик не съедается — окно под ней получит его как
+                // обычно.
+                //
+                // Кнопку передаём целиком, а не только левую: значку трея нужны
+                // все три (Activate, ContextMenu, SecondaryActivate), и правый
+                // клик по звуку глушит его без открытия меню.
+                if ButtonState::Pressed == btn_state && !курсор_у_клиента {
                     let screen = self.pointer_screen_physical();
-                    if self.bar_click(screen) {
-                        съел("панель столов", screen);
+                    if self.bar_click(screen, button == BTN_RIGHT, button == BTN_MIDDLE) {
+                        съел("панель", screen);
                         return;
                     }
                 }
@@ -942,11 +958,63 @@ impl Dawn {
                     }
                 }
 
-                // Клик по миникарте: телепорт к окну под курсором.
-                if ButtonState::Pressed == btn_state && !курсор_у_клиента
-                    && self.try_handle_minimap_click() {
-                    съел("миникарта", self.pointer_screen_physical());
-                    return;
+                // ── Карточка предпросмотра ───────────────────────────────────
+                // С 26.08.2026 она — такая же мини-копия мира, как карта, и
+                // разбирает клики теми же правилами: ЛКМ по миниатюре — перейти
+                // к окну (со сменой стола, если оно на чужом), ЛКМ по пустому
+                // месту — пан самой карточки, ПКМ — сброс её вида. Стоит ПЕРЕД
+                // картой: карточка висит поверх, и под ней вполне может лежать
+                // раскрытая карта окон.
+                if !курсор_у_клиента {
+                    if ButtonState::Pressed == btn_state {
+                        if let Some(точка) = self.preview_hit() {
+                            if button == BTN_RIGHT {
+                                // ПКМ — «покажи стол целиком»: вместе с видом
+                                // забываем и запомненное место, иначе карточка
+                                // вернулась бы туда же следующим наведением.
+                                self.preview_забыть_вид();
+                                self.preview_reset_view();
+                                self.request_redraw();
+                            } else if !self.preview_activate(точка) {
+                                self.preview_begin_drag();
+                            }
+                            съел("предпросмотр: нажатие", self.pointer_screen_physical());
+                            return;
+                        }
+                    } else if self.preview_drag {
+                        self.preview_end_drag();
+                        съел("предпросмотр", self.pointer_screen_physical());
+                        return;
+                    }
+                }
+
+                // ── Карта окон ───────────────────────────────────────────────
+                // Своя мини-копия мира. ЛКМ по МИНИАТЮРЕ ОКНА — перейти к нему
+                // (фокус + перелёт камеры + карта уезжает); ЛКМ по ПУСТОМУ
+                // месту — пан самой карты, камеру он не трогает; ПКМ — сброс к
+                // автоподгонке. Событие карта ЗАБИРАЕТ себе целиком: под ней
+                // холст и окна, и тычок в карту не должен фокусировать
+                // спрятанное под ней окно или начинать рамку выделения.
+                //
+                // Хит-тест окна стоит ПЕРЕД драгом нарочно: карта теперь во
+                // весь стол, окон в ней много, и «промахнулся по окну — поехал
+                // пан» читается гораздо естественнее обратного порядка.
+                if !курсор_у_клиента {
+                    if ButtonState::Pressed == btn_state {
+                        if let Some(точка) = self.minimap_hit() {
+                            if button == BTN_RIGHT || self.minimap_reset_button_hit(точка) {
+                                self.minimap_reset();
+                            } else if !self.minimap_activate(точка) {
+                                self.minimap_begin_drag();
+                            }
+                            съел("карта окон: нажатие", self.pointer_screen_physical());
+                            return;
+                        }
+                    } else if self.minimap_drag {
+                        self.minimap_end_drag();
+                        съел("карта окон", self.pointer_screen_physical());
+                        return;
+                    }
                 }
 
                 // Любой клик отменяет ожидающий тап Super (обзор столов).
@@ -1250,11 +1318,62 @@ impl Dawn {
                     .map(|kb| kb.modifier_state().alt)
                     .unwrap_or(false);
 
+                // ── Таблица жестов: два пальца ───────────────────────────
+                //
+                // Два пальца libinput жестом НЕ считает (GestureSwipe/Pinch
+                // начинаются с трёх) — он шлёт их прокруткой с
+                // `source = Finger`. Поэтому `2-finger-swipe` из `gesture{}`
+                // ловится здесь, а снаружи это ровно такой же бинд, как
+                // трёхпальцевый: разница видна только в этом месте.
+                //
+                // Начала и конца у прокрутки нет, есть поток кадров и
+                // финальный кадр амплитуды 0 — по нему и закрываем жест.
+                // Карточка предпросмотра забирает пальцы ПЕРВОЙ — раньше и
+                // таблицы жестов, и всего остального. Она висит поверх холста,
+                // и прокрутка над ней обязана водить её, а не камеру под ней —
+                // ровно тот же довод, по которому выше от неё закрыто колесо.
+                // Карточка первой, карта следом — тот же порядок, что у
+                // колеса ниже: карточка висит поверх карты.
+                if source == AxisSource::Finger && self.preview_pan_by(h, v) {
+                    return;
+                }
+                if source == AxisSource::Finger && self.minimap_pan_by(h, v) {
+                    return;
+                }
+                if source == AxisSource::Finger {
+                    if h == 0.0 && v == 0.0 {
+                        if self.жест_конец(false) {
+                            return;
+                        }
+                    } else {
+                        if self.жест.is_none()
+                            && self.жест_начало(crate::gestures::ОсноваЖеста::Свайп, 2)
+                        {
+                            // Первый кадр отдаём тому же обработчику, что и
+                            // остальные, — иначе он потерялся бы.
+                        }
+                        if self.жест_свайп_шаг(h, v, event.time_msec()) {
+                            return;
+                        }
+                    }
+                }
+
                 // Super + 2-палец тачпад-скролл → таскать окно под курсором.
                 // ВАЖНО: 2-пальцевое движение по тачпаду libinput шлёт как
                 // scroll с source=Finger (жесты GestureSwipe/Pinch — это 3+
                 // пальца), поэтому "Super+2 пальца" ловится именно здесь, а не
                 // в GestureSwipe. Курсор при этом стоит на месте, окно едет.
+                // Колесо над картой окон и над карточкой предпросмотра крутит ИХ
+                // зум, а не холста. Проверка стоит до всего остального: иначе
+                // плашка, лежащая поверх холста, всё равно пропускала бы колесо
+                // сквозь себя. Карточка первой — она висит поверх карты.
+                if source != AxisSource::Finger && self.preview_wheel(-v / 15.0) {
+                    return;
+                }
+                if source != AxisSource::Finger && self.minimap_wheel(-v / 15.0) {
+                    return;
+                }
+
                 let logo_held = self.logo_held
                     || self.seat.get_keyboard().map(|kb| kb.modifier_state().logo).unwrap_or(false);
                 // Жест с зажатым Super отменяет ожидающий тап Super (обзор столов).
@@ -1530,7 +1649,17 @@ impl Dawn {
             }
 
             // ── Pinch → zoom canvas ──────────────────────────────────────
-            InputEvent::GesturePinchBegin { .. } => {
+            InputEvent::GesturePinchBegin { event, .. } => {
+                // Щипок над карточкой — её зум, и он старше таблицы жестов по
+                // той же причине, что и пан выше: под пальцами карточка, а не
+                // холст. Отправную точку масштаба ставим здесь.
+                self.preview_pinch_last = 1.0;
+                if self.preview_hit().is_some() || self.minimap_hit().is_some() {
+                    return;
+                }
+                if self.жест_начало(crate::gestures::ОсноваЖеста::Щипок, event.fingers()) {
+                    return;
+                }
                 tracing::debug!("ЖЕСТ: pinch начат, logo_held={}", self.logo_held);
                 self.pinch_last_scale = 1.0;
                 // Super+2-пальца pinch → resize окна под курсором (в любом режиме;
@@ -1558,6 +1687,18 @@ impl Dawn {
 
             InputEvent::GesturePinchUpdate { event, .. } => {
                 let scale = event.scale();
+                // libinput отдаёт масштаб от НАЧАЛА жеста, а зум карточки
+                // копится — отсюда деление на прошлый кадр.
+                if scale > 0.0 && (self.preview_hit().is_some() || self.minimap_hit().is_some()) {
+                    let множитель = scale / self.preview_pinch_last.max(1e-6);
+                    self.preview_pinch_last = scale;
+                    if self.preview_pinch(множитель) || self.minimap_pinch(множитель) {
+                        return;
+                    }
+                }
+                if self.жест_щипок_шаг(scale) {
+                    return;
+                }
                 if scale <= 0.0 { return; }
 
                 if let Some(window) = self.gesture_resize_window.clone() {
@@ -1573,8 +1714,12 @@ impl Dawn {
                     }
                     let factor = scale.powf(PINCH_GAIN).clamp(0.05, 20.0);
                     for (w, base) in self.gesture_resize_group.clone() {
-                        let new_w = (base.w as f64 * factor).round().clamp(50.0, 20000.0) as i32;
-                        let new_h = (base.h as f64 * factor).round().clamp(50.0, 20000.0) as i32;
+                        // Пол — 1 px (нулевая поверхность недопустима), а не
+                        // «приличные» 50: щипок ужимает окно во что угодно, как
+                        // и остальные пути ресайза. Потолок оставлен только от
+                        // переполнения арифметики размеров.
+                        let new_w = (base.w as f64 * factor).round().clamp(1.0, 20000.0) as i32;
+                        let new_h = (base.h as f64 * factor).round().clamp(1.0, 20000.0) as i32;
                         crate::xwin::set_size(&w, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
                         crate::xwin::configure(&w);
                     }
@@ -1589,7 +1734,9 @@ impl Dawn {
                 // Зум камеры щипком раньше не проверял раскладку ВООБЩЕ: он
                 // работал и во Float, и в ленте Columns, где пан для того же
                 // жеста давно закрыт. Теперь условие одно на все жесты камеры.
-                if !self.touchpad_camera_allowed() {
+                // Режим лупы (Super+Space) держит максимум отдаления и зум не
+                // отдаёт никому — ни колесу, ни пальцам.
+                if !self.touchpad_camera_allowed() || self.zoom_locked() {
                     // Масштаб всё равно запоминаем: иначе на следующем жесте
                     // factor посчитается от единицы и камера прыгнет рывком.
                     self.pinch_last_scale = scale;
@@ -1605,7 +1752,7 @@ impl Dawn {
                 // своей цели поверх пальцев.
                 self.zoom_glide = None;
                 let old_zoom = self.viewport.zoom;
-                let new_zoom = (old_zoom * factor).clamp(0.05, 5.0);
+                let new_zoom = (old_zoom * factor).clamp(Dawn::ZOOM_MIN, Dawn::ZOOM_MAX);
                 self.viewport.zoom = new_zoom;
 
                 // Якорь под курсором
@@ -1619,7 +1766,10 @@ impl Dawn {
                 tracing::debug!("pinch: zoom={:.3}", new_zoom);
             }
 
-            InputEvent::GesturePinchEnd { .. } => {
+            InputEvent::GesturePinchEnd { event, .. } => {
+                if self.жест_конец(event.cancelled()) {
+                    return;
+                }
                 self.pinch_last_scale = 1.0;
                 let group = std::mem::take(&mut self.gesture_resize_group);
                 tracing::debug!("ЖЕСТ: pinch закончен, окон в группе={}", group.len());
@@ -1636,7 +1786,13 @@ impl Dawn {
             }
 
             // ── Swipe (2 пальца, любой режим) → pan canvas ───────────────
-            InputEvent::GestureSwipeBegin { .. } => {
+            InputEvent::GestureSwipeBegin { event, .. } => {
+                // Таблица жестов (`gesture{}`) идёт ПЕРВОЙ и, если нашла свой
+                // бинд, забирает жест целиком. Не нашла — ниже всё как было до
+                // 30.08.2026, слово в слово. См. gestures.rs.
+                if self.жест_начало(crate::gestures::ОсноваЖеста::Свайп, event.fingers()) {
+                    return;
+                }
                 // Super+2-палец → перемещение окна под курсором (новый жест).
                 if self.logo_held && self.tile_config.layout == Layout::Float {
                     let pos = self.pointer_location;
@@ -1646,6 +1802,9 @@ impl Dawn {
 
             InputEvent::GestureSwipeUpdate { event, .. } => {
                 let delta = event.delta();
+                if self.жест_свайп_шаг(delta.x, delta.y, event.time_msec()) {
+                    return;
+                }
                 if delta.x == 0.0 && delta.y == 0.0 { return; }
 
                 if let Some(window) = self.gesture_move_window.clone() {
@@ -1708,7 +1867,10 @@ impl Dawn {
                 tracing::debug!("swipe pan: cam=({:.1},{:.1})", self.viewport.cam_x, self.viewport.cam_y);
             }
 
-            InputEvent::GestureSwipeEnd { .. } => {
+            InputEvent::GestureSwipeEnd { event, .. } => {
+                if self.жест_конец(event.cancelled()) {
+                    return;
+                }
                 if self.gesture_move_window.take().is_some() {
                     return;
                 }
@@ -1724,9 +1886,285 @@ impl Dawn {
                 self.momentum.launch();
             }
 
+            // ── Удержание ────────────────────────────────────────────────
+            // Раньше `hold` не обрабатывался вовсе — libinput его слал, dawn
+            // ронял в общий `_ =>`. Теперь это полноценный триггер таблицы
+            // (`4-finger-hold` и подобные), но только через неё: без бинда обе
+            // ветки по-прежнему не делают ничего.
+            InputEvent::GestureHoldBegin { event, .. } => {
+                self.жест_начало(crate::gestures::ОсноваЖеста::Удержание, event.fingers());
+            }
+            InputEvent::GestureHoldEnd { event, .. } => {
+                self.жест_конец(event.cancelled());
+            }
+
             _ => {}
         }
     }
+}
+
+/// Разбор клавиши: всё, что композитор делает с ней ДО клиента — тап по Super,
+/// режим лупы, меню, захват клавиш приложением и бинды из `config.lua`.
+///
+/// Вынесено из замыкания `process_input_event` НЕ ради красоты: этой же дорогой
+/// ходят клавиши из Minecraft (`mine::seat::клавиша`), а до 01.09.2026 у режима
+/// была своя урезанная копия — один `find_action` и ничего больше. Из игры
+/// поэтому не работало ровно то, чего в таблице биндов нет: обзор столов тапом
+/// по Super, лупа Super+Space, пан лупы стрелками, Alt+Tab (перебор кончается
+/// на ОТПУСКАНИИ Alt), меню полки, поиск окон и аварийное Super+Shift+Escape.
+/// Две копии разъезжаются молча — теперь копия одна.
+///
+/// `из_игры` меняет ровно одно: `mine_mode` не выполняется. Выйти из режима
+/// изнутри игры — верный способ остаться без панелей и без клавиатуры, чтобы
+/// вернуть их (хозяйская в этот момент у Minecraft).
+pub(crate) fn разобрать_клавишу(
+    state: &mut Dawn,
+    modifiers: &smithay::input::keyboard::ModifiersState,
+    handle: smithay::input::keyboard::KeysymHandle<'_>,
+    pressed: bool,
+    из_игры: bool,
+) -> FilterResult<()> {
+    const SUPER_L: u32 = keysyms::KEY_Super_L;
+    const SUPER_R: u32 = keysyms::KEY_Super_R;
+    let sym = handle.modified_sym();
+    let raw = sym.raw();
+
+    // Трекаем Super по keysym + детект "тапа" (обзор столов)
+    if raw == SUPER_L || raw == SUPER_R {
+        state.logo_held = pressed;
+        if pressed {
+            // Кандидат на тап — сбросится любым другим вводом.
+            state.super_tap = true;
+            state.super_tap_shift = modifiers.shift;
+        } else {
+            if state.super_tap {
+                // Обзор открывает чистый тап Super в ЛЮБОЙ
+                // раскладке. В Columns дополнительно
+                // работает и Shift+Super — тап с Shift тоже
+                // считается тапом (см. ветку Shift ниже),
+                // так что обе комбинации ведут в обзор.
+                state.toggle_overview();
+            }
+            state.super_tap = false;
+            state.super_tap_shift = false;
+        }
+        return FilterResult::Forward;
+    }
+
+    // Shift, нажатый ВО ВРЕМЯ удержания Super, тап не
+    // отменяет — он его модификатор (Shift+Super в
+    // Columns). Любая другая клавиша отменяет как раньше.
+    const SHIFT_L: u32 = keysyms::KEY_Shift_L;
+    const SHIFT_R: u32 = keysyms::KEY_Shift_R;
+    if raw == SHIFT_L || raw == SHIFT_R {
+        if pressed && state.super_tap {
+            state.super_tap_shift = true;
+        }
+        return FilterResult::Forward;
+    }
+
+    // Отпустили Alt — перебор стопки (Alt+Tab) закончен, и
+    // следующий Tab начнёт новую стопку с текущего окна.
+    // Ловим ДО общего `if !pressed`: отпускание клавиши
+    // ниже никуда не доходит.
+    const ALT_L: u32 = keysyms::KEY_Alt_L;
+    const ALT_R: u32 = keysyms::KEY_Alt_R;
+    const META_L: u32 = keysyms::KEY_Meta_L;
+    const META_R: u32 = keysyms::KEY_Meta_R;
+    if matches!(raw, ALT_L | ALT_R | META_L | META_R) && !pressed {
+        state.cycle_stack_end();
+        return FilterResult::Forward;
+    }
+
+    // Любое другое нажатие клавиши отменяет ожидающий тап Super
+    // (Super+D, Super+1 и т.п. — это не тап).
+    if pressed {
+        state.super_tap = false;
+    }
+
+    // ── Super+Space (тумблер) → режим лупы (zoom-nav) ──
+    // Настраивается через set{bird_eye_key=...} (по умолчанию space).
+    // Раньше это был hold-жест bird's-eye; теперь тумблер: вкл —
+    // зум к центру, стрелки панорамируют, повторный Super+Space
+    // сбрасывает (см. Dawn::toggle_zoom_nav).
+    if raw == state.lua_config.bird_eye_key {
+        if pressed && state.logo_held {
+            state.toggle_zoom_nav();
+        }
+        if state.logo_held {
+            return FilterResult::Intercept(());
+        }
+        return FilterResult::Forward;
+    }
+
+    if !pressed { return FilterResult::Forward; }
+
+    // Escape во время выбора источника для демонстрации
+    // экрана — отмена (см. portal.rs). Перехватываем до
+    // всех биндов и до клиента: пока идёт выбор, клавиша
+    // принадлежит выбору.
+    if state.portal_picking() && raw == keysyms::KEY_Escape {
+        state.portal_pick_click(true);
+        return FilterResult::Intercept(());
+    }
+
+    // Во время выбора источника цифра выбирает МОНИТОР
+    // напрямую: на двух экранах «ткни в пустой холст» даёт
+    // тот, где стоит стрелка, а показать часто нужно
+    // соседний. Клавиша принадлежит выбору и до биндов не
+    // доходит — новых сочетаний в config.lua не заводится.
+    if state.portal_picking() {
+        if let Some(n) = цифра_монитора(raw) {
+            if state.portal_pick_monitor(n) {
+                return FilterResult::Intercept(());
+            }
+        }
+    }
+
+    // Escape во время выделения области для снимка экрана
+    // (PrtScr, см. snip.rs) — отмена, ровно как у выбора
+    // источника выше.
+    if state.snip_идёт() && raw == keysyms::KEY_Escape {
+        state.snip_cancel();
+        return FilterResult::Intercept(());
+    }
+
+    let alt   = modifiers.alt;
+    let shift = modifiers.shift;
+    let ctrl  = modifiers.ctrl;
+    let logo  = modifiers.logo || state.logo_held;
+
+    // Для layout-independence: берём latin sym если отличается
+    // (важно теперь вдвойне — с несколькими XKB-раскладками
+    // биндинги должны срабатывать независимо от активной)
+    let raw_latin = handle.raw_latin_sym_or_raw_current_sym()
+        .map(|s| s.raw())
+        .unwrap_or(raw);
+
+    tracing::debug!(
+        "KEY: key={} alt={} shift={} ctrl={} logo={}", raw_latin, alt, shift, ctrl, logo
+    );
+
+    // Режим лупы (Super+Space): голые стрелки панорамируют
+    // увеличенный вид — перехватываем раньше обычных биндов
+    // (focus_direction), чтобы не уводить фокус.
+    if state.zoom_nav_mode {
+        let step = if raw_latin == keysyms::KEY_Left {
+            Some((-1.0, 0.0))
+        } else if raw_latin == keysyms::KEY_Right {
+            Some((1.0, 0.0))
+        } else if raw_latin == keysyms::KEY_Up {
+            Some((0.0, -1.0))
+        } else if raw_latin == keysyms::KEY_Down {
+            Some((0.0, 1.0))
+        } else {
+            None
+        };
+        if let Some((dx, dy)) = step {
+            state.zoom_nav_pan(dx, dy);
+            return FilterResult::Intercept(());
+        }
+    }
+
+    // Открытый поиск окон (Super+F) — это поле ввода: пока
+    // он на экране, ГОЛЫЕ клавиши принадлежат ему целиком,
+    // включая буквы, Enter, Tab и Backspace. Комбинации с
+    // модификаторами не трогаем — тем же Super+F поиск и
+    // закрывается, и переключение стола из него работает.
+    //
+    // Символ берём из ТЕКУЩЕЙ раскладки (modified_sym), а не
+    // из латинской: в поле ввода буква — это буква, и
+    // русское имя окна надо уметь набрать по-русски.
+    if state.search_open() && !logo && !ctrl && !alt {
+        let ch = handle.modified_sym().key_char();
+        if state.search_key(raw_latin, ch) {
+            return FilterResult::Intercept(());
+        }
+    }
+
+    // Открытое меню блютуза забирает ГОЛЫЕ клавиши: стрелки,
+    // Enter и буквы действий принадлежат ему, а не клиенту
+    // под курсором (см. bluetooth.rs). Комбинации с
+    // модификаторами не трогаем — иначе тот же Super+Shift+B,
+    // которым меню открыли, не смог бы его закрыть, а вместе
+    // с ним отвалились бы и переключение стола, и VT.
+    // Раскладка латинская: в русской иначе не сработали бы
+    // D/F/S/P.
+    if state.bt_menu_open() && !logo && !ctrl && !alt {
+        if state.bt_key(raw_latin) {
+            return FilterResult::Intercept(());
+        }
+    }
+
+    // Меню вайфая и звука — как блютузное: голые клавиши
+    // принадлежат им. Вайфаю нужен ещё и СИМВОЛ: в поле
+    // пароля буквы это буквы, а не команды.
+    if state.wifi_menu_open() && !logo && !ctrl && !alt {
+        let ch = handle.modified_sym().key_char();
+        if state.wifi_key(raw_latin, ch) {
+            return FilterResult::Intercept(());
+        }
+    }
+    if state.audio_menu_open() && !logo && !ctrl && !alt {
+        if state.audio_key(raw_latin) {
+            return FilterResult::Intercept(());
+        }
+    }
+
+    // Открытая полка забирает только Esc — остальные
+    // клавиши ей не нужны, и отнимать их у клиента незачем.
+    if !logo && !ctrl && !alt && state.tray_key(raw_latin) {
+        return FilterResult::Intercept(());
+    }
+
+    // Панель управления раздачей (повторное Super+Shift+S):
+    // стрелки, j/k, x — выгнать, b — забанить, s —
+    // закончить раздачу, Esc — закрыть. Как и у остальных
+    // меню, забирает только ГОЛЫЕ клавиши: сочетание с
+    // Super должно продолжать работать, иначе панель нельзя
+    // было бы закрыть тем же Super+Shift+S, которым открыли.
+    if state.раздача_панель_открыта() && !logo && !ctrl && !alt {
+        if state.раздача_клавиша(raw_latin) {
+            return FilterResult::Intercept(());
+        }
+    }
+
+    // ── Захват клавиатуры приложением (keyboard_grab_apps) ──
+    //
+    // Пока в фокусе окно из списка (по умолчанию `dshare`),
+    // ВСЕ клавиши принадлежат ему: ни один бинд композитора
+    // не срабатывает. Без этого гость мультиюзера не мог бы
+    // отдать чужому столу ни Super+D, ни Super+1, ни
+    // Super+Q — их съедал бы его собственный dawn.
+    //
+    // Super+Shift+Escape проверяется ПЕРЕД захватом и
+    // никогда ему не отдаётся: это аварийный выход. Повисни
+    // окно с захватом — человек остался бы в своём сеансе
+    // без единой рабочей команды.
+    if logo && shift && raw_latin == keysyms::KEY_Escape {
+        state.захват_клавиш_снят = !state.захват_клавиш_снят;
+        tracing::info!(
+            "dawn: захват клавиш приложением {}",
+            if state.захват_клавиш_снят { "СНЯТ вручную" } else { "возвращён" },
+        );
+        return FilterResult::Intercept(());
+    }
+    if !state.захват_клавиш_снят && state.клавиши_забирает_окно() {
+        return FilterResult::Forward;
+    }
+
+    // ── Биндинги из Lua-конфига (см. src/config.rs, default_config.lua) ──
+    let mods = crate::config::ModMask { ctrl, alt, shift, logo };
+    if let Some(action) = state.lua_config.find_action(mods, raw_latin) {
+        if из_игры && matches!(action, crate::config::Action::MineMode) {
+            tracing::warn!("dawn/mine: выйти из режима можно только с клавиатуры хозяина");
+            return FilterResult::Intercept(());
+        }
+        state.dispatch_action(action);
+        return FilterResult::Intercept(());
+    }
+
+    FilterResult::Forward
 }
 
 #[cfg(test)]
