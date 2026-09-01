@@ -1,29 +1,46 @@
 mod anim;
+mod bar;
+mod blur;
 mod bluetooth;
 mod canvas;
+mod close;
 mod capture;
 mod columns;
+mod constellation;
 mod config;
+mod ctl;
 mod decor;
 mod dwindle;
 mod focus;
 mod fullscreen;
+mod gestures;
 mod grabs;
 mod handlers;
+mod headless;
+mod icons;
 mod input;
+mod mine;
 mod mode;
+mod monitors;
 mod overview;
 mod portal;
 mod portal_stream;
+mod rounded;
 mod screencopy;
 mod selection;
 mod session;
+mod share;
+mod snip;
+mod sni;
 mod state;
 mod switcher;
+mod synth;
 mod text;
 mod udev;
+mod vr;
 mod audio;
 mod tiling;
+mod touchpad;
 mod tray;
 mod wifi;
 mod winit;
@@ -49,7 +66,20 @@ pub use state::Dawn;
 /// Зовётся дважды: сразу после подъёма бэкенда (WAYLAND_DISPLAY уже известен) и
 /// после старта Xwayland (появляется DISPLAY). Отсутствие
 /// dbus-update-activation-environment не фатально — просто предупреждение.
+/// Взводится в main по `--headless`. Смотрит `export_session_env`: харнесс не
+/// имеет права трогать окружение D-Bus живого сеанса — иначе портал, pipewire и
+/// всё, что поднимается активацией, поедут на ЕГО сокет вместо настоящего.
+pub static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn headless() -> bool {
+    HEADLESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn export_session_env() {
+    if headless() {
+        tracing::info!("dawn: headless — окружение сессии в D-Bus НЕ отдаём");
+        return;
+    }
     const VARS: [&str; 4] = [
         "WAYLAND_DISPLAY",
         "DISPLAY",
@@ -79,11 +109,49 @@ pub fn export_session_env() {
     }
 }
 
+/// Поднять мягкий лимит открытых файлов до жёсткого.
+///
+/// Композитору дескрипторы — расходный материал: каждый буфер клиента приезжает
+/// набором dmabuf-дескрипторов и живёт, пока клиент его не уничтожит. Замер
+/// 24.08.2026 в живом сеансе: 847 дескрипторов при мягком лимите 1024, из них
+/// 741 dmabuf от живых обоев (утечка чинилась отдельно, в dwall). Упереться в
+/// лимит — это не «стало тесно», а отказ всего подряд разом: в логе за тот день
+/// «dawn/audio: pactl не запустился: Too many open files», провалы
+/// `eglCreateImageKHR` («could not bind to DMA buffer») и `dawn/dmabuf: import
+/// failed`, то есть окна перестают показывать содержимое.
+///
+/// Жёсткий лимит здесь 4096 и достаётся даром: это ровно то, что делают sway и
+/// mutter при старте. Дырявых клиентов это не лечит, но даёт запас в четыре
+/// раза, а вместе с ним — время увидеть проблему в логе, а не по мёртвому
+/// экрану.
+fn поднять_лимит_дескрипторов() {
+    unsafe {
+        let mut лимит: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut лимит) != 0 {
+            tracing::warn!("dawn: не прочитать RLIMIT_NOFILE: {}",
+                std::io::Error::last_os_error());
+            return;
+        }
+        if лимит.rlim_cur >= лимит.rlim_max {
+            return;
+        }
+        let было = лимит.rlim_cur;
+        лимит.rlim_cur = лимит.rlim_max;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &лимит) != 0 {
+            tracing::warn!("dawn: не поднять RLIMIT_NOFILE: {}",
+                std::io::Error::last_os_error());
+            return;
+        }
+        tracing::info!("dawn: лимит дескрипторов {} → {}", было, лимит.rlim_max);
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     tracing::info!("dawn starting");
+    поднять_лимит_дескрипторов();
 
     // Явный 'static: LoopHandle с этим временем жизни нужен X11Wm::start_wm,
     // который сам вешает в цикл источник X11-событий (см. xwayland.rs).
@@ -93,14 +161,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let force_tty   = std::env::args().any(|a| a == "--tty");
     let force_winit = std::env::args().any(|a| a == "--winit");
+    // Headless: ни экрана, ни ввода — кадр собирается тем же кодом, что и для
+    // монитора, и уходит в PNG по команде управляющего сокета (см. headless.rs).
+    // Это единственный режим, в котором рендер DRM-пути можно смотреть, не
+    // занимая монитор живого сеанса и не деля с ним клавиатуру.
+    let headless   = std::env::args().any(|a| a == "--headless");
+    HEADLESS.store(headless, std::sync::atomic::Ordering::Relaxed);
     // Не доверяем DISPLAY/WAYLAND_DISPLAY — могут быть унаследованы от родителя
-    let tty_mode = force_tty || !force_winit;
+    let tty_mode = !headless && (force_tty || !force_winit);
 
-    tracing::info!("dawn: mode={} (force_tty={} force_winit={})",
-        if tty_mode { "TTY" } else { "Winit" },
-        force_tty, force_winit);
+    tracing::info!("dawn: mode={} (force_tty={} force_winit={} headless={})",
+        if headless { "Headless" } else if tty_mode { "TTY" } else { "Winit" },
+        force_tty, force_winit, headless);
 
-    if tty_mode {
+    if headless {
+        crate::headless::init_headless(&mut event_loop, &mut state)?;
+        unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
+    } else if tty_mode {
         tracing::info!("dawn: trying TTY/DRM backend...");
         match crate::udev::init_udev(&mut event_loop, &mut state) {
             Ok(()) if !state.udev_devices.is_empty() => {
@@ -126,6 +203,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("dawn socket: {:?}", state.socket_name);
 
+    // Управляющий сокет: в харнессе всегда, в живом сеансе — только по
+    // DAWN_CTL=1 (см. ctl.rs, там же почему не по умолчанию).
+    if headless || std::env::var_os("DAWN_CTL").is_some() {
+        if let Err(e) = crate::ctl::init(&event_loop.handle(), &state) {
+            tracing::warn!("dawn/ctl: сокет не поднялся: {}", e);
+        }
+    }
+
     // Отдаём окружение сессии в D-Bus/systemd --user. Без этого
     // xdg-desktop-portal (его поднимает не dawn, а D-Bus-активация) не видит ни
     // WAYLAND_DISPLAY, ни XDG_CURRENT_DESKTOP: подключиться к нам он не может,
@@ -136,11 +221,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Портал (демонстрация экрана) ─────────────────────────────────────────
     // Бэкенд живёт в своём потоке на сессионной шине, а выбор источника делает
     // сам композитор — запросы приходят сюда каналом calloop. См. portal.rs.
-    crate::portal::install_portal_files();
+    // Всё, что дальше садится на D-Bus (портал, BlueZ-агент, трей, вайфай,
+    // звук), в харнессе НЕ поднимаем: имена на шине одни на всю сессию, и
+    // второй экземпляр их бы отобрал у живого dawn — демонстрация экрана,
+    // сопряжение и трей поехали бы к нему. Проверять рендер это не мешает.
+    if !headless { crate::portal::install_portal_files(); }
     {
         use smithay::reexports::calloop::channel;
         let (to_dawn, from_portal) = channel::channel::<crate::portal::Request>();
-        if crate::portal::spawn(to_dawn) {
+        if !headless && crate::portal::spawn(to_dawn) {
             event_loop.handle().insert_source(from_portal, |event, _, state| {
                 if let channel::Event::Msg(request) = event {
                     state.handle_portal_request(request);
@@ -156,7 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         use smithay::reexports::calloop::channel;
         let (to_dawn, from_bt) = channel::channel::<crate::bluetooth::Event>();
-        if let Some(tx) = crate::bluetooth::spawn(to_dawn) {
+        if let Some(tx) = (!headless).then(|| crate::bluetooth::spawn(to_dawn)).flatten() {
             let autoconnect = state.lua_config.bluetooth_autoconnect;
             state.init_bluetooth(tx, autoconnect);
             event_loop.handle().insert_source(from_bt, |event, _, state| {
@@ -170,10 +259,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Полка состояния ──────────────────────────────────────────────────────
     // Вайфай (NetworkManager), звук (wpctl) и батарея (/sys) — см. tray.rs.
     // Поток спит, пока полку не открыли, поэтому поднимаем его всегда.
+    //
+    // В харнессе полка по умолчанию выключена вместе с остальной шиной (см.
+    // выше), но без неё нечего и проверять: `tray_toggle` сразу выходит на
+    // `self.tray = None`, то есть ни выезда, ни блюра под полкой в кадре не
+    // появится. `DAWN_HEADLESS_SERVICES=1` включает её ЯВНО — и только для
+    // случая, когда харнесс запущен на СВОЕЙ шине (`dbus-run-session`):
+    // на общей он отобрал бы `org.kde.StatusNotifierWatcher` у живого dawn,
+    // и значки трея уехали бы в невидимый экземпляр.
+    let сервисы_харнесса = std::env::var_os("DAWN_HEADLESS_SERVICES").is_some();
+    let полка_и_меню = !headless || сервисы_харнесса;
     {
         use smithay::reexports::calloop::channel;
         let (to_dawn, from_tray) = channel::channel::<crate::tray::Event>();
-        if let Some(tx) = crate::tray::spawn(to_dawn) {
+        if let Some(tx) = полка_и_меню.then(|| crate::tray::spawn(to_dawn)).flatten() {
             state.init_tray(tx);
             event_loop.handle().insert_source(from_tray, |event, _, state| {
                 if let channel::Event::Msg(event) = event {
@@ -188,7 +287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         use smithay::reexports::calloop::channel;
         let (to_dawn, from_wifi) = channel::channel::<crate::wifi::Event>();
-        if let Some(tx) = crate::wifi::spawn(to_dawn) {
+        if let Some(tx) = полка_и_меню.then(|| crate::wifi::spawn(to_dawn)).flatten() {
             state.init_wifi(tx);
             event_loop.handle().insert_source(from_wifi, |event, _, state| {
                 if let channel::Event::Msg(event) = event {
@@ -197,7 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
         }
         let (to_dawn, from_audio) = channel::channel::<crate::audio::Event>();
-        if let Some(tx) = crate::audio::spawn(to_dawn) {
+        if let Some(tx) = полка_и_меню.then(|| crate::audio::spawn(to_dawn)).flatten() {
             state.init_audio(tx);
             event_loop.handle().insert_source(from_audio, |event, _, state| {
                 if let channel::Event::Msg(event) = event {
@@ -206,6 +305,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
         }
     }
+
+    // ── Трей приложений (StatusNotifierItem) ─────────────────────────────────
+    // Поднимать надо ПРИ СТАРТЕ и безусловно: приложения ищут реестр
+    // (org.kde.StatusNotifierWatcher) в момент своего запуска, и если его нет,
+    // многие уходят в старый XEmbed-трей и больше не возвращаются (см. sni.rs).
+    {
+        use smithay::reexports::calloop::channel;
+        let (to_dawn, from_sni) = channel::channel::<crate::sni::Event>();
+        if let Some(tx) = (!headless).then(|| crate::sni::spawn(to_dawn)).flatten() {
+            state.init_sni(tx);
+            event_loop.handle().insert_source(from_sni, |event, _, state| {
+                if let channel::Event::Msg(event) = event {
+                    state.handle_sni_event(event);
+                }
+            })?;
+        }
+    }
+
+    // Раскладка в панели: до первого нажатия её никто не пересчитает, а
+    // показать «EN» надо с первого кадра.
+    state.refresh_kb_layout();
 
     // XWayland поднимаем ПОСЛЕ бэкенда: DISPLAY выставится по готовности
     // сервера, и всё, что мы спавним дальше, увидит уже рабочий X11.
@@ -230,6 +350,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         TimeoutAction::ToDuration(state.tick_interval())
     })?;
 
+    // `--vr`: надеть шлем сразу при старте, не дожидаясь бинда. Отказ не
+    // фатален — сеанс продолжается на мониторах, а причина уходит в лог.
+    if std::env::args().any(|a| a == "--vr") || state.lua_config.vr.auto {
+        if let Err(e) = crate::vr::включить(&mut state) {
+            tracing::warn!("dawn/vr: --vr не сработал: {e}");
+        }
+    }
+
     // Как в anvil — dispatch с timeout чтобы seatd не голодал
     loop {
         // Ждать дольше можно ровно настолько, насколько нечего показывать:
@@ -238,6 +366,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // места в той же итерации и медленный таймер её не задерживает.
         let result = event_loop.dispatch(Some(state.tick_interval()), &mut state);
         if result.is_err() { break; }
+        // Выход/перезапуск: строго после dispatch, до всей работы кадра —
+        // рисовать и рассылать кадры уходящей сессии незачем. Проверять надо
+        // именно флаг: loop_signal.stop() смотрит только EventLoop::run(), а
+        // здесь цикл свой, и Super+Shift+Q поэтому не работал вовсе (см.
+        // state::ExitAction).
+        if state.exit.is_some() { break; }
         // Тик здесь, а не только по таймеру: он и делает редкий таймер
         // безопасным (см. anim::TICK_IDLE). Считается по Instant, поэтому
         // лишний вызов ничего не ломает — он просто сэмплирует анимацию.
@@ -270,6 +404,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.needs_redraw = false;
             crate::udev::render_all(&mut state);
         }
+        // ── Шлем ────────────────────────────────────────────────────────────
+        // Строго ПОСЛЕ кадра мониторов и после flush_clients: внутри лежит
+        // `xrWaitFrame`, то есть ожидание своей очереди у шлема (до 11 мс на
+        // 90 Гц). Всё, что должно уйти клиентам в этой итерации, обязано уйти
+        // до того, как мы уснём. Пока VR выключен — это одна проверка на
+        // `Option` за итерацию (см. vr/mod.rs).
+        crate::vr::тик(&mut state);
+        // ── Minecraft ───────────────────────────────────────────────────────
+        // Ровно там же и по той же причине: кадр панелей уезжает моду после
+        // того, как всё положенное ушло клиентам. Пока режим выключен — одна
+        // проверка `Option` за итерацию (см. mine/mod.rs).
+        crate::mine::тик(&mut state);
+    }
+
+    // Перезапуск — это код возврата, а не exec: скрипт запуска поднимает нас
+    // заново из чистого процесса. Через exec() пришлось бы тащить в новую
+    // жизнь чужие дескрипторы — DRM master остался бы занят прежним открытым
+    // файлом, а сокет wayland-1 держал бы свой lock, и новый компоновщик сел
+    // бы на wayland-2 мимо всех клиентов сессии.
+    if state.exit == Some(crate::state::ExitAction::Restart) {
+        tracing::info!("dawn: выхожу с кодом {} — жду перезапуска", crate::state::RESTART_EXIT_CODE);
+        // Хвост лога должен успеть лечь на диск: дальше процесс не разворачивает
+        // стек, а сразу отдаёт код скрипту.
+        drop(state);
+        std::process::exit(crate::state::RESTART_EXIT_CODE);
     }
 
     Ok(())

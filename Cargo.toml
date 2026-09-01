@@ -45,6 +45,22 @@ mlua = { version = "0.12", features = ["lua54", "vendored"] }
 zbus = "5"
 pipewire = "0.8"
 libspa = "0.8"
+fontdue = "0.9"
+# Только ради доказательства кода в мультиюзере (sha256, см. share/proto.rs):
+# сам код по проводу не идёт, по сети летит sha256(соль ‖ код).
+sha2 = "0.10"
+png = "0.18.1"
+# Значки тем в SVG (см. icons.rs). Без default-features: из полного набора нам
+# не нужны ни шрифты (`text`, `system-fonts` — это fontdb + rustybuzz), ни
+# растровые вставки внутрь SVG (`raster-images` — gif/jpeg/webp), ни .svgz
+# (таких файлов в темах на этой машине нет). Остаётся чистый разбор и
+# растеризация путей: usvg + tiny-skia, обе на Rust, без C.
+resvg = { version = "0.48", default-features = false }
+# VR/AR (см. src/vr/). Высокоуровневая обёртка над OpenXR: она сама грузит
+# libopenxr_loader.so на старте (`Entry::load`), поэтому шлем и рантайм —
+# необязательная зависимость времени ВЫПОЛНЕНИЯ: без них dawn просто не входит
+# в VR-режим, а собирается и работает как раньше.
+openxr = "0.21"
 
 [profile.release]
 # fat LTO + один codegen-unit: оптимизатор видит всю программу разом, что

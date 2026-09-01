@@ -117,6 +117,7 @@ pub fn init_winit(
                 backend.window().request_redraw();
             }
             WinitEvent::CloseRequested => {
+                state.exit = Some(crate::state::ExitAction::Quit);
                 state.loop_signal.stop();
             }
             _ => (),

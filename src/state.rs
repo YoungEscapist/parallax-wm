@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::OsString, sync::Arc, time::Duration};
+use std::{collections::HashMap, ffi::OsString, sync::Arc};
 
 use crate::anim::{CameraAnim, ZoomAnim};
 use smithay::{
@@ -43,6 +43,7 @@ use smithay::{
 
 // ── Viewport ─────────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug)]
 pub struct Viewport {
     pub cam_x: f64,
     pub cam_y: f64,
@@ -91,6 +92,13 @@ pub struct TaggedWindow {
     /// сборке (повторная сборка уже собранного не затирает исходное место), и
     /// снимается при разборке. См. selection.rs.
     pub pre_constellation: Option<Point<i32, Logical>>,
+    /// Размер окна ДО сборки в созвездие — пара к `pre_constellation`.
+    ///
+    /// Появился вместе с halley-раскладкой грозди: она окна ещё и РЕСАЙЗИТ
+    /// (мастеру 60% ширины, остальным доля правой колонки), а роспуск обязан
+    /// быть обратной операцией. Возвращать одну позицию, оставив окна в
+    /// размерах грозди, — значит распустить её только наполовину.
+    pub pre_constellation_size: Option<Size<i32, Logical>>,
     /// Созвездие, в котором состоит окно, «растащено»: одно из его окон увели
     /// руками (драг мышью или Super+стрелки), и взаимное расположение, ради
     /// которого созвездие и заводили, нарушено.
@@ -122,6 +130,46 @@ pub struct Portal {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CursorMode { Normal, Move, Resize, Pan }
 
+// ── ExitAction ───────────────────────────────────────────────────────────────
+
+/// Чем кончается работа компоновщика. Ставится в `Dawn::exit`, а разбирает его
+/// главный цикл в main.rs.
+///
+/// `LoopSignal::stop()` для этого НЕ годится: цикл в main.rs крутится вручную
+/// (`event_loop.dispatch()` в `loop {}`), а флаг сигнала смотрит только
+/// `EventLoop::run()`. Именно поэтому Super+Shift+Q писал в лог «dawn: quit»,
+/// сохранял сессию — и продолжал работать как ни в чём не бывало (логи от
+/// 17.08 и 22.08.2026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitAction {
+    /// Обычный выход: сессия закрывается, launch_native.sh доводит уборку.
+    Quit,
+    /// Перезапуск (Super+R): dawn выходит с кодом [`RESTART_EXIT_CODE`], и
+    /// скрипт запуска поднимает его заново — пересобрав, если исходники
+    /// новее бинаря. Без перелогина в ly.
+    Restart,
+}
+
+/// Код возврата, по которому launch_native.sh понимает «подними меня снова».
+pub const RESTART_EXIT_CODE: i32 = 42;
+
+/// Подпись кнопки сброса вида в шапке карты окон. Одна на отрисовку
+/// (`udev::build_minimap_header`) и на замер её плашки
+/// (`Dawn::minimap_reset_button`) — иначе кнопка разъедется с надписью.
+pub const MINIMAP_RESET_LABEL: &str = "Сбросить вид";
+
+/// Окно на карточке предпросмотра: где оно лежит на СВОЁМ столе и куда класть
+/// его живое содержимое до масштабирования.
+///
+/// `root` — угол дерева поверхностей (позиция минус `geometry().loc`): у окна с
+/// тенями и полями это НЕ угол его прямоугольника, и путать их нельзя — та же
+/// тонкость, что у миниатюр карты.
+pub struct ПредпросмотрОкно {
+    pub window: Window,
+    pub root: Point<i32, Logical>,
+    pub rect: Rectangle<i32, Logical>,
+}
+
 // ── Dawn ─────────────────────────────────────────────────────────────────────
 
 pub struct Dawn {
@@ -130,6 +178,14 @@ pub struct Dawn {
     pub display_handle: DisplayHandle,
     pub space: Space<Window>,
     pub loop_signal: LoopSignal,
+    /// Мультиюзер: раздача рабочего стола гостям. `None` — выключено, и ни
+    /// одна проверка по коду ничего не стоит (см. src/share/mod.rs).
+    pub раздача: Option<crate::share::Раздача>,
+    /// Ручка цикла событий: нужна тем, кто заводит источники не на старте, а
+    /// по ходу дела (мультиюзер: сокет на каждого гостя, см. share/net.rs).
+    pub петля: smithay::reexports::calloop::LoopHandle<'static, Dawn>,
+    /// Пока `None` — работаем; см. [`ExitAction`].
+    pub exit: Option<ExitAction>,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     /// xdg-decoration: без этого глобала GTK-клиенты рисуют свой заголовок и
@@ -183,8 +239,30 @@ pub struct Dawn {
     pub tagged_windows: Vec<TaggedWindow>,
     pub libinput_handle: Option<smithay::reexports::input::Libinput>,
    pub logo_held: bool,
+   /// Тачпады, с которых читаем положение пальцев напрямую (автодовод по
+   /// краям накладки, см. touchpad.rs). Пусто — автодовода нет, и это не
+   /// ошибка: у настольной машины тачпада попросту не бывает.
+   pub тачпады: Vec<crate::touchpad::Тачпад>,
+   /// Когда последний раз двигали курсор автодоводом — из разницы времени
+   /// считается пройденное расстояние.
+   pub автодовод_был: Option<std::time::Instant>,
+   /// Жест тачпада, который идёт прямо сейчас и разбирается таблицей
+   /// `gesture{}` (см. gestures.rs). `None` — жеста нет либо он не наш, и его
+   /// обрабатывают прежние ветки `input.rs`.
+   pub жест: Option<crate::gestures::Идёт>,
+   /// Захват клавиатуры приложением (`keyboard_grab_apps`) снят вручную —
+   /// Super+Shift+Escape. Аварийный выход: пока окно вроде `dshare` держит
+   /// фокус, ни один бинд не работает, и повисни оно — человек остался бы в
+   /// собственном сеансе без единой команды. Возвращается тем же сочетанием.
+   pub захват_клавиш_снят: bool,
    pub pinch_last_scale: f64,
    pub pan_button_held: bool,
+    /// Сколько кнопок мыши удерживается прямо сейчас (любых, считая те, что
+    /// съел сам компоновщик). Пока счётчик не ноль, курсор НЕ переходит на
+    /// соседний монитор: жест начат в одном приложении — выделение текста,
+    /// ползунок, перетаскивание — и уехавшая за край стрелка рвала бы его.
+    /// См. `input.rs`, переход через край.
+    pub кнопок_нажато: u32,
     pub udev_devices: HashMap<smithay::backend::drm::DrmNode, crate::udev::Device>,
     pub tile_config: crate::tiling::TileConfig,
     pub cursor_default_buffer: Option<MemoryRenderBuffer>,
@@ -210,19 +288,33 @@ pub struct Dawn {
     /// двойной/тройной буферизации "тень" предыдущего кадра иначе остаётся в
     /// ещё не отрисованных буферах ещё несколько кадров. См. request_plane_reset().
     pub plane_reset_frames: u8,
+    /// Сколько раз кадр возвращали к развёрнутому окну и когда об этом писали
+    /// в лог (см. `resync_fullscreen_frame`). Строка идёт не чаще раза в
+    /// секунду: в сеансе 23.08 их набралось 15674, и каждая — синхронная
+    /// запись на диск из главного потока.
+    pub fullscreen_resync_счёт: u64,
+    pub fullscreen_resync_лог: Option<std::time::Instant>,
     // ── Анимация (Module 1) ──────────────────────────────────────────────────
     pub momentum: crate::canvas::MomentumState,
     pub camera_anim: Option<crate::anim::CameraAnim>,
     pub zoom_anim: Option<crate::anim::ZoomAnim>,
+    /// Закрытые окна, которые ещё гаснут на экране (см. close.rs). Живут уже
+    /// без клиента — от окна остался только снимок последнего кадра.
+    pub закрытия: Vec<crate::close::Уход>,
     /// Доезд зума колесом (см. anim::ZoomGlide). Живёт отдельно от zoom_anim:
     /// тот везёт камеру по заданной траектории, а этот просто догоняет цель,
     /// которую двигает колесо.
     pub zoom_glide: Option<crate::anim::ZoomGlide>,
     /// true пока Super+Space зажат (bird's-eye view, устар. — см. zoom_nav_mode)
     pub bird_eye_active: bool,
-    /// Режим лупы (Super+Space, тумблер): зум к центру экрана, навигация
-    /// стрелками, повторный Super+Space сбрасывает. См. enter/exit_zoom_nav.
+    /// Режим лупы (Super+Space, тумблер): отдаление НА МАКСИМУМ к центру
+    /// экрана, навигация стрелками, зум при этом заперт. Повторный Super+Space
+    /// возвращает ровно тот кадр, из которого вошли. См. `toggle_zoom_nav`.
     pub zoom_nav_mode: bool,
+    /// Кадр `(cam_x, cam_y, zoom)`, из которого вошли в режим лупы. Именно он
+    /// восстанавливается повторным Super+Space: «вернуться на исходное
+    /// положение» — это вернуть и место, и масштаб, а не просто зум = 1.
+    pub zoom_nav_saved: Option<(f64, f64, f64)>,
     /// Закладки камеры: слот 1-9 → позиция camera (cam_x, cam_y)
     pub camera_bookmarks: HashMap<u32, Point<f64, Logical>>,
     /// Режим закладок камеры (Super+M toggle): true → Super+[1-9] управляют
@@ -233,11 +325,113 @@ pub struct Dawn {
     /// view_tag).
     pub visited_tags: std::collections::HashSet<u32>,
     // ── Module 2 ──────────────────────────────────────────────────────────
-    /// Магнитирование окон при перетаскивании (Super+S toggle)
+    /// Коллизия (Super+A): окна расталкивают друг друга — при перетаскивании,
+    /// при ресайзе соседа и в полёте по инерции. Раньше этот же флаг включал и
+    /// магнитирование, из-за чего два разных поведения нельзя было развести:
+    /// расталкивание хотелось держать включённым постоянно, а прилипание к
+    /// краю соседа — нет.
     pub is_snapping_enabled: bool,
+    /// Магнитирование (Super+M): при ОТПУСКАНИИ окно один раз подравнивается
+    /// краем к ближайшему соседу в пределах SNAP_DISTANCE. Живёт отдельно от
+    /// коллизии и работает независимо от неё.
+    pub is_magnetism_enabled: bool,
     // ── Module 3 ──────────────────────────────────────────────────────────
-    /// Оверлей миникарты (Super+` toggle)
+    /// Оверлей карты окон (Super+` toggle)
     pub is_minimap_visible: bool,
+    /// Насколько убрана ПАНЕЛЬ (см. `bar::island_y`): 0 — на месте, 1 — ушла
+    /// за верхний край вместе со своей полкой состояния.
+    ///
+    /// Цель ставят обзор столов и полный экран, ведёт `anim::tick`. Раньше оба
+    /// просто НЕ РИСОВАЛИ панель — она пропадала кадром, и вход в обзор
+    /// выглядел как мигание. Теперь она спокойно уезжает вверх, пока внизу
+    /// собирается предпросмотр столов.
+    pub bar_hide: f64,
+    /// Прогресс раскрытия карточки карты окон: 0 — закрыта, 1 — раскрыта
+    /// целиком. Тумблер выше только задаёт цель, саму долю ведёт `anim::tick`.
+    /// Карта рисуется, пока доля > 0, — иначе выключение срезало бы её
+    /// мгновенно и закрываться было бы нечему.
+    ///
+    /// **26.08.2026: это ДИАФРАГМА, а не шторка и не выезд вбок.** Пока карта
+    /// была панелью 320×200 в углу, доля двигала её за правый край экрана;
+    /// с переездом в карточку во весь стол доля стала задавать высоту видимой
+    /// части (карта раскрывалась сверху вниз), потому что считалось, что живое
+    /// содержимое окон гасить нечем. Альфу несёт сам источник
+    /// (`Window::render_elements(.., alpha)`), поэтому теперь карточка
+    /// распахивается от центра и одновременно проявляется — см.
+    /// `canvas::minimap_reveal` и `canvas::minimap_fade`. Доля при этом идёт
+    /// ЛИНЕЙНО за фиксированное время, всю форму движения задают эти кривые.
+    pub minimap_slide: f64,
+    // ── Шлем (см. vr/) ───────────────────────────────────────────────────────
+    /// Живая VR-сессия. `None` — dawn обычный композитор, и ни одна строка
+    /// VR-кода не выполняется вовсе. В боксе, потому что структура крупная
+    /// (swapchain'ы, полотна окон), а `Dawn` копируется по стеку в каждом
+    /// обработчике.
+    pub vr: Option<Box<crate::vr::ВР>>,
+    /// Человек попросил шлем, а сессии ещё нет. Подключение делает ближайший
+    /// тик — там, где есть живой рендерер (см. vr::тик_с).
+    pub vr_просят: bool,
+    /// Ждём, когда человек наденет шлем: команда `vr mode` подняла сервер и
+    /// теперь раз в секунду пробует открыть сессию. `None` — не ждём никого,
+    /// и тогда неудачная попытка входа сразу становится отказом.
+    pub vr_ожидание: Option<crate::vr::Ожидание>,
+    /// Канал к потоку, который ищет шлем. Пока он здесь — поток жив и второй
+    /// заводить нельзя.
+    ///
+    /// Поток вообще существует по одной причине: под WiVRn `xrCreateInstance`
+    /// спит до тех пор, пока к серверу не подключится Quest, и никакого
+    /// таймаута у этого сна нет. В главном потоке это означало намертво
+    /// зависший композитор (см. `vr::завести_поиск`).
+    pub vr_поиск: Option<std::sync::mpsc::Receiver<
+        Result<crate::vr::xr::Заготовка, crate::vr::ОшибкаВхода>,
+    >>,
+    /// Раскладка панелей в пространстве. Живёт ВНЕ сессии: человек выбрал
+    /// «стену» — она обязана остаться стеной и в следующий раз, когда он
+    /// наденет шлем.
+    pub vr_раскладка: crate::vr::scene::Раскладка,
+    // ── Minecraft (см. mine/) ────────────────────────────────────────────────
+    /// Живой режим dmine. `None` — сокета нет и ни одна строка mine-кода не
+    /// выполняется. В боксе по той же причине, что и шлем: структура крупная
+    /// (полотна окон), а `Dawn` ездит по стеку в каждом обработчике.
+    pub mine: Option<Box<crate::mine::Шахта>>,
+    /// Зум миникарты (см. canvas::MinimapView): 1.0 — MINIMAP_SPAN_SCREENS
+    /// экранов по ширине. ОТОБРАЖАЕМОЕ значение — доводится к
+    /// `minimap_zoom_target` в `anim::tick`.
+    ///
+    /// **25.08.2026: снова ручной, вместе с `minimap_manual`.** 24.08.2026 тут
+    /// стоял автозум (панель сама подбирала кадр под окна стола), но это была
+    /// избыточная правка на жалобу «клик по карте не должен уносить камеру» —
+    /// Ярик просил убрать именно ТЕЛЕПОРТ, а не сам пульт целиком. Итог правки
+    /// оказался ближе к «мёртвая витрина», чем к «мини-копия мира со своим
+    /// паном и зумом», которую и просили изначально. Пока `minimap_manual`
+    /// снят — цель по-прежнему автоподгонка (`minimap_auto_target`), это
+    /// разумное значение по умолчанию для только что открытой панели. Колесо
+    /// и драг переводят `minimap_manual` в true и дальше цель берётся из
+    /// `minimap_manual_zoom`/`minimap_manual_center` — панель живёт своей
+    /// жизнью, вплоть до ПКМ (`minimap_reset`), который возвращает автоподгонку.
+    pub minimap_zoom: f64,
+    /// Цель доводки зума миникарты — считается в `anim::tick` (авто или ручная
+    /// в зависимости от `minimap_manual`).
+    pub minimap_zoom_target: f64,
+    /// Сглаженный ЦЕНТР ВИДА миникарты (см. `minimap_view`). Сглаживание нужно
+    /// и в ручном режиме — иначе драг наперегонки с инерцией холста дёргал бы
+    /// картинку (см. `minimap_follow_tau`).
+    pub minimap_follow: Point<f64, Logical>,
+    /// Цель для `minimap_follow`, посчитанная в `anim::tick`. Отдельным полем,
+    /// а не заново на каждый вызов: её спрашивает и `anim_busy`, который зовут
+    /// на КАЖДОЙ итерации главного цикла.
+    pub minimap_center_target: Point<f64, Logical>,
+    /// Панель миникарты сейчас под РУЧНЫМ управлением (колесо/драг), а не на
+    /// автоподгонке. Снимается по ПКМ (`minimap_reset`).
+    pub minimap_manual: bool,
+    /// Ручной зум панели — используется как цель, пока `minimap_manual`.
+    /// Заводится (копией текущего отображаемого) в момент ПЕРВОГО колеса или
+    /// драга, чтобы переход в ручной режим не давал скачка.
+    pub minimap_manual_zoom: f64,
+    /// Ручной центр вида панели — используется как цель, пока `minimap_manual`.
+    pub minimap_manual_center: Point<f64, Logical>,
+    /// Идёт ли сейчас драг панели ЛКМ (её собственный пан). Камеру холста не
+    /// трогает — своя копия мира со своим паном, см. `minimap_drag_motion`.
+    pub minimap_drag: bool,
     // ── Module 4 ──────────────────────────────────────────────────────────
     /// Загруженная при старте топология (4.3): app_id → очередь позиций,
     /// расходуется в XdgShellHandler::app_id_changed по мере появления окон.
@@ -256,6 +450,11 @@ pub struct Dawn {
     pub portal_capture: Option<crate::portal::Capture>,
     /// Живой поток кадров в PipeWire (демонстрация экрана идёт прямо сейчас).
     pub portal_cast: Option<crate::portal_stream::Cast>,
+    /// Идёт выделение области для снимка экрана (PrtScr, см. snip.rs).
+    pub snip: Option<crate::snip::Выделение>,
+    /// Готовая область ждёт ближайшего кадра нужного выхода: пиксели живут в
+    /// GlesRenderer, а он принадлежит циклу отрисовки в udev.rs.
+    pub snip_ждёт: Option<crate::snip::Запрос>,
     /// Блютуз: последний снимок BlueZ, канал команд и состояние меню.
     /// None — поток не поднялся (нет системной шины), меню не откроется.
     pub bt: Option<crate::bluetooth::BtUi>,
@@ -266,6 +465,18 @@ pub struct Dawn {
     pub wifi: Option<crate::wifi::WifiUi>,
     /// Звук: устройства вывода/ввода и состояние меню (см. audio.rs).
     pub audio: Option<crate::audio::AudioUi>,
+    /// Трей приложений (StatusNotifierItem): значки Telegram, Vesktop, Steam
+    /// и их готовые текстуры. None — сессионная шина не поднялась (см. sni.rs).
+    pub tray_apps: Option<crate::sni::TrayApps>,
+    /// Часы и дата в том виде, в каком они СЕЙЧАС нарисованы. Держим строками,
+    /// а не временем: `anim::tick` сравнивает их со свежими и только на разнице
+    /// просит перерисовку — иначе панель либо отставала бы на минуту, либо
+    /// будила бы рендер каждый тик (см. bar::clock_text).
+    pub bar_clock: String,
+    pub bar_date: String,
+    /// Короткое имя активной раскладки («RU»); пусто — раскладка одна.
+    /// Обновляется в `Dawn::refresh_kb_layout`.
+    pub bar_kb: String,
     /// Идущий прямо сейчас перебор стопки по Alt+Tab (см. switcher.rs).
     /// Живёт, пока держат Alt.
     pub alt_tab: Option<crate::switcher::AltTab>,
@@ -285,6 +496,23 @@ pub struct Dawn {
     /// переключает и режим. Новый (ещё не посещённый) стол всегда открывается
     /// в Tile — см. view_tag.
     pub tag_layouts: HashMap<u32, crate::tiling::Layout>,
+    // ── Мониторы ─────────────────────────────────────────────────────────────
+    /// Все подключённые выходы: у каждого свой вид на холст, своя карта слоёв
+    /// и свои столы (см. src/monitors.rs). Порядок — порядок подключения.
+    pub мониторы: Vec<crate::monitors::Монитор>,
+    /// Индекс монитора, на котором курсор и клавиатурный фокус. `Dawn::viewport`
+    /// — ЖИВОЙ вид именно этого монитора, у остальных вид лежит в их записи.
+    pub активный: usize,
+    /// На каком мониторе СТРЕЛКА. Почти всегда равен `активный` (фокус идёт за
+    /// мышью), но во время сборки кадра `активный` временно подменяется на
+    /// рисуемый монитор (см. `monitors::войти_в_монитор`), а курсор при этом
+    /// остаётся где был. По расхождению этих двух и решается, рисовать ли
+    /// стрелку в кадре: иначе она двоилась бы на обоих экранах.
+    pub курсор_монитор: usize,
+    /// Кому принадлежит стол — как в hyprland, где воркспейс живёт на
+    /// мониторе. Переход на чужой стол переводит фокус на его монитор, а не
+    /// тащит стол к себе. Ключ — маска тега, значение — индекс монитора.
+    pub tag_monitor: HashMap<u32, usize>,
     // ── Module 5 ──────────────────────────────────────────────────────────
     /// Focus Aura (5.3): последняя цель (позиция, размер) — для детекта смены фокуса.
     pub focus_aura_target: Option<(Point<f64, Logical>, (f64, f64))>,
@@ -296,6 +524,63 @@ pub struct Dawn {
     /// Пружина, а не LERP с длительностью: цель здесь меняется на лету, и
     /// только пружина умеет перенацелиться без разрыва скорости (см. PosAnim).
     pub window_pos_anims: Vec<(Window, crate::anim::PosAnim)>,
+    /// Окна СТОЛА, С КОТОРОГО УХОДЯТ, пока идёт слайд перелистывания.
+    ///
+    /// Они уже сняты с текущего набора тегов (refresh_tags их не покажет), но
+    /// на холсте остаются до конца анимации — иначе уходящий стол не уезжал бы,
+    /// а просто исчезал. Снимает их с холста `anim::tick`, когда их пружины
+    /// доехали (см. `Dawn::слайд_прибрать`).
+    pub слайд_уходят: Vec<Window>,
+    /// Куда встанут ОСТАЛЬНЫЕ окна группы, пока одно из них тащат.
+    ///
+    /// Прямоугольники холста, по одному на члена группы (выделение + созвездие,
+    /// см. `group_drag_members_excluding`), плюс общая рамка вокруг них. Пока
+    /// драг идёт, `move_grab` держит их в актуальном состоянии, на отпускании —
+    /// чистит. Пусто = ничего не рисуем.
+    pub призраки_группы: Vec<Rectangle<i32, Logical>>,
+    /// Ячейка панели под курсором — по ней строится предпросмотр
+    /// (см. `udev::build_bar_preview`). None — курсор не над панелью.
+    pub bar_hover: Option<crate::bar::Cell>,
+    /// Ячейка, чей предпросмотр РИСУЕТСЯ. Отдельно от `bar_hover` потому, что
+    /// карточке надо ещё уехать: курсор ушёл с панели — наведения уже нет, а
+    /// показывать в эти 150 мс всё ещё есть что.
+    pub preview_cell: Option<crate::bar::Cell>,
+    /// Доля раскрытия карточки предпросмотра: 0 — убрана, 1 — раскрыта целиком.
+    /// Ведёт `anim::tick`, читают `canvas::preview_geom` (размер и подъём) и
+    /// `canvas::preview_fade` (проявление).
+    pub preview_anim: f64,
+    /// Курсор стоит на самой КАРТОЧКЕ предпросмотра, а не на ячейке панели.
+    ///
+    /// Держит карточку раскрытой: с 26.08.2026 она работает как маленькая
+    /// миникарта — по ней панят, зумят и кликают, и гаснуть под тянущейся к ней
+    /// мышью она не имеет права. Ведёт `bar_hover_update` (там же, где
+    /// считается сама ячейка), читают `anim::tick` и `anim_busy`.
+    pub preview_hover: bool,
+    /// Собственный зум карточки: 1.0 — кадр стола влезает в неё целиком.
+    /// Сглаженное значение (цель — `preview_view_target`).
+    pub preview_zoom: f64,
+    /// Показываемый центр карточки (точка холста в середине её поля),
+    /// сглаженный тем же способом, что `minimap_follow`.
+    pub preview_center: Point<f64, Logical>,
+    /// Карточку панят/зумят вручную — цель берётся из полей ниже, а не из
+    /// кадра стола. Снимается при уходе курсора и смене ячейки.
+    pub preview_manual: bool,
+    pub preview_manual_zoom: f64,
+    pub preview_manual_center: Point<f64, Logical>,
+    /// Идёт ЛКМ-драг по карточке (её собственный пан).
+    pub preview_drag: bool,
+    /// Масштаб щипка на прошлом кадре — чтобы копить зум карточки из
+    /// абсолютного scale, который присылает libinput.
+    pub preview_pinch_last: f64,
+    /// Куда карточку УЖЕ отпанили руками — по ячейке, к которой она относится
+    /// (стол или чип окна). Наведение на ту же ячейку снова открывает карточку
+    /// ровно там, где её оставили; ПКМ по карточке забывает место, и она опять
+    /// показывает кадр стола целиком. Живёт до конца сеанса — заметка о том,
+    /// куда человек смотрел, ценна ровно тем, что переживает уход курсора.
+    pub preview_память: std::collections::HashMap<crate::bar::Cell, (Point<f64, Logical>, f64)>,
+    /// Доля выезда полки состояния из-под панели. Тумблер (`tray.open`) задаёт
+    /// только цель; пока доля не дошла до неё, полка едет.
+    pub shelf_anim: f64,
     /// Окно, которое ПРЯМО СЕЙЧАС таскают мышью (MoveSurfaceGrab). Его позицию
     /// каждый motion задаёт курсор, поэтому анимации его не трогают: толчок от
     /// прилетевшего соседа дрался бы с мышью, и окно дрожало бы под курсором.
@@ -303,6 +588,27 @@ pub struct Dawn {
     /// Момент прошлого anim::tick — источник реального dt (тик зовут и таймер,
     /// и VBlank, интервал плавает).
     pub anim_last_tick: Option<std::time::Instant>,
+    /// Когда фоновый слой (обои) в последний раз прислал кадр. По свежести
+    /// этой отметки видно, что обои ЖИВЫЕ (dwall крутит видео), а не картинка:
+    /// живым нужен частый тик и сторож кадровых callback'ов, см.
+    /// `Dawn::будить_фоновые_слои`.
+    pub фон_коммит: Option<std::time::Instant>,
+    /// Повреждения бесконечных обоев. Элемент обоев рисуется НАШЕЙ текстурой
+    /// (`build_wallpaper_backdrop`), а не поверхностью клиента, поэтому damage
+    /// tracker сам о новом кадре видео не узнаёт: у статического элемента
+    /// счётчик коммитов не растёт, и на неподвижной камере кадр обоев со сцены
+    /// не переписывается. Мешок сбрасывается на каждом коммите фонового слоя —
+    /// сброс и значит «повреждено всё» (см. `DamageSnapshot::damage_since`).
+    pub wallpaper_damage: smithay::backend::renderer::utils::DamageBag<
+        i32,
+        smithay::utils::Buffer,
+    >,
+    /// Когда сторож в последний раз будил СПЯЩИЕ обои (`фон_коммит` протух).
+    /// Отдельная отметка нужна, чтобы холодная побудка шла редко и не сыпала
+    /// callback'ами 60 раз в секунду в тех случаях, когда фоновый слой на них
+    /// не отвечает вовсе (статичная картинка, обоев нет), см.
+    /// `Dawn::будить_фоновые_слои`.
+    pub фон_побудка: Option<std::time::Instant>,
     /// Анимации появления новых окон "с ростом" (Float-режим).
     pub window_open_anims: Vec<(Window, crate::anim::OpenAnim)>,
     /// Плитки декораций (тень окна, маска угла, полоса параллакса) и пулы их
@@ -328,6 +634,11 @@ pub struct Dawn {
     /// event_loop.dispatch() в main.rs, схлопывая пачку событий одного тика
     /// в один проход по CRTC вместо N (см. request_redraw()).
     pub needs_redraw: bool,
+    /// Куда положить PNG следующего собранного кадра (управляющий сокет,
+    /// команда `shot`). Снимает headless-бэкенд — на DRM-пути кадр и так уходит
+    /// на монитор, а снять его можно grim'ом.
+    pub shot_request: Option<std::path::PathBuf>,
+
     /// Счётчик кадров: раз в секунду печатает, сколько кадров реально ушло на
     /// экран, сколько это стоило по времени и из скольких элементов кадр собран.
     /// Нужен, чтобы «лагает» можно было проверить числом, а не глазом.
@@ -374,6 +685,47 @@ pub struct Dawn {
     pub overview_bg_ids: Vec<crate::udev::SolidSlot>,
     pub minimap_ids: Vec<crate::udev::SolidSlot>,
     pub selection_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул слотов для контуров группового драга (см. udev::build_ghost_elements).
+    pub ghost_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул слотов карточки предпросмотра (см. udev::build_bar_preview).
+    pub preview_ids: Vec<crate::udev::SolidSlot>,
+    /// Id элемента обоев бесконечного холста. Постоянный на всё время работы:
+    /// damage tracker индексируется по нему, и новый Id каждый кадр означал бы
+    /// полную перерисовку экрана (см. udev::build_wallpaper_backdrop).
+    pub wallpaper_id: Option<smithay::backend::renderer::element::Id>,
+    /// Найденные значки приложений (см. icons.rs). Поиск лезет в файловую
+    /// систему, поэтому результат — включая «не нашлось» — кэшируется по имени
+    /// на всё время работы.
+    pub icon_cache: crate::icons::Кэш,
+    /// Готовые буферы значков для чипов окон в панели, по `app_id`.
+    ///
+    /// Собираются НЕ в отрисовке, а при появлении окна (`Dawn::ensure_chip_icon`):
+    /// поиск значка обходит каталоги темы, и делать это внутри кадра значило бы
+    /// подвесить рендер на первом же новом приложении. Буфер живёт до конца
+    /// сеанса: приложений на столе десятки, а не тысячи, и каждый — это
+    /// 20×20×4 байта.
+    pub chip_icons: std::collections::HashMap<
+        String,
+        (smithay::backend::renderer::element::memory::MemoryRenderBuffer, (i32, i32)),
+    >,
+    /// Размытый фон текущего кадра (см. blur.rs). None — блюра нет: выключен,
+    /// шейдер не собрался или обоев ещё нет. Плашки в этом случае рисуются как
+    /// раньше, сплошной полупрозрачной заливкой.
+    pub blur_tex: Option<smithay::backend::renderer::gles::GlesTexture>,
+    /// Шейдер скругления, которым обрезается размытый фон под плашками.
+    /// Копия того же, что скругляет окна (см. rounded.rs): заводить второй
+    /// смысла нет, а тащить `Surface` в сборку элементов панели — лишний шов.
+    pub blur_shape: Option<crate::rounded::Шейдер>,
+    /// Постоянные Id заплат размытия (по одной на остров панели).
+    ///
+    /// Раньше заплата брала `Id::new()` на КАЖДЫЙ кадр. Damage tracker ведёт
+    /// историю по Id: элемент со свежим Id для него каждый кадр новый, а
+    /// вчерашний — исчезнувший, и область под панелью то перерисовывалась
+    /// целиком, то бралась из буфера позапрошлого кадра. Снаружи это ровно то
+    /// самое «маска скругления мигает на баре». Все остальные текстурные
+    /// элементы dawn (плитки обоев, миниатюры миникарты) держат Id в пуле
+    /// именно поэтому — заплата была единственным исключением.
+    pub blur_ids: Vec<smithay::backend::renderer::element::Id>,
     pub portal_ids: Vec<crate::udev::SolidSlot>,
     /// Позиция курсора в последнем ОТРИСОВАННОМ кадре и его время — по ним
     /// видно, отстаёт ли картинка от мыши (см. PTR HIT в input.rs).
@@ -381,10 +733,17 @@ pub struct Dawn {
     pub frame_drawn_at: std::time::Instant,
     /// Пул прямоугольников для подсветки выбора источника (см. portal.rs).
     pub portal_pick_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул заливок для выделения области под снимок (см. snip.rs): затемнение
+    /// вокруг рамки и сама рамка.
+    pub snip_ids: Vec<crate::udev::SolidSlot>,
     /// Пул под панель рабочих столов (бар снизу).
     pub bar_ids: Vec<crate::udev::SolidSlot>,
     /// Пул прямоугольников меню блютуза (фон, строки, подсветка).
     pub bt_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул заливок панели управления раздачей — как `bt_ids` у меню блютуза:
+    /// свой, чтобы два меню не отбирали друг у друга идентификаторы
+    /// поверхностей на кадре, где открыты оба.
+    pub share_ids: Vec<crate::udev::SolidSlot>,
     /// Отдельный пул под значок блютуза у панели столов: он виден и когда меню
     /// открыто, поэтому делить слоты с меню нельзя.
     pub bt_ind_ids: Vec<crate::udev::SolidSlot>,
@@ -638,7 +997,11 @@ impl Dawn {
         self.cursor_named_cache.get(key).and_then(|o| o.as_ref())
     }
 
-    pub fn new(event_loop: &mut EventLoop<Self>, display: Display<Self>) -> Self {
+    /// `'static` у цикла — не украшение: `LoopHandle` кладётся в состояние и
+    /// живёт столько же, сколько сам dawn. Без него нельзя добавлять источники
+    /// НА ХОДУ, а мультиюзеру это нужно на каждое подключение гостя
+    /// (см. share/net.rs).
+    pub fn new(event_loop: &mut EventLoop<'static, Self>, display: Display<Self>) -> Self {
         let dh = display.handle();
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
@@ -681,6 +1044,7 @@ impl Dawn {
         CursorShapeManagerState::new::<Self>(&dh);
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
+        let петля = event_loop.handle();
         let cursor_size = cursor_size_from(&lua_config);
         let cursor_client_max = if lua_config.cursor_client_max >= 0 {
             lua_config.cursor_client_max
@@ -695,6 +1059,9 @@ impl Dawn {
             socket_name,
             space: Space::default(),
             loop_signal,
+            петля,
+            раздача: None,
+            exit: None,
             compositor_state,
             xdg_shell_state,
             xdg_decoration_state,
@@ -724,8 +1091,13 @@ impl Dawn {
             tagged_windows: Vec::new(),
             libinput_handle: None,
            logo_held: false,
+           тачпады: Vec::new(),
+           автодовод_был: None,
+           жест: None,
+           захват_клавиш_снят: false,
            pinch_last_scale: 1.0,
            pan_button_held: false,
+            кнопок_нажато: 0,
             udev_devices: HashMap::new(),
             tile_config: crate::tiling::TileConfig::default(),
             cursor_default_buffer,
@@ -737,39 +1109,92 @@ impl Dawn {
             session: None,
             session_active: true,
             plane_reset_frames: 0,
-            momentum: crate::canvas::MomentumState::new(0.5),
+            fullscreen_resync_счёт: 0,
+            fullscreen_resync_лог: None,
+            momentum: crate::canvas::MomentumState::new(lua_config.pan_drift),
             camera_anim: None,
             zoom_anim: None,
+            закрытия: Vec::new(),
             zoom_glide: None,
             bird_eye_active: false,
             zoom_nav_mode: false,
+            zoom_nav_saved: None,
             camera_bookmarks: HashMap::new(),
             bookmarks_mode: false,
             // Начальный воркспейс (tag 1) считается уже посещённым — при
             // возврате на него после ухода layout не сбрасывается.
             visited_tags: std::collections::HashSet::from([1u32]),
             is_snapping_enabled: false,
+            is_magnetism_enabled: false,
             is_minimap_visible: false,
+            minimap_slide: 0.0,
+            vr: None,
+            vr_просят: false,
+            vr_ожидание: None,
+            vr_поиск: None,
+            vr_раскладка: crate::vr::scene::Раскладка::Дуга,
+            mine: None,
+            bar_hide: 0.0,
+            minimap_zoom: 1.0,
+            minimap_zoom_target: 1.0,
+            minimap_follow: Point::from((0.0, 0.0)),
+            minimap_center_target: Point::from((0.0, 0.0)),
+            minimap_manual: false,
+            minimap_manual_zoom: 1.0,
+            minimap_manual_center: Point::from((0.0, 0.0)),
+            minimap_drag: false,
             pending_session: crate::session::load(),
             portal: None,
             fullscreens: Vec::new(),
             portal_pick: None,
             portal_capture: None,
             portal_cast: None,
+            snip: None,
+            snip_ждёт: None,
             bt: None,
             tray: None,
             wifi: None,
             audio: None,
+            tray_apps: None,
+            bar_clock: crate::bar::clock_text(),
+            bar_date: crate::bar::date_text(),
+            bar_kb: String::new(),
             alt_tab: None,
             search: None,
             tag_cameras: HashMap::new(),
             tag_layouts: HashMap::new(),
+            мониторы: Vec::new(),
+            активный: 0,
+            курсор_монитор: 0,
+            // Первый стол закреплён за первым монитором заранее: он открыт с
+            // самого старта (Viewport::default), а `закрепить_стол` зовётся
+            // только при ПЕРЕХОДЕ на стол — без этой строки стол 1 остался бы
+            // ничьим и первый же Super+1 «переехал» бы на него как на новый.
+            tag_monitor: HashMap::from([(1u32, 0usize)]),
             focus_aura_target: None,
             focus_aura_current: None,
             focus_aura_anim: None,
             window_pos_anims: Vec::new(),
+            слайд_уходят: Vec::new(),
+            призраки_группы: Vec::new(),
+            bar_hover: None,
+            preview_cell: None,
+            preview_anim: 0.0,
+            preview_hover: false,
+            preview_zoom: 1.0,
+            preview_center: Point::from((0.0, 0.0)),
+            preview_manual: false,
+            preview_manual_zoom: 1.0,
+            preview_manual_center: Point::from((0.0, 0.0)),
+            preview_память: std::collections::HashMap::new(),
+            preview_drag: false,
+            preview_pinch_last: 1.0,
+            shelf_anim: 0.0,
             dragged_window: None,
             anim_last_tick: None,
+            фон_коммит: None,
+            фон_побудка: None,
+            wallpaper_damage: Default::default(),
             window_open_anims: Vec::new(),
             decor: crate::decor::DecorCache::new(),
             pre_tiling_view: None,
@@ -777,6 +1202,7 @@ impl Dawn {
             gesture_resize_window: None,
             gesture_resize_group: Vec::new(),
             needs_redraw: true,
+            shot_request: None,
             render_stats: crate::udev::RenderStats::new(),
             lua_config,
             selection_drag: None,
@@ -812,12 +1238,22 @@ impl Dawn {
             overview_bg_ids: Vec::new(),
             minimap_ids: Vec::new(),
             selection_ids: Vec::new(),
+            ghost_ids: Vec::new(),
+            preview_ids: Vec::new(),
+            wallpaper_id: None,
+            icon_cache: crate::icons::Кэш::default(),
+            chip_icons: std::collections::HashMap::new(),
+            blur_tex: None,
+            blur_shape: None,
+            blur_ids: Vec::new(),
             portal_ids: Vec::new(),
             portal_pick_ids: Vec::new(),
             frame_cursor: Point::from((0.0, 0.0)),
             frame_drawn_at: std::time::Instant::now(),
+            snip_ids: Vec::new(),
             bar_ids: Vec::new(),
             bt_ids: Vec::new(),
+            share_ids: Vec::new(),
             bt_ind_ids: Vec::new(),
             tray_ids: Vec::new(),
             menu_ids: Vec::new(),
@@ -911,8 +1347,15 @@ impl Dawn {
     // выхода всегда равен размеру экрана, а ВИДИМАЯ часть холста при отдалении
     // больше экрана — её даёт visible_canvas_size().
 
-    /// Размер экрана в логических пикселях (режим монитора).
+    /// Размер экрана в логических пикселях — АКТИВНОГО монитора.
+    ///
+    /// Раньше здесь стоял «первый выход из space», и с двумя мониторами это
+    /// значило, что панель, миникарта и весь экранный слой второго монитора
+    /// считались по размеру первого.
     pub fn screen_size(&self) -> Size<i32, Logical> {
+        if !self.мониторы.is_empty() {
+            return self.монитор_размер();
+        }
         self.space.outputs().next()
             .and_then(|o| o.current_mode())
             .map(|m| Size::from((m.size.w, m.size.h)))
@@ -982,7 +1425,10 @@ impl Dawn {
         let cam_x = self.viewport.cam_x.round() as i32;
         let cam_y = self.viewport.cam_y.round() as i32;
         let zoom = self.viewport.zoom;
-        let output = self.space.outputs().next().cloned();
+        // Выход АКТИВНОГО монитора: `Dawn::viewport` — его вид, и двигать по
+        // нему чужой выход значило бы утащить второй монитор за первым.
+        let output = self.монитор().map(|m| m.output.clone())
+            .or_else(|| self.space.outputs().next().cloned());
         if let Some(output) = output {
             // Zoom через fractional scale — правильный способ.
             //
@@ -1010,6 +1456,29 @@ impl Dawn {
             let mapped = self.space.output_geometry(&output).map(|g| g.loc);
             if mapped != Some(Point::from((cam_x, cam_y))) {
                 self.space.map_output(&output, (cam_x, cam_y));
+            }
+        }
+    }
+
+    /// Свести КАЖДЫЙ выход с камерой СВОЕГО монитора.
+    ///
+    /// `apply_camera` двигает только активный выход — он и должен, его зовут
+    /// из тика анимации десятки раз в секунду. Но у неактивных мониторов
+    /// камера тоже своя, и после смены активного (или прихода нового выхода)
+    /// их привязку надо поставить один раз. Без этого второй монитор стоял бы
+    /// в точке, куда его положил `map_output` при подключении, и показывал
+    /// чужой кусок холста.
+    pub fn apply_camera_all(&mut self) {
+        self.сохранить_вид();
+        let места: Vec<(smithay::output::Output, Point<i32, Logical>)> = self.мониторы.iter()
+            .map(|m| (
+                m.output.clone(),
+                Point::from((m.viewport.cam_x.round() as i32, m.viewport.cam_y.round() as i32)),
+            ))
+            .collect();
+        for (output, loc) in места {
+            if self.space.output_geometry(&output).map(|g| g.loc) != Some(loc) {
+                self.space.map_output(&output, loc);
             }
         }
     }
@@ -1055,6 +1524,31 @@ impl Dawn {
         self.apply_camera();
         let pos = self.pointer_location;
         self.warp_pointer(pos);
+    }
+
+    /// Курсор едет за содержимым мини-копии мира (карта окон, карточка
+    /// предпросмотра): сдвинуть стрелку на ту же ЭКРАННУЮ дельту, на которую
+    /// уехало содержимое под ней.
+    ///
+    /// Зачем это отдельно от обычного движения мыши. Пан карты обрабатывается
+    /// раньше и забирает событие себе целиком — иначе тот же жест ещё и панил
+    /// бы холст под картой. Но вместе с событием пропадала и единственная точка,
+    /// где двигается курсор, и стрелка примерзала к экрану, пока карта уезжала
+    /// из-под неё (жалоба 26.08.2026). У пана холста стрелка остаётся на той же
+    /// точке ХОЛСТА и потому идёт по экрану за рукой (`pan_camera_by`); здесь
+    /// то же самое, только «холст» — содержимое карты, и держать под стрелкой
+    /// надо схваченный кусок мира.
+    pub fn drag_pointer_by_screen(&mut self, dx: f64, dy: f64) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        let z = self.viewport.zoom.max(0.01);
+        let pos = Point::from((
+            self.pointer_location.x + dx / z,
+            self.pointer_location.y + dy / z,
+        ));
+        self.warp_pointer(pos);
+        self.request_redraw();
     }
 
     /// Вторая половина `pan_camera_by` для тех мест, где камера считается не
@@ -1148,6 +1642,10 @@ impl Dawn {
     /// делает anim::ZoomGlide. Раньше зум переставлялся здесь же, и каждый
     /// щелчок был мгновенным скачком на 10%.
     pub fn zoom_step_at_cursor(&mut self, factor: f64) {
+        // Режим лупы держит максимум отдаления и зум не отдаёт (см. zoom_locked).
+        if self.zoom_locked() {
+            return;
+        }
         let cursor = self.pointer_location;
         let zoom = self.viewport.zoom;
         // Экранная точка курсора: её и держим неподвижной весь доезд.
@@ -1159,7 +1657,7 @@ impl Dawn {
         // быстрый прокрут терял бы щелчки — каждый следующий считался бы от
         // ещё не доехавшего зума.
         let base = self.zoom_glide.as_ref().map(|g| g.target).unwrap_or(zoom);
-        let target = (base * factor).clamp(0.05, 5.0);
+        let target = (base * factor).clamp(Self::ZOOM_MIN, Self::ZOOM_MAX);
         // Жест пользователя главнее перелёта камеры: иначе обе анимации
         // писали бы zoom по очереди и картинка дрожала бы.
         self.zoom_anim = None;
@@ -1380,11 +1878,10 @@ impl Dawn {
         const PORTAL_W: i32 = 320;
         const PORTAL_H: i32 = 240;
         const MARGIN: i32 = 20;
-        let output = match self.space.outputs().next() { Some(o) => o.clone(), None => return };
-        let mode = match output.current_mode() { Some(m) => m, None => return };
+        let экран = self.screen_size();
         self.portal = Some(Portal {
             surface: focused,
-            screen_pos: Point::from((mode.size.w - PORTAL_W - MARGIN, MARGIN)),
+            screen_pos: Point::from((экран.w - PORTAL_W - MARGIN, MARGIN)),
             box_size: Size::from((PORTAL_W, PORTAL_H)),
         });
         tracing::info!("dawn: portal opened");
@@ -1470,22 +1967,126 @@ impl Dawn {
 
     // ── Tag operations ───────────────────────────────────────────────────────
 
-    /// Переключиться на тег (Super+N)
+    /// Переключиться на тег (Super+N).
+    ///
+    /// Стол принадлежит монитору (`tag_monitor`), и это меняет смысл перехода
+    /// при двух экранах: Super+2, когда второй стол живёт на соседнем мониторе,
+    /// — это «перейти ТУДА», а не «показать его стол у себя». Так же ведёт себя
+    /// hyprland, и без этого получалось зеркало: камера своего монитора уезжала
+    /// в чужой дом холста (`view_tag → 0b10 (кадр 999398,887)` при своём доме в
+    /// нуле), оба экрана показывали одни и те же окна, а стрелка с клавиатурой
+    /// оставались на покинутом.
+    ///
+    /// Стрелку уводим следом за фокусом: dawn живёт на sloppy focus (фокус идёт
+    /// за мышью), поэтому курсор, брошенный на прежнем мониторе, первым же
+    /// движением руки отобрал бы фокус обратно.
     pub fn view_tag(&mut self, tag: u32) {
-        use crate::tiling::Layout;
         // Из обзора столов переход по столам = ВЫХОД из обзора на этот стол.
-        // Guard стоит здесь, а не в dispatch_action, потому что сюда приходят и
-        // другие бинды: workspace_step (Super+PageUp/Down),
-        // move_column_to_workspace. Раньше они меняли теги и дёргали
-        // set_layout/arrange, пока обзор ещё активен, а его снимок геометрии
-        // (overview_prev/overview_saved_geo) оставался от прежнего стола — на
-        // выходе окна восстанавливались не туда, и «бинды столов ломались».
-        // Рекурсии нет: exit_overview_immediate зовёт view_tag уже с
-        // overview_active = false.
+        // Guard стоит ДО переезда между мониторами: exit_overview_immediate
+        // зовёт view_tag заново, и переезд отработает там — иначе он случился бы
+        // дважды, второй раз уже с чужой камерой в снимке обзора.
         if self.overview_active {
             self.exit_overview_immediate(Some(tag));
             return;
         }
+        let переезд = match self.монитор_стола(tag) {
+            // Стол на соседнем экране — переезжаем к нему.
+            Some(м) if м != self.активный => self.активировать_монитор(м),
+            Some(_) => false,
+            // Стол ещё ничей: закрепляем за тем монитором, на котором его
+            // открыли. Иначе он остался бы «общим», и второй монитор,
+            // переключившись на него же, показывал бы то же самое — то самое
+            // зеркало, от которого уходим.
+            None => {
+                let свой = self.активный;
+                self.закрепить_стол(tag, свой);
+                false
+            }
+        };
+        self.view_tag_inner(tag);
+        if переезд {
+            self.курсор_на_свой_монитор(tag);
+        }
+    }
+
+    /// Верхнее окно стола — то, которому логично отдать фокус, приехав на него.
+    fn верхнее_окно_стола(&self, tag: u32) -> Option<Window> {
+        // space.elements() идёт снизу вверх, поэтому верхнее — последнее.
+        self.space.elements()
+            .filter(|w| self.tagged_windows.iter()
+                .any(|tw| &tw.window == *w && tw.tags & tag != 0))
+            .next_back()
+            .cloned()
+    }
+
+    /// Перенести стрелку на монитор, который только что стал активным.
+    ///
+    /// **Зачем.** Переход на стол соседнего экрана делается с клавиатуры, и
+    /// никакого движения мыши за ним не следует — а фокус в dawn идёт за мышью
+    /// (`input::sloppy_focus`). Стрелка, брошенная на прежнем мониторе, — это
+    /// «смотрю на один экран, печатаю в другой», и первое же шевеление руки
+    /// утаскивает фокус обратно.
+    ///
+    /// **Почему цель считается по БУДУЩЕМУ кадру.** Переход обычно
+    /// заканчивается перелётом камеры (`camera_anim`/`zoom_anim`), то есть в
+    /// момент вызова монитор смотрит ещё не туда. Пока камера летит,
+    /// `sync_pointer_to_camera` держит стрелку в одной точке ЭКРАНА — значит
+    /// надо сразу посчитать, где цель окажется на экране, КОГДА камера долетит,
+    /// и поставить стрелку туда. По текущей камере ставить нельзя: точка холста
+    /// под стрелкой уедет вместе с кадром.
+    fn курсор_на_свой_монитор(&mut self, tag: u32) {
+        let окно = self.верхнее_окно_стола(tag);
+        let (кам_x, кам_y, зум) = self.view_frame_target();
+        let зум = зум.max(0.01);
+        let экран = self.screen_size();
+        // Целимся в середину верхнего окна стола; стол пуст — в середину экрана.
+        let цель: Point<f64, Logical> = окно.as_ref()
+            .and_then(|w| self.space.element_geometry(w))
+            .map(|g| Point::from((
+                (g.loc.x as f64 + g.size.w as f64 / 2.0 - кам_x) * зум,
+                (g.loc.y as f64 + g.size.h as f64 / 2.0 - кам_y) * зум,
+            )))
+            .unwrap_or_else(|| Point::from((экран.w as f64 / 2.0, экран.h as f64 / 2.0)));
+        // Окно может стоять частью за краем кадра — стрелке место на экране.
+        let на_экране = Point::from((
+            цель.x.clamp(0.0, экран.w as f64),
+            цель.y.clamp(0.0, экран.h as f64),
+        ));
+        let pos = self.screen_to_canvas(на_экране);
+        self.warp_pointer(pos);
+        // Клавиатура следом. Сам перенос стрелки фокус не двигает: sloppy focus
+        // живёт в обработчике ввода, а события мыши здесь нет. `refocus_visible`
+        // тоже не поможет — окно покинутого монитора остаётся в `space` (там
+        // лежат окна ВСЕХ видимых столов, см. `видимые_теги`), и он считает
+        // фокус живым. Слой, держащий клавиатуру (открытый fuzzel, строка поиска
+        // dwall), — исключение: отобрать у него ввод значит закрыть его.
+        if self.layer_keyboard.is_none() {
+            match окно {
+                Some(w) => crate::xwin::focus(self, &w),
+                None => {
+                    if let Some(kb) = self.seat.get_keyboard() {
+                        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                        kb.set_focus(self, None, serial);
+                    }
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Собственно переход на стол — уже на том мониторе, которому он
+    /// принадлежит (см. [`Dawn::view_tag`]).
+    fn view_tag_inner(&mut self, tag: u32) {
+        use crate::tiling::Layout;
+        // Обзор столов сюда не доходит: guard стоит в `view_tag`, а он —
+        // единственный вход. Держать его надо именно там, а не в
+        // dispatch_action, потому что переход по столам приходит и от других
+        // биндов: workspace_step (Super+PageUp/Down), move_column_to_workspace.
+        // Раньше они меняли теги и дёргали set_layout/arrange, пока обзор ещё
+        // активен, а его снимок геометрии (overview_prev/overview_saved_geo)
+        // оставался от прежнего стола — на выходе окна восстанавливались не
+        // туда, и «бинды столов ломались».
+        //
         // У каждого воркспейса свой КАДР (камера + зум) И своя раскладка —
         // запоминаем текущие перед уходом, восстанавливаем сохранённые для
         // нового тега.
@@ -1499,8 +2100,20 @@ impl Dawn {
         // в какую изоляцию мы едем.
         let is_new = !self.visited_tags.contains(&tag);
         let target_layout = if is_new {
-            // Новые столы всегда открываются в Tile.
-            Layout::Tile
+            // Новый стол открывается в Tile — КРОМЕ прихода из ленты.
+            //
+            // Лента (niri) — это стопка этажей, и прокрутка вниз заводит
+            // очередной этаж ТОЙ ЖЕ ленты; пустой этаж снизу существует ровно
+            // для этого (см. `niri_ws_count`, `columns_tag_foreign`: «зайдя на
+            // непосещённый стол из ленты, он становится ленточным»). Пока тут
+            // стоял безусловный Tile, шаг вниз (Super+PageDown, свайп) выбивал
+            // из ленты в тайлинг: стол, только что бывший её пустым этажом,
+            // становился ей ЧУЖИМ, и лента укорачивалась под ногами.
+            if self.tile_config.layout == Layout::Columns {
+                Layout::Columns
+            } else {
+                Layout::Tile
+            }
         } else {
             *self.tag_layouts.get(&tag).unwrap_or(&Layout::Tile)
         };
@@ -1524,6 +2137,13 @@ impl Dawn {
         // считается по tag_layouts, см. columns_is_strip_tag.
         self.visited_tags.insert(tag);
         self.tag_layouts.insert(tag, target_layout);
+        // Кто сейчас на экране — снимаем ДО смены тега: после refresh_tags эти
+        // окна уже не найти по тегам, а уехать за край они обязаны (см.
+        // `слайд_столов`). Позиции берём настоящие, из space.
+        let уходящие: Vec<(Window, Point<i32, Logical>)> = self.tagged_windows.iter()
+            .filter(|tw| tw.tags & old_tag != 0 && tw.tags & tag == 0)
+            .filter_map(|tw| self.space.element_geometry(&tw.window).map(|g| (tw.window.clone(), g.loc)))
+            .collect();
         self.viewport.tagset[self.viewport.seltags] = tag;
         self.refresh_tags();
         // Фокус за окном, которое только что ушло с экрана, — это клавиатура,
@@ -1562,7 +2182,7 @@ impl Dawn {
                     let to = self.camera_anim.as_ref().map(|a| a.to).unwrap_or(from);
                     self.camera_anim = None;
                     self.zoom_anim = Some(ZoomAnim::new_pan(
-                        from, to, self.viewport.zoom, zoom, Duration::from_millis(220),
+                        from, to, self.viewport.zoom, zoom, crate::anim::дуг::перелёт_к_столу(),
                     ));
                 }
             }
@@ -1571,17 +2191,25 @@ impl Dawn {
         }
 
         if is_new {
-            // Стол ещё не видели: показывать его неоткуда — ставим кадр в
-            // начало координат сами. Раньше это делал restore_layout, но
-            // теперь он камеру при ПЕРЕХОДЕ НА СТОЛ не трогает (иначе затирал
-            // бы запомненный кадр, см. tiling::set_layout_inner).
+            // Стол ещё не видели: показывать его неоткуда — ставим кадр в угол
+            // сами. Раньше это делал restore_layout, но теперь он камеру при
+            // ПЕРЕХОДЕ НА СТОЛ не трогает (иначе затирал бы запомненный кадр,
+            // см. tiling::set_layout_inner).
+            //
+            // Угол — это ДОМ СВОЕГО МОНИТОРА, а не начало координат холста.
+            // Пока dawn был одномониторным, это было одно и то же; со вторым
+            // монитором дом уезжает на `ШАГ_ДОМА` (см. monitors.rs), окна
+            // нового стола раскладываются от него (`tiling::screen_area`), а
+            // камера, оставленная в нуле, смотрела бы на чужой дом — свои окна
+            // за краем, а на экране зеркало соседнего монитора.
+            let дом = self.монитор_дом();
             self.restore_layout(target_layout);
             self.momentum.stop();
             self.camera_anim = None;
             self.zoom_anim = None;
             self.viewport.zoom = 1.0;
-            self.viewport.cam_x = 0.0;
-            self.viewport.cam_y = 0.0;
+            self.viewport.cam_x = дом.x as f64;
+            self.viewport.cam_y = дом.y as f64;
             self.apply_camera();
             tracing::info!("dawn: view_tag → {:#b} (new workspace → {})", tag, target_layout.symbol());
             return;
@@ -1605,10 +2233,12 @@ impl Dawn {
         // Когда зум меняется, камеру ведёт ZoomAnim::new_pan: две отдельные
         // анимации (camera_anim + zoom_anim) писали бы cam_x/cam_y по очереди
         // каждый кадр и дрались бы между собой.
+        let дом = self.монитор_дом();
         let frame = self.tag_cameras.get(&tag).copied()
             // Стол посещали ДО того, как кадры начали запоминаться (или он
-            // потерял запись) — открываем его в начале координат, как раньше.
-            .unwrap_or((0.0, 0.0, 1.0));
+            // потерял запись) — открываем его в углу своего монитора (на одном
+            // мониторе это и есть начало координат, как было раньше).
+            .unwrap_or((дом.x as f64, дом.y as f64, 1.0));
         let (x, y, zoom) = frame;
         let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
         let to = Point::from((x, y));
@@ -1618,11 +2248,11 @@ impl Dawn {
         if зум_иной {
             self.camera_anim = None;
             self.zoom_anim = Some(ZoomAnim::new_pan(
-                from, to, self.viewport.zoom, zoom, Duration::from_millis(300),
+                from, to, self.viewport.zoom, zoom, crate::anim::дуг::перелёт_к_столу(),
             ));
         } else if сдвиг {
             self.zoom_anim = None;
-            self.camera_anim = Some(CameraAnim::new(from, to, Duration::from_millis(300)));
+            self.camera_anim = Some(CameraAnim::new(from, to, crate::anim::дуг::перелёт_к_столу()));
         } else {
             self.camera_anim = None;
             self.zoom_anim = None;
@@ -1630,10 +2260,105 @@ impl Dawn {
             self.viewport.cam_y = y;
             self.viewport.zoom = zoom;
             self.apply_camera();
+            // Кадр у обоих столов один и тот же — значит перелёт камеры ничего
+            // не покажет, и переход выглядел бы как мгновенная подмена окон.
+            // Вот здесь и место слайду.
+            self.слайд_столов(old_tag, tag, уходящие);
         }
         tracing::info!(
             "dawn: view_tag → {:#b} (кадр {:.0},{:.0} zoom {:.2})", tag, x, y, zoom,
         );
+    }
+
+    /// Перелистывание столов вбок, как в Hyprland: уходящий стол уезжает за
+    /// край экрана, приходящий въезжает с противоположной стороны.
+    ///
+    /// **Почему движутся ОКНА, а не камера.** В dawn все столы собираются в
+    /// одном прямоугольнике холста — экран от (0,0), см. `tiling::screen_area`
+    /// (там же и разгадка обзора «как есть»). То есть между столами нет
+    /// пространственного отношения, которое камера могла бы проехать: сдвинуть
+    /// её некуда, соседний стол лежит ровно там же. Поэтому едут окна, каждое
+    /// своей пружиной, — тем же механизмом, которым собирается тайлинг.
+    ///
+    /// Сторона определяется НОМЕРОМ стола: с первого на третий листаем влево
+    /// (новый приходит справа), обратно — вправо. Это единственное, что делает
+    /// перелистывание перелистыванием, а не случайным разлётом.
+    ///
+    /// Слайд НЕ запускается, если у столов разные кадры (камера или зум): там
+    /// переходом уже служит перелёт камеры, и два движения разом читались бы
+    /// как рывок в две стороны.
+    fn слайд_столов(
+        &mut self,
+        old_tag: u32,
+        tag: u32,
+        уходящие: Vec<(Window, Point<i32, Logical>)>,
+    ) {
+        let Some(экран) = self.screen_area() else { return };
+        // Зазор между столами: без него окно, стоящее у самого края, кажется
+        // перетекающим на соседний стол, а не сменяющимся.
+        const ЗАЗОР: i32 = 120;
+        let шаг = экран.size.w + ЗАЗОР;
+
+        let Some(сторона) = слайд_сторона(old_tag, tag) else { return };
+
+        // Дом приходящих берём из `tw.position`, а НЕ из живой геометрии в
+        // space. Разница видна при быстром перелистывании (1→2→1): окна
+        // первого стола в этот момент ещё летят за край, и `element_geometry`
+        // вернула бы точку на полпути. Именно она стала бы целью въезда — стол
+        // открывался бы с окнами, застрявшими где попало, и с каждым
+        // перелистыванием всё дальше. `tw.position` слайд не трогает, там
+        // настоящее место окна на столе.
+        let приходящие: Vec<(Window, Point<i32, Logical>)> = self.tagged_windows.iter()
+            .filter(|tw| tw.tags & tag != 0)
+            .filter(|tw| self.space.element_geometry(&tw.window).is_some())
+            .map(|tw| (tw.window.clone(), tw.position))
+            .collect();
+        if приходящие.is_empty() && уходящие.is_empty() {
+            return;
+        }
+
+        let dur = crate::anim::дуг::слайд_стола();
+        // Прошлый слайд прибираем ПЕРВЫМ делом.
+        //
+        // Порядок здесь не косметика. При быстром «туда-обратно» (1→2→1) окна
+        // первого стола ещё уезжают за край и лежат в `слайд_уходят` — и они же
+        // оказываются ПРИХОДЯЩИМИ на втором переходе. Прибери мы их после того,
+        // как приходящие уже расставлены, — уборка сняла бы с холста и погасила
+        // анимацию ровно у тех окон, которые только что запустили обратно.
+        self.слайд_прибрать();
+        // Приходящие ставим за краем и отпускаем в их настоящие места.
+        for (w, дом) in приходящие {
+            let старт = Point::from((дом.x + сторона * шаг, дом.y));
+            self.space.map_element(w.clone(), старт, false);
+            self.animate_window_to_dur(&w, дом, dur);
+        }
+        // Уходящие остаются на холсте и уезжают в противоположную сторону.
+        // refresh_tags их уже снял — возвращаем на место, откуда они поедут.
+        for (w, дом) in уходящие {
+            self.space.map_element(w.clone(), дом, false);
+            let край = Point::from((дом.x - сторона * шаг, дом.y));
+            self.animate_window_to_dur(&w, край, dur);
+            self.слайд_уходят.push(w);
+        }
+        self.request_plane_reset();
+        self.request_redraw();
+    }
+
+    /// Снять с холста окна уехавшего стола. Зовётся из `anim::tick`, когда их
+    /// пружины доехали, и здесь же — если новый слайд начался раньше, чем
+    /// закончился прошлый (быстрое перелистывание через несколько столов).
+    pub fn слайд_прибрать(&mut self) {
+        for w in std::mem::take(&mut self.слайд_уходят) {
+            self.space.unmap_elem(&w);
+            self.window_pos_anims.retain(|(x, _)| !crate::dwindle::same_window(x, &w));
+        }
+    }
+
+    /// Доехали ли уходящие окна слайда.
+    pub fn слайд_доехал(&self) -> bool {
+        !self.слайд_уходят.iter().any(|w| {
+            self.window_pos_anims.iter().any(|(x, _)| crate::dwindle::same_window(x, w))
+        })
     }
 
     /// Число активных воркспейсов в niri-модели: индекс последнего занятого
@@ -1643,10 +2368,13 @@ impl Dawn {
     pub fn niri_ws_count(&self) -> i32 {
         // Считаем ЭТАЖИ ленты, а не биты тегов, и только по своим столам:
         // чужой (тайловый) стол в середине не должен ни занимать этаж, ни
-        // удлинять ленту (см. columns_tag_foreign).
+        // удлинять ленту (см. columns_tag_foreign). «Свои» — ещё и по монитору:
+        // у каждого экрана своя лента, и окна соседнего не обязаны удлинять
+        // мою (иначе свайп вниз уезжал бы на пустые этажи чужих столов).
+        let свои = self.columns_strip_order();
         let mut highest = self.columns_floor_index(self.viewport.current_tags()) + 1;
         for tw in &self.tagged_windows {
-            if !tw.floating && tw.tags != 0 && !self.columns_tag_foreign(tw.tags) {
+            if !tw.floating && tw.tags != 0 && свои.contains(&tw.tags) {
                 let idx = self.columns_floor_index(tw.tags) + 1;
                 if idx > highest { highest = idx; }
             }
@@ -1781,12 +2509,13 @@ impl Dawn {
             }
         }
 
-        if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-            crate::xwin::is_surface(&tw.window, &focused)
-        }) {
-            tw.tags = tag;
-            tracing::info!("dawn: tag_window → {:#b}", tag);
-        }
+        // Стол-приёмник может жить на ДРУГОМ мониторе, а окна лежат на холсте
+        // от дома своего монитора: одной сменой тега окно уехало бы «в никуда»
+        // — с прежнего экрана пропало (тег сменился), на новом не появилось (до
+        // его дома ШАГ_ДОМА пикселей). Перенос делает `перенести_окно_на_стол`,
+        // он же вынимает окно из дерева донора.
+        let сменил_монитор = self.перенести_окно_на_стол(&window, tag, true);
+        tracing::info!("dawn: tag_window → {:#b}", tag);
         // Окно ушло со СВОЕГО стола — донор обязан сомкнуться сразу. Полоса
         // держит его в колонке, дерево dwindle — в листе, и вычищают их только
         // columns_reconcile / sync_dwindle_tree, то есть arrange. Без него на
@@ -1794,6 +2523,23 @@ impl Dawn {
         // раскладкой: refresh_tags лишь снимает окно с холста.
         self.refresh_tags();
         self.arrange();
+        // …и едем следом. Отправить окно на другой стол и остаться смотреть на
+        // дыру, где оно было, — не то, чего ждут от Win+Shift+цифра: окно
+        // уносят туда, где собираются с ним работать. Слайд при этом честно
+        // везёт его с собой — оно уже принадлежит новому столу и въезжает
+        // вместе с ним (см. слайд_столов).
+        if old_tag != tag {
+            self.view_tag(tag);
+            // …и раскладываем стол-ПРИЁМНИК. `view_tag_inner` зовёт `arrange`
+            // только для нового или ленточного стола: на посещённый тайловый он
+            // лишь перелетает камерой, и приехавшее окно осталось бы стоять там,
+            // где его застал перенос, — поверх соседей, а на другом мониторе ещё
+            // и не своего размера. Здесь мы уже на мониторе-приёмнике, поэтому
+            // `arrange` считает по ЕГО экрану.
+            if сменил_монитор {
+                self.arrange();
+            }
+        }
     }
 
     /// Toggle тег на focused окне (Super+Ctrl+Shift+N)
@@ -1818,10 +2564,43 @@ impl Dawn {
     /// Обновить space — показать только окна с видимыми тегами
     pub fn refresh_tags(&mut self) {
         let current = self.viewport.current_tags();
+        // Обои едут за столом (см. monitors::СлайдОбоев). Здесь, а не в
+        // view_tag: сюда сходятся все смены тегов, а повторный вызов с тем же
+        // столом слайд не трогает.
+        self.обновить_слайд_обоев();
 
-        // Сохраняем позиции перед unmapping
+        // Сохраняем позиции перед unmapping.
+        //
+        // У ЛЕТЯЩЕГО окна берём цель пружины, а не то место, где оно оказалось
+        // в этом кадре. Иначе refresh_tags, случившийся посреди анимации,
+        // замораживает окно на полпути и делает промежуточную точку его
+        // «настоящей» позицией — стол потом открывается с окнами, застрявшими
+        // между слотами. Слайд перелистывания (см. `слайд_столов`) наступал бы
+        // на это каждый раз: там окна летят через весь экран.
+        let цели: Vec<(Window, Point<i32, Logical>)> = self.window_pos_anims.iter()
+            .map(|(w, a)| (w.clone(), a.target.to_i32_round()))
+            .collect();
+        // Окна, которые ПРЯМО СЕЙЧАС уезжают за край в слайде столов, — особый
+        // случай, и на нём ломалось «окна при переключении столов уезжают».
+        //
+        // У них цель пружины намеренно лежит за экраном (`дом − сторона·шаг`,
+        // см. `слайд_столов`): это не место, где окно живёт, а место, куда его
+        // выпроваживают с глаз. Правило выше («у летящего окна берём цель
+        // пружины») для них даёт ровно противоположное задуманному — записывает
+        // в `tw.position` точку за краем и делает её НАСТОЯЩИМ домом стола.
+        // Дальше это уже необратимо: стол открывается пустым, потому что все
+        // его окна честно стоят в экране с лишним от камеры, и каждое
+        // следующее перелистывание отодвигает их ещё на шаг.
+        //
+        // Их дом уже записан в `tw.position` (слайд его не трогает) — просто
+        // ничего не пишем.
         for tw in &mut self.tagged_windows {
-            if let Some(loc) = self.space.element_location(&tw.window) {
+            let уезжает = self.слайд_уходят.iter()
+                .any(|w| crate::dwindle::same_window(w, &tw.window));
+            let цель = цели.iter()
+                .find(|(w, _)| crate::dwindle::same_window(w, &tw.window))
+                .map(|(_, t)| *t);
+            if let Some(loc) = дом_окна(уезжает, цель, self.space.element_location(&tw.window)) {
                 tw.position = loc;
             }
         }
@@ -1841,10 +2620,19 @@ impl Dawn {
         // тумблера: view_tag меняет тег раньше, чем layout, и по тумблеру
         // тайловый стол на миг считался ленточным — окна соседних этажей
         // оставались на экране поверх него (нулевой этаж лежит ровно на нём).
+        //
+        // С двумя мониторами «видимо» — это видимо ХОТЯ БЫ НА ОДНОМ: на
+        // соседнем экране в этот же момент открыт другой стол, и его окна
+        // обязаны оставаться на холсте. Разводит их не видимость, а «дома»
+        // мониторов — чужие окна лежат за миллион пикселей и не попадают в
+        // кадр (отсечение по видимой части холста в `собрать_элементы`).
+        // Раньше здесь стояли теги ОДНОГО вида, и любой refresh_tags сдувал с
+        // холста всё, что открыто на втором мониторе.
+        let видимые = self.видимые_теги();
         let strip = self.columns_is_strip_tag(current);
         let visible: Vec<(Window, Point<i32, Logical>)> = self.tagged_windows.iter()
             .filter(|tw| {
-                tw.tags & current != 0
+                tw.tags & видимые != 0
                     || (strip && tw.tags != 0 && self.columns_is_strip_tag(tw.tags))
             })
             .map(|tw| (tw.window.clone(), tw.position))
@@ -1906,9 +2694,8 @@ impl Dawn {
     // ── Hold-to-zoom / bird's-eye (1.3) ──────────────────────────────────────
 
     pub(crate) fn screen_center_and_anchor(&self) -> Option<(Point<f64, Logical>, Point<f64, Logical>)> {
-        let output = self.space.outputs().next()?;
-        let out_geo = self.space.output_geometry(output)?;
-        let screen_center = Point::from((out_geo.size.w as f64 / 2.0, out_geo.size.h as f64 / 2.0));
+        let экран = self.screen_size();
+        let screen_center = Point::from((экран.w as f64 / 2.0, экран.h as f64 / 2.0));
         let anchor_canvas = Point::from((
             self.viewport.cam_x + screen_center.x / self.viewport.zoom,
             self.viewport.cam_y + screen_center.y / self.viewport.zoom,
@@ -1920,7 +2707,7 @@ impl Dawn {
         self.bird_eye_active = true;
         if let Some((anchor_canvas, screen_center)) = self.screen_center_and_anchor() {
             self.zoom_anim = Some(ZoomAnim::new(
-                anchor_canvas, screen_center, self.viewport.zoom, 0.6, Duration::from_millis(250),
+                anchor_canvas, screen_center, self.viewport.zoom, 0.6, crate::anim::дуг::смена_зума(),
             ));
         }
         tracing::info!("dawn: bird's-eye on");
@@ -1930,40 +2717,90 @@ impl Dawn {
         self.bird_eye_active = false;
         if let Some((anchor_canvas, screen_center)) = self.screen_center_and_anchor() {
             self.zoom_anim = Some(ZoomAnim::new(
-                anchor_canvas, screen_center, self.viewport.zoom, 1.0, Duration::from_millis(250),
+                anchor_canvas, screen_center, self.viewport.zoom, 1.0, crate::anim::дуг::смена_зума(),
             ));
         }
         tracing::info!("dawn: bird's-eye off");
     }
 
     // ── Режим обзора (Super+Space, тумблер) ──────────────────────────────────
-    /// Уровень зума в режиме обзора: ОТДАЛЕНИЕ к центру экрана (обзор сверху).
-    /// 0.2 ≈ область в 5× viewport; можно уменьшить для ещё большего отдаления.
-    pub const ZOOM_NAV_LEVEL: f64 = 0.2;
+    /// Пределы масштаба холста. Один набор на все пути зума — колесо
+    /// (`zoom_step_at_cursor`), щипок тачпада и режим лупы. Раньше числа
+    /// 0.05/5.0 стояли литералами в трёх местах, и «максимальное отдаление»
+    /// нельзя было назвать по имени.
+    pub const ZOOM_MIN: f64 = 0.05;
+    pub const ZOOM_MAX: f64 = 5.0;
+    /// Уровень зума в режиме лупы — самый край отдаления.
+    ///
+    /// Раньше здесь было 0.2 «≈5 экранов». Ярик 24.08.2026 попросил ровно
+    /// максимум: Win+Space должен показывать весь холст разом, а не «немного
+    /// подальше», — поэтому уровень и предел зума теперь одно и то же число.
+    pub const ZOOM_NAV_LEVEL: f64 = Self::ZOOM_MIN;
     /// Шаг панорамирования стрелками в режиме обзора (экранные px за нажатие).
     pub const ZOOM_NAV_PAN_STEP: f64 = 220.0;
 
-    /// Super+Space: включить/выключить режим лупы. Вкл — плавный зум к
-    /// `ZOOM_NAV_LEVEL` с якорем в центре экрана; выкл — обратно к zoom=1.
+    /// Заперт ли зум. В режиме лупы — да: она и есть «максимально отдалено», и
+    /// любое колесо/щипок оттуда либо приближали бы (то есть отменяли режим
+    /// молча), либо упирались бы в тот же предел.
+    pub fn zoom_locked(&self) -> bool {
+        // Обзор столов — исключение: там колесо это его собственный зум, и
+        // запирать его заодно значило бы сломать обзор из-за чужого режима.
+        self.zoom_nav_mode && !self.overview_active
+    }
+
+    /// Super+Space: включить/выключить режим лупы. Вкл — плавное отдаление
+    /// до `ZOOM_NAV_LEVEL` с якорем в центре экрана, зум после этого заперт;
+    /// выкл — возврат в ТОТ ЖЕ кадр, из которого входили.
     pub fn toggle_zoom_nav(&mut self) {
         if self.zoom_nav_mode {
             self.zoom_nav_mode = false;
-            if let Some((anchor_canvas, screen_center)) = self.screen_center_and_anchor() {
-                self.zoom_anim = Some(ZoomAnim::new(
-                    anchor_canvas, screen_center, self.viewport.zoom, 1.0, Duration::from_millis(220),
-                ));
+            // Снимаем всё, что могло бы писать камеру параллельно: возврат
+            // задан целиком одной анимацией, и второй писатель увёл бы кадр
+            // мимо запомненного (та же грабля, что у view_tag).
+            self.momentum.stop();
+            self.camera_anim = None;
+            self.zoom_glide = None;
+            let сюда = self.zoom_nav_saved.take();
+            match сюда {
+                Some((x, y, zoom)) => {
+                    let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
+                    self.zoom_anim = Some(ZoomAnim::new_pan(
+                        from,
+                        Point::from((x, y)),
+                        self.viewport.zoom,
+                        zoom,
+                        crate::anim::дуг::смена_зума(),
+                    ));
+                    tracing::info!("dawn: zoom-nav off → кадр ({x:.0},{y:.0}) zoom {zoom:.2}");
+                }
+                None => {
+                    // Кадра не запомнили (вход был ещё до этой правки или
+                    // состояние сбросили) — честный запасной вариант.
+                    if let Some((anchor_canvas, screen_center)) = self.screen_center_and_anchor() {
+                        self.zoom_anim = Some(ZoomAnim::new(
+                            anchor_canvas, screen_center, self.viewport.zoom, 1.0,
+                            crate::anim::дуг::смена_зума(),
+                        ));
+                    }
+                    tracing::info!("dawn: zoom-nav off (кадра не было, zoom → 1)");
+                }
             }
-            tracing::info!("dawn: zoom-nav off");
         } else {
+            // Запоминаем ЦЕЛЬ идущей анимации, а не полпути: войти в лупу
+            // можно и посреди перелёта к столу, и тогда «исходным положением»
+            // обязан быть тот кадр, куда вид ехал.
+            let (x, y, zoom) = self.view_frame_target();
+            self.zoom_nav_saved = Some((x, y, zoom));
             self.zoom_nav_mode = true;
             self.momentum.stop();
+            self.zoom_glide = None;
             if let Some((anchor_canvas, screen_center)) = self.screen_center_and_anchor() {
                 self.zoom_anim = Some(ZoomAnim::new(
                     anchor_canvas, screen_center, self.viewport.zoom, Self::ZOOM_NAV_LEVEL,
-                    Duration::from_millis(220),
+                    crate::anim::дуг::смена_зума(),
                 ));
             }
-            tracing::info!("dawn: zoom-nav on");
+            tracing::info!("dawn: zoom-nav on (вернуться в {x:.0},{y:.0} zoom {zoom:.2})");
         }
         self.request_redraw();
     }
@@ -1981,7 +2818,7 @@ impl Dawn {
             .unwrap_or_else(|| Point::from((self.viewport.cam_x, self.viewport.cam_y)));
         let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
         let to = Point::from((base.x + dx * step, base.y + dy * step));
-        self.camera_anim = Some(CameraAnim::new(from, to, Duration::from_millis(360)));
+        self.camera_anim = Some(CameraAnim::new(from, to, crate::anim::дуг::шаг_пана()));
         self.request_redraw();
     }
 
@@ -1991,98 +2828,829 @@ impl Dawn {
     /// под точкой клика (по canvas-координатам) и телепортирует камеру + курсор
     /// к его центру. Если клик пришёлся на пустое место — центрирует камеру
     /// на этой точке. Возвращает true (клик съеден, не должен доходить до окон).
-    pub fn try_handle_minimap_click(&mut self) -> bool {
-        // Условия ровно те же, при которых миникарта РИСУЕТСЯ (см. render_surface):
-        // невидимая панель не имеет права есть клики. Раньше здесь стояла
-        // проверка только на `is_minimap_visible`, а в кадре миникарту прятали
-        // ещё и под полноэкранным окном и в обзоре — то есть в полноэкранной
-        // игре её панель 460×300 висела в правом верхнем углу НЕВИДИМОЙ ловушкой:
-        // выстрел в ту зону экрана съедался компоновщиком и уносил камеру к
-        // окну «под точкой клика».
-        if !self.is_minimap_visible || self.overview_active || self.fullscreen_here() {
-            return false;
+    /// Кадр миникарты: окрестность камеры плюс собственный сдвиг и зум.
+    ///
+    /// Один на всех НАРОЧНО — по тем же граблям, из-за которых у `project_minimap`
+    /// когда-то завели общий параметр `extra`: отрисовка и хит-тест обязаны
+    /// считать по одному и тому же виду, иначе клик по окну на панели уносит
+    /// камеру мимо, и тем сильнее, чем больше разошлись кадры.
+    pub fn minimap_view(&self) -> crate::canvas::MinimapView {
+        // Оба числа — СГЛАЖЕННЫЕ: цель считает `minimap_auto_target`, а
+        // догоняет её `anim::tick`. Брать цель прямо здесь нельзя — панель
+        // тогда прыгала бы на каждое движение окна.
+        crate::canvas::MinimapView {
+            center: self.minimap_follow,
+            zoom: self.minimap_zoom,
         }
-        let output = match self.space.outputs().next() { Some(o) => o.clone(), None => return false };
-        let mode = match output.current_mode() { Some(m) => m, None => return false };
+    }
 
-        let zoom = self.viewport.zoom;
-        // Позиция курсора в screen-координатах (физических)
-        let screen_logical_x = self.pointer_location.x - self.viewport.cam_x;
-        let screen_logical_y = self.pointer_location.y - self.viewport.cam_y;
-        let screen_physical_x = screen_logical_x * zoom;
-        let screen_physical_y = screen_logical_y * zoom;
+    /// Куда и во сколько раз миникарте смотреть — она решает это САМА.
+    ///
+    /// Показать надо ровно две вещи: всё, что открыто на текущем столе, и то
+    /// место, где ты стоишь (видимый кусок холста). Их объединение и есть
+    /// кадр карты; зум подбирается так, чтобы оно влезло целиком
+    /// (`canvas::minimap_auto_zoom`).
+    ///
+    /// Экран входит в объединение НАМЕРЕННО, даже когда окон нет вовсе: без
+    /// него на пустом столе объединение выродилось бы в точку, зум улетел бы в
+    /// потолок, а карта показывала бы пустоту крупным планом.
+    pub fn minimap_auto_target(&self) -> (Point<f64, Logical>, f64) {
+        let vis = self.visible_canvas_size();
+        let mut x0 = self.viewport.cam_x;
+        let mut y0 = self.viewport.cam_y;
+        let mut x1 = x0 + vis.w;
+        let mut y1 = y0 + vis.h;
+        let current = self.viewport.current_tags();
+        for tw in self.tagged_windows.iter().filter(|tw| tw.tags & current != 0) {
+            let Some(g) = self.space.element_geometry(&tw.window) else { continue };
+            x0 = x0.min(g.loc.x as f64);
+            y0 = y0.min(g.loc.y as f64);
+            x1 = x1.max((g.loc.x + g.size.w) as f64);
+            y1 = y1.max((g.loc.y + g.size.h) as f64);
+        }
+        let центр = Point::from(((x0 + x1) / 2.0, (y0 + y1) / 2.0));
+        let зум = crate::canvas::minimap_auto_zoom(
+            Size::from((x1 - x0, y1 - y0)),
+            self.minimap_screen(),
+            self.minimap_geom().content.size,
+        );
+        (центр, зум)
+    }
 
-        // Проверяем попадание в панель миникарты
-        let origin = crate::canvas::minimap_panel_origin(mode.size);
-        let click_px = screen_physical_x - origin.x as f64;
-        let click_py = screen_physical_y - origin.y as f64;
-        if click_px < 0.0 || click_py < 0.0
-            || click_px > crate::canvas::MINIMAP_PANEL_W as f64
-            || click_py > crate::canvas::MINIMAP_PANEL_H as f64
+    /// Карточка карты и область карты внутри неё на ТЕКУЩЕМ выходе.
+    ///
+    /// Одна точка правды для отрисовки и для ввода: разъехавшись, они снова
+    /// уносят клик мимо окна. Пока выхода нет (ранний запуск, headless без
+    /// режима) — считаем по 1920×1080, чтобы арифметика не делила на ноль.
+    pub fn minimap_geom(&self) -> crate::canvas::MinimapGeom {
+        let экран = self.screen_size();
+        crate::canvas::minimap_geom(Size::<i32, Physical>::from((экран.w, экран.h)))
+    }
+
+    /// Размер экрана в логических единицах — то, от чего миникарта считает,
+    /// сколько холста показать.
+    pub fn minimap_screen(&self) -> Size<i32, Logical> {
+        self.screen_area().map(|r| r.size).unwrap_or(Size::from((1920, 1080)))
+    }
+
+    /// Курсор в ЭКРАННЫХ физических координатах, если он сейчас над карточкой
+    /// карты, иначе None (карта убрана, перекрыта или курсор мимо).
+    ///
+    /// Условия ровно те же, при которых карта РИСУЕТСЯ: невидимая карточка не
+    /// имеет права есть ни клики, ни колесо. Раньше проверялся только тумблер
+    /// `is_minimap_visible`, а в кадре панель прятали ещё и под полноэкранным
+    /// окном и в обзоре — то есть в полноэкранной игре она висела в углу
+    /// НЕВИДИМОЙ ловушкой: выстрел в ту зону съедался компоновщиком. Сверяем не
+    /// тумблер, а РАСКРЫТУЮ ЧАСТЬ (`canvas::minimap_reveal`): что нарисовано,
+    /// то и ловит клики — карта на ходу принимает их ровно по ней.
+    pub fn minimap_hit(&self) -> Option<Point<f64, smithay::utils::Physical>> {
+        if self.minimap_slide <= 0.0 || self.overview_active || self.fullscreen_here() {
+            return None;
+        }
+        let p = self.pointer_screen_physical();
+        let видно = crate::canvas::minimap_reveal(self.minimap_geom().panel, self.minimap_slide);
+        (p.x >= видно.loc.x as f64
+            && p.y >= видно.loc.y as f64
+            && p.x <= (видно.loc.x + видно.size.w) as f64
+            && p.y <= (видно.loc.y + видно.size.h) as f64)
+            .then_some(p)
+    }
+
+    /// Окна текущих столов сверху вниз — в том же порядке и с той же
+    /// геометрией, в каких карта их рисует (`udev::build_minimap_elements`).
+    ///
+    /// `space.elements()` идёт снизу вверх, поэтому разворачиваем: и отрисовка,
+    /// и хит-тест обязаны считать перекрытие одинаково, иначе клик по видимому
+    /// окну попадёт в то, что лежит под ним.
+    fn minimap_windows(&self) -> Vec<(Window, Rectangle<i32, Logical>)> {
+        let current = self.viewport.current_tags();
+        self.space.elements().rev()
+            .filter(|w| self.tagged_windows.iter()
+                .any(|tw| &tw.window == *w && tw.tags & current != 0))
+            .filter_map(|w| self.space.element_geometry(w).map(|g| (w.clone(), g)))
+            .collect()
+    }
+
+    /// Какое окно лежит под точкой `screen` (экранные физические координаты) на
+    /// карте. Считает ТЕМ ЖЕ видом и той же проекцией, что и отрисовка.
+    ///
+    /// Точки в полях карточки (заголовок, рамка) окном не считаются: там карты
+    /// нет, и клик по заголовку не должен никуда улетать.
+    pub fn minimap_window_at(
+        &self,
+        screen: Point<f64, smithay::utils::Physical>,
+    ) -> Option<Window> {
+        let g = self.minimap_geom();
+        let (lx, ly) = (screen.x - g.content.loc.x as f64, screen.y - g.content.loc.y as f64);
+        if lx < 0.0 || ly < 0.0
+            || lx > g.content.size.w as f64
+            || ly > g.content.size.h as f64
         {
+            return None;
+        }
+        let окна = self.minimap_windows();
+        let проекция: Vec<(Point<i32, Logical>, Size<i32, Logical>, bool)> =
+            окна.iter().map(|(_, g)| (g.loc, g.size, false)).collect();
+        let proj = crate::canvas::project_minimap(
+            &проекция, self.minimap_view(), self.minimap_screen(), g.content.size,
+        );
+        // Список идёт сверху вниз — первое попадание и есть верхнее окно.
+        окна.iter().zip(proj.boxes.iter())
+            .find(|(_, b)| {
+                lx >= b.loc.x as f64 && ly >= b.loc.y as f64
+                    && lx < (b.loc.x + b.size.w) as f64
+                    && ly < (b.loc.y + b.size.h) as f64
+            })
+            .map(|((w, _), _)| w.clone())
+    }
+
+    /// ЛКМ по миниатюре окна: сфокусировать его, увести к нему камеру и убрать
+    /// карту — «клик по окну = перейти к окну», как в образце 25.08.2026.
+    ///
+    /// Клик по ПУСТОМУ месту карты сюда не попадает: там начинается драг её
+    /// собственного вида (`minimap_begin_drag`), и камеру он по-прежнему не
+    /// трогает — правило «клик не телепортирует камеру на точку под курсором»
+    /// осталось в силе, оно было именно про пустоту.
+    ///
+    /// Возвращает true, если окно нашлось и клик съеден.
+    pub fn minimap_activate(&mut self, screen: Point<f64, smithay::utils::Physical>) -> bool {
+        let Some(window) = self.minimap_window_at(screen) else { return false };
+        // Камеру ведём к окну ДО фокуса — тем же порядком, что и поиск по имени
+        // (`search_activate`): focus() поднимает окно и активирует его, а лететь
+        // потом всё равно пришлось бы.
+        self.snap_camera_to_window(&window);
+        crate::xwin::focus(self, &window);
+        self.is_minimap_visible = false;
+        self.minimap_drag = false;
+        self.request_redraw();
+        true
+    }
+
+    /// Панель переходит под ручное управление (если ещё не была) — копирует
+    /// ТЕКУЩЕЕ отображаемое как отправную точку, иначе первый же щелчок или
+    /// пиксель драга дал бы скачок с автоподгонки.
+    fn minimap_take_manual_control(&mut self) {
+        if !self.minimap_manual {
+            self.minimap_manual = true;
+            self.minimap_manual_zoom = self.minimap_zoom;
+            self.minimap_manual_center = self.minimap_follow;
+        }
+    }
+
+    /// Колесо над панелью — крутит ЕЁ СОБСТВЕННЫЙ зум (25.08.2026: возвращено
+    /// по прямой просьбе — «миникарта должна быть мини копией мира со своим
+    /// паном и зумом, не зависящем от основного dawn»). Тот же шаг 1.1/0.9,
+    /// что и у зума холста колесом в обзоре (см. `zoom_step_at_cursor`), но
+    /// цель не анимируется через `ZoomGlide` — доводит её тот же плавный
+    /// доезд, что и автоподгонку (`anim::tick`, minimap_zoom_omega).
+    /// Возвращает true (событие съедено), пока курсор над панелью — иначе
+    /// прокрут проваливался бы в зум ХОЛСТА под ней.
+    pub fn minimap_wheel(&mut self, шагов: f64) -> bool {
+        let Some(точка) = self.minimap_hit() else { return false };
+        if шагов != 0.0 {
+            self.minimap_take_manual_control();
+            // Зум держится за КУРСОР, а не за центр карты: точка холста под
+            // стрелкой обязана остаться под ней (26.08.2026). Так это работает
+            // у зума холста (`zoom_step_at_cursor`) и у любой карты вообще —
+            // иначе, приближаясь к окну с краю, его каждый раз выносит из
+            // кадра и приходится догонять драгом.
+            let g = self.minimap_geom();
+            let якорь = self.minimap_canvas_at(точка);
+            let factor = if шагов > 0.0 { 1.1 } else { 0.9 };
+            self.minimap_manual_zoom = (self.minimap_manual_zoom * factor)
+                .clamp(crate::canvas::MINIMAP_ZOOM_MIN, crate::canvas::MINIMAP_ZOOM_MAX);
+            let s = crate::canvas::minimap_scale(
+                self.minimap_manual_zoom, self.minimap_screen().w, g.content.size.w,
+            );
+            if s > 0.0 {
+                self.minimap_manual_center = Point::from((
+                    якорь.x + (g.content.size.w as f64 / 2.0
+                        - (точка.x - g.content.loc.x as f64)) / s,
+                    якорь.y + (g.content.size.h as f64 / 2.0
+                        - (точка.y - g.content.loc.y as f64)) / s,
+                ));
+            }
+            self.request_redraw();
+        }
+        true
+    }
+
+    /// Точка холста под экранной точкой на карте — обратная к проекции
+    /// (`canvas::project_minimap`), считанная тем же видом, что и отрисовка.
+    fn minimap_canvas_at(&self, screen: Point<f64, Physical>) -> Point<f64, Logical> {
+        let g = self.minimap_geom();
+        let вид = self.minimap_view();
+        let scale = crate::canvas::minimap_scale(
+            вид.zoom, self.minimap_screen().w, g.content.size.w,
+        ).max(1e-9);
+        Point::from((
+            вид.center.x + (screen.x - g.content.loc.x as f64 - g.content.size.w as f64 / 2.0) / scale,
+            вид.center.y + (screen.y - g.content.loc.y as f64 - g.content.size.h as f64 / 2.0) / scale,
+        ))
+    }
+
+    /// Нажатие ЛКМ над панелью — начало её собственного драга (см.
+    /// `minimap_drag_motion`). Заводит ручной режим тем же способом, что и
+    /// колесо, чтобы драг стартовал без скачка.
+    pub fn minimap_begin_drag(&mut self) {
+        self.minimap_take_manual_control();
+        self.minimap_drag = true;
+    }
+
+    /// Движение курсора при зажатой ЛКМ над панелью — её собственный пан.
+    /// `dx`/`dy` — дельта курсора в экранных (физических) пикселях, тех же,
+    /// в которых считана `minimap_hit`. Камеру холста НЕ трогает: это пан
+    /// ВНУТРИ мини-копии мира, а не холста под ней.
+    pub fn minimap_drag_motion(&mut self, dx: f64, dy: f64) -> bool {
+        if !self.minimap_drag {
             return false;
         }
+        let scale = crate::canvas::minimap_scale(
+            self.minimap_manual_zoom,
+            self.minimap_screen().w,
+            self.minimap_geom().content.size.w,
+        );
+        if scale > 0.0 {
+            // Тащишь панель вправо — под пальцем должен остаться тот же
+            // кусок карты, то есть ВИД должен сместиться влево (навстречу).
+            self.minimap_manual_center.x -= dx / scale;
+            self.minimap_manual_center.y -= dy / scale;
+            self.request_redraw();
+        }
+        true
+    }
 
-        // Собираем окна текущего тега (те же, что и в рендере)
-        let current_tags = self.viewport.current_tags();
-        let windows: Vec<(Point<i32, Logical>, Size<i32, Logical>, bool)> = self.tagged_windows.iter()
-            .filter(|tw| tw.tags & current_tags != 0)
-            .filter_map(|tw| self.space.element_geometry(&tw.window).map(|g| (g.loc, g.size, false)))
-            .collect();
+    /// Отпускание ЛКМ — конец драга панели.
+    pub fn minimap_end_drag(&mut self) {
+        self.minimap_drag = false;
+    }
 
-        // Та же проекция, что и в build_minimap_elements
-        let proj = crate::canvas::project_minimap(&windows);
+    // ── Карта с тачпада ──────────────────────────────────────────────────────
+    //
+    // Один в один с карточкой предпросмотра (`preview_pan_by`/`preview_pinch`):
+    // два пальца — пан, щипок — зум, курсор идёт за пальцами. Карта и карточка
+    // для руки — одно и то же (мини-копия мира, по которой панят и зумят), и
+    // разное поведение у них было бы просто ошибкой памяти.
 
-        // Клик в панели → canvas-координаты
-        let click_in_panel = smithay::utils::Point::<f64, smithay::utils::Physical>::from((click_px, click_py));
-        let canvas_point = crate::canvas::minimap_click_to_canvas(click_in_panel, proj.bbox, proj.scale);
+    /// Прокрутка двумя пальцами над картой — её пан, со стрелкой за пальцами.
+    pub fn minimap_pan_by(&mut self, dx: f64, dy: f64) -> bool {
+        if self.minimap_hit().is_none() {
+            return false;
+        }
+        if dx == 0.0 && dy == 0.0 {
+            return true;
+        }
+        self.minimap_take_manual_control();
+        let scale = crate::canvas::minimap_scale(
+            self.minimap_manual_zoom,
+            self.minimap_screen().w,
+            self.minimap_geom().content.size.w,
+        );
+        if scale > 0.0 {
+            self.minimap_manual_center.x -= dx / scale;
+            self.minimap_manual_center.y -= dy / scale;
+            self.курсор_за_пальцами(dx, dy);
+            self.request_redraw();
+        }
+        true
+    }
 
-        // Ищем окно, в которое попал клик (по canvas-координатам)
-        let target = self.tagged_windows.iter()
-            .filter(|tw| tw.tags & current_tags != 0)
-            .filter_map(|tw| self.space.element_geometry(&tw.window).map(|g| (tw.window.clone(), g)))
-            .find(|(_, g)| {
-                canvas_point.x >= g.loc.x as f64
-                    && canvas_point.x <= (g.loc.x + g.size.w) as f64
-                    && canvas_point.y >= g.loc.y as f64
-                    && canvas_point.y <= (g.loc.y + g.size.h) as f64
-            })
-            .map(|(w, g)| {
-                // Центр окна — туда полетит камера и курсор
-                let cx = g.loc.x as f64 + g.size.w as f64 / 2.0;
-                let cy = g.loc.y as f64 + g.size.h as f64 / 2.0;
-                (w, Point::from((cx, cy)))
-            });
-
-        let (target_point, cam_target) = if let Some((_window, center)) = target {
-            // Кликнули по окну — летим к его центру
-            let cam: Point<f64, Logical> = Point::from((
-                center.x - mode.size.w as f64 / (2.0 * zoom),
-                center.y - mode.size.h as f64 / (2.0 * zoom),
+    /// Щипок над картой — её зум с якорем под стрелкой. `множитель`
+    /// относительный, как у карточки.
+    pub fn minimap_pinch(&mut self, множитель: f64) -> bool {
+        let Some(точка) = self.minimap_hit() else { return false };
+        if !множитель.is_finite() || множитель <= 0.0 || (множитель - 1.0).abs() < 1e-4 {
+            return true;
+        }
+        self.minimap_take_manual_control();
+        let g = self.minimap_geom();
+        let якорь = self.minimap_canvas_at(точка);
+        self.minimap_manual_zoom = (self.minimap_manual_zoom * множитель)
+            .clamp(crate::canvas::MINIMAP_ZOOM_MIN, crate::canvas::MINIMAP_ZOOM_MAX);
+        let s = crate::canvas::minimap_scale(
+            self.minimap_manual_zoom, self.minimap_screen().w, g.content.size.w,
+        );
+        if s > 0.0 {
+            self.minimap_manual_center = Point::from((
+                якорь.x + (g.content.size.w as f64 / 2.0
+                    - (точка.x - g.content.loc.x as f64)) / s,
+                якорь.y + (g.content.size.h as f64 / 2.0
+                    - (точка.y - g.content.loc.y as f64)) / s,
             ));
-            (center, cam)
-        } else {
-            // Кликнули по пустому месту — центрируем на точке клика
-            let cam: Point<f64, Logical> = Point::from((
-                canvas_point.x - mode.size.w as f64 / (2.0 * zoom),
-                canvas_point.y - mode.size.h as f64 / (2.0 * zoom),
-            ));
-            (canvas_point, cam)
-        };
-
-        // Мгновенный телепорт (без анимации — курсор уже стоит на панели,
-        // хочется чтобы реакция была моментальной)
-        self.camera_anim = None;
-        self.viewport.cam_x = cam_target.x;
-        self.viewport.cam_y = cam_target.y;
-        self.apply_camera();
-        // Курсор здесь переносится НАМЕРЕННО (вместе с камерой): warp_pointer
-        // разошлёт motion и зафиксирует новую экранную позицию, иначе
-        // sync_pointer_to_camera увидит уехавшую камеру и вернёт стрелку туда,
-        // где она была на панели миникарты.
-        self.warp_pointer(target_point);
+        }
         self.request_redraw();
-        tracing::info!("dawn: minimap click → teleport to ({:.0},{:.0})", target_point.x, target_point.y);
+        true
+    }
+
+    /// ПКМ по карте или кнопка в её шапке — сброс ручного пана/зума обратно на
+    /// автоподгонку (`minimap_auto_target`): снова вписывает все окна стола и
+    /// текущий экран целиком.
+    pub fn minimap_reset(&mut self) {
+        self.minimap_manual = false;
+        self.request_redraw();
+    }
+
+    /// Кнопка «сбросить вид» в шапке карточки — ПКМ мышью найдёт не каждый, а
+    /// в образце 25.08.2026 такая кнопка есть («Recentrar»).
+    ///
+    /// Считается по тексту, а не по константе ширины: подпись в кэше та же
+    /// самая, и разъехаться плашке с надписью тут нечем.
+    pub fn minimap_reset_button(&self) -> Rectangle<i32, smithay::utils::Physical> {
+        const PAD_X: i32 = 10;
+        const H: i32 = 20;
+        let g = self.minimap_geom();
+        let поле = crate::canvas::MINIMAP_PADDING_PX.round() as i32;
+        let w = crate::text::width_of(
+            MINIMAP_RESET_LABEL, crate::bar::STRONG, crate::bar::TEXT_SMALL,
+        ) + PAD_X * 2;
+        Rectangle::new(
+            Point::from((
+                g.panel.loc.x + g.panel.size.w - поле - w,
+                g.panel.loc.y + поле + (crate::canvas::MINIMAP_HEADER_PX - H) / 2,
+            )),
+            Size::from((w, H)),
+        )
+    }
+
+    /// Попал ли клик (экранные физические координаты) в кнопку сброса вида.
+    pub fn minimap_reset_button_hit(
+        &self,
+        screen: Point<f64, smithay::utils::Physical>,
+    ) -> bool {
+        let b = self.minimap_reset_button();
+        screen.x >= b.loc.x as f64
+            && screen.y >= b.loc.y as f64
+            && screen.x <= (b.loc.x + b.size.w) as f64
+            && screen.y <= (b.loc.y + b.size.h) as f64
+    }
+
+    // ── Карточка предпросмотра: та же мини-копия мира, что и карта ───────────
+    //
+    // 26.08.2026 по прямой просьбе: «если навести мышку на них, то они должны
+    // работать как мини-карта». Всё, что ниже, — ровно те же пять действий, что
+    // у карты (`minimap_*`), только над карточкой под панелью: свой вид, колесо,
+    // драг, сброс и клик по окну. Геометрия и вид считаются В ОДНОМ месте
+    // (`preview_geom`/`preview_view`) и оттуда же берутся отрисовкой — иначе
+    // клик снова уйдёт мимо окна.
+
+    /// Какой стол показывает карточка: у значка стола — он сам, у чипа окна —
+    /// текущий (чип отвечает на вопрос «где оно и что рядом»).
+    pub fn preview_mask(&self) -> Option<u32> {
+        match self.preview_cell? {
+            crate::bar::Cell::Tag(m) => Some(m),
+            crate::bar::Cell::Window(_) => Some(self.viewport.current_tags()),
+            _ => None,
+        }
+    }
+
+    /// Кадр стола, вокруг которого строится карточка, — ПОСЛЕДНЯЯ КАМЕРА ЭТОГО
+    /// СТОЛА, а не начало координат.
+    ///
+    /// **26.08.2026, прямая жалоба: «предпросмотр рабочих столов должен
+    /// работать относительно последней позиции камеры».** Раньше здесь стоял
+    /// `screen_area()` — прямоугольник (0,0)…(экран), то есть карточка ВСЕГДА
+    /// показывала начало холста. На бесконечном холсте это почти никогда не то
+    /// место, где стоят окна: стол, уехавший камерой в сторону, выглядел
+    /// пустым, а его окна лезли из карточки квадратами.
+    ///
+    /// У текущего стола берём цель перелёта (`view_frame_target`), а не сырую
+    /// камеру: пока идёт полёт к столу, карточка обязана показывать то место,
+    /// КУДА едем.
+    pub fn preview_base(&self) -> Option<Rectangle<f64, Logical>> {
+        let mask = self.preview_mask()?;
+        let экран = self.screen_size();
+        // Сперва — по САМИМ ОКНАМ (01.09.2026, прямая просьба: «предпросмотр
+        // окон относительно них, а не камеры»).
+        //
+        // Камера — это то, куда человек смотрел последним, и к окнам она
+        // отношения не имеет: отъехал на полэкрана — и стол в карточке
+        // наполовину пустой, а окна прижаты к краю. Рамка по охватывающему
+        // прямоугольнику окон показывает ровно то, ради чего карточку и
+        // открывают, и не зависит ни от зума, ни от того, где стоит камера.
+        //
+        // Камерный кадр остаётся запасным путём: на столе без единого окна
+        // охватывать нечего, и там «где я был» — единственный осмысленный
+        // ответ.
+        if let Some(окна) = self.preview_windows_base() {
+            return Some(окна);
+        }
+        let (x, y, zoom) = if mask == self.viewport.current_tags() {
+            self.view_frame_target()
+        } else {
+            self.tag_cameras.get(&mask).copied().unwrap_or((0.0, 0.0, 1.0))
+        };
+        let z = zoom.max(0.01);
+        Some(Rectangle::new(
+            Point::from((x, y)),
+            Size::from((экран.w as f64 / z, экран.h as f64 / z)),
+        ))
+    }
+
+    /// Охватывающий прямоугольник ОКОН показываемого стола, с полями.
+    ///
+    /// `None` — окон на столе нет вовсе, охватывать нечего.
+    ///
+    /// Поля (`ПОЛЯ_ОКОН`) нужны, чтобы окна не упирались в самый край
+    /// карточки: без них крайнее окно сливается с рамкой и кажется обрезанным.
+    /// Считаются от БОЛЬШЕЙ стороны рамки, а не от каждой по отдельности:
+    /// иначе узкий вертикальный стол получал бы по бокам поля толще самих окон.
+    ///
+    /// Пропорции карточки не навязываем: `MiniView::fit` вписывает рамку любой
+    /// формы, добавляя недостающее по короткой стороне сам.
+    fn preview_windows_base(&self) -> Option<Rectangle<f64, Logical>> {
+        const ПОЛЯ_ОКОН: f64 = 0.06;
+        let окна = self.preview_frames();
+        let (mut x0, mut y0) = (f64::MAX, f64::MAX);
+        let (mut x1, mut y1) = (f64::MIN, f64::MIN);
+        for окно in &окна {
+            let (w, h) = (окно.rect.size.w as f64, окно.rect.size.h as f64);
+            // Окно нулевого размера (клиент ещё не прислал буфер) в охват не
+            // берём: точка в стороне растянула бы рамку на пустоту.
+            if w <= 0.0 || h <= 0.0 {
+                continue;
+            }
+            x0 = x0.min(окно.rect.loc.x as f64);
+            y0 = y0.min(окно.rect.loc.y as f64);
+            x1 = x1.max(окно.rect.loc.x as f64 + w);
+            y1 = y1.max(окно.rect.loc.y as f64 + h);
+        }
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        let поля = (x1 - x0).max(y1 - y0) * ПОЛЯ_ОКОН;
+        Some(Rectangle::new(
+            Point::from((x0 - поля, y0 - поля)),
+            Size::from((x1 - x0 + поля * 2.0, y1 - y0 + поля * 2.0)),
+        ))
+    }
+
+    /// Куда и во сколько раз смотреть карточке: её собственные пан/зум, пока
+    /// её крутят вручную, иначе кадр стола целиком.
+    pub fn preview_view_target(&self) -> (Point<f64, Logical>, f64) {
+        if self.preview_manual {
+            return (self.preview_manual_center, self.preview_manual_zoom);
+        }
+        match self.preview_base() {
+            Some(base) => (
+                Point::from((
+                    base.loc.x + base.size.w / 2.0,
+                    base.loc.y + base.size.h / 2.0,
+                )),
+                1.0,
+            ),
+            None => (self.preview_center, self.preview_zoom),
+        }
+    }
+
+    /// Карточка и кадр стола внутри неё на текущем кадре анимации. None —
+    /// карточки сейчас нет (не наведено, обзор, полный экран).
+    pub fn preview_geom(&self) -> Option<crate::canvas::PreviewGeom> {
+        if self.preview_anim <= 0.0 || self.overview_active || self.fullscreen_here() {
+            return None;
+        }
+        let cell = self.preview_cell?;
+        let rect = crate::bar::layout(&self.bar_data())
+            .cells.iter().find(|i| i.cell == cell).map(|i| i.rect)?;
+        // От ТЕКУЩЕГО места панели: она уезжает вверх при входе в обзор, и
+        // карточка обязана ехать вместе с ней.
+        let top = crate::bar::island_y(self.bar_hide)
+            + crate::bar::H + crate::canvas::PREVIEW_GAP;
+        Some(crate::canvas::preview_geom(
+            rect.x + rect.w / 2, top, self.screen_size().w, self.preview_anim,
+        ))
+    }
+
+    /// Геометрия карточки вместе с её видом — то, по чему и рисуют, и
+    /// кликают, и панят.
+    pub fn preview_view(&self) -> Option<(crate::canvas::PreviewGeom, crate::canvas::MiniView)> {
+        let g = self.preview_geom()?;
+        let base = self.preview_base()?;
+        let вид = crate::canvas::MiniView::fit(
+            base, g.content.size, self.preview_zoom, self.preview_center,
+        );
+        Some((g, вид))
+    }
+
+    /// Лежит ли экранная точка на карточке. Считает по АНИМИРОВАННОЙ геометрии:
+    /// что нарисовано, то и ловит мышь.
+    pub fn preview_contains(&self, screen: Point<f64, Physical>) -> bool {
+        let Some(g) = self.preview_geom() else { return false };
+        screen.x >= g.card.loc.x as f64
+            && screen.y >= g.card.loc.y as f64
+            && screen.x <= (g.card.loc.x + g.card.size.w) as f64
+            && screen.y <= (g.card.loc.y + g.card.size.h) as f64
+    }
+
+    /// То же, но с ЗАЗОРОМ между панелью и карточкой: по дороге с ячейки на
+    /// карточку курсор пересекает 8 px пустоты (`PREVIEW_GAP`), и без этой
+    /// поблажки карточка начинала бы сворачиваться ровно посреди движения к
+    /// ней — мигание на каждое наведение. Клики зазор НЕ ловит: там ничего не
+    /// нарисовано (см. `preview_contains`).
+    pub fn preview_hover_zone(&self, screen: Point<f64, Physical>) -> bool {
+        let Some(g) = self.preview_geom() else { return false };
+        let верх = (g.card.loc.y - crate::canvas::PREVIEW_GAP - 2) as f64;
+        screen.x >= g.card.loc.x as f64
+            && screen.y >= верх
+            && screen.x <= (g.card.loc.x + g.card.size.w) as f64
+            && screen.y <= (g.card.loc.y + g.card.size.h) as f64
+    }
+
+    /// Курсор над карточкой? Экранные физические координаты, если да.
+    pub fn preview_hit(&self) -> Option<Point<f64, Physical>> {
+        let p = self.pointer_screen_physical();
+        self.preview_contains(p).then_some(p)
+    }
+
+    /// Окна стола, который показывает карточка, вместе с их местом на СВОЁМ
+    /// столе. У видимых берём живую геометрию, у остальных — сохранённую: они
+    /// не в `space`.
+    ///
+    /// Один список на отрисовку и на хит-тест — по тем же граблям, что у
+    /// `minimap_windows`.
+    pub fn preview_frames(&self) -> Vec<ПредпросмотрОкно> {
+        let Some(mask) = self.preview_mask() else { return Vec::new() };
+        let текущие = self.viewport.current_tags();
+        self.tagged_windows.iter()
+            .filter(|tw| tw.tags & mask != 0)
+            .map(|tw| {
+                let (loc, size) = match self.space.element_geometry(&tw.window) {
+                    Some(g) if tw.tags & текущие != 0 => (g.loc, g.size),
+                    _ => (tw.position, tw.window.geometry().size),
+                };
+                ПредпросмотрОкно {
+                    root: loc - tw.window.geometry().loc,
+                    rect: Rectangle::new(loc, size),
+                    window: tw.window.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Окно под точкой на карточке. Список рисуется в прямом порядке (и то, что
+    /// в кадре добавлено позже, лежит ниже), поэтому ищем с конца — сверху вниз.
+    pub fn preview_window_at(&self, screen: Point<f64, Physical>) -> Option<Window> {
+        let (g, вид) = self.preview_view()?;
+        // Точка в полях карточки (подпись, рамка) окном не считается.
+        if screen.x < g.content.loc.x as f64 || screen.y < g.content.loc.y as f64
+            || screen.x > (g.content.loc.x + g.content.size.w) as f64
+            || screen.y > (g.content.loc.y + g.content.size.h) as f64
+        {
+            return None;
+        }
+        self.preview_frames().iter().rev()
+            .find(|к| {
+                let r = вид.rect(g.content.loc, g.content.size, к.rect);
+                screen.x >= r.loc.x as f64 && screen.y >= r.loc.y as f64
+                    && screen.x < (r.loc.x + r.size.w) as f64
+                    && screen.y < (r.loc.y + r.size.h) as f64
+            })
+            .map(|к| к.window.clone())
+    }
+
+    /// ЛКМ по миниатюре на карточке: перейти на её стол, сфокусировать окно и
+    /// увести к нему камеру — ровно то же, что делает клик по карте
+    /// (`minimap_activate`), только цель может лежать на ДРУГОМ столе.
+    ///
+    /// Клик по пустому месту сюда не попадает: там начинается пан карточки.
+    pub fn preview_activate(&mut self, screen: Point<f64, Physical>) -> bool {
+        let Some(window) = self.preview_window_at(screen) else { return false };
+        let mask = self.preview_mask();
+        if let Some(mask) = mask {
+            if mask != self.viewport.current_tags() {
+                self.dispatch_action(crate::config::Action::ViewTag(mask));
+            }
+        }
+        // Камера ДО фокуса — тем же порядком, что у карты и поиска по имени.
+        self.snap_camera_to_window(&window);
+        crate::xwin::focus(self, &window);
+        self.preview_close();
+        true
+    }
+
+    /// Убрать карточку: курсор ушёл или по ней кликнули.
+    pub fn preview_close(&mut self) {
+        self.preview_hover = false;
+        self.preview_drag = false;
+        self.bar_hover = None;
+        // Место, куда её отпанили, обязано пережить уход курсора — в этом вся
+        // память вида (см. preview_запомнить_вид).
+        self.preview_запомнить_вид();
+        self.preview_reset_view();
+        self.request_redraw();
+    }
+
+    /// Запомнить, куда карточку отпанили руками. Зовётся ПЕРЕД сменой ячейки и
+    /// перед закрытием — то есть в тот момент, когда вид вот-вот пропадёт.
+    ///
+    /// Кладём только ручной вид: карточка, которую не трогали, показывает кадр
+    /// стола, а он и так пересчитывается сам (и меняется, когда стол уезжает
+    /// камерой) — запоминать тут нечего.
+    pub fn preview_запомнить_вид(&mut self) {
+        if !self.preview_manual {
+            return;
+        }
+        let Some(cell) = self.preview_cell else { return };
+        self.preview_память
+            .insert(cell, (self.preview_manual_center, self.preview_manual_zoom));
+    }
+
+    /// Забыть отпаненное место этой ячейки: ПКМ по карточке значит «покажи
+    /// стол целиком», и в следующий раз она обязана открыться так же.
+    pub fn preview_забыть_вид(&mut self) {
+        if let Some(cell) = self.preview_cell {
+            self.preview_память.remove(&cell);
+        }
+    }
+
+    /// Поставить карточке вид её ячейки: ЗАПОМНЕННЫЙ, если по ней уже панили,
+    /// иначе кадр стола целиком. Зовётся при смене ячейки и при закрытии.
+    ///
+    /// **29.08.2026, прямая просьба Ярика: «сделай память прошлой позиции в
+    /// предпросмотрах столов/приложений».** Раньше вид сбрасывался всегда:
+    /// нашёл нужный угол стола, увёл курсор — и в следующее наведение ищи
+    /// заново.
+    pub fn preview_reset_view(&mut self) {
+        // Запомненное место ячейки. Оно в координатах ХОЛСТА, поэтому не
+        // портится от того, что стол за это время уехал камерой.
+        let помним = self.preview_cell.and_then(|c| self.preview_память.get(&c).copied());
+        if let Some((центр, зум)) = помним {
+            self.preview_manual = true;
+            self.preview_manual_center = центр;
+            self.preview_manual_zoom = зум;
+            // Показываемое ставим СРАЗУ, без доводки, — ровно по тому же
+            // доводу, что и ниже: карточка только открывается, ехать ей
+            // неоткуда, а плавный въезд читался бы как промах мимо места.
+            self.preview_center = центр;
+            self.preview_zoom = зум;
+            return;
+        }
+        self.preview_manual = false;
+        self.preview_manual_zoom = 1.0;
+        // Показываемое подтягиваем СРАЗУ, без доводки: карточка только
+        // открывается, ехать ей неоткуда.
+        if let Some(base) = self.preview_base() {
+            let центр = Point::from((
+                base.loc.x + base.size.w / 2.0,
+                base.loc.y + base.size.h / 2.0,
+            ));
+            self.preview_center = центр;
+            self.preview_manual_center = центр;
+            self.preview_zoom = 1.0;
+        }
+    }
+
+    /// Карточка переходит под ручное управление, копируя ТЕКУЩЕЕ показываемое
+    /// как отправную точку (иначе первый же щелчок дал бы скачок).
+    fn preview_take_manual_control(&mut self) {
+        if !self.preview_manual {
+            self.preview_manual = true;
+            self.preview_manual_zoom = self.preview_zoom;
+            self.preview_manual_center = self.preview_center;
+        }
+    }
+
+    /// Колесо над карточкой — её собственный зум (шаг тот же, что у карты).
+    /// Возвращает true, пока курсор над карточкой: иначе прокрут проваливался
+    /// бы в зум холста под ней.
+    pub fn preview_wheel(&mut self, шагов: f64) -> bool {
+        let Some(точка) = self.preview_hit() else { return false };
+        if шагов != 0.0 {
+            self.preview_take_manual_control();
+            let Some((g, вид)) = self.preview_view() else { return true };
+            // Держимся за курсор — та же арифметика, что у карты
+            // (`minimap_wheel`): точка холста под стрелкой не двигается.
+            let якорь = вид.canvas_at(g.content.loc, g.content.size, точка);
+            let factor = if шагов > 0.0 { 1.1 } else { 0.9 };
+            self.preview_manual_zoom = (self.preview_manual_zoom * factor)
+                .clamp(crate::canvas::MINI_ZOOM_MIN, crate::canvas::MINI_ZOOM_MAX);
+            if let Some(base) = self.preview_base() {
+                let s = crate::canvas::MiniView::fit(
+                    base, g.content.size, self.preview_manual_zoom, якорь,
+                ).scale;
+                if s > 0.0 {
+                    self.preview_manual_center = Point::from((
+                        якорь.x + (g.content.size.w as f64 / 2.0
+                            - (точка.x - g.content.loc.x as f64)) / s,
+                        якорь.y + (g.content.size.h as f64 / 2.0
+                            - (точка.y - g.content.loc.y as f64)) / s,
+                    ));
+                }
+            }
+            self.request_redraw();
+        }
+        true
+    }
+
+    /// Нажатие ЛКМ по пустому месту карточки — начало её пана.
+    pub fn preview_begin_drag(&mut self) {
+        self.preview_take_manual_control();
+        self.preview_drag = true;
+    }
+
+    /// Движение мыши при зажатой ЛКМ над карточкой — её собственный пан.
+    /// Камеру холста не трогает, как и пан карты.
+    pub fn preview_drag_motion(&mut self, dx: f64, dy: f64) -> bool {
+        if !self.preview_drag {
+            return false;
+        }
+        let Some((_, вид)) = self.preview_view() else { return true };
+        if вид.scale > 0.0 {
+            self.preview_manual_center.x -= dx / вид.scale;
+            self.preview_manual_center.y -= dy / вид.scale;
+            self.request_redraw();
+        }
+        true
+    }
+
+    pub fn preview_end_drag(&mut self) {
+        self.preview_drag = false;
+    }
+
+    // ── Карточка с тачпада ───────────────────────────────────────────────────
+    //
+    // Мышь водит карточку зажатой кнопкой и колесом; на тачпаде ни того, ни
+    // другого нет. Пальцы дают ровно те же два движения напрямую: два пальца
+    // по накладке — пан, щипок — зум. Обе точки входа НИЧЕГО не считают сами,
+    // а зовут ту же арифметику, что мышь, — иначе карточка ездила бы от
+    // тачпада иначе, чем от мыши, и расхождение пришлось бы ловить дважды.
+
+    /// Прокрутка двумя пальцами над карточкой — её пан. Драг для этого не
+    /// нужен: у прокрутки нет ни нажатия, ни отпускания.
+    ///
+    /// `true` — курсор над карточкой и движение съедено. Иначе прокрутка
+    /// провалилась бы в холст под карточкой и панорамировала бы камеру —
+    /// ровно та беда, от которой колесо закрыто в `preview_wheel`.
+    ///
+    /// **Курсор при этом ЕДЕТ вместе с пальцами.** libinput на двух пальцах
+    /// стрелку не двигает вовсе (для него это прокрутка), и карточка ездила
+    /// под неподвижным курсором — Ярик сказал прямо: «должен двигаться как
+    /// мышка» (01.09.2026). Поэтому жест повторяет мышиный драг целиком:
+    /// стрелка идёт за пальцами через `warp_pointer`, а вид смещается
+    /// НАВСТРЕЧУ (`-=`, как в `preview_drag_motion`) — тогда кусок холста,
+    /// подхваченный под стрелкой, так под ней и остаётся.
+    pub fn preview_pan_by(&mut self, dx: f64, dy: f64) -> bool {
+        if self.preview_hit().is_none() {
+            return false;
+        }
+        if dx == 0.0 && dy == 0.0 {
+            return true;
+        }
+        self.preview_take_manual_control();
+        let Some((_, вид)) = self.preview_view() else { return true };
+        if вид.scale > 0.0 {
+            self.preview_manual_center.x -= dx / вид.scale;
+            self.preview_manual_center.y -= dy / вид.scale;
+            self.курсор_за_пальцами(dx, dy);
+            self.request_redraw();
+        }
+        true
+    }
+
+    /// Сдвинуть стрелку на экранную дельту — общий шаг для всех жестов, где
+    /// пальцы обязаны вести курсор, хотя libinput его не двигает.
+    ///
+    /// Дельта приходит в ЭКРАННЫХ пикселях, а курсор живёт в координатах
+    /// холста, поэтому делим на зум — ровно как ветка «Super+2 пальца» в
+    /// input.rs. Двигаем через `warp_pointer`, а не записью в
+    /// `pointer_location`: иначе стрелка и хит-тест разъезжаются (см. его
+    /// комментарий).
+    fn курсор_за_пальцами(&mut self, dx: f64, dy: f64) {
+        let zoom = self.viewport.zoom.max(1e-6);
+        let mut p = self.pointer_location;
+        p.x += dx / zoom;
+        p.y += dy / zoom;
+        self.warp_pointer(p);
+    }
+
+    /// Щипок над карточкой — её зум. `множитель` уже относительный (текущий
+    /// масштаб жеста, делённый на прошлый кадр), потому что libinput отдаёт
+    /// scale от НАЧАЛА жеста, а зум карточки копится.
+    ///
+    /// Держимся за курсор ровно как колесо: точка холста под стрелкой на месте.
+    pub fn preview_pinch(&mut self, множитель: f64) -> bool {
+        let Some(точка) = self.preview_hit() else { return false };
+        if !множитель.is_finite() || множитель <= 0.0 || (множитель - 1.0).abs() < 1e-4 {
+            return self.preview_hit().is_some();
+        }
+        self.preview_take_manual_control();
+        let Some((g, вид)) = self.preview_view() else { return true };
+        let якорь = вид.canvas_at(g.content.loc, g.content.size, точка);
+        self.preview_manual_zoom = (self.preview_manual_zoom * множитель)
+            .clamp(crate::canvas::MINI_ZOOM_MIN, crate::canvas::MINI_ZOOM_MAX);
+        if let Some(base) = self.preview_base() {
+            let s = crate::canvas::MiniView::fit(
+                base, g.content.size, self.preview_manual_zoom, якорь,
+            ).scale;
+            if s > 0.0 {
+                self.preview_manual_center = Point::from((
+                    якорь.x + (g.content.size.w as f64 / 2.0
+                        - (точка.x - g.content.loc.x as f64)) / s,
+                    якорь.y + (g.content.size.h as f64 / 2.0
+                        - (точка.y - g.content.loc.y as f64)) / s,
+                ));
+            }
+        }
+        self.request_redraw();
         true
     }
 
@@ -2093,10 +3661,8 @@ impl Dawn {
     /// сначала закрепить (Alt+B на позиции курсора или Super+Shift+N в
     /// bookmarks-режиме на центре экрана).
     fn bookmark_anchor_for_screen_center(&self) -> Point<f64, Logical> {
-        let (w, h) = self.space.outputs().next()
-            .and_then(|o| self.space.output_geometry(o))
-            .map(|g| (g.size.w as f64, g.size.h as f64))
-            .unwrap_or((0.0, 0.0));
+        let экран = self.screen_size();
+        let (w, h) = (экран.w as f64, экран.h as f64);
         Point::from((
             self.viewport.cam_x + w / (2.0 * self.viewport.zoom),
             self.viewport.cam_y + h / (2.0 * self.viewport.zoom),
@@ -2144,17 +3710,15 @@ impl Dawn {
 
     pub fn jump_to_camera_bookmark(&mut self, slot: u32) {
         if let Some(&anchor) = self.camera_bookmarks.get(&slot) {
-            let (w, h) = self.space.outputs().next()
-                .and_then(|o| self.space.output_geometry(o))
-                .map(|g| (g.size.w as f64, g.size.h as f64))
-                .unwrap_or((0.0, 0.0));
+            let экран = self.screen_size();
+            let (w, h) = (экран.w as f64, экран.h as f64);
             // Центрируем камеру на якоре закладки.
             let target = Point::from((
                 anchor.x - w / (2.0 * self.viewport.zoom),
                 anchor.y - h / (2.0 * self.viewport.zoom),
             ));
             let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
-            self.camera_anim = Some(CameraAnim::new(from, target, Duration::from_millis(320)));
+            self.camera_anim = Some(CameraAnim::new(from, target, crate::anim::дуг::прыжок_к_закладке()));
             tracing::info!("dawn: jump to camera bookmark {}", slot);
         }
     }
@@ -2178,9 +3742,102 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+
+/// В какую сторону листать со стола `old_tag` на `tag`: +1 — новый приходит
+/// справа (уходящий уезжает влево), −1 — наоборот, None — листать некуда.
+///
+/// Номер стола — это позиция единственного бита в маске (`1 << (n-1)`), так что
+/// сравниваем `trailing_zeros`. Маска МОЖЕТ содержать несколько бит (Super+Ctrl
+/// добавляет тег к виду) — тогда номером считается младший из них, и
+/// перелистывание идёт по нему: другого разумного «номера» у такого вида нет.
+/// Куда записать «дом» окна при пересборке видимых окон (`refresh_tags`).
+///
+/// Три источника, и порядок между ними — ровно то место, где ломалось
+/// «окна при переключении столов уезжают»:
+/// · `уезжает` — окно прямо сейчас выпроваживают за край слайдом столов. Его
+///   цель пружины лежит ЗА экраном и домом быть не может ни при каких
+///   условиях: записав её, стол теряет окно навсегда;
+/// · `цель_пружины` — окно летит к своему слоту. Дом — куда прилетит, а не где
+///   застали: иначе стол открывается с окнами, застрявшими на полпути;
+/// · `в_space` — окно стоит на месте, брать откуда стоит.
+///
+/// `None` — не трогать сохранённое.
+fn дом_окна(
+    уезжает: bool,
+    цель_пружины: Option<Point<i32, Logical>>,
+    в_space: Option<Point<i32, Logical>>,
+) -> Option<Point<i32, Logical>> {
+    if уезжает {
+        return None;
+    }
+    цель_пружины.or(в_space)
+}
+
+fn слайд_сторона(old_tag: u32, tag: u32) -> Option<i32> {
+    if old_tag == 0 || tag == 0 {
+        return None;
+    }
+    match tag.trailing_zeros().cmp(&old_tag.trailing_zeros()) {
+        std::cmp::Ordering::Greater => Some(1),
+        std::cmp::Ordering::Less => Some(-1),
+        // Тот же стол (или два вида с общим младшим тегом) — листать нечего.
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Перелистывание обязано идти В СТОРОНУ НОМЕРА стола: со второго на пятый
+    /// — влево (новый приходит справа), обратно — вправо. Без этого «слайд»
+    /// превращается в разлёт окон в случайную сторону, и он перестаёт
+    /// сообщать, куда ты двигаешься по столам.
+    /// Стол, с которого только что ушли, обязан помнить, где стояли его окна.
+    ///
+    /// Регрессия «окна при переключении столов уезжают»: у окна, которое слайд
+    /// выпроваживает за край, цель пружины лежит за экраном. Общее правило «у
+    /// летящего окна дом = цель пружины» записывало эту точку как настоящее
+    /// место окна на столе, и стол терял окна безвозвратно — каждое следующее
+    /// перелистывание отодвигало их ещё на экран с лишним.
+    #[test]
+    fn уезжающее_окно_не_меняет_свой_дом() {
+        let дом = Point::<i32, Logical>::from((100, 200));
+        let за_краем = Point::<i32, Logical>::from((-2680, 200));
+
+        // Окно слайда уезжает за край: дом НЕ переписывается ничем.
+        assert_eq!(дом_окна(true, Some(за_краем), Some(за_краем)), None);
+        // …даже если пружины уже нет, а в space оно стоит за краем.
+        assert_eq!(дом_окна(true, None, Some(за_краем)), None);
+
+        // Обычное летящее окно по-прежнему целится в слот, а не в точку, где
+        // его застали, — это правило ломать было нельзя.
+        let слот = Point::<i32, Logical>::from((640, 0));
+        let полпути = Point::<i32, Logical>::from((300, 100));
+        assert_eq!(дом_окна(false, Some(слот), Some(полпути)), Some(слот));
+        // Стоящее окно берётся из space.
+        assert_eq!(дом_окна(false, None, Some(дом)), Some(дом));
+        // Окна нет нигде — писать нечего.
+        assert_eq!(дом_окна(false, None, None), None);
+    }
+
+    #[test]
+    fn листаем_в_сторону_номера_стола() {
+        let стол = |n: u32| 1u32 << (n - 1);
+        assert_eq!(слайд_сторона(стол(1), стол(2)), Some(1), "вперёд — новый справа");
+        assert_eq!(слайд_сторона(стол(2), стол(5)), Some(1));
+        assert_eq!(слайд_сторона(стол(5), стол(2)), Some(-1), "назад — новый слева");
+        assert_eq!(слайд_сторона(стол(9), стол(1)), Some(-1));
+        // Никуда не листаем: тот же стол и пустые маски.
+        assert_eq!(слайд_сторона(стол(3), стол(3)), None);
+        assert_eq!(слайд_сторона(0, стол(3)), None);
+        assert_eq!(слайд_сторона(стол(3), 0), None);
+        // Составной вид (несколько тегов сразу) считается по младшему биту —
+        // и это не должно паниковать или давать «сторону 0».
+        assert_eq!(слайд_сторона(стол(1) | стол(2), стол(4)), Some(1));
+        assert_eq!(слайд_сторона(стол(4), стол(1) | стол(2)), Some(-1));
+        assert_eq!(слайд_сторона(стол(1) | стол(2), стол(1) | стол(8)), None);
+    }
 
     /// Курсор темы приходит РОВНО запрошенного размера, и форма ищется не
     /// только по современному имени.

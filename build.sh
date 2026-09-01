@@ -20,8 +20,46 @@ set -e
 # pkg-config находит их сам без PKG_CONFIG_PATH. mold ставится штатно:
 # `sudo xbps-install mold`.
 
+TARGET_DIR=/mnt/dawn-build/target
+
 cd "$(dirname "$0")"
-cargo build --release --target-dir /mnt/dawn-build/target "$@"
+cargo build --release --target-dir "$TARGET_DIR" "$@"
+
+# Сборку зовут ДВА разных пользователя: человек (или Super+R внутри сессии) —
+# от yarik, я при проверках — от root. Каталог сборки при этом ОДИН, и после
+# прогона от root в нём остаются root'овые .o и .rlib: следующая сборка от
+# yarik доходит до них и падает на «Permission denied» — rustc открывает
+# готовый файл на запись, а не пересоздаёт его. Ровно так 23.08.2026 Super+R
+# три минуты собирал, тихо откатился на прежний бинарь (rebuild_if_stale не
+# фатален) и поднял сессию БЕЗ свежих правок — а выглядело это как «панель не
+# появилась».
+#
+# Поэтому root, закончив, возвращает каталог владельцу репозитория. Обратная
+# сторона (yarik портит сборку root'у) не важна: у root прав хватает всегда.
+# ВНИМАНИЕ: имя переменной ЛАТИНИЦЕЙ. Кириллическое имя bash за имя переменной
+# не считает — строка `хозяин="..."` выполняется как КОМАНДА и падает с
+# «command not found», а `set -e` до неё не добирается (присваивание внутри
+# if — не последняя команда конвейера). Итог: chown молча не выполнялся вовсе,
+# и root оставлял за собой ровно тот каталог сборки, ради которого этот блок и
+# написан. Поймано 23.08.2026: после сборки от root в /mnt/dawn-build/target
+# лежало 3160 root'овых файлов.
+if [[ $EUID -eq 0 ]]; then
+    owner="$(stat -c %U:%G "$(dirname "$0")")"
+    chown -R "$owner" "$TARGET_DIR" 2>/dev/null || true
+fi
+
+# dawn-share — терминальная команда раздачи. Кладём рядом с dwall, в
+# ~/.local/bin ВЛАДЕЛЬЦА репозитория: при сборке от root $HOME — это /root, и
+# команда тихо уехала бы туда, где её никто не ищет.
+owner_user="$(stat -c %U "$(dirname "$0")")"
+owner_home="$(getent passwd "$owner_user" | cut -d: -f6)"
+bindir="${owner_home:-$HOME}/.local/bin"
+mkdir -p "$bindir"
+cp dawn-share "$bindir/.dawn-share.new"
+mv -f "$bindir/.dawn-share.new" "$bindir/dawn-share"
+chmod +x "$bindir/dawn-share"
+[[ $EUID -eq 0 ]] && chown "$owner_user" "$bindir/dawn-share" 2>/dev/null
 
 echo ""
-echo "Binary: /mnt/dawn-build/target/release/dawn"
+echo "Binary: $TARGET_DIR/release/dawn"
+echo "Команда: $bindir/dawn-share"
