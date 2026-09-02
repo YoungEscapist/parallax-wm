@@ -340,6 +340,13 @@ impl XwmHandler for Dawn {
         let location = self.x11_to_canvas(surface.geometry().loc);
         let window = Window::new_x11_window(surface);
         self.space.map_element(window, location, true);
+        // Меню маплется ПОСЛЕДНИМ, то есть поверх всего, — а в режиме Minecraft
+        // поверх всего обязана быть игра (см. `mine::игру_наверх`). Иначе
+        // выпавшее меню Steam на мониторе накрывает развёрнутую игру, хотя
+        // человек видит его панелью в мире. Мимо `focus()` этот путь проходит
+        // нарочно (override-redirect фокус не принимает), поэтому здесь своя
+        // строка.
+        crate::mine::игру_наверх(self);
         self.request_redraw();
     }
 

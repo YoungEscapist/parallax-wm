@@ -98,7 +98,12 @@ fn поверхность(
 /// Фокус едет ЗА ВЗГЛЯДОМ, а не за кликом (в отличие от гостя `dshare`): в
 /// шлеме это ровно то же правило, и оно единственное, при котором можно
 /// смотреть в терминал и печатать, ничего не нажимая.
-pub fn навести(state: &mut Dawn, окно: &Window, пкс_x: f64, пкс_y: f64) {
+///
+/// `брать_фокус` — «взгляд ТОЛЬКО ЧТО зашёл на эту панель» (решает
+/// [`crate::mine::взять_фокус`]). Указка едет каждый кадр, а клавиатура — нет:
+/// иначе фокус был бы не «за взглядом», а ПРИБИТ к нему, и всякий бинд,
+/// метящий в фокус, откатывался бы следующим же кадром.
+pub fn навести(state: &mut Dawn, окно: &Window, пкс_x: f64, пкс_y: f64, брать_фокус: bool) {
     let Some(место) = место(state) else { return };
     let Some((поверхность, точка, начало)) = поверхность(state, окно, пкс_x, пкс_y) else {
         return;
@@ -106,11 +111,13 @@ pub fn навести(state: &mut Dawn, окно: &Window, пкс_x: f64, пкс
     let serial = SERIAL_COUNTER.next_serial();
     let время = state.start_time.elapsed().as_millis() as u32;
 
-    let прежний = место.get_keyboard().and_then(|к| к.current_focus());
-    let цель = crate::focus::KeyboardFocusTarget::for_window(окно);
-    if let (Some(клавиатура), Some(цель)) = (место.get_keyboard(), цель) {
-        if прежний.as_ref() != Some(&цель) {
-            клавиатура.set_focus(state, Some(цель), serial);
+    if брать_фокус {
+        let прежний = место.get_keyboard().and_then(|к| к.current_focus());
+        let цель = crate::focus::KeyboardFocusTarget::for_window(окно);
+        if let (Some(клавиатура), Some(цель)) = (место.get_keyboard(), цель) {
+            if прежний.as_ref() != Some(&цель) {
+                клавиатура.set_focus(state, Some(цель), serial);
+            }
         }
     }
 

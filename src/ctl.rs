@@ -456,9 +456,17 @@ fn шахта(хвост: &str, state: &mut Dawn) -> String {
             let y: f32 = слова.get(3).and_then(|с| с.parse().ok()).unwrap_or(0.0);
             crate::mine::закрепить_снаружи(state, ключ, x, y)
         }
+        // `mine game <номер из windows>` — объявить окно окном игры («-» снять).
+        // Живьём оно находится по pid мода; у харнесса мода-процесса с окном нет
+        // вовсе, и без этой команды правило «игра всегда сверху и клавиатура её»
+        // проверялось бы только запуском Minecraft.
+        Some("game") => {
+            let номер = слова.get(1).and_then(|с| с.parse::<usize>().ok());
+            crate::mine::назначить_игру(state, номер)
+        }
         иное => format!(
-            "ошибка: mine on|off|mode|layout|status|panels|ray x y z dx dy dz|pin ключ x y \
-             (было '{:?}')",
+            "ошибка: mine on|off|mode|layout|status|panels|ray x y z dx dy dz|pin ключ x y|\
+             game номер (было '{:?}')",
             иное
         ),
     }

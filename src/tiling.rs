@@ -1146,6 +1146,9 @@ impl Dawn {
 
         let wins: Vec<WinPos> = self.tagged_windows.iter()
             .filter(|tw| tw.tags & current_tags != 0)
+            // Игра занимает весь экран, и «фокус вправо» из панели всегда
+            // попадал бы в неё — то есть в никуда (см. `mine::в_переборе`).
+            .filter(|tw| crate::mine::в_переборе(self, &tw.window))
             .filter_map(|tw| {
                 self.space.element_geometry(&tw.window).map(|g| {
                     let cx = g.loc.x as f64 + g.size.w as f64 / 2.0;
@@ -1196,6 +1199,9 @@ impl Dawn {
         let visible: Vec<Window> = self.tagged_windows
             .iter()
             .filter(|tw| tw.tags & current_tags != 0)
+            // Окно Minecraft из кольца вычитается: попав на него, перебор
+            // застревал навсегда (см. `mine::в_переборе`).
+            .filter(|tw| crate::mine::в_переборе(self, &tw.window))
             .map(|tw| tw.window.clone())
             .collect();
         if visible.is_empty() { return; }

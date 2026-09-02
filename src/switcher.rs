@@ -40,6 +40,10 @@ impl Dawn {
             .elements()
             .rev()
             .filter(|w| !crate::xwin::is_override_redirect(w))
+            // Окно Minecraft перекрывает собой ВСЁ, поэтому в стопку
+            // «что лежит под этим окном» оно попадало всегда — и Alt+Tab
+            // упирался в него намертво (см. `mine::в_переборе`).
+            .filter(|w| crate::mine::в_переборе(self, w))
             .filter(|w| {
                 self.space
                     .element_geometry(w)
@@ -70,6 +74,7 @@ impl Dawn {
                     .elements()
                     .rev()
                     .filter(|w| !crate::xwin::is_override_redirect(w))
+                    .filter(|w| crate::mine::в_переборе(self, w))
                     .cloned()
                     .collect();
             }
@@ -247,6 +252,9 @@ impl Dawn {
             .tagged_windows
             .iter()
             .filter(|tw| tw.window.alive())
+            // Искать в игре саму игру нечего: выбрать её значит отдать фокус
+            // окну, которое человек и так видит вокруг себя.
+            .filter(|tw| crate::mine::в_переборе(self, &tw.window))
             .filter_map(|tw| {
                 let app = crate::xwin::app_id(&tw.window).unwrap_or_default();
                 let title = crate::xwin::title(&tw.window)
