@@ -105,6 +105,10 @@ smithay::backend::renderer::element::render_elements! {
     // Размытый фон под островом панели: та же текстура, но обрезанная
     // скруглением плашки тем же шейдером, что и углы окон (см. blur.rs).
     Blur = crate::rounded::Rounded<CropRenderElement<TextureRenderElement<GlesTexture>>>,
+    // Миниатюра обзора, развёрнутая в перспективе (см. наклон.rs). Тот же
+    // элемент, что и Minimap, только нарисованный своим шейдером: обзор от
+    // этого становится вогнутой стеной окон, а не плоской картой.
+    Наклон = crate::наклон::Наклон<CropRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>>,
 }
 
 type GbmDrmCompositor = DrmCompositor<
@@ -1059,6 +1063,7 @@ fn add_surface(
     // потом только клонируется (внутри — Arc на программу).
     if state.blur_shape.is_none() {
         state.blur_shape = crate::rounded::Шейдер::new(&mut device.gles);
+        state.наклон_шейдер = crate::наклон::Шейдер::new(&mut device.gles);
     }
     tracing::info!("plx/udev: output '{}' {}x{}@{}Hz",
         output_name, wl_mode.size.w, wl_mode.size.h, wl_mode.refresh/1000);
@@ -1626,7 +1631,10 @@ fn build_minimap_elements(
 
     // Живые миниатюры собираем ДО заимствования пула solid-слотов: дальше
     // `state` занят изменяемой ссылкой на `minimap_ids`.
-    let миниатюры = build_minimap_thumbnails(renderer, &окна, &proj, остриё, карта, видимость);
+    let миниатюры = build_minimap_thumbnails(
+        renderer, &окна, &proj, остриё, карта, видимость,
+        state.наклон_шейдер.clone(), state.lua_config.overview_3d,
+    );
     // Подписи под миниатюрами и заголовок карточки — им нужен `state` целиком
     // (кэш текста), поэтому тоже ДО пула.
     let (подписи, плашки_подписей) =
@@ -2038,8 +2046,12 @@ fn build_minimap_thumbnails(
     остриё: Point<i32, Physical>,
     карта: Rectangle<i32, Physical>,
     видимость: f32,
+    наклон: Option<crate::наклон::Шейдер>,
+    сила_3d: f32,
 ) -> Vec<OutputRenderElements> {
     let панель = карта;
+    // Разворачивать миниатюры имеет смысл, только если есть чем и на сколько.
+    let наклон = наклон.filter(|_| сила_3d > 0.0);
 
     let mut out = Vec::new();
     for окно in окна {
@@ -2059,12 +2071,41 @@ fn build_minimap_thumbnails(
             smithay::utils::Scale::from(1.0),
             видимость,
         );
+        // Прямоугольник ЭТОЙ миниатюры на экране: он же — рамка, в которую
+        // вписывается развёрнутая карточка. Считается тем же преобразованием,
+        // что и сама миниатюра (проекция карты плюс её масштаб).
+        let рамка = {
+            let x = остриё.x as f64 + (окно.loc.x - proj.bbox.loc.x) as f64 * proj.scale;
+            let y = остриё.y as f64 + (окно.loc.y - proj.bbox.loc.y) as f64 * proj.scale;
+            let w = окно.size.w as f64 * proj.scale;
+            let h = окно.size.h as f64 * proj.scale;
+            [x as f32, y as f32, w as f32, h as f32]
+        };
+        // Доля от центра карты: −1 у левого края, +1 у правого. По ней и
+        // считается угол — карточки поворачиваются к центру, и обзор
+        // становится вогнутой стеной окон.
+        let доля = if карта.size.w > 0 {
+            let центр_карты = карта.loc.x as f32 + карта.size.w as f32 * 0.5;
+            let центр_окна = рамка[0] + рамка[2] * 0.5;
+            ((центр_окна - центр_карты) / (карта.size.w as f32 * 0.5)).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let разворот = crate::наклон::Разворот::по_месту(доля, сила_3d);
+        let наклон_окна = наклон.clone();
+
         out.extend(els.into_iter().filter_map(|el| {
             let ужатое = RescaleRenderElement::from_element(el, остриё, proj.scale);
             // Обрезка обязательна: панель показывает весь холст с запасом 20%,
             // но окно у края bbox своей рамкой из неё торчит — без Crop оно
             // рисовалось бы поверх экрана рядом с панелью.
-            CropRenderElement::from_element(ужатое, 1.0, панель).map(OutputRenderElements::Minimap)
+            let обрезанное = CropRenderElement::from_element(ужатое, 1.0, панель)?;
+            Some(match наклон_окна.as_ref() {
+                Some(ш) => OutputRenderElements::Наклон(crate::наклон::Наклон::new(
+                    обрезанное, ш, рамка, разворот,
+                )),
+                None => OutputRenderElements::Minimap(обрезанное),
+            })
         }));
     }
     out

@@ -735,6 +735,9 @@ pub struct Parallax {
     /// Копия того же, что скругляет окна (см. rounded.rs): заводить второй
     /// смысла нет, а тащить `Surface` в сборку элементов панели — лишний шов.
     pub blur_shape: Option<crate::rounded::Шейдер>,
+    /// Шейдер перспективы для миниатюр обзора (см. src/наклон.rs).
+    /// Компилируется там же, где blur_shape, и живёт столько же.
+    pub наклон_шейдер: Option<crate::наклон::Шейдер>,
     /// Постоянные Id заплат размытия (по одной на остров панели).
     ///
     /// Раньше заплата брала `Id::new()` на КАЖДЫЙ кадр. Damage tracker ведёт
@@ -1268,6 +1271,7 @@ impl Parallax {
             chip_icons: std::collections::HashMap::new(),
             blur_tex: None,
             blur_shape: None,
+            наклон_шейдер: None,
             blur_ids: Vec::new(),
             portal_ids: Vec::new(),
             portal_pick_ids: Vec::new(),

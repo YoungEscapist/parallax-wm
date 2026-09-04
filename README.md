@@ -39,7 +39,10 @@ in-tree docs; this file and the config reference are in English too.
 - Zoom-nav (`Super+Space`): pull back for a bird's-eye view and pan with the
   arrow keys.
 - Minimap (`Super+~`) with live window thumbnails, its own pan/zoom, and
-  click-to-fly.
+  click-to-fly. The thumbnails can stand in perspective — each one turned
+  towards the centre, far edge receding and dimmed, so the overview reads as a
+  curved wall of windows rather than a flat map (`set{ overview_3d = 1.0 }`).
+  It is a real projective warp done in the fragment shader, not a scale trick.
 - Camera bookmarks: drop one anywhere (`Alt+B`), jump to it (`Super+Alt+1..9`),
   or switch to bookmark mode instead of workspaces entirely (`Super+B`).
 - Overview shows the workspaces exactly as they are — floating windows stay

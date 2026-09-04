@@ -449,6 +449,10 @@ pub struct Config {
     pub glow: f32,
     /// `set{ glow_width = ... }` — ширина этой каймы в логических пикселях.
     pub glow_width: f32,
+    /// `set{ overview_3d = ... }` — перспектива миниатюр в карточке обзора
+    /// окон: карточки разворачиваются к центру, дальний край уходит вглубь
+    /// (см. наклон.rs). Сила 0.0…1.0, 0 — плоский обзор, как раньше.
+    pub overview_3d: f32,
     /// `set{ blur = ... }` — размывать фон под островами панели (см. blur.rs).
     /// ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО: код проходом рендера живьём не отсмотрен, а
     /// ошибка там стоит чёрного экрана.
@@ -528,6 +532,7 @@ impl Default for Config {
             // строкой в config.lua.
             glow: 0.0,
             glow_width: 12.0,
+            overview_3d: 0.0,
             blur: false,
             close_anim: true,
             intro: true,
@@ -860,6 +865,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let blur: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let glow: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
     let glow_width: Rc<RefCell<f32>> = Rc::new(RefCell::new(12.0));
+    let overview_3d: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
     let close_anim: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let intro: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let notify_sound: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
@@ -997,6 +1003,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let blur = blur.clone();
         let glow = glow.clone();
         let glow_width = glow_width.clone();
+        let overview_3d = overview_3d.clone();
         let close_anim = close_anim.clone();
         let intro = intro.clone();
         let notify_sound = notify_sound.clone();
@@ -1060,6 +1067,9 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             }
             if let Ok(Some(v)) = tbl.get::<Option<f32>>("glow_width") {
                 *glow_width.borrow_mut() = v.max(0.0);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("overview_3d") {
+                *overview_3d.borrow_mut() = v.clamp(0.0, 1.0);
             }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("blur") {
                 *blur.borrow_mut() = v;
@@ -1356,6 +1366,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         share_guest_all: *share_guest_all.borrow(),
         keyboard_grab_apps: keyboard_grab_apps.borrow().clone(),
         glow: *glow.borrow(),
+        overview_3d: *overview_3d.borrow(),
         glow_width: *glow_width.borrow(),
         blur: *blur.borrow(),
         close_anim: *close_anim.borrow(),
