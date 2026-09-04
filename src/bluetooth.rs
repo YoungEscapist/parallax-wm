@@ -1,12 +1,12 @@
 //! Блютуз внутри композитора: BlueZ по D-Bus, меню устройств и индикатор.
 //!
-//! Почему в самом dawn. Кроме dawn в сессии нет ничего, что рисовало бы
+//! Почему в самом parallax. Кроме parallax в сессии нет ничего, что рисовало бы
 //! интерфейс: панели, трея и апплетов тут нет by design — рабочий стол это
 //! бесконечный холст с окнами. Значит и «подключить наушники» должен уметь сам
 //! композитор, иначе за этим приходится уходить в терминал с `bluetoothctl`.
 //!
 //! Устройство — как у портала (см. portal.rs): D-Bus живёт в СВОЁМ потоке
-//! (zbus, блокирующий API), потому что главный цикл dawn — calloop и
+//! (zbus, блокирующий API), потому что главный цикл parallax — calloop и
 //! однопоточный, асинхронному рантайму там места нет. Из потока в композитор
 //! идут события каналом calloop, обратно — команды обычным `mpsc`.
 //!
@@ -35,7 +35,7 @@ const ADAPTER_IFACE: &str = "org.bluez.Adapter1";
 const DEVICE_IFACE: &str = "org.bluez.Device1";
 const BATTERY_IFACE: &str = "org.bluez.Battery1";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
-const AGENT_PATH: &str = "/dawn/bluetooth/agent";
+const AGENT_PATH: &str = "/parallax/bluetooth/agent";
 
 /// Как часто спрашиваем BlueZ о состоянии, когда меню ОТКРЫТО.
 const POLL_IDLE: Duration = Duration::from_millis(1200);
@@ -137,23 +137,23 @@ pub enum Cmd {
 
 /// Поднять поток. `None` — системной шины нет; блютуза в такой сессии не будет,
 /// но это не повод падать (ровно так же ведёт себя портал).
-pub fn spawn(to_dawn: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
+pub fn spawn(to_plx: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
     let (tx, rx) = mpsc::channel::<Cmd>();
     let ok = std::thread::Builder::new()
-        .name("dawn-bluetooth".into())
-        .spawn(move || serve(to_dawn, rx))
+        .name("plx-bluetooth".into())
+        .spawn(move || serve(to_plx, rx))
         .is_ok();
     ok.then_some(tx)
 }
 
-fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
+fn serve(to_plx: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
     // Соединение может не подняться (нет системной шины) — тогда ждём и
     // пробуем снова: сессия могла стартовать раньше dbus.
     let conn = loop {
         match zbus::blocking::Connection::system() {
             Ok(c) => break c,
             Err(err) => {
-                tracing::warn!("dawn/bt: системная шина недоступна: {}", err);
+                tracing::warn!("plx/bt: system bus unavailable: {}", err);
                 // Команды всё это время копятся в канале; если композитор
                 // умер, канал закроется и поток пора заканчивать.
                 std::thread::sleep(RETRY);
@@ -164,7 +164,7 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
         }
     };
 
-    register_agent(&to_dawn);
+    register_agent(&to_plx);
 
     let mut last: Option<Snapshot> = None;
     let mut next_poll = Instant::now();
@@ -188,8 +188,8 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
             }
             Ok(cmd) => {
                 let snap = last.clone().unwrap_or_default();
-                if let Err(err) = run_cmd(&conn, &snap, cmd, &to_dawn) {
-                    let _ = to_dawn.send(Event::Notice(short_error(&err)));
+                if let Err(err) = run_cmd(&conn, &snap, cmd, &to_plx) {
+                    let _ = to_plx.send(Event::Notice(short_error(&err)));
                 }
                 // После команды состояние почти наверняка изменилось.
                 next_poll = Instant::now();
@@ -212,12 +212,12 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
                     };
                 if last.as_ref() != Some(&snap) {
                     tracing::debug!(
-                        "dawn/bt: состояние: адаптер={:?} powered={} устройств={} подключено={}",
+                        "plx/bt: state: adapter={:?} powered={} devices={} connected={}",
                         snap.adapter, snap.powered, snap.devices.len(),
                         snap.devices.iter().filter(|d| d.connected).count(),
                     );
                     last = Some(snap.clone());
-                    if to_dawn.send(Event::State(snap)).is_err() {
+                    if to_plx.send(Event::State(snap)).is_err() {
                         return;
                     }
                 }
@@ -226,8 +226,8 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
                 next_poll = Instant::now() + RETRY;
                 if !warned_missing {
                     warned_missing = true;
-                    tracing::warn!("dawn/bt: BlueZ не отвечает: {}", err);
-                    let _ = to_dawn.send(Event::Notice(
+                    tracing::warn!("plx/bt: BlueZ not responding: {}", err);
+                    let _ = to_plx.send(Event::Notice(
                         "bluetoothd is not running (sv up bluetoothd)".into(),
                     ));
                 }
@@ -280,7 +280,7 @@ fn read_state(conn: &zbus::blocking::Connection) -> zbus::Result<Snapshot> {
     // см. serve): опрос идёт по таймеру, и безусловный debug! давал по строке
     // на каждый заход — в неподвижном сеансе это весь лог целиком.
     tracing::trace!(
-        "dawn/bt: объектов={} адаптер={:?} powered={} устройств={}",
+        "plx/bt: objects={} adapter={:?} powered={} devices={}",
         objects.len(), snap.adapter, snap.powered, snap.devices.len(),
     );
     // Порядок в меню: подключённые, потом сопряжённые, потом остальные (у
@@ -309,7 +309,7 @@ fn run_cmd(
     conn: &zbus::blocking::Connection,
     snap: &Snapshot,
     cmd: Cmd,
-    to_dawn: &channel::Sender<Event>,
+    to_plx: &channel::Sender<Event>,
 ) -> zbus::Result<()> {
     // Команда может прийти РАНЬШЕ первого опроса — так и происходит с
     // AutoConnect, которую композитор шлёт сразу на старте. Тогда переданный
@@ -325,11 +325,11 @@ fn run_cmd(
     match cmd {
         Cmd::Power(on) => {
             let Some(adapter) = snap.adapter.clone() else {
-                let _ = to_dawn.send(Event::Notice("no adapter".into()));
+                let _ = to_plx.send(Event::Notice("no adapter".into()));
                 return Ok(());
             };
             set_prop(conn, &adapter, ADAPTER_IFACE, "Powered", on)?;
-            let _ = to_dawn.send(Event::Notice(
+            let _ = to_plx.send(Event::Notice(
                 if on { "adapter on" } else { "adapter off" }.into(),
             ));
         }
@@ -340,34 +340,34 @@ fn run_cmd(
             // ошибкой — она здесь ожидаема и в лицо человеку не нужна.
             let m = if on { "StartDiscovery" } else { "StopDiscovery" };
             if let Err(err) = proxy.call::<_, _, ()>(m, &()) {
-                tracing::debug!("dawn/bt: {}: {}", m, err);
+                tracing::debug!("plx/bt: {}: {}", m, err);
             }
         }
         Cmd::Connect(path) => {
             let name = device_name(snap, &path);
-            let _ = to_dawn.send(Event::Notice(format!("{name}: connecting...")));
+            let _ = to_plx.send(Event::Notice(format!("{name}: connecting...")));
             // Trusted ставим до Connect: иначе после перезагрузки наушников
             // BlueZ будет спрашивать разрешение на каждый профиль заново.
             let _ = set_prop(conn, &path, DEVICE_IFACE, "Trusted", true);
             proxy(conn, &path, DEVICE_IFACE)?.call::<_, _, ()>("Connect", &())?;
             remember_last(&device_address(snap, &path));
-            let _ = to_dawn.send(Event::Notice(format!("{name}: connected")));
+            let _ = to_plx.send(Event::Notice(format!("{name}: connected")));
         }
         Cmd::Disconnect(path) => {
             let name = device_name(snap, &path);
             proxy(conn, &path, DEVICE_IFACE)?.call::<_, _, ()>("Disconnect", &())?;
-            let _ = to_dawn.send(Event::Notice(format!("{name}: disconnected")));
+            let _ = to_plx.send(Event::Notice(format!("{name}: disconnected")));
         }
         Cmd::Pair(path) => {
             let name = device_name(snap, &path);
-            let _ = to_dawn.send(Event::Notice(format!("{name}: pairing...")));
+            let _ = to_plx.send(Event::Notice(format!("{name}: pairing...")));
             proxy(conn, &path, DEVICE_IFACE)?.call::<_, _, ()>("Pair", &())?;
             let _ = set_prop(conn, &path, DEVICE_IFACE, "Trusted", true);
             // Сопряжение само по себе звука в наушниках не даёт — сразу
             // подключаем, этого от «нажал Enter на устройстве» и ждут.
             let _ = proxy(conn, &path, DEVICE_IFACE)?.call::<_, _, ()>("Connect", &());
             remember_last(&device_address(snap, &path));
-            let _ = to_dawn.send(Event::Notice(format!("{name}: paired")));
+            let _ = to_plx.send(Event::Notice(format!("{name}: paired")));
         }
         Cmd::Forget(path) => {
             let Some(adapter) = snap.adapter.clone() else { return Ok(()) };
@@ -376,7 +376,7 @@ fn run_cmd(
                 .map_err(|e| zbus::Error::Failure(e.to_string()))?;
             proxy(conn, &adapter, ADAPTER_IFACE)?
                 .call::<_, _, ()>("RemoveDevice", &(obj,))?;
-            let _ = to_dawn.send(Event::Notice(format!("{name}: forgotten")));
+            let _ = to_plx.send(Event::Notice(format!("{name}: forgotten")));
         }
         // Разбирается в serve (меняет темп опроса), сюда не доходит.
         Cmd::Watch(_) => {}
@@ -389,7 +389,7 @@ fn run_cmd(
                 std::thread::sleep(Duration::from_millis(700));
             }
             let Some(last) = load_last() else {
-                tracing::debug!("dawn/bt: автоподключение: некого подключать");
+                tracing::debug!("plx/bt: autoconnect: nothing to connect to");
                 return Ok(());
             };
             // Перечитываем: снимок мог быть снят до подъёма адаптера, и тогда
@@ -398,17 +398,17 @@ fn run_cmd(
             let Some(dev) = fresh.devices.iter()
                 .find(|d| d.address == last && d.paired && !d.connected)
             else {
-                tracing::debug!("dawn/bt: автоподключение: {} не найдено или уже подключено", last);
+                tracing::debug!("plx/bt: autoconnect: {} not found or already connected", last);
                 return Ok(());
             };
-            tracing::info!("dawn/bt: автоподключение {} ({})", dev.name, dev.address);
-            let _ = to_dawn.send(Event::Notice(format!("{}: connecting...", dev.name)));
+            tracing::info!("plx/bt: autoconnect {} ({})", dev.name, dev.address);
+            let _ = to_plx.send(Event::Notice(format!("{}: connecting...", dev.name)));
             match proxy(conn, &dev.path, DEVICE_IFACE)?.call::<_, _, ()>("Connect", &()) {
                 Ok(()) => {
-                    let _ = to_dawn.send(Event::Notice(format!("{}: connected", dev.name)));
+                    let _ = to_plx.send(Event::Notice(format!("{}: connected", dev.name)));
                 }
                 // Наушники в кейсе — обычное дело, руганью это сопровождать не надо.
-                Err(err) => tracing::info!("dawn/bt: автоподключение не вышло: {}", err),
+                Err(err) => tracing::info!("plx/bt: autoconnect failed: {}", err),
             }
         }
     }
@@ -488,7 +488,7 @@ fn short_error(err: &zbus::Error) -> String {
 
 fn state_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".local/state/dawn/bluetooth"))
+    Some(std::path::PathBuf::from(home).join(".local/state/parallax/bluetooth"))
 }
 
 /// Запомнить адрес устройства, к которому подключались вручную — по нему потом
@@ -502,7 +502,7 @@ fn remember_last(address: &str) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Err(err) = std::fs::write(&path, address) {
-        tracing::warn!("dawn/bt: {}: {}", path.display(), err);
+        tracing::warn!("plx/bt: {}: {}", path.display(), err);
     }
 }
 
@@ -517,7 +517,7 @@ fn load_last() -> Option<String> {
 /// Реализация `org.bluez.Agent1`: BlueZ зовёт её, когда при сопряжении нужно
 /// участие человека.
 struct Agent {
-    to_dawn: channel::Sender<Event>,
+    to_plx: channel::Sender<Event>,
 }
 
 #[zbus::interface(name = "org.bluez.Agent1")]
@@ -530,7 +530,7 @@ impl Agent {
         let (tx, rx) = mpsc::channel();
         let name = device.as_str().rsplit('/').next().unwrap_or("device")
             .trim_start_matches("dev_").replace('_', ":");
-        if self.to_dawn.send(Event::Confirm { name, passkey, reply: tx }).is_err() {
+        if self.to_plx.send(Event::Confirm { name, passkey, reply: tx }).is_err() {
             return Err(zbus::fdo::Error::Failed("compositor is not responding".into()));
         }
         match rx.recv_timeout(CONFIRM_TIMEOUT) {
@@ -543,7 +543,7 @@ impl Agent {
     /// Устройству нечем показать код — оно просто просит разрешения.
     fn request_authorization(&self, _device: OwnedObjectPath) -> zbus::fdo::Result<()> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.to_dawn.send(Event::Confirm {
+        let _ = self.to_plx.send(Event::Confirm {
             name: "pairing".into(), passkey: 0, reply: tx,
         });
         match rx.recv_timeout(CONFIRM_TIMEOUT) {
@@ -562,11 +562,11 @@ impl Agent {
     /// Код показывает НАМ устройство, набирать его надо на нём — показываем
     /// строкой в меню.
     fn display_passkey(&self, _device: OwnedObjectPath, passkey: u32, _entered: u16) {
-        let _ = self.to_dawn.send(Event::Notice(format!("code on the device: {passkey:06}")));
+        let _ = self.to_plx.send(Event::Notice(format!("code on the device: {passkey:06}")));
     }
 
     fn display_pin_code(&self, _device: OwnedObjectPath, pincode: String) -> zbus::fdo::Result<()> {
-        let _ = self.to_dawn.send(Event::Notice(format!("PIN on the device: {pincode}")));
+        let _ = self.to_plx.send(Event::Notice(format!("PIN on the device: {pincode}")));
         Ok(())
     }
 
@@ -582,24 +582,24 @@ impl Agent {
     }
 
     fn cancel(&self) {
-        let _ = self.to_dawn.send(Event::Notice("pairing cancelled by the device".into()));
+        let _ = self.to_plx.send(Event::Notice("pairing cancelled by the device".into()));
     }
 }
 
 /// Поднять агента на ОТДЕЛЬНОМ соединении (см. шапку модуля) и объявить его
 /// агентом по умолчанию.
-fn register_agent(to_dawn: &channel::Sender<Event>) {
-    let to_dawn = to_dawn.clone();
+fn register_agent(to_plx: &channel::Sender<Event>) {
+    let to_plx = to_plx.clone();
     let spawned = std::thread::Builder::new()
-        .name("dawn-bt-agent".into())
+        .name("plx-bt-agent".into())
         .spawn(move || {
             let conn = match zbus::blocking::connection::Builder::system()
-                .and_then(|b| b.serve_at(AGENT_PATH, Agent { to_dawn }))
+                .and_then(|b| b.serve_at(AGENT_PATH, Agent { to_plx }))
                 .and_then(|b| b.build())
             {
                 Ok(c) => c,
                 Err(err) => {
-                    tracing::warn!("dawn/bt: агент не поднялся: {}", err);
+                    tracing::warn!("plx/bt: agent failed to start: {}", err);
                     return;
                 }
             };
@@ -618,10 +618,10 @@ fn register_agent(to_dawn: &channel::Sender<Event>) {
                 });
                 match ok {
                     Ok(()) => {
-                        tracing::info!("dawn/bt: агент сопряжения зарегистрирован");
+                        tracing::info!("plx/bt: pairing agent registered");
                         break;
                     }
-                    Err(err) => tracing::debug!("dawn/bt: агент ждёт bluetoothd: {}", err),
+                    Err(err) => tracing::debug!("plx/bt: agent waiting for bluetoothd: {}", err),
                 }
                 std::thread::sleep(RETRY);
             }
@@ -631,7 +631,7 @@ fn register_agent(to_dawn: &channel::Sender<Event>) {
         })
         .is_ok();
     if !spawned {
-        tracing::warn!("dawn/bt: не удалось создать поток агента");
+        tracing::warn!("plx/bt: could not spawn the agent thread");
     }
 }
 
@@ -808,7 +808,7 @@ impl BtUi {
     }
 }
 
-impl crate::state::Dawn {
+impl crate::state::Parallax {
     /// Поднять блютуз-поток. Зовётся один раз при старте; если шины нет,
     /// `bt` останется None и всё меню просто не откроется.
     pub fn init_bluetooth(&mut self, tx: mpsc::Sender<Cmd>, autoconnect: bool) {
@@ -839,7 +839,7 @@ impl crate::state::Dawn {
                 bt.open = true;
             }
             Event::Notice(text) => {
-                tracing::info!("dawn/bt: {}", text);
+                tracing::info!("plx/bt: {}", text);
                 bt.notice = Some((text, Instant::now()));
             }
         }
@@ -849,7 +849,7 @@ impl crate::state::Dawn {
     /// Открыть/закрыть меню (действие `bluetooth_menu`).
     pub fn bt_toggle_menu(&mut self) {
         let Some(bt) = self.bt.as_mut() else {
-            tracing::warn!("dawn/bt: блютуз не поднят (нет системной шины?)");
+            tracing::warn!("plx/bt: bluetooth is not up (no system bus?)");
             return;
         };
         bt.open = !bt.open;
@@ -945,7 +945,7 @@ impl crate::state::Dawn {
     pub fn bt_send(&mut self, cmd: Cmd) {
         if let Some(bt) = self.bt.as_ref() {
             if bt.tx.send(cmd).is_err() {
-                tracing::warn!("dawn/bt: поток блютуза не отвечает");
+                tracing::warn!("plx/bt: bluetooth thread not responding");
             }
         }
         self.request_redraw();

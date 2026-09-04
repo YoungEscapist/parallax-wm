@@ -2,12 +2,12 @@
 //! Telegram, Vesktop, Steam и прочие показывают свой значок «в трее».
 //!
 //! Почему в самом композиторе — по той же причине, что блютуз и полка: в сессии
-//! dawn нет панели, а свернувшийся в трей мессенджер иначе пропадает совсем.
+//! parallax нет панели, а свернувшийся в трей мессенджер иначе пропадает совсем.
 //!
 //! Как это устроено в мире. Приложение поднимает на СВОЕЙ шине объект
 //! `org.kde.StatusNotifierItem` и зовёт `RegisterStatusNotifierItem` у
 //! `org.kde.StatusNotifierWatcher`. Watcher — общесистемный «реестр», его
-//! обычно держит панель. Значит, чтобы значки появились, dawn должен:
+//! обычно держит панель. Значит, чтобы значки появились, parallax должен:
 //!
 //! 1. **взять имя watcher'а** и вести реестр;
 //! 2. **объявить себя хостом** (`IsStatusNotifierHostRegistered = true`) — без
@@ -15,13 +15,13 @@
 //!    старый XEmbed-трей, которого в вэйланде нет вовсе;
 //! 3. читать у каждого предмета `IconPixmap` и рисовать его в панели.
 //!
-//! Если имя watcher'а УЖЕ занято (запущен waybar со своим треем), dawn не
+//! Если имя watcher'а УЖЕ занято (запущен waybar со своим треем), parallax не
 //! отбирает его, а работает «только хостом»: регистрируется у чужого watcher'а
 //! и читает его список. Иначе два реестра дрались бы за имя, и значки моргали
 //! бы у обоих.
 //!
 //! Потоки. Шину обслуживает свой поток с блокирующим zbus — ровно как в
-//! bluetooth.rs и wifi.rs, потому что главный цикл dawn однопоточный (calloop).
+//! bluetooth.rs и wifi.rs, потому что главный цикл parallax однопоточный (calloop).
 //! Сигналы шины ловят ещё два коротких потока (по одному на правило подписки) и
 //! складывают их В ТОТ ЖЕ канал команд: так рабочий поток ждёт один источник, а
 //! не крутит опрос вхолостую.
@@ -32,7 +32,7 @@
 //! приложение показывает СВОЁ окно меню (так делают Telegram и Vesktop).
 //! Иконки берутся только из `IconPixmap` (готовые пиксели по шине); для
 //! предметов, которые присылают лишь `IconName` (имя в теме значков), рисуется
-//! кружок с первой буквой — читать PNG из темы означало бы тащить в dawn
+//! кружок с первой буквой — читать PNG из темы означало бы тащить в parallax
 //! распаковщик zlib.
 
 use std::collections::HashMap;
@@ -180,14 +180,14 @@ impl Watcher {
                 reg.push(ключ);
             }
         }
-        tracing::info!("dawn/sni: предмет зарегистрирован: {}{}", service, path);
+        tracing::info!("plx/sni: item registered: {}{}", service, path);
         let _ = self.notes.send(Cmd::Bus(Note::Registered { service, path }));
     }
 
     /// Хосты (панели) отмечаются здесь. Свой список мы не ведём: единственное,
     /// что от него зависит, — свойство ниже, а оно у нас всегда true.
     fn register_status_notifier_host(&mut self, service: &str) {
-        tracing::debug!("dawn/sni: хост зарегистрирован: {}", service);
+        tracing::debug!("plx/sni: host registered: {}", service);
     }
 
     #[zbus(property)]
@@ -210,21 +210,21 @@ impl Watcher {
 
 // ── Поток ────────────────────────────────────────────────────────────────────
 
-pub fn spawn(to_dawn: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
+pub fn spawn(to_plx: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
     let (tx, rx) = mpsc::channel::<Cmd>();
     let свой = tx.clone();
     let ok = std::thread::Builder::new()
-        .name("dawn-sni".into())
-        .spawn(move || serve(to_dawn, rx, свой))
+        .name("plx-sni".into())
+        .spawn(move || serve(to_plx, rx, свой))
         .is_ok();
     ok.then_some(tx)
 }
 
-fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>, notes: mpsc::Sender<Cmd>) {
+fn serve(to_plx: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>, notes: mpsc::Sender<Cmd>) {
     let registry: Registry = Arc::new(Mutex::new(Vec::new()));
 
     // Соединение поднимаем вместе с объектом реестра: сессионной шины может
-    // ещё не быть (dawn стартует раньше dbus) — тогда ждём и пробуем снова.
+    // ещё не быть (parallax стартует раньше dbus) — тогда ждём и пробуем снова.
     let conn = loop {
         let построено = zbus::blocking::connection::Builder::session().and_then(|b| {
             b.serve_at(
@@ -236,7 +236,7 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>, notes: mpsc::
         match построено {
             Ok(c) => break c,
             Err(err) => {
-                tracing::warn!("dawn/sni: сессионная шина недоступна: {}", err);
+                tracing::warn!("plx/sni: session bus unavailable: {}", err);
                 std::thread::sleep(RETRY);
                 if matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
                     return;
@@ -253,11 +253,11 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>, notes: mpsc::
     ) {
         Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => true,
         Ok(other) => {
-            tracing::warn!("dawn/sni: {} уже занят ({:?}) — работаю только хостом", WATCHER_NAME, other);
+            tracing::warn!("plx/sni: {} is already taken ({:?}) — acting as host only", WATCHER_NAME, other);
             false
         }
         Err(err) => {
-            tracing::warn!("dawn/sni: имя реестра не взято: {} — работаю только хостом", err);
+            tracing::warn!("plx/sni: could not claim the watcher name: {} — acting as host only", err);
             false
         }
     };
@@ -273,7 +273,7 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>, notes: mpsc::
         let _ = p.call::<_, _, ()>("RegisterStatusNotifierHost", &(host_name.as_str(),));
     }
     if свой_реестр {
-        // Сигнал ОБЯЗАН уйти: приложение, запущенное раньше dawn, ждёт именно
+        // Сигнал ОБЯЗАН уйти: приложение, запущенное раньше parallax, ждёт именно
         // его, чтобы поднять свой предмет заново.
         let _ = conn.emit_signal(
             None::<&str>,
@@ -284,8 +284,8 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>, notes: mpsc::
         );
     }
     tracing::info!(
-        "dawn/sni: трей поднят ({}), хост {}",
-        if свой_реестр { "свой реестр" } else { "чужой реестр" },
+        "plx/sni: tray is up ({}), host {}",
+        if свой_реестр { "own watcher" } else { "foreign watcher" },
         host_name,
     );
 
@@ -370,8 +370,8 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>, notes: mpsc::
             })
         {
             items = свежие;
-            tracing::debug!("dawn/sni: значков в трее: {}", items.len());
-            if to_dawn.send(Event::Items(items.clone())).is_err() {
+            tracing::debug!("plx/sni: tray icons: {}", items.len());
+            if to_plx.send(Event::Items(items.clone())).is_err() {
                 return;
             }
         }
@@ -420,7 +420,7 @@ fn watch_signals(conn: &zbus::blocking::Connection, notes: mpsc::Sender<Cmd>) {
         let notes = notes.clone();
         if let Ok(iter) = zbus::blocking::MessageIterator::for_match_rule(rule, conn, Some(64)) {
             let _ = std::thread::Builder::new()
-                .name("dawn-sni-items".into())
+                .name("plx-sni-items".into())
                 .spawn(move || {
                     for msg in iter {
                         let Ok(msg) = msg else { continue };
@@ -438,7 +438,7 @@ fn watch_signals(conn: &zbus::blocking::Connection, notes: mpsc::Sender<Cmd>) {
     if let Some(rule) = правило_имён {
         if let Ok(iter) = zbus::blocking::MessageIterator::for_match_rule(rule, conn, Some(64)) {
             let _ = std::thread::Builder::new()
-                .name("dawn-sni-names".into())
+                .name("plx-sni-names".into())
                 .spawn(move || {
                     for msg in iter {
                         let Ok(msg) = msg else { continue };
@@ -468,7 +468,7 @@ fn run_cmd(conn: &zbus::blocking::Connection, известные: &[(String, Str
         Cmd::Bus(_) => return,
     };
     let Some((service, path)) = известные.iter().find(|(s, p)| format!("{s}{p}") == key) else {
-        tracing::debug!("dawn/sni: {} — предмет {} уже ушёл", метод, key);
+        tracing::debug!("plx/sni: {} — item {} is already gone", метод, key);
         return;
     };
     let Ok(p) = zbus::blocking::Proxy::new(conn, service.as_str(), path.as_str(), ITEM_IFACE)
@@ -476,7 +476,7 @@ fn run_cmd(conn: &zbus::blocking::Connection, известные: &[(String, Str
         return;
     };
     if let Err(err) = p.call::<_, _, ()>(метод, &(x, y)) {
-        tracing::debug!("dawn/sni: {} у {} не сработал: {}", метод, key, err);
+        tracing::debug!("plx/sni: {} on {} failed: {}", метод, key, err);
     }
 }
 
@@ -668,7 +668,7 @@ impl TrayApps {
     }
 }
 
-impl crate::state::Dawn {
+impl crate::state::Parallax {
     pub fn init_sni(&mut self, tx: mpsc::Sender<Cmd>) {
         self.tray_apps = Some(TrayApps {
             tx, items: Vec::new(), buffers: HashMap::new(), sizes: HashMap::new(),
@@ -761,9 +761,9 @@ impl crate::state::Dawn {
         } else {
             Cmd::Activate { key, x, y }
         };
-        tracing::info!("dawn/sni: {:?}", cmd);
+        tracing::info!("plx/sni: {:?}", cmd);
         if apps.tx.send(cmd).is_err() {
-            tracing::warn!("dawn/sni: поток трея не отвечает");
+            tracing::warn!("plx/sni: tray thread not responding");
         }
     }
 }
@@ -927,8 +927,8 @@ mod tests {
         // желающих ходить на шину среди тестов нет.
         unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &шина.адрес) };
 
-        let (to_dawn, канал) = channel::channel::<Event>();
-        let _tx = spawn(to_dawn).expect("поток трея не поднялся");
+        let (to_plx, канал) = channel::channel::<Event>();
+        let _tx = spawn(to_plx).expect("поток трея не поднялся");
 
         // Ждём, пока трей возьмёт имя реестра: приложение, пришедшее раньше,
         // просто не найдёт, к кому обратиться.

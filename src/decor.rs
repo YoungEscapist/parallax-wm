@@ -222,7 +222,7 @@ impl DecorCache {
         if self.proto.is_some() && self.radius == radius {
             return;
         }
-        tracing::debug!("dawn/decor: пересборка плиток, радиус={} px", radius);
+        tracing::debug!("plx/decor: rebuilding the tiles, radius={} px", radius);
         self.radius = radius;
         self.proto = Some(Proto::new(radius));
         self.shadow_corner = Default::default();

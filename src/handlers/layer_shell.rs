@@ -8,9 +8,9 @@ use smithay::{
     },
 };
 
-use crate::state::Dawn;
+use crate::state::Parallax;
 
-impl WlrLayerShellHandler for Dawn {
+impl WlrLayerShellHandler for Parallax {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
         &mut self.layer_shell_state
     }
@@ -23,7 +23,7 @@ impl WlrLayerShellHandler for Dawn {
         _namespace: String,
     ) {
         // Клиент ВПРАВЕ назвать выход (`zwlr_layer_shell_v1.get_layer_surface`
-        // первым аргументом), и обои с панелями им пользуются: dwall создаёт по
+        // первым аргументом), и обои с панелями им пользуются: plx-wall создаёт по
         // поверхности на каждый wl_output. Раньше этот аргумент отбрасывался —
         // все слои валились в карту одного выхода, и обои на втором мониторе
         // получить было нельзя в принципе.
@@ -39,11 +39,11 @@ impl WlrLayerShellHandler for Dawn {
             .or_else(|| self.layer_output.clone())
             .unwrap_or_else(|| {
                 self.space.outputs().next()
-                    .expect("dawn: layer-surface without any output")
+                    .expect("plx: layer-surface without any output")
                     .clone()
             });
         tracing::debug!(
-            "dawn/layer: «{}» ({:?}) → монитор {} ({})",
+            "plx/layer: '{}' ({:?}) → monitor {} ({})",
             _namespace, _layer, индекс,
             self.мониторы.get(индекс).map(|m| m.коннектор.as_str()).unwrap_or("—"),
         );
@@ -51,7 +51,7 @@ impl WlrLayerShellHandler for Dawn {
         {
             let mut map = layer_map_for_output(&output);
             if let Err(e) = map.map_layer(&layer_surface) {
-                tracing::warn!("dawn/layer: map_layer failed: {:?}", e);
+                tracing::warn!("plx/layer: map_layer failed: {:?}", e);
                 return;
             }
         } // map дропается здесь, до request_redraw
@@ -81,7 +81,7 @@ impl WlrLayerShellHandler for Dawn {
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         // Собираем output-ы ДО заимствований. Карты слоёв ВСЕХ мониторов, а не
         // одного: слой мог жить на втором мониторе, и раньше он оставался в
-        // карте навсегда — обои снятого dwall продолжали рисоваться.
+        // карте навсегда — обои снятого plx-wall продолжали рисоваться.
         let outputs: Vec<_> = self.все_слои().into_iter()
             .chain(self.space.outputs().cloned())
             .collect();
@@ -117,4 +117,4 @@ impl WlrLayerShellHandler for Dawn {
     }
 }
 
-delegate_layer_shell!(Dawn);
+delegate_layer_shell!(Parallax);

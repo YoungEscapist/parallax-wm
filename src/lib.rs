@@ -1,3 +1,26 @@
+//! Parallax — оконный менеджер Wayland на бесконечном холсте.
+//!
+//! Вся программа живёт здесь, в библиотеке; бинари в `bins/` — это по пять
+//! строк вокруг [`run`]. Отличаются они только НАБОРОМ ФИЧ:
+//!
+//! * `plx-minimal` — композитор, тайлинг, лента, обзор, обои, панель, трей,
+//!   блютуз, вайфай, звук, портал, снимок, X11, жесты;
+//! * `plx-extra` — то же плюс шлем (`vr`), окна в Minecraft (`mine`) и
+//!   мультиюзер (`share`).
+//!
+//! Выключенная фича не обкладывает места вызова `#[cfg]`: вместо модуля
+//! подставляется ЗАГЛУШКА с тем же внешним видом (`*_stub/`), а `#[path]`
+//! ниже — единственное место, где эта подмена происходит. Поэтому `state.rs`,
+//! `input.rs` и `udev.rs` про сборку ничего не знают и читаются одинаково.
+
+// Имена в этом крейте русские, и однобуквенные локальные переменные неизбежно
+// сталкиваются с латинскими из соседних файлов: `с` и `c`, `р` и `p`, `г` и
+// `r`, `о` и `o`. Удовлетворить линт нечем: он ругается на ОДНУ пару за раз,
+// и правка одного места просто всплывает в следующем. Многобуквенные имена мы
+// и так предпочитаем (см. `рад`, `глуб`, `статус`), а на этом уровне лучше
+// сказать прямо: в русском коде гомоглифы — норма, а не опечатка.
+#![allow(confusable_idents)]
+
 mod anim;
 mod bar;
 mod blur;
@@ -19,9 +42,15 @@ mod handlers;
 mod headless;
 mod icons;
 mod input;
+mod lang;
+#[cfg(feature = "mine")]
+mod mine;
+#[cfg(not(feature = "mine"))]
+#[path = "mine_stub/mod.rs"]
 mod mine;
 mod mode;
 mod monitors;
+mod notify;
 mod overview;
 mod portal;
 mod portal_stream;
@@ -29,6 +58,10 @@ mod rounded;
 mod screencopy;
 mod selection;
 mod session;
+#[cfg(feature = "share")]
+mod share;
+#[cfg(not(feature = "share"))]
+#[path = "share_stub/mod.rs"]
 mod share;
 mod snip;
 mod sni;
@@ -37,6 +70,10 @@ mod switcher;
 mod synth;
 mod text;
 mod udev;
+#[cfg(feature = "vr")]
+mod vr;
+#[cfg(not(feature = "vr"))]
+#[path = "vr_stub/mod.rs"]
 mod vr;
 mod audio;
 mod tiling;
@@ -54,12 +91,12 @@ use smithay::reexports::{
     },
     wayland_server::Display,
 };
-pub use state::Dawn;
+pub use state::Parallax;
 
 /// Перелить переменные сессии в окружение D-Bus-активации и systemd --user.
 ///
 /// Всё, что запускается не нами, а шиной (портал, его бэкенд, pipewire-клиенты),
-/// наследует окружение НЕ от dawn, а от systemd --user, который стартовал при
+/// наследует окружение НЕ от parallax, а от systemd --user, который стартовал при
 /// логине и про наш wayland-сокет ничего не знает. Отсюда классический симптом:
 /// портал есть, а «поделиться экраном» отдаёт чёрный кадр или сразу ошибку.
 ///
@@ -77,7 +114,7 @@ pub fn headless() -> bool {
 
 pub fn export_session_env() {
     if headless() {
-        tracing::info!("dawn: headless — окружение сессии в D-Bus НЕ отдаём");
+        tracing::info!("plx: headless — NOT exporting the session environment to D-Bus");
         return;
     }
     const VARS: [&str; 4] = [
@@ -98,13 +135,13 @@ pub fn export_session_env() {
         .status()
     {
         Ok(st) if st.success() => {
-            tracing::info!("dawn: окружение сессии передано в D-Bus: {:?}", present);
+            tracing::info!("plx: session environment exported to D-Bus: {:?}", present);
         }
         Ok(st) => {
-            tracing::warn!("dawn: dbus-update-activation-environment вернул {}", st);
+            tracing::warn!("plx: dbus-update-activation-environment returned {}", st);
         }
         Err(e) => {
-            tracing::warn!("dawn: dbus-update-activation-environment не запустился: {}", e);
+            tracing::warn!("plx: dbus-update-activation-environment did not start: {}", e);
         }
     }
 }
@@ -114,10 +151,10 @@ pub fn export_session_env() {
 /// Композитору дескрипторы — расходный материал: каждый буфер клиента приезжает
 /// набором dmabuf-дескрипторов и живёт, пока клиент его не уничтожит. Замер
 /// 24.08.2026 в живом сеансе: 847 дескрипторов при мягком лимите 1024, из них
-/// 741 dmabuf от живых обоев (утечка чинилась отдельно, в dwall). Упереться в
+/// 741 dmabuf от живых обоев (утечка чинилась отдельно, в plx-wall). Упереться в
 /// лимит — это не «стало тесно», а отказ всего подряд разом: в логе за тот день
-/// «dawn/audio: pactl не запустился: Too many open files», провалы
-/// `eglCreateImageKHR` («could not bind to DMA buffer») и `dawn/dmabuf: import
+/// «plx/audio: pactl не запустился: Too many open files», провалы
+/// `eglCreateImageKHR` («could not bind to DMA buffer») и `plx/dmabuf: import
 /// failed`, то есть окна перестают показывать содержимое.
 ///
 /// Жёсткий лимит здесь 4096 и достаётся даром: это ровно то, что делают sway и
@@ -128,7 +165,7 @@ fn поднять_лимит_дескрипторов() {
     unsafe {
         let mut лимит: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut лимит) != 0 {
-            tracing::warn!("dawn: не прочитать RLIMIT_NOFILE: {}",
+            tracing::warn!("plx: cannot read RLIMIT_NOFILE: {}",
                 std::io::Error::last_os_error());
             return;
         }
@@ -138,26 +175,123 @@ fn поднять_лимит_дескрипторов() {
         let было = лимит.rlim_cur;
         лимит.rlim_cur = лимит.rlim_max;
         if libc::setrlimit(libc::RLIMIT_NOFILE, &лимит) != 0 {
-            tracing::warn!("dawn: не поднять RLIMIT_NOFILE: {}",
+            tracing::warn!("plx: cannot raise RLIMIT_NOFILE: {}",
                 std::io::Error::last_os_error());
             return;
         }
-        tracing::info!("dawn: лимит дескрипторов {} → {}", было, лимит.rlim_max);
+        tracing::info!("plx: file descriptor limit {} → {}", было, лимит.rlim_max);
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Набор фич, с которым собран ЭТОТ бинарь. Не украшение: разница между
+/// `plx-minimal` и `plx-extra` задаётся только фичами, и по одному имени файла
+/// её не видно — бинарь можно переименовать, скопировать, собрать самому.
+/// В отчёте об ошибке это первое, что нужно знать.
+fn собранные_фичи() -> Vec<&'static str> {
+    let mut список = Vec::new();
+    if cfg!(feature = "vr") {
+        список.push("vr");
+    }
+    if cfg!(feature = "mine") {
+        список.push("mine");
+    }
+    if cfg!(feature = "share") {
+        список.push("share");
+    }
+    список
+}
+
+/// `--version` и `--help`. Возвращает `true`, если ответ напечатан и запускаться
+/// не надо.
+///
+/// Текст ЗДЕСЬ ВСЕГДА АНГЛИЙСКИЙ, в отличие от всего остального, что видит
+/// человек. Причина та же, по которой английские логи: этот вывод просят
+/// вставить в отчёт об ошибке (см. `.github/ISSUE_TEMPLATE/bug_report.yml`),
+/// и читать его будет не только автор. Да и переводить нечем — конфигурация с
+/// `set{ lang }` к этому моменту ещё не прочитана.
+fn справка_или_версия() -> bool {
+    let имя = std::env::args()
+        .next()
+        .and_then(|путь| {
+            std::path::Path::new(&путь)
+                .file_name()
+                .map(|о| о.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "parallax".into());
+    let версия = env!("CARGO_PKG_VERSION");
+    // Хеш подставляет build.rs; в сборке из архива без .git его нет.
+    let коммит = option_env!("PLX_COMMIT").unwrap_or("unknown commit");
+    let фичи = собранные_фичи();
+    let фичи = if фичи.is_empty() {
+        "none".to_string()
+    } else {
+        фичи.join(", ")
+    };
+
+    let ключи: Vec<String> = std::env::args().skip(1).collect();
+
+    if ключи.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{имя} {версия} ({коммит})");
+        println!("features: {фичи}");
+        return true;
+    }
+
+    if ключи.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{имя} {версия} ({коммит}) — features: {фичи}");
+        println!();
+        println!("A Wayland compositor on an infinite canvas.");
+        println!();
+        println!("Usage: {имя} [OPTIONS]");
+        println!();
+        println!("Options:");
+        println!("      --tty        run on TTY/DRM (the default when not nested)");
+        println!("      --winit      run nested inside an existing session, for development");
+        println!("      --headless   no output and no input; frames are taken through");
+        println!("                   the control socket (see harness.sh)");
+        // Ключ есть только там, где есть сам шлем: в plx-minimal `--vr` ответил
+        // бы «этой сборки не касается», и в справке ему делать нечего.
+        if cfg!(feature = "vr") {
+            println!("      --vr         put on the headset at startup (needs an OpenXR runtime)");
+        }
+        println!("  -V, --version    print version and exit");
+        println!("  -h, --help       print this and exit");
+        println!();
+        println!("Configuration: ~/.config/parallax/config.lua");
+        println!("  every knob is documented in default_config.lua, next to the line");
+        println!("  that sets it; reload a running compositor with Super+Shift+C.");
+        println!();
+        println!("Environment:");
+        println!("  RUST_LOG         log filter (e.g. RUST_LOG=parallax=debug,info)");
+        println!("  PLX_CONFIG       path to config.lua, overriding the default");
+        println!();
+        println!("https://github.com/mifaroslav-dotcom/parallax");
+        return true;
+    }
+
+    false
+}
+
+/// Точка входа композитора. Оба бинаря (`plx-minimal` и `plx-extra`) — это
+/// пять строк вокруг неё; вся разница между сборками задана НАБОРОМ ФИЧ,
+/// с которым каждый из них тянет эту библиотеку (см. bins/ и `[features]`).
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // ДО инициализации логов: иначе `--version` в отчёте об ошибке приезжал бы
+    // вперемешку со строками tracing, а его именно копируют и вставляют.
+    if справка_или_версия() {
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    tracing::info!("dawn starting");
+    tracing::info!("parallax starting");
     поднять_лимит_дескрипторов();
 
     // Явный 'static: LoopHandle с этим временем жизни нужен X11Wm::start_wm,
     // который сам вешает в цикл источник X11-событий (см. xwayland.rs).
-    let mut event_loop: EventLoop<'static, Dawn> = EventLoop::try_new()?;
-    let display: Display<Dawn> = Display::new()?;
-    let mut state = Dawn::new(&mut event_loop, display);
+    let mut event_loop: EventLoop<'static, Parallax> = EventLoop::try_new()?;
+    let display: Display<Parallax> = Display::new()?;
+    let mut state = Parallax::new(&mut event_loop, display);
 
     let force_tty   = std::env::args().any(|a| a == "--tty");
     let force_winit = std::env::args().any(|a| a == "--winit");
@@ -170,7 +304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Не доверяем DISPLAY/WAYLAND_DISPLAY — могут быть унаследованы от родителя
     let tty_mode = !headless && (force_tty || !force_winit);
 
-    tracing::info!("dawn: mode={} (force_tty={} force_winit={} headless={})",
+    tracing::info!("plx: mode={} (force_tty={} force_winit={} headless={})",
         if headless { "Headless" } else if tty_mode { "TTY" } else { "Winit" },
         force_tty, force_winit, headless);
 
@@ -178,41 +312,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         crate::headless::init_headless(&mut event_loop, &mut state)?;
         unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
     } else if tty_mode {
-        tracing::info!("dawn: trying TTY/DRM backend...");
+        tracing::info!("plx: trying TTY/DRM backend...");
         match crate::udev::init_udev(&mut event_loop, &mut state) {
             Ok(()) if !state.udev_devices.is_empty() => {
-                tracing::info!("dawn: TTY/DRM backend OK");
+                tracing::info!("plx: TTY/DRM backend OK");
                 unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
             }
             Ok(()) => {
-                tracing::warn!("dawn: no DRM devices found, falling back to Winit");
+                tracing::warn!("plx: no DRM devices found, falling back to Winit");
                 crate::winit::init_winit(&mut event_loop, &mut state)?;
                 unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
             }
             Err(e) => {
-                tracing::warn!("dawn: DRM failed ({}), falling back to Winit", e);
+                tracing::warn!("plx: DRM failed ({}), falling back to Winit", e);
                 crate::winit::init_winit(&mut event_loop, &mut state)?;
                 unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
             }
         }
     } else {
-        tracing::info!("dawn: Winit backend");
+        tracing::info!("plx: Winit backend");
         crate::winit::init_winit(&mut event_loop, &mut state)?;
         unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
     }
 
-    tracing::info!("dawn socket: {:?}", state.socket_name);
+    tracing::info!("parallax socket: {:?}", state.socket_name);
 
     // Управляющий сокет: в харнессе всегда, в живом сеансе — только по
-    // DAWN_CTL=1 (см. ctl.rs, там же почему не по умолчанию).
-    if headless || std::env::var_os("DAWN_CTL").is_some() {
+    // PLX_CTL=1 (см. ctl.rs, там же почему не по умолчанию).
+    if headless || std::env::var_os("PLX_CTL").is_some() {
         if let Err(e) = crate::ctl::init(&event_loop.handle(), &state) {
-            tracing::warn!("dawn/ctl: сокет не поднялся: {}", e);
+            tracing::warn!("plx/ctl: socket failed to start: {}", e);
         }
     }
 
     // Отдаём окружение сессии в D-Bus/systemd --user. Без этого
-    // xdg-desktop-portal (его поднимает не dawn, а D-Bus-активация) не видит ни
+    // xdg-desktop-portal (его поднимает не parallax, а D-Bus-активация) не видит ни
     // WAYLAND_DISPLAY, ни XDG_CURRENT_DESKTOP: подключиться к нам он не может,
     // а бэкенд выбирает по «рабочему столу», которого не знает. Для
     // демонстрации экрана в Discord это обязательный шаг — см. screencopy.rs.
@@ -223,13 +357,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // сам композитор — запросы приходят сюда каналом calloop. См. portal.rs.
     // Всё, что дальше садится на D-Bus (портал, BlueZ-агент, трей, вайфай,
     // звук), в харнессе НЕ поднимаем: имена на шине одни на всю сессию, и
-    // второй экземпляр их бы отобрал у живого dawn — демонстрация экрана,
+    // второй экземпляр их бы отобрал у живого parallax — демонстрация экрана,
     // сопряжение и трей поехали бы к нему. Проверять рендер это не мешает.
     if !headless { crate::portal::install_portal_files(); }
     {
         use smithay::reexports::calloop::channel;
-        let (to_dawn, from_portal) = channel::channel::<crate::portal::Request>();
-        if !headless && crate::portal::spawn(to_dawn) {
+        let (to_plx, from_portal) = channel::channel::<crate::portal::Request>();
+        if !headless && crate::portal::spawn(to_plx) {
             event_loop.handle().insert_source(from_portal, |event, _, state| {
                 if let channel::Event::Msg(request) = event {
                     state.handle_portal_request(request);
@@ -244,8 +378,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // работают даже в сессии, запущенной без dbus-run-session. См. bluetooth.rs.
     {
         use smithay::reexports::calloop::channel;
-        let (to_dawn, from_bt) = channel::channel::<crate::bluetooth::Event>();
-        if let Some(tx) = (!headless).then(|| crate::bluetooth::spawn(to_dawn)).flatten() {
+        let (to_plx, from_bt) = channel::channel::<crate::bluetooth::Event>();
+        if let Some(tx) = (!headless).then(|| crate::bluetooth::spawn(to_plx)).flatten() {
             let autoconnect = state.lua_config.bluetooth_autoconnect;
             state.init_bluetooth(tx, autoconnect);
             event_loop.handle().insert_source(from_bt, |event, _, state| {
@@ -263,16 +397,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // В харнессе полка по умолчанию выключена вместе с остальной шиной (см.
     // выше), но без неё нечего и проверять: `tray_toggle` сразу выходит на
     // `self.tray = None`, то есть ни выезда, ни блюра под полкой в кадре не
-    // появится. `DAWN_HEADLESS_SERVICES=1` включает её ЯВНО — и только для
+    // появится. `PLX_HEADLESS_SERVICES=1` включает её ЯВНО — и только для
     // случая, когда харнесс запущен на СВОЕЙ шине (`dbus-run-session`):
-    // на общей он отобрал бы `org.kde.StatusNotifierWatcher` у живого dawn,
+    // на общей он отобрал бы `org.kde.StatusNotifierWatcher` у живого parallax,
     // и значки трея уехали бы в невидимый экземпляр.
-    let сервисы_харнесса = std::env::var_os("DAWN_HEADLESS_SERVICES").is_some();
+    let сервисы_харнесса = std::env::var_os("PLX_HEADLESS_SERVICES").is_some();
     let полка_и_меню = !headless || сервисы_харнесса;
     {
         use smithay::reexports::calloop::channel;
-        let (to_dawn, from_tray) = channel::channel::<crate::tray::Event>();
-        if let Some(tx) = полка_и_меню.then(|| crate::tray::spawn(to_dawn)).flatten() {
+        let (to_plx, from_tray) = channel::channel::<crate::tray::Event>();
+        if let Some(tx) = полка_и_меню.then(|| crate::tray::spawn(to_plx)).flatten() {
             state.init_tray(tx);
             event_loop.handle().insert_source(from_tray, |event, _, state| {
                 if let channel::Event::Msg(event) = event {
@@ -286,8 +420,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Оба спят, пока не открыта полка или их меню (см. Cmd::Watch).
     {
         use smithay::reexports::calloop::channel;
-        let (to_dawn, from_wifi) = channel::channel::<crate::wifi::Event>();
-        if let Some(tx) = полка_и_меню.then(|| crate::wifi::spawn(to_dawn)).flatten() {
+        let (to_plx, from_wifi) = channel::channel::<crate::wifi::Event>();
+        if let Some(tx) = полка_и_меню.then(|| crate::wifi::spawn(to_plx)).flatten() {
             state.init_wifi(tx);
             event_loop.handle().insert_source(from_wifi, |event, _, state| {
                 if let channel::Event::Msg(event) = event {
@@ -295,8 +429,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })?;
         }
-        let (to_dawn, from_audio) = channel::channel::<crate::audio::Event>();
-        if let Some(tx) = полка_и_меню.then(|| crate::audio::spawn(to_dawn)).flatten() {
+        let (to_plx, from_audio) = channel::channel::<crate::audio::Event>();
+        if let Some(tx) = полка_и_меню.then(|| crate::audio::spawn(to_plx)).flatten() {
             state.init_audio(tx);
             event_loop.handle().insert_source(from_audio, |event, _, state| {
                 if let channel::Event::Msg(event) = event {
@@ -312,8 +446,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // многие уходят в старый XEmbed-трей и больше не возвращаются (см. sni.rs).
     {
         use smithay::reexports::calloop::channel;
-        let (to_dawn, from_sni) = channel::channel::<crate::sni::Event>();
-        if let Some(tx) = (!headless).then(|| crate::sni::spawn(to_dawn)).flatten() {
+        let (to_plx, from_sni) = channel::channel::<crate::sni::Event>();
+        if let Some(tx) = (!headless).then(|| crate::sni::spawn(to_plx)).flatten() {
             state.init_sni(tx);
             event_loop.handle().insert_source(from_sni, |event, _, state| {
                 if let channel::Event::Msg(event) = event {
@@ -321,6 +455,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })?;
         }
+    }
+
+    // ── Звук уведомлений ─────────────────────────────────────────────────────
+    // Свой поток на сессионной шине, в режиме монитора (см. notify.rs). В
+    // харнессе — только вместе с остальными службами: на общей шине лишний
+    // монитор безвреден, но звучал бы он на уведомления ЖИВОГО сеанса.
+    if полка_и_меню {
+        crate::notify::поднять(crate::notify::Настройки {
+            файл: state.lua_config.notify_sound.clone(),
+            громкость: state.lua_config.notify_volume,
+        });
     }
 
     // Раскладка в панели: до первого нажатия её никто не пересчитает, а
@@ -340,7 +485,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_loop.handle().insert_source(anim_timer, |_, _, state| {
         crate::anim::tick(state);
         // Пока идёт демонстрация экрана, кадр нужен РОВНО по расписанию.
-        // Обычно dawn рисует только по изменениям, и на статичном экране поток
+        // Обычно parallax рисует только по изменениям, и на статичном экране поток
         // проседал до 3 кадров в секунду — зритель видел рывки, а клиент мог
         // счесть поток зависшим. Кадры берутся из отрисованного (см.
         // push_cast_frame), поэтому будим рендер сами, ровно с частотой потока.
@@ -354,7 +499,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // фатален — сеанс продолжается на мониторах, а причина уходит в лог.
     if std::env::args().any(|a| a == "--vr") || state.lua_config.vr.auto {
         if let Err(e) = crate::vr::включить(&mut state) {
-            tracing::warn!("dawn/vr: --vr не сработал: {e}");
+            tracing::warn!("plx/vr: --vr did not work: {e}");
         }
     }
 
@@ -387,7 +532,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // обзор или перелёт по столам (см. resync_fullscreen_frame).
         state.resync_fullscreen_frame();
         // X11-клиенты должны узнать, куда мы их передвинули за этот тик
-        // (раскладка, анимации, драг) — см. Dawn::sync_x11_geometry.
+        // (раскладка, анимации, драг) — см. Parallax::sync_x11_geometry.
         state.sync_x11_geometry();
         // Курсор — устройство ЭКРАНА: если камера за эту итерацию уехала сама
         // (анимация, инерция, зум, смена стола), стрелка остаётся на месте
@@ -399,7 +544,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = state.display_handle.flush_clients();
         // Один render_all() на весь дозреваемый в dispatch() пакет событий
         // (клавиши/мышь/anim-тик) вместо N вызовов, раскиданных по хендлерам —
-        // см. Dawn::request_redraw() и комментарии на каждом старом callsite.
+        // см. Parallax::request_redraw() и комментарии на каждом старом callsite.
         if state.needs_redraw {
             state.needs_redraw = false;
             crate::udev::render_all(&mut state);
@@ -424,7 +569,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // файлом, а сокет wayland-1 держал бы свой lock, и новый компоновщик сел
     // бы на wayland-2 мимо всех клиентов сессии.
     if state.exit == Some(crate::state::ExitAction::Restart) {
-        tracing::info!("dawn: выхожу с кодом {} — жду перезапуска", crate::state::RESTART_EXIT_CODE);
+        tracing::info!("plx: exiting with code {} — expecting a restart", crate::state::RESTART_EXIT_CODE);
         // Хвост лога должен успеть лечь на диск: дальше процесс не разворачивает
         // стек, а сразу отдаёт код скрипту.
         drop(state);

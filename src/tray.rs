@@ -2,7 +2,7 @@
 //! который из неё выезжает — блютуз, вайфай, звук, батарея, питание.
 //!
 //! Почему в самом композиторе — по той же причине, что и блютуз (см.
-//! bluetooth.rs): в сессии dawn нет ни панели, ни трея, а «убавить звук» и
+//! bluetooth.rs): в сессии parallax нет ни панели, ни трея, а «убавить звук» и
 //! «уйти в сон» нужны каждый день.
 //!
 //! Сама полка НЕ ходит в железо: вайфай живёт в wifi.rs, звук в audio.rs,
@@ -86,16 +86,16 @@ pub enum Cmd {
 
 // ── Поток опроса ─────────────────────────────────────────────────────────────
 
-pub fn spawn(to_dawn: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
+pub fn spawn(to_plx: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
     let (tx, rx) = mpsc::channel::<Cmd>();
     let ok = std::thread::Builder::new()
-        .name("dawn-tray".into())
-        .spawn(move || serve(to_dawn, rx))
+        .name("plx-tray".into())
+        .spawn(move || serve(to_plx, rx))
         .is_ok();
     ok.then_some(tx)
 }
 
-fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
+fn serve(to_plx: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
     let mut last: Option<Snapshot> = None;
     let mut watching = false;
     let mut next_poll = Instant::now();
@@ -118,7 +118,7 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
                 }
                 Cmd::Power(action) => {
                     let text = do_power(action);
-                    let _ = to_dawn.send(Event::Notice(text));
+                    let _ = to_plx.send(Event::Notice(text));
                 }
             }
         }
@@ -127,7 +127,7 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
         next_poll = Instant::now() + if watching { POLL } else { POLL_BG };
         if last.as_ref() != Some(&snap) {
             last = Some(snap.clone());
-            if to_dawn.send(Event::State(snap)).is_err() {
+            if to_plx.send(Event::State(snap)).is_err() {
                 return;
             }
         }
@@ -138,7 +138,7 @@ fn run(bin: &str, args: &[&str]) -> bool {
     match Command::new(bin).args(args).status() {
         Ok(st) => st.success(),
         Err(err) => {
-            tracing::warn!("dawn/tray: {} не запустился: {}", bin, err);
+            tracing::warn!("plx/tray: {} did not start: {}", bin, err);
             false
         }
     }
@@ -152,7 +152,7 @@ fn do_power(action: PowerAction) -> String {
     if run("loginctl", &[sub]) {
         return action.human().to_string();
     }
-    tracing::warn!("dawn/tray: loginctl {} не сработал — пробую {}", sub, fallback);
+    tracing::warn!("plx/tray: loginctl {} did not work — trying {}", sub, fallback);
     if run(fallback, &[]) {
         return action.human().to_string();
     }
@@ -318,7 +318,7 @@ impl TrayUi {
     }
 }
 
-impl crate::state::Dawn {
+impl crate::state::Parallax {
     pub fn init_tray(&mut self, tx: mpsc::Sender<Cmd>) {
         self.tray = Some(TrayUi {
             tx,
@@ -334,7 +334,7 @@ impl crate::state::Dawn {
         match event {
             Event::State(snap) => tray.snap = snap,
             Event::Notice(text) => {
-                tracing::info!("dawn/tray: {}", text);
+                tracing::info!("plx/tray: {}", text);
                 tray.notice = Some((text, Instant::now()));
             }
         }
@@ -348,7 +348,7 @@ impl crate::state::Dawn {
     fn tray_send(&self, cmd: Cmd) {
         if let Some(tray) = self.tray.as_ref() {
             if tray.tx.send(cmd).is_err() {
-                tracing::warn!("dawn/tray: поток опроса не отвечает");
+                tracing::warn!("plx/tray: polling thread not responding");
             }
         }
     }
@@ -447,7 +447,7 @@ impl crate::state::Dawn {
                     self.tray_send(Cmd::Power(action));
                 } else if let Some(t) = self.tray.as_mut() {
                     t.armed = Some((action, Instant::now()));
-                    tracing::info!("dawn/tray: {} — жду второй клик", action.human());
+                    tracing::info!("plx/tray: {} — waiting for the second click", action.human());
                 }
             }
         }

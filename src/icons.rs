@@ -1,9 +1,9 @@
 //! Настоящие значки приложений: поиск по теме значков и разбор PNG.
 //!
-//! **Что было.** dawn рисовал БУКВУ в кружке везде, где нужен значок: и в трее
+//! **Что было.** parallax рисовал БУКВУ в кружке везде, где нужен значок: и в трее
 //! (приложение прислало только `IconName` — имя значка в теме, а не пиксели),
 //! и на чипах окон в панели. Причина была записана прямо в коде: «читать PNG
-//! из темы значило бы тащить в dawn распаковщик zlib». Ярик 24.08.2026:
+//! из темы значило бы тащить в parallax распаковщик zlib». Ярик 24.08.2026:
 //! «сделай, чтобы справа показывались именно иконки приложений» — значит,
 //! распаковщик тащим. Крейт `png` (он же `miniz_oxide`) — чистый Rust, без C и
 //! без системных библиотек, то есть сборка от него не усложняется.
@@ -23,7 +23,7 @@
 //!   машине оказалось наоборот. PNG нет НИ У ОДНОГО приложения GNOME
 //!   (Nautilus, Настройки, Текстовый редактор, Калькулятор, Консоль, Loupe —
 //!   у всех только `hicolor/scalable/apps/*.svg`), нет у Alacritty,
-//!   pavucontrol, dshare, inir; Adwaita с 46-й версии растровых значков не
+//!   pavucontrol, plx-share, inir; Adwaita с 46-й версии растровых значков не
 //!   поставляет вовсе, а Papirus на машине не стоит. Буква в чипе — это ровно
 //!   те приложения. `resvg` без default-features (без шрифтов и без растровых
 //!   вставок) — usvg + tiny-skia, чистый Rust, как и `png`.
@@ -67,7 +67,7 @@ fn каталоги_тем() -> Vec<PathBuf> {
 /// Nix на не-NixOS (у Ярика Void) ставит приложения в свой профиль и добавляет
 /// его `share` в `XDG_DATA_DIRS` только через `nix.sh` — то есть в
 /// интерактивном шелле. Сессия композитора поднимается не из него, и в живом
-/// dawn 29.08.2026 `XDG_DATA_DIRS` был ровно flatpak + /usr: значок AyuGram
+/// parallax 29.08.2026 `XDG_DATA_DIRS` был ровно flatpak + /usr: значок AyuGram
 /// лежал в `/nix/store/…-profile/share/icons/hicolor/128x128/apps`, а панель
 /// рисовала на его месте букву («значок "com.ayugram.desktop" (20px) — нет»).
 ///
@@ -115,9 +115,9 @@ fn каталоги_вразнобой() -> Vec<PathBuf> {
 /// hicolor (по спецификации это общая свалка, куда кладут все приложения).
 fn темы() -> Vec<String> {
     let mut out = Vec::new();
-    // Своей ручки у dawn нет, но GTK-приложения читают ровно эту переменную,
+    // Своей ручки у parallax нет, но GTK-приложения читают ровно эту переменную,
     // и держать тему значков компоновщика отдельно от них незачем.
-    if let Ok(t) = std::env::var("DAWN_ICON_THEME").or_else(|_| std::env::var("GTK_ICON_THEME")) {
+    if let Ok(t) = std::env::var("PLX_ICON_THEME").or_else(|_| std::env::var("GTK_ICON_THEME")) {
         if !t.trim().is_empty() {
             out.push(t.trim().to_string());
         }
@@ -369,8 +369,8 @@ pub fn найти(имя: &str, цель: u32) -> Option<Icon> {
     match &итог {
         // Путь ИСХОДНИКА в логе — то, чем проверяется жалоба «значок мыльный»:
         // по числу в пути сразу видно, во сколько раз его ужимали (см. `штраф`).
-        Some(_) => tracing::debug!("dawn/icons: {:?} → {}px из {:?}", имя, цель, путь),
-        None => tracing::debug!("dawn/icons: {:?} не разобрался", путь),
+        Some(_) => tracing::debug!("plx/icons: {:?} → {}px from {:?}", имя, цель, путь),
+        None => tracing::debug!("plx/icons: {:?} did not parse", путь),
     }
     итог
 }
@@ -430,7 +430,7 @@ fn x11_связь() -> Option<&'static (
     )>> = std::sync::OnceLock::new();
     СВЯЗЬ.get_or_init(|| {
         let (conn, _) = x11rb::connect(None)
-            .map_err(|e| tracing::debug!("dawn/icons: X11 для значков недоступен: {e}"))
+            .map_err(|e| tracing::debug!("plx/icons: X11 is unavailable for icons: {e}"))
             .ok()?;
         let atom = conn.intern_atom(false, b"_NET_WM_ICON").ok()?.reply().ok()?.atom;
         Some((conn, atom))
@@ -469,12 +469,13 @@ pub fn значок_окна_x11(окно: u32, цель: u32) -> Option<Icon> {
 /// сокета и есть pid этого окна. У Wayland-клиентов то же берётся из
 /// `wl_client`, а у Xwayland — только отсюда: с точки зрения Wayland все
 /// X11-окна принадлежат одному процессу, самому Xwayland.
+#[cfg(feature = "mine")]
 pub fn pid_окна_x11(окно: u32) -> Option<u32> {
     use smithay::reexports::x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
     let (conn, _) = x11_связь()?;
     static АТОМ: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     let atom = (*АТОМ.get_or_init(|| {
-        conn.intern_atom(false, b"_NET_WM_PID").ok()?.reply().ok().map(|о| о.atom)
+        conn.intern_atom(false, b"_NET_WM_PID").ok()?.reply().ok().map(|отв| отв.atom)
     }))?;
     let ответ = conn
         .get_property(false, окно, atom, AtomEnum::CARDINAL, 0, 1)
@@ -587,8 +588,8 @@ impl Кэш {
         if !self.значки.contains_key(&ключ) {
             let найденный = найти(имя, цель);
             tracing::debug!(
-                "dawn/icons: значок {:?} ({}px) — {}",
-                имя, цель, if найденный.is_some() { "нашёлся" } else { "нет" },
+                "plx/icons: icon {:?} ({}px) — {}",
+                имя, цель, if найденный.is_some() { "found" } else { "missing" },
             );
             self.значки.insert(ключ.clone(), найденный);
         }
@@ -663,7 +664,7 @@ mod tests {
     /// показаны буквами»: у приложений GNOME в теме только `scalable/*.svg`.
     #[test]
     fn svg_находится_и_растеризуется_в_нужный_размер() {
-        let dir = std::env::temp_dir().join(format!("dawn-svg-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("plx-svg-test-{}", std::process::id()));
         let scalable = dir.join("тема/scalable/apps");
         std::fs::create_dir_all(&scalable).unwrap();
         let p = scalable.join("зелёный.svg");
@@ -688,7 +689,7 @@ mod tests {
     /// значок обязан остаться широким, иначе логотипы поедут.
     #[test]
     fn пропорции_вектора_сохраняются() {
-        let dir = std::env::temp_dir().join(format!("dawn-svg-agr-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("plx-svg-agr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("широкий.svg");
         std::fs::write(
@@ -705,7 +706,7 @@ mod tests {
     /// растеризуем то, что уже готово.
     #[test]
     fn точный_png_выигрывает_у_вектора() {
-        let dir = std::env::temp_dir().join(format!("dawn-svg-vs-png-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("plx-svg-vs-png-{}", std::process::id()));
         let растр = dir.join("20x20/apps");
         let вектор = dir.join("scalable/apps");
         std::fs::create_dir_all(&растр).unwrap();
@@ -723,7 +724,7 @@ mod tests {
     /// `Icon=` берётся только из главной группы: у действий свои значки.
     #[test]
     fn icon_читается_из_главной_группы() {
-        let dir = std::env::temp_dir().join(format!("dawn-icons-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("plx-icons-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.desktop");
         std::fs::write(
@@ -755,7 +756,7 @@ mod tests {
             "telegram", "org.telegram.desktop", "blueman", "gimp", "Alacritty",
             // Только SVG в теме — те самые «буквы вместо значков» до 29.08.2026.
             "org.gnome.Nautilus", "org.gnome.TextEditor", "org.gnome.Console",
-            "org.pulseaudio.pavucontrol", "dshare",
+            "org.pulseaudio.pavucontrol", "plx-share",
             "нет-такого-значка",
         ] {
             let t = std::time::Instant::now();
@@ -783,7 +784,7 @@ mod tests {
     /// ровно там, где значки из темы стыкуются с картинками SNI.
     #[test]
     fn png_разбирается_в_premultiplied_rgba() {
-        let dir = std::env::temp_dir().join(format!("dawn-png-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("plx-png-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("i.png");
         {

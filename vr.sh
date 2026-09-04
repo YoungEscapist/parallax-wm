@@ -1,5 +1,5 @@
 #!/bin/bash
-# Поднять VR-сессию dawn: сервер WiVRn на ПК + шлем Quest 3 по Wi-Fi.
+# Поднять VR-сессию parallax: сервер WiVRn на ПК + шлем Quest 3 по Wi-Fi.
 #
 #   ./vr.sh            — поднять сервер и ждать шлем
 #   ./vr.sh --status   — что сейчас: сервер, рантайм, подключён ли шлем
@@ -9,12 +9,12 @@
 #
 # Как это устроено целиком:
 #
-#   dawn (OpenXR-клиент)  ──►  libopenxr_wivrn.so  ──►  wivrn-server (Monado)
+#   parallax (OpenXR-клиент)  ──►  libopenxr_wivrn.so  ──►  wivrn-server (Monado)
 #                                                            │ Wi-Fi, H.264/265
 #                                                            ▼
 #                                                    WiVRn на Quest 3
 #
-# То есть dawn не знает про Wi-Fi и кодеки вовсе: он отдаёт кадр стандартному
+# То есть parallax не знает про Wi-Fi и кодеки вовсе: он отдаёт кадр стандартному
 # рантайму OpenXR, а всё остальное — забота WiVRn. Ровно поэтому VR-режим
 # работает и с проводным шлемом, и с симулятором Monado (см. harness.sh).
 #
@@ -37,7 +37,7 @@ user=${SUDO_USER:-yarik}
     if [ -e "$active" ]; then
         echo "активный: $(readlink -f "$active")"
     else
-        echo "активный: не задан (dawn возьмёт XR_RUNTIME_JSON)"
+        echo "активный: не задан (parallax возьмёт XR_RUNTIME_JSON)"
     fi
     if pgrep -x wivrn-server >/dev/null; then
         echo "процесс:  идёт (pid $(pgrep -x wivrn-server | tr '\n' ' '))"
@@ -78,7 +78,7 @@ if [ ! -x "$server" ]; then
 fi
 
 # Активный рантайм OpenXR. Без него каждый клиент обязан сам знать
-# XR_RUNTIME_JSON; с ним dawn (и любая игра) находит WiVRn сам.
+# XR_RUNTIME_JSON; с ним parallax (и любая игра) находит WiVRn сам.
 if [ ! -e /etc/xdg/openxr/1/active_runtime.json ]; then
     echo "делаю WiVRn активным рантаймом OpenXR"
     mkdir -p /etc/xdg/openxr/1
@@ -89,7 +89,7 @@ if pgrep -x wivrn-server >/dev/null; then
     echo "сервер уже идёт"
 else
     # Своё окружение сессии: сервер должен видеть тот же XDG_RUNTIME_DIR, что и
-    # dawn, иначе клиент не найдёт его IPC-сокет.
+    # parallax, иначе клиент не найдёт его IPC-сокет.
     runtime=${XDG_RUNTIME_DIR:-/tmp/runtime-1000}
     echo "поднимаю wivrn-server (XDG_RUNTIME_DIR=$runtime)"
     # stdin обязателен НАСТОЯЩИЙ: Monado следит за ним через epoll, а на
@@ -110,7 +110,7 @@ cat <<'КОНЕЦ'
 Дальше:
   1. надень Quest 3, запусти на нём приложение WiVRn;
   2. в списке выбери этот компьютер (он объявляет себя по сети сам);
-  3. в dawn нажми Win+Alt+V — окна разъедутся панелями по комнате.
+  3. в parallax нажми Win+Alt+V — окна разъедутся панелями по комнате.
 
 Внутри шлема:
   Win+Alt+A — passthrough (окна поверх настоящей комнаты);

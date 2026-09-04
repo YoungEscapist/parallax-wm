@@ -1,7 +1,7 @@
 //! Единый интерфейс к окну независимо от его природы: нативный Wayland-клиент
 //! (xdg_toplevel) или X11-клиент через XWayland (X11Surface).
 //!
-//! Весь остальной код dawn работает с `smithay::desktop::Window` и НЕ должен
+//! Весь остальной код parallax работает с `smithay::desktop::Window` и НЕ должен
 //! знать, какой протокол за ним стоит. Раньше он знал: везде стояло
 //! `window.toplevel().unwrap()` / сравнение окон по `wl_surface()` — у X11-окна
 //! `toplevel()` возвращает None, поэтому такое окно нельзя было ни
@@ -27,7 +27,7 @@ use smithay::{
     wayland::seat::WaylandFocus,
 };
 
-use crate::state::{Dawn, TaggedWindow};
+use crate::state::{Parallax, TaggedWindow};
 use crate::tiling::Layout;
 use std::cell::Cell;
 
@@ -102,7 +102,7 @@ pub enum Tiled {
 /// Wayland: складывает изменение в pending state, отправляет его [`configure`].
 /// X11: применяется сразу — у X11 нечего копить, configure идёт по X-соединению
 /// одним пакетом вместе с позицией (позицию потом досылает
-/// [`Dawn::sync_x11_geometry`]).
+/// [`Parallax::sync_x11_geometry`]).
 pub fn set_size(window: &Window, size: Option<Size<i32, Logical>>, tiled: Tiled) {
     match window.underlying_surface() {
         WindowSurface::Wayland(t) => {
@@ -152,7 +152,7 @@ pub fn set_size(window: &Window, size: Option<Size<i32, Logical>>, tiled: Tiled)
             }
             geo.size = size;
             if let Err(err) = s.configure(geo) {
-                tracing::warn!("dawn/xwayland: configure(size) failed: {}", err);
+                tracing::warn!("plx/xwayland: configure(size) failed: {}", err);
             }
         }
     }
@@ -178,7 +178,7 @@ pub fn set_fullscreen(window: &Window, size: Option<Size<i32, Logical>>) {
         }
         WindowSurface::X11(s) => {
             if let Err(err) = s.set_fullscreen(true) {
-                tracing::warn!("dawn/xwayland: set_fullscreen: {}", err);
+                tracing::warn!("plx/xwayland: set_fullscreen: {}", err);
             }
             set_size(window, size, Tiled::Keep);
         }
@@ -196,7 +196,7 @@ pub fn unset_fullscreen(window: &Window, size: Option<Size<i32, Logical>>) {
         }
         WindowSurface::X11(s) => {
             if let Err(err) = s.set_fullscreen(false) {
-                tracing::warn!("dawn/xwayland: unset_fullscreen: {}", err);
+                tracing::warn!("plx/xwayland: unset_fullscreen: {}", err);
             }
             set_size(window, size, Tiled::Keep);
         }
@@ -245,7 +245,7 @@ pub fn size_constraints(window: &Window) -> (Size<i32, Logical>, Size<i32, Logic
     }
 }
 
-/// Последний размер, который у окна ЗАПРАШИВАЛ dawn через [`set_size`] — в
+/// Последний размер, который у окна ЗАПРАШИВАЛ parallax через [`set_size`] — в
 /// отличие от `window.geometry().size` (что клиент реально подтвердил
 /// коммитом). У X11 отдельного хранилища нет и не нужно: там `set_size`
 /// применяется через `ConfigureWindow` немедленно, и `window.geometry()`
@@ -328,7 +328,7 @@ pub fn close(window: &Window) {
         WindowSurface::Wayland(t) => t.send_close(),
         WindowSurface::X11(s) => {
             if let Err(err) = s.close() {
-                tracing::warn!("dawn/xwayland: close failed: {}", err);
+                tracing::warn!("plx/xwayland: close failed: {}", err);
             }
         }
     }
@@ -350,7 +350,7 @@ pub fn is_override_redirect(window: &Window) -> bool {
 
 /// Сфокусировать окно клавиатурой: активирует его, гасит остальные и
 /// поднимает наверх.
-pub fn focus(state: &mut Dawn, window: &Window) {
+pub fn focus(state: &mut Parallax, window: &Window) {
     // Меню и тултипы X11-клиента (override-redirect) фокус не принимают —
     // и что важнее, не имеют права его ОТНИМАТЬ.
     //
@@ -385,7 +385,7 @@ pub fn focus(state: &mut Dawn, window: &Window) {
     //
     // Окно при этом не остаётся ничьим: активным оно становится как обычно, а
     // фокус получает МЕСТО МОДА — то самое «окно, с которым сейчас работают»
-    // для биндов (см. `Dawn::focused_surface`). Дальше фокус, как всегда в
+    // для биндов (см. `Parallax::focused_surface`). Дальше фокус, как всегда в
     // режиме, поедет за взглядом.
     if crate::mine::панель_а_не_игра(state, window) {
         window.set_activated(true);
@@ -433,7 +433,7 @@ pub fn focus(state: &mut Dawn, window: &Window) {
 
 // ── Появление нового окна ────────────────────────────────────────────────────
 
-impl Dawn {
+impl Parallax {
     /// Размер, который получит новое окно в текущей раскладке. Считается ДО
     /// создания окна, чтобы клиенту ушёл ровно один configure, а не два
     /// (наш «предварительный» и потом ещё один от arrange()).
@@ -575,7 +575,7 @@ impl Dawn {
         focus(self, &window);
 
         tracing::info!(
-            "dawn: new window ({}) idx={} tags={:#b} spawn=({},{}) size={}x{}",
+            "plx: new window ({}) idx={} tags={:#b} spawn=({},{}) size={}x{}",
             if window.is_x11() { "x11" } else { "wayland" },
             insert_idx,
             current_tags,

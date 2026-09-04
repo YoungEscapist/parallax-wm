@@ -1,4 +1,4 @@
-//! VR/AR-режим dawn: окна, развешанные по комнате.
+//! VR/AR-режим parallax: окна, развешанные по комнате.
 //!
 //! **Что это.** Ещё один способ смотреть на тот же самый композитор. Окна,
 //! столы, тайлинг, панель, бинды — всё остаётся ровно тем же; меняется только
@@ -6,7 +6,7 @@
 //! в шлем, а каждое окно висит своей панелью в комнате.
 //!
 //! ```text
-//!   окно dawn ──► текстура (обычный рендер smithay)
+//!   окно parallax ──► текстура (обычный рендер smithay)
 //!                     │
 //!                     ▼
 //!   сцена: где панель висит в метрах (scene.rs)
@@ -18,22 +18,28 @@
 //! **Устройство по файлам.**
 //!
 //! · `math.rs` — векторы/кватернионы/матрицы и пересечение луча с панелью;
-//! · `egl.rs` — привязка OpenXR к EGL-контексту dawn (`XR_MNDX_egl_enable`);
+//! · `egl.rs` — привязка OpenXR к EGL-контексту parallax (`XR_MNDX_egl_enable`);
 //! · `xr.rs` — сессия, кадровый цикл, позы глаз, passthrough;
 //! · `scene.rs` — расстановка панелей по зоне шлема (чистая, с тестами);
 //! · `render.rs` — сырой GL: панели, лучи, глубина;
 //! · `input.rs` — контроллеры, руки, действия OpenXR;
 //! · этот файл — связка: кто кого зовёт и как ввод шлема становится обычным
-//!   вводом dawn.
+//!   вводом parallax.
 //!
 //! **Главное решение всей затеи.** Указка (луч контроллера, взгляд или мышь)
 //! попадает в панель → мы считаем ПИКСЕЛЬ окна → и ставим туда обычный курсор
-//! dawn на холсте. Дальше работает весь существующий код: `surface_under`,
-//! фокус по наведению, клики, перетаскивание, меню. Ни одна подсистема dawn не
+//! parallax на холсте. Дальше работает весь существующий код: `surface_under`,
+//! фокус по наведению, клики, перетаскивание, меню. Ни одна подсистема parallax не
 //! знает, что человек в шлеме, — и именно поэтому в VR сразу работают вещи,
 //! которые иначе пришлось бы писать заново.
 
 pub mod egl;
+/// Жесты как значения — собирается ВСЕГДА, нужен конфигу (см. vr/жест.rs).
+///
+/// `#[path]` здесь обязателен, а не для красоты: rustc отказывается сам
+/// искать файл для модуля с неASCII-именем (E0754).
+#[path = "жест.rs"]
+pub mod жест;
 pub mod input;
 pub mod math;
 pub mod render;
@@ -54,7 +60,8 @@ use smithay::backend::renderer::{Bind, ImportMem, Offscreen};
 use smithay::desktop::Window;
 use smithay::utils::{Buffer as BufferCoords, Physical, Point, Scale, Size, Transform};
 
-use crate::state::Dawn;
+use crate::state::Parallax;
+use crate::{т, тф};
 use math::{Век3, Луч, Мат4};
 use scene::{Ключ, ОкноВСцене, Панель, Раскладка, Сцена, Зона};
 
@@ -62,7 +69,7 @@ use scene::{Ключ, ОкноВСцене, Панель, Раскладка, С
 ///
 /// Damage tracker здесь не роскошь: без него каждое окно перерисовывалось бы
 /// целиком 90 раз в секунду на глаз. С ним перерисовываются только те куски,
-/// которые клиент действительно поменял, — то же самое, что dawn делает для
+/// которые клиент действительно поменял, — то же самое, что parallax делает для
 /// монитора.
 pub(crate) struct Полотно {
     pub(crate) текстура: GlesTexture,
@@ -90,7 +97,7 @@ pub struct ВР {
     полотна: HashMap<Ключ, Полотно>,
     /// Панель, в которую сейчас смотрит указка, и точка в пикселях.
     pub наведено: Option<(Ключ, f64, f64)>,
-    /// Пульты dawn (пуск, клавиатура) — панели, которые рисует не клиент, а мы
+    /// Пульты parallax (пуск, клавиатура) — панели, которые рисует не клиент, а мы
     /// сами (см. ui.rs). Живут отдельно от `сцена.панели` потому, что `свести`
     /// каждый кадр строит список панелей по ОКНАМ; пульты в него добавляются
     /// после и своей позой владеют сами.
@@ -150,7 +157,7 @@ impl ВР {
 /// внутри замыкания таймера (см. `headless.rs`) и снаружи его не достать.
 /// Заодно это разводит «человек нажал бинд» и «мы действительно открыли
 /// сессию»: между ними может пройти кадр, и ошибка приходит уведомлением.
-pub fn включить(state: &mut Dawn) -> Result<(), String> {
+pub fn включить(state: &mut Parallax) -> Result<(), String> {
     if state.vr.is_some() {
         return Ok(());
     }
@@ -218,11 +225,11 @@ impl Ожидание {
 /// 4. повторным нажатием отменяет ожидание, а из VR — выходит.
 ///
 /// То есть от человека нужно ровно одно: нажать Super+Alt+V и надеть Quest.
-pub fn режим(state: &mut Dawn) {
+pub fn режим(state: &mut Parallax) {
     // Уже в шлеме — значит это «снять».
     if state.vr.is_some() {
         выключить(state);
-        state.уведомить("VR: шлем снят");
+        state.уведомить(т!("VR: шлем снят", "VR: headset taken off"));
         return;
     }
     // Уже ждём — значит это «передумал». Иначе отменить ожидание было бы
@@ -237,13 +244,13 @@ pub fn режим(state: &mut Dawn) {
         // старта потока, а отмена приходит человеческим темпом, секундами
         // позже; к этому моменту читать её уже некому.
         wivrn::убрать_рантайм();
-        state.уведомить("VR: ожидание шлема отменено");
+        state.уведомить(т!("VR: ожидание шлема отменено", "VR: stopped waiting for the headset"));
         return;
     }
 
     if !wivrn::рантайм_есть() {
         state.уведомить(
-            "VR: рантайм OpenXR не найден — нужен WiVRn (или Monado) и его манифест",
+            т!("VR: рантайм OpenXR не найден — нужен WiVRn (или Monado) и его манифест", "VR: no OpenXR runtime found — WiVRn (or Monado) and its manifest are required"),
         );
         return;
     }
@@ -254,7 +261,7 @@ pub fn режим(state: &mut Dawn) {
     if wivrn::это_wivrn() && !wivrn::сервер_идёт() {
         if let Some(бинарь) = wivrn::сервер_путь() {
             state.spawn(&wivrn::команда_сервера(&бинарь));
-            state.уведомить("VR: поднимаю сервер WiVRn");
+            state.уведомить(т!("VR: поднимаю сервер WiVRn", "VR: starting the WiVRn server"));
             подняли = true;
         }
     }
@@ -296,7 +303,7 @@ impl From<String> for ОшибкаВхода {
 /// **Почему не в главном цикле, как было.** `xrCreateInstance` под WiVRn —
 /// блокирующий вызов без таймаута: клиент Monado соединяется с `wivrn-server` и
 /// спит в `recvmsg`, пока к серверу не подключится живой Quest (см. `xr.rs`,
-/// `Заготовка`). Пока он спал в главном потоке, dawn не обрабатывал ни ввод, ни
+/// `Заготовка`). Пока он спал в главном потоке, parallax не обрабатывал ни ввод, ни
 /// клиентов, ни кадры — весь сеанс выглядел намертво зависшим, и выйти можно
 /// было только жёсткой перезагрузкой. Замер 31.08.2026: харнесс перестал
 /// отвечать на `vr state` сразу после `vr mode`, главный поток стоял в
@@ -310,7 +317,7 @@ impl From<String> for ОшибкаВхода {
 /// наконец отпустит, не сможет отправить результат, уронит инстанс (а с ним и
 /// соединение с сервером) и тихо кончится. Ровно поэтому же новый поиск заводим
 /// только при пустом `vr_поиск`: пока приёмник наш, поток жив и второй не нужен.
-fn завести_поиск(state: &mut Dawn) {
+fn завести_поиск(state: &mut Parallax) {
     if state.vr_поиск.is_some() {
         return;
     }
@@ -332,7 +339,7 @@ fn завести_поиск(state: &mut Dawn) {
     wivrn::подставить_рантайм();
     let (отправитель, приёмник) = std::sync::mpsc::channel();
     let поток = std::thread::Builder::new()
-        .name("dawn-vr-поиск".into())
+        .name("plx-vr-scan".into())
         .spawn(move || {
             if !пауза.is_zero() {
                 std::thread::sleep(пауза);
@@ -364,22 +371,22 @@ fn завести_поиск(state: &mut Dawn) {
         Ok(_) => {
             state.vr_поиск = Some(приёмник);
             if сказать {
-                state.уведомить("VR: жду шлем — надень Quest и запусти на нём WiVRn");
+                state.уведомить(т!("VR: жду шлем — надень Quest и запусти на нём WiVRn", "VR: waiting for the headset — put on the Quest and start WiVRn there"));
             }
         }
         Err(e) => {
             wivrn::убрать_рантайм();
             state.vr_просят = false;
             state.vr_ожидание = None;
-            tracing::warn!("dawn/vr: поток поиска шлема не завёлся: {e}");
-            state.уведомить("VR: не удалось завести поиск шлема");
+            tracing::warn!("plx/vr: headset discovery thread failed to start: {e}");
+            state.уведомить(т!("VR: не удалось завести поиск шлема", "VR: could not start the headset search"));
         }
     }
 }
 
 /// Собственно подключение — с рендерером на руках и уже готовой заготовкой.
 fn подключить(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     заготовка: xr::Заготовка,
 ) -> Result<ВР, ОшибкаВхода> {
@@ -392,12 +399,12 @@ fn подключить(
         .reference_space_bounds_rect(openxr::ReferenceSpaceType::STAGE)
     {
         Ok(Some(р)) => {
-            tracing::info!("dawn/vr: зона шлема {:.2}×{:.2} м", р.width, р.height);
+            tracing::info!("plx/vr: headset play area {:.2}×{:.2} m", р.width, р.height);
             Зона::прямоугольная(р.width, р.height)
         }
         _ => {
             tracing::info!(
-                "dawn/vr: зона неизвестна, беру круг {} м",
+                "plx/vr: play area unknown, using a circle of {} m",
                 Зона::РАДИУС_ПО_УМОЛЧАНИЮ
             );
             Зона::default()
@@ -441,7 +448,7 @@ fn подключить(
 }
 
 /// Выключить VR-режим и вернуть GL-ресурсы.
-pub fn выключить(state: &mut Dawn) {
+pub fn выключить(state: &mut Parallax) {
     state.vr_просят = false;
     let Some(вр) = state.vr.take() else { return };
     let вр = *вр;
@@ -454,10 +461,10 @@ pub fn выключить(state: &mut Dawn) {
         // нечем. Программы и буферы уйдут вместе с контекстом при выходе —
         // единственное место, где мы это допускаем, и только потому, что
         // headless живёт ровно один прогон харнесса.
-        tracing::debug!("dawn/vr: GL-ресурсы освободит контекст (headless)");
+        tracing::debug!("plx/vr: GL resources will be freed with the context (headless)");
     }
     state.udev_devices = устройства;
-    tracing::info!("dawn/vr: режим выключен");
+    tracing::info!("plx/vr: mode off");
     state.request_redraw();
 }
 
@@ -465,11 +472,11 @@ pub fn выключить(state: &mut Dawn) {
 ///
 /// Внутри — `xrWaitFrame`, то есть ожидание своей очереди у шлема; на 90 Гц это
 /// до 11 мс, и они же играют роль паузы главного цикла.
-pub fn тик(state: &mut Dawn) {
+pub fn тик(state: &mut Parallax) {
     if state.vr.is_none() && !state.vr_просят {
         return;
     }
-    // Забираем и режим, и устройства: и тому и другому нужен `&mut Dawn`
+    // Забираем и режим, и устройства: и тому и другому нужен `&mut Parallax`
     // внутри (сцена читает окна, ввод двигает курсор). Тот же приём, что в
     // `udev::render_all`.
     let mut устройства = std::mem::take(&mut state.udev_devices);
@@ -487,7 +494,7 @@ pub fn тик(state: &mut Dawn) {
 /// где `GlesRenderer` живёт внутри замыкания таймера (см. `headless::такт`).
 /// Благодаря этому весь VR-режим проверяется харнессом на симуляторе Monado,
 /// без шлема и без живого сеанса.
-pub fn тик_с(state: &mut Dawn, renderer: &mut GlesRenderer) {
+pub fn тик_с(state: &mut Parallax, renderer: &mut GlesRenderer) {
     if state.vr_просят && state.vr.is_none() {
         // Поиск шлема идёт в своём потоке (см. `завести_поиск`) — здесь только
         // заглядываем в канал и НИКОГДА не ждём: любая блокировка в этой точке
@@ -501,7 +508,7 @@ pub fn тик_с(state: &mut Dawn, renderer: &mut GlesRenderer) {
             // Поток умер, не ответив, — такого быть не должно, но молчать об
             // этом нельзя: иначе `vr_просят` висел бы до конца сеанса.
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                Err(ОшибкаВхода::from("поиск шлема оборвался".to_string()))
+                Err(ОшибкаВхода::from(т!("поиск шлема оборвался", "the headset search broke off").to_string()))
             }
         };
         // Ответ пришёл — поиск кончился в любом случае, и повторные попытки
@@ -513,18 +520,18 @@ pub fn тик_с(state: &mut Dawn, renderer: &mut GlesRenderer) {
         match ответ.and_then(|з| подключить(state, renderer, з)) {
             Ok(вр) => {
                 tracing::info!(
-                    "dawn/vr: режим включён, раскладка {}",
+                    "plx/vr: mode on, layout {}",
                     вр.сцена.раскладка.имя()
                 );
                 state.vr = Some(Box::new(вр));
                 if ждали {
-                    state.уведомить("VR: шлем на связи");
+                    state.уведомить(т!("VR: шлем на связи", "VR: the headset is connected"));
                 }
             }
             Err(e) => {
-                tracing::warn!("dawn/vr: не включился: {}", e.текст);
+                tracing::warn!("plx/vr: failed to start: {}", e.текст);
                 state.уведомить(&if ждали && e.ждать {
-                    "VR: шлем так и не появился".to_string()
+                    т!("VR: шлем так и не появился", "VR: the headset never showed up").to_string()
                 } else {
                     format!("VR: {}", e.текст)
                 });
@@ -542,12 +549,12 @@ pub fn тик_с(state: &mut Dawn, renderer: &mut GlesRenderer) {
     } else {
         вр.рендер.разобрать(renderer);
         state.vr_раскладка = вр.сцена.раскладка;
-        tracing::info!("dawn/vr: сессия закончилась, возвращаемся на мониторы");
+        tracing::info!("plx/vr: session ended, back to the monitors");
         state.request_redraw();
     }
 }
 
-fn шаг(вр: &mut ВР, renderer: &mut GlesRenderer, state: &mut Dawn) -> bool {
+fn шаг(вр: &mut ВР, renderer: &mut GlesRenderer, state: &mut Parallax) -> bool {
     if !вр.шлем.события() {
         return false;
     }
@@ -578,7 +585,7 @@ fn шаг(вр: &mut ВР, renderer: &mut GlesRenderer, state: &mut Dawn) -> boo
     if вр.сцена.нужен_якорь {
         вр.сцена.якорь_по_голове(голова, центр.y);
         tracing::info!(
-            "dawn/vr: якорь сцены — перед {:.0}°, глаза {:.2} м",
+            "plx/vr: scene anchor — {:.0}° ahead, eyes at {:.2} m",
             вр.сцена.перед.to_degrees(),
             вр.сцена.высота_глаз
         );
@@ -594,7 +601,7 @@ fn шаг(вр: &mut ВР, renderer: &mut GlesRenderer, state: &mut Dawn) -> boo
     вр.сцена.свести(&окна.iter().map(|(_, о)| *о).collect::<Vec<_>>());
     вр.сцена.разложить();
 
-    // ── Пульты dawn ─────────────────────────────────────────────────────────
+    // ── Пульты parallax ─────────────────────────────────────────────────────────
     // Кнопки контроллеров и жесты рук — до того, как пульты попадут в сцену:
     // пульт, открытый в этом кадре, обязан в этом же кадре и появиться, иначе
     // между жестом и картинкой был бы видимый провал.
@@ -606,14 +613,14 @@ fn шаг(вр: &mut ВР, renderer: &mut GlesRenderer, state: &mut Dawn) -> boo
         нарисовать_окно(вр, renderer, окно, *о);
     }
     // Полотна закрытых окон освобождаем: текстура окна 2560×1080 это 11 МиБ,
-    // и десяток забытых съедает больше, чем весь остальной dawn.
+    // и десяток забытых съедает больше, чем весь остальной parallax.
     let живые: std::collections::HashSet<Ключ> = окна.iter().map(|(_, о)| о.ключ).collect();
     вр.полотна.retain(|к, _| живые.contains(к));
 
     // ── Холсты пультов ──────────────────────────────────────────────────────
     обновить_текстуры(вр, renderer);
 
-    // ── Указка → курсор dawn ────────────────────────────────────────────────
+    // ── Указка → курсор parallax ────────────────────────────────────────────────
     let лучи = собрать_лучи(вр, голова);
     применить_ввод(вр, state, &лучи, центр);
 
@@ -673,7 +680,7 @@ fn шаг(вр: &mut ВР, renderer: &mut GlesRenderer, state: &mut Dawn) -> boo
         }
         Some(e) => {
             вр.подряд_ошибок += 1;
-            tracing::warn!("dawn/vr: кадр не вышел ({e}), подряд {}", вр.подряд_ошибок);
+            tracing::warn!("plx/vr: frame failed ({e}), {} in a row", вр.подряд_ошибок);
             вр.шлем.закрыть_пустой();
             // Десяток подряд — это не рябь, а сломанный конвейер: гасим VR,
             // чтобы человек не сидел в чёрном шлеме, гадая, что случилось.
@@ -695,7 +702,7 @@ fn шаг(вр: &mut ВР, renderer: &mut GlesRenderer, state: &mut Dawn) -> boo
 /// которое на рабочем столе левее, и панелью висит левее — человек попадает в
 /// уже знакомую ему раскладку. Ключ в хвосте сравнения — чтобы порядок был
 /// определён и у окон, лежащих ровно друг на друге.
-pub(crate) fn окна_для_сцены(state: &Dawn) -> Vec<(Window, ОкноВСцене)> {
+pub(crate) fn окна_для_сцены(state: &Parallax) -> Vec<(Window, ОкноВСцене)> {
     let mut окна: Vec<(i32, i32, Ключ, Window, ОкноВСцене)> = state
         .space
         .elements()
@@ -749,7 +756,7 @@ pub(crate) fn нарисовать_в_полотно(
         let текстура: GlesTexture = match renderer.create_buffer(Fourcc::Abgr8888, размер) {
             Ok(т) => т,
             Err(e) => {
-                tracing::warn!("dawn/vr: полотно {}×{}: {e:?}", размер.w, размер.h);
+                tracing::warn!("plx/vr: canvas {}×{}: {e:?}", размер.w, размер.h);
                 return Повреждения::Мимо;
             }
         };
@@ -785,7 +792,7 @@ pub(crate) fn нарисовать_в_полотно(
     let mut fb = match renderer.bind(&mut цель) {
         Ok(fb) => fb,
         Err(e) => {
-            tracing::warn!("dawn/vr: bind полотна: {e:?}");
+            tracing::warn!("plx/vr: canvas bind: {e:?}");
             return Повреждения::Мимо;
         }
     };
@@ -808,7 +815,7 @@ pub(crate) fn нарисовать_в_полотно(
             }
         }
         Err(e) => {
-            tracing::warn!("dawn/vr: полотно окна: {e:?}");
+            tracing::warn!("plx/vr: window canvas: {e:?}");
             Повреждения::Мимо
         }
     }
@@ -818,12 +825,12 @@ pub(crate) fn нарисовать_в_полотно(
 
 /// Кнопки контроллеров и жесты рук за этот кадр.
 ///
-/// Жест не «делает что-то своё»: он выбирает обычное действие dawn — то же
+/// Жест не «делает что-то своё»: он выбирает обычное действие parallax — то же
 /// самое, что вешается на клавиши в `bind{}`. Какое именно, решает `config.lua`
 /// (`vr{ gestures = { fist = "vr_launcher" } }`), а если человек молчал —
 /// [`input::Жест::по_умолчанию`]. Отсюда и главное свойство: любая функция
-/// dawn доступна в шлеме без единой правки в этом файле.
-fn жесты_ввода(вр: &mut ВР, state: &mut Dawn) {
+/// parallax доступна в шлеме без единой правки в этом файле.
+fn жесты_ввода(вр: &mut ВР, state: &mut Parallax) {
     let жесты = match вр.шлем.ввод.as_mut() {
         Some(в) => в.жесты(),
         None => return,
@@ -842,19 +849,19 @@ fn жесты_ввода(вр: &mut ВР, state: &mut Dawn) {
             .get(ж.имя())
             .cloned()
             .unwrap_or_else(|| ж.по_умолчанию());
-        tracing::info!("dawn/vr: жест «{}» → {:?}", ж.имя(), действие);
+        tracing::info!("plx/vr: gesture '{}' → {:?}", ж.имя(), действие);
         выполнить(вр, state, действие);
     }
 }
 
-/// Сделать действие dawn, попрошенное из шлема.
+/// Сделать действие parallax, попрошенное из шлема.
 ///
 /// **Почему не просто `state.dispatch_action`.** На время кадра VR вынут из
 /// состояния (`state.vr` сейчас `None` — см. `кадр`), а действия про шлем как
 /// раз через `state.vr` и работают: `dispatch_action(VrLauncher)` ответил бы
 /// «шлем не включён». Поэтому свои действия делаются здесь, прямо по `вр`, а
 /// всё остальное уходит обычной дорогой — той же, что у клавиш.
-fn выполнить(вр: &mut ВР, state: &mut Dawn, действие: crate::config::Action) {
+fn выполнить(вр: &mut ВР, state: &mut Parallax, действие: crate::config::Action) {
     use crate::config::Action as Д;
     match действие {
         Д::VrLauncher => тумблер(вр, state, ui::Вид::Пуск),
@@ -876,20 +883,20 @@ fn выполнить(вр: &mut ВР, state: &mut Dawn, действие: crate
         Д::VrAr => {
             let хочу = !вр.шлем.ар_включена();
             if !вр.шлем.дополненная(хочу) && хочу {
-                tracing::warn!("dawn/vr: этот рантайм не показывает комнату — остаёмся в VR");
+                tracing::warn!("plx/vr: this runtime has no passthrough — staying in VR");
             }
         }
         // Выключать шлем изнутри шлема — верный способ остаться без картинки от
         // случайного жеста, и «включить обратно» оттуда уже нечем.
         Д::VrToggle | Д::VrMode => {
-            tracing::warn!("dawn/vr: снимать шлем жестом нельзя — только с клавиатуры");
+            tracing::warn!("plx/vr: cannot leave the headset by gesture — keyboard only");
         }
         иное => state.dispatch_action(иное),
     }
 }
 
 /// Приложения пульта «Пуск»: из `vr{ apps = … }`, иначе набор по умолчанию.
-fn приложения(state: &Dawn) -> Vec<(String, String)> {
+fn приложения(state: &Parallax) -> Vec<(String, String)> {
     let свои = &state.lua_config.vr.apps;
     if свои.is_empty() {
         ui::приложения_по_умолчанию()
@@ -899,7 +906,7 @@ fn приложения(state: &Dawn) -> Vec<(String, String)> {
 }
 
 /// Показать пульт, если его нет, и спрятать, если есть.
-pub fn тумблер(вр: &mut ВР, state: &Dawn, вид: ui::Вид) {
+pub fn тумблер(вр: &mut ВР, state: &Parallax, вид: ui::Вид) {
     if let Some(i) = вр.пульты.iter().position(|п| п.вид == вид) {
         let ключ = вр.пульты[i].ключ();
         вр.пульты.remove(i);
@@ -907,7 +914,7 @@ pub fn тумблер(вр: &mut ВР, state: &Dawn, вид: ui::Вид) {
         // Панель пульта уходит из сцены немедленно: она попала бы в неё ещё раз
         // только на следующем кадре, но луч и клик считаются здесь и сейчас.
         вр.сцена.панели.retain(|п| п.ключ != ключ);
-        tracing::info!("dawn/vr: пульт «{}» спрятан", вид.имя());
+        tracing::info!("plx/vr: control panel '{}' hidden", вид.имя());
         return;
     }
     let пульт = match вид {
@@ -915,7 +922,7 @@ pub fn тумблер(вр: &mut ВР, state: &Dawn, вид: ui::Вид) {
         ui::Вид::Клавиатура => ui::Пульт::клавиатура(),
     };
     tracing::info!(
-        "dawn/vr: пульт «{}» открыт ({} кнопок)",
+        "plx/vr: control panel '{}' opened ({} buttons)",
         вид.имя(),
         пульт.кнопки.len()
     );
@@ -965,7 +972,7 @@ fn обновить_текстуры(вр: &mut ВР, renderer: &mut GlesRendere
                 п.перерисовать = false;
             }
             Err(e) => {
-                tracing::warn!("dawn/vr: холст пульта «{}» не залился: {e:?}", п.вид.имя());
+                tracing::warn!("plx/vr: control panel '{}' canvas upload failed: {e:?}", п.вид.имя());
                 // Не пробуем снова каждым кадром: если формат не подошёл, он не
                 // подойдёт и через кадр, а лог был бы завален.
                 п.перерисовать = false;
@@ -980,14 +987,14 @@ fn обновить_текстуры(вр: &mut ВР, renderer: &mut GlesRendere
 ///
 /// Возвращает `true`, если пульт после этого надо перерисовать (залип
 /// модификатор).
-fn нажать_кнопку(вр: &mut ВР, state: &mut Dawn, ключ: Ключ, номер: usize) {
+fn нажать_кнопку(вр: &mut ВР, state: &mut Parallax, ключ: Ключ, номер: usize) {
     let Some(i) = вр.пульты.iter().position(|п| п.ключ() == ключ) else { return };
     let Some(действие) = вр.пульты[i].кнопки.get(номер).map(|к| к.действие.clone()) else {
         return;
     };
     match действие {
         ui::Действие::Запуск(команда) => {
-            tracing::info!("dawn/vr: пульт → {команда}");
+            tracing::info!("plx/vr: control panel → {команда}");
             state.spawn(&команда);
         }
         ui::Действие::Дать(действие) => state.dispatch_action(действие),
@@ -1009,14 +1016,14 @@ fn нажать_кнопку(вр: &mut ВР, state: &mut Dawn, ключ: Клю
             вр.пульты[i].перерисовать = !залипли.is_empty();
         }
         ui::Действие::Модификатор(код) => вр.пульты[i].залипание(код),
-        ui::Действие::Ар => {
+        ui::Действие::АР => {
             // Не через `dispatch_action`: на время кадра `state.vr` вынут из
             // состояния (см. `тик_с`), и общий путь решил бы, что шлем выключен.
             let хочу = !вр.шлем.ар_включена();
             let стало = вр.шлем.дополненная(хочу);
             tracing::info!(
-                "dawn/vr: пульт → AR {}",
-                if стало { "включена" } else { "не вышла" }
+                "plx/vr: control panel → AR {}",
+                if стало { "on" } else { "failed" }
             );
         }
         ui::Действие::Раскладка => {
@@ -1065,8 +1072,8 @@ fn собрать_лучи(вр: &ВР, голова: math::Поза) -> Vec<(us
     лучи
 }
 
-/// Указка → курсор и кнопки dawn.
-fn применить_ввод(вр: &mut ВР, state: &mut Dawn, лучи: &[(usize, Луч)], глаз: Век3) {
+/// Указка → курсор и кнопки parallax.
+fn применить_ввод(вр: &mut ВР, state: &mut Parallax, лучи: &[(usize, Луч)], глаз: Век3) {
     let ведущая = вр.шлем.ввод.as_ref().and_then(|в| в.ведущая());
     // Луч ведущей руки, иначе первый попавшийся (взгляд).
     let луч = лучи
@@ -1174,7 +1181,7 @@ fn применить_ввод(вр: &mut ВР, state: &mut Dawn, лучи: &[(u
 
     // ── Пульт под указкой ───────────────────────────────────────────────────
     //
-    // Курсор dawn сюда не едет вовсе: пульт — это не окно, за ним нет клиента,
+    // Курсор parallax сюда не едет вовсе: пульт — это не окно, за ним нет клиента,
     // и «навести мышь» на кнопку клавиатуры значило бы увести указатель с того
     // окна, в которое человек как раз собирается печатать.
     if ui::пульт_ли(ключ) {
@@ -1193,7 +1200,7 @@ fn применить_ввод(вр: &mut ВР, state: &mut Dawn, лучи: &[(u
     if !мышь_главная {
         if let Some(окно) = окно_по_ключу(state, ключ) {
             if let Some(г) = state.space.element_geometry(&окно) {
-                // Пиксель панели → точка холста. Дальше dawn работает как всегда:
+                // Пиксель панели → точка холста. Дальше parallax работает как всегда:
                 // фокус по наведению, hit-test, клиенты.
                 let точка = Point::<f64, smithay::utils::Logical>::from((
                     г.loc.x as f64 + пкс_x,
@@ -1227,7 +1234,7 @@ fn применить_ввод(вр: &mut ВР, state: &mut Dawn, лучи: &[(u
 /// холст → окно → пиксель панели. Одно и то же место в двух представлениях, и
 /// сходятся они по построению — оба считают от `element_geometry` окна.
 fn окно_под_курсором(
-    state: &Dawn,
+    state: &Parallax,
     точка: Point<f64, smithay::utils::Logical>,
 ) -> Option<(Ключ, f64, f64)> {
     let (окно, начало) = state.space.element_under(точка)?;
@@ -1240,7 +1247,7 @@ fn окно_под_курсором(
     ))
 }
 
-pub(crate) fn окно_по_ключу(state: &Dawn, ключ: Ключ) -> Option<Window> {
+pub(crate) fn окно_по_ключу(state: &Parallax, ключ: Ключ) -> Option<Window> {
     state
         .space
         .elements()
@@ -1249,7 +1256,7 @@ pub(crate) fn окно_по_ключу(state: &Dawn, ключ: Ключ) -> Opti
 }
 
 /// Нажать/отпустить левую кнопку от имени указки.
-fn клик(state: &mut Dawn, нажать: bool) {
+fn клик(state: &mut Parallax, нажать: bool) {
     state.vr_клик(нажать);
 }
 
@@ -1259,7 +1266,7 @@ fn к_показу(вр: &ВР) -> Vec<render::КПоказу> {
         .панели
         .iter()
         .filter_map(|п| {
-            // Панель — это либо окно (полотно с его кадром), либо пульт dawn
+            // Панель — это либо окно (полотно с его кадром), либо пульт parallax
             // (холст, который мы нарисовали сами).
             let текстура = match вр.полотна.get(&п.ключ) {
                 Some(полотно) => полотно.текстура.tex_id(),
@@ -1365,7 +1372,7 @@ fn линии_сцены(вр: &ВР, лучи: &[(usize, Луч)]) -> Vec<rende
     // ── Курсор на панели ────────────────────────────────────────────────────
     //
     // Без него в шлеме не видно, куда нажмёшь: содержимое панели — это кадр
-    // окна, а стрелку dawn рисует ПОВЕРХ кадра монитора, то есть в полотно она
+    // окна, а стрелку parallax рисует ПОВЕРХ кадра монитора, то есть в полотно она
     // не попадает вовсе. Крестик рисуется в плоскости самой панели, поэтому
     // «прилипает» к ней при повороте головы, как настоящий курсор к экрану.
     if let Some((ключ, пкс_x, пкс_y)) = вр.наведено {
@@ -1404,7 +1411,7 @@ fn линии_сцены(вр: &ВР, лучи: &[(usize, Луч)]) -> Vec<rende
 }
 
 /// Сменить раскладку по кругу (действие `vr_layout`).
-pub fn сменить_раскладку(state: &mut Dawn) -> Раскладка {
+pub fn сменить_раскладку(state: &mut Parallax) -> Раскладка {
     let новая = state.vr_раскладка.следующая();
     state.vr_раскладка = новая;
     if let Some(вр) = state.vr.as_mut() {
@@ -1427,27 +1434,27 @@ pub fn сменить_раскладку(state: &mut Dawn) -> Раскладка
 /// делает ничего. Пока оба исхода отвечали одинаково («выключена»), сломанный
 /// passthrough на живом Quest выглядел бы ровно как нормальное выключение.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ар {
+pub enum АР {
     Включена,
     Выключена,
     НеУмеет,
 }
 
 /// Переключить дополненную реальность (действие `vr_ar`).
-pub fn переключить_ар(state: &mut Dawn) -> Ар {
-    let Some(вр) = state.vr.as_mut() else { return Ар::НеУмеет };
+pub fn переключить_ар(state: &mut Parallax) -> АР {
+    let Some(вр) = state.vr.as_mut() else { return АР::НеУмеет };
     let хочу = !вр.шлем.ар_включена();
     let стало = вр.шлем.дополненная(хочу);
     let исход = match (хочу, стало) {
-        (_, true) => Ар::Включена,
-        (false, false) => Ар::Выключена,
-        (true, false) => Ар::НеУмеет,
+        (_, true) => АР::Включена,
+        (false, false) => АР::Выключена,
+        (true, false) => АР::НеУмеет,
     };
     match исход {
-        Ар::Включена => tracing::info!("dawn/vr: дополненная реальность включена"),
-        Ар::Выключена => tracing::info!("dawn/vr: дополненная реальность выключена"),
-        Ар::НеУмеет => {
-            tracing::warn!("dawn/vr: этот рантайм не показывает комнату — остаёмся в VR")
+        АР::Включена => tracing::info!("plx/vr: passthrough on"),
+        АР::Выключена => tracing::info!("plx/vr: passthrough off"),
+        АР::НеУмеет => {
+            tracing::warn!("plx/vr: this runtime has no passthrough — staying in VR")
         }
     }
     исход
@@ -1455,7 +1462,7 @@ pub fn переключить_ар(state: &mut Dawn) -> Ар {
 
 /// Поставить панели заново вокруг текущего направления взгляда
 /// (действие `vr_recenter`).
-pub fn пересобрать(state: &mut Dawn) {
+pub fn пересобрать(state: &mut Parallax) {
     let Some(вр) = state.vr.as_mut() else { return };
     // «Перед» — туда, куда человек смотрит сейчас. Взять это направление можно
     // только из последней позы головы, а она приходит с кадром; поэтому просто
@@ -1470,12 +1477,12 @@ pub fn пересобрать(state: &mut Dawn) {
 ///
 /// Снаружи — с бинда, из сокета — пульт переключается ровно так же, как
 /// кнопкой контроллера: одна дорога и для человека в шлеме, и для харнесса.
-pub fn пульт(state: &mut Dawn, вид: ui::Вид) -> Result<bool, String> {
+pub fn пульт(state: &mut Parallax, вид: ui::Вид) -> Result<bool, String> {
     if state.vr.is_none() {
-        return Err("шлем не включён".into());
+        return Err(т!("шлем не включён", "the headset is not on").into());
     }
     // Берём VR из состояния на время вызова: `тумблер` хочет и `&mut ВР`, и
-    // `&Dawn` (список приложений живёт в конфиге).
+    // `&Parallax` (список приложений живёт в конфиге).
     let mut вр = state.vr.take().unwrap();
     тумблер(&mut вр, state, вид);
     let открыт = вр.пульты.iter().any(|п| п.вид == вид);
@@ -1488,9 +1495,9 @@ pub fn пульт(state: &mut Dawn, вид: ui::Вид) -> Result<bool, String> 
 ///
 /// В шлеме кнопку нажимают лучом, а снаружи луча нет: без этой команды пульты
 /// нельзя было бы проверить ничем, кроме как надев Quest.
-pub fn нажать(state: &mut Dawn, вид: ui::Вид, номер: usize) -> Result<String, String> {
+pub fn нажать(state: &mut Parallax, вид: ui::Вид, номер: usize) -> Result<String, String> {
     if state.vr.is_none() {
-        return Err("шлем не включён".into());
+        return Err(т!("шлем не включён", "the headset is not on").into());
     }
     let mut вр = state.vr.take().unwrap();
     let ключ = ui::ключ(вид);
@@ -1505,7 +1512,7 @@ pub fn нажать(state: &mut Dawn, вид: ui::Вид, номер: usize) -> 
             нажать_кнопку(&mut вр, state, ключ, номер);
             Ok(п)
         }
-        None => Err(format!("у пульта «{}» нет кнопки {номер}", вид.имя())),
+        None => Err(тф!("у пульта «{}» нет кнопки {номер}", "the control panel '{}' has no button {номер}", вид.имя())),
     };
     state.vr = Some(вр);
     state.request_redraw();
@@ -1513,19 +1520,23 @@ pub fn нажать(state: &mut Dawn, вид: ui::Вид, номер: usize) -> 
 }
 
 /// Пульты и их кнопки построчно (команда `vr pults`).
-pub fn пульты_строкой(state: &Dawn) -> String {
+pub fn пульты_строкой(state: &Parallax) -> String {
     let Some(вр) = state.vr.as_ref() else {
-        return "шлем не включён".into();
+        return т!("шлем не включён", "the headset is not on").into();
     };
     if вр.пульты.is_empty() {
-        return "пультов нет (Пуск — кулак, кнопка ☰ или нажатие на стик, \
-                ладонь вверх, Super+Alt+M; вся раскладка — `vr gestures`)"
-            .into();
+        return т!(
+            "пультов нет (Пуск — кулак, кнопка ☰ или нажатие на стик, \
+             ладонь вверх, Super+Alt+M; вся раскладка — `vr gestures`)",
+            "no control panels (Launcher — a fist, the ☰ button or a stick click, \
+             palm up, Super+Alt+M; the full map is `vr gestures`)"
+        )
+        .into();
     }
     let mut из = String::new();
     for п in &вр.пульты {
-        из.push_str(&format!(
-            "пульт «{}» {}×{} пкс, {} м в ширину, поза {}\n",
+        из.push_str(&тф!(
+            "пульт «{}» {}×{} пкс, {} м в ширину, поза {}\n", "control panel '{}' {}×{} px, {} m wide, pose {}\n",
             п.вид.имя(),
             п.ширина_пкс,
             п.высота_пкс,
@@ -1535,7 +1546,7 @@ pub fn пульты_строкой(state: &Dawn) -> String {
                     "({:.2},{:.2},{:.2})",
                     поза.место.x, поза.место.y, поза.место.z
                 ),
-                None => "встанет на ближайшем кадре".into(),
+                None => т!("встанет на ближайшем кадре", "will be placed on the next frame").into(),
             },
         ));
         for (i, к) in п.кнопки.iter().enumerate() {
@@ -1547,16 +1558,16 @@ pub fn пульты_строкой(state: &Dawn) -> String {
             ));
         }
         if !п.залипли.is_empty() {
-            из.push_str(&format!("  залипли модификаторы: {:?}\n", п.залипли));
+            из.push_str(&тф!("  залипли модификаторы: {:?}\n", "  sticky modifiers: {:?}\n", п.залипли));
         }
     }
     из
 }
 
 /// Попросить снимок кадра шлема (команда `vr shot <путь>`).
-pub fn снимок(state: &mut Dawn, путь: std::path::PathBuf) -> Result<(), String> {
+pub fn снимок(state: &mut Parallax, путь: std::path::PathBuf) -> Result<(), String> {
     let Some(вр) = state.vr.as_mut() else {
-        return Err("шлем не включён".into());
+        return Err(т!("шлем не включён", "the headset is not on").into());
     };
     вр.снимок = Some(путь);
     state.request_redraw();
@@ -1576,14 +1587,14 @@ fn снять_глаз(
     {
         Ok(п) => п,
         Err(e) => {
-            tracing::warn!("dawn/vr: снимок не вышел: {e}");
+            tracing::warn!("plx/vr: screenshot failed: {e}");
             return;
         }
     };
     let файл = match std::fs::File::create(путь) {
         Ok(ф) => ф,
         Err(e) => {
-            tracing::warn!("dawn/vr: снимок {путь:?}: {e}");
+            tracing::warn!("plx/vr: screenshot {путь:?}: {e}");
             return;
         }
     };
@@ -1592,27 +1603,27 @@ fn снять_глаз(
     кодер.set_depth(png::BitDepth::Eight);
     let запись = кодер.write_header().and_then(|mut w| w.write_image_data(&пиксели));
     match запись {
-        Ok(()) => tracing::info!("dawn/vr: снимок глаза → {путь:?} ({ширина}×{высота})"),
-        Err(e) => tracing::warn!("dawn/vr: PNG не записался: {e}"),
+        Ok(()) => tracing::info!("plx/vr: eye screenshot → {путь:?} ({ширина}×{высота})"),
+        Err(e) => tracing::warn!("plx/vr: PNG write failed: {e}"),
     }
 }
 
 /// Панели построчно: ключ, место в метрах, размер, закреплена ли.
 ///
 /// Это измеритель, а не украшение: расстановку в комнате иначе видно только в
-/// шлеме, а проверять её надо там же, где и всё остальное в dawn, — командой
+/// шлеме, а проверять её надо там же, где и всё остальное в parallax, — командой
 /// из сокета (см. ctl.rs, `vr panels`).
-pub fn панели_строкой(state: &Dawn) -> String {
+pub fn панели_строкой(state: &Parallax) -> String {
     let Some(вр) = state.vr.as_ref() else {
-        return "шлем не включён".into();
+        return т!("шлем не включён", "the headset is not on").into();
     };
     if вр.сцена.панели.is_empty() {
-        return "панелей нет".into();
+        return т!("панелей нет", "no panels").into();
     }
     let mut из = String::new();
     for (i, п) in вр.сцена.панели.iter().enumerate() {
-        из.push_str(&format!(
-            "{}{} ключ={} место=({:.2},{:.2},{:.2}) размер={:.2}x{:.2}м пиксели={}x{} {}\n",
+        из.push_str(&тф!(
+            "{}{} ключ={} место=({:.2},{:.2},{:.2}) размер={:.2}x{:.2}м пиксели={}x{} {}\n", "{}{} key={} at=({:.2},{:.2},{:.2}) size={:.2}x{:.2}m pixels={}x{} {}\n",
             if вр.наведено.map(|(к, _, _)| к) == Some(п.ключ) { "*" } else { " " },
             i,
             п.ключ,
@@ -1623,11 +1634,11 @@ pub fn панели_строкой(state: &Dawn) -> String {
             п.пол_высота * 2.0,
             п.ширина_пкс,
             п.высота_пкс,
-            if п.закреплена { "закреплена" } else { "по раскладке" },
+            if п.закреплена { т!("закреплена", "pinned") } else { т!("по раскладке", "from the layout") },
         ));
     }
     if let Some((_, x, y)) = вр.наведено {
-        из.push_str(&format!("указка в пикселе ({:.0},{:.0})\n", x, y));
+        из.push_str(&тф!("указка в пикселе ({:.0},{:.0})\n", "pointer at pixel ({:.0},{:.0})\n", x, y));
     }
     из
 }
@@ -1639,44 +1650,44 @@ pub fn панели_строкой(state: &Dawn) -> String {
 /// Monado ни контроллеров, ни суставов нет вовсе, и весь `input.rs` там
 /// проходит вхолостую. Разница между «луч от контроллера» и «луч от ладони»
 /// показана отдельно — по одному «указка есть» их не различить.
-pub fn ввод_строкой(state: &Dawn) -> String {
+pub fn ввод_строкой(state: &Parallax) -> String {
     let Some(вр) = state.vr.as_ref() else {
-        return "шлем не включён".into();
+        return т!("шлем не включён", "the headset is not on").into();
     };
     let Some(ввод) = вр.шлем.ввод.as_ref() else {
-        return "ввод не поднят (действия не создались)".into();
+        return т!("ввод не поднят (действия не создались)", "input is not up (the actions were not created)").into();
     };
-    let mut из = format!(
-        "отслеживание рук: {}\n",
-        if ввод.руки_есть() { "есть" } else { "рантайм не даёт" }
+    let mut из = тф!(
+        "отслеживание рук: {}\n", "hand tracking: {}\n",
+        if ввод.руки_есть() { т!("есть", "yes") } else { т!("рантайм не даёт", "the runtime does not provide it") }
     );
     let ведущая = ввод.ведущая();
-    for (i, имя) in [(input::ЛЕВАЯ, "левая"), (input::ПРАВАЯ, "правая")] {
+    for (i, имя) in [(input::ЛЕВАЯ, т!("левая", "left")), (input::ПРАВАЯ, т!("правая", "right"))] {
         let р = &ввод.состояние[i];
         let профиль = ввод.профиль(i);
-        из.push_str(&format!(
-            "{}{имя}: профиль {} | ",
+        из.push_str(&тф!(
+            "{}{имя}: профиль {} | ", "{}{имя}: profile {} | ",
             if ведущая == Some(i) { "*" } else { " " },
             if профиль.is_empty() { "—" } else { профиль },
         ));
         match р.указка {
-            None => из.push_str("указки нет"),
-            Some(п) => из.push_str(&format!(
-                "указка {} ({:.2},{:.2},{:.2})",
-                if р.от_руки { "от ладони" } else { "от контроллера" },
+            None => из.push_str(т!("указки нет", "no pointer")),
+            Some(п) => из.push_str(&тф!(
+                "указка {} ({:.2},{:.2},{:.2})", "pointer {} ({:.2},{:.2},{:.2})",
+                if р.от_руки { т!("от ладони", "from the palm") } else { т!("от контроллера", "from the controller") },
                 п.место.x,
                 п.место.y,
                 п.место.z,
             )),
         }
-        из.push_str(&format!(
-            " | выбор {} хват {} меню {} стик ({:+.2},{:+.2}) щипок {} ({:.3} м)\n",
-            if р.выбор { "да" } else { "нет" },
-            if р.хват { "да" } else { "нет" },
-            if р.меню_нажато { "да" } else { "нет" },
+        из.push_str(&тф!(
+            " | выбор {} хват {} меню {} стик ({:+.2},{:+.2}) щипок {} ({:.3} м)\n", " | select {} grip {} menu {} stick ({:+.2},{:+.2}) pinch {} ({:.3} m)\n",
+            if р.выбор { т!("да", "yes") } else { т!("нет", "no") },
+            if р.хват { т!("да", "yes") } else { т!("нет", "no") },
+            if р.меню_нажато { т!("да", "yes") } else { т!("нет", "no") },
             р.стик.0,
             р.стик.1,
-            if р.щипок { "да" } else { "нет" },
+            if р.щипок { т!("да", "yes") } else { т!("нет", "no") },
             р.щепоть_м,
         ));
         // Жесты руки — отдельной строкой и по ИМЕНАМ из конфига: так за один
@@ -1684,8 +1695,12 @@ pub fn ввод_строкой(state: &Dawn) -> String {
         // жест переназначается в `vr{ gestures }`. Без имён пришлось бы
         // сопоставлять «кулак» с `fist` в голове.
         let mut жесты: Vec<&str> = Vec::new();
+        // `clenched` — единственное в списке, чего в конфиге НЕТ: это сырое
+        // «пальцы согнуты прямо сейчас», из которого выдержкой рождается
+        // `fist`. Видеть их рядом и надо: пальцы согнуты, а кулака нет —
+        // значит не дожали выдержку, а не рантайм потерял суставы.
         if р.сжат {
-            жесты.push("сжат");
+            жесты.push("clenched");
         }
         if р.кулак {
             жесты.push(input::Жест::Кулак.имя());
@@ -1705,16 +1720,16 @@ pub fn ввод_строкой(state: &Dawn) -> String {
         if р.щипок_мизинец {
             жесты.push(input::Жест::ЩипокМизинцем.имя());
         }
-        из.push_str(&format!(
-            "  жесты: {} | ладонь вверх на {:+.2}\n",
+        из.push_str(&тф!(
+            "  жесты: {} | ладонь вверх на {:+.2}\n", "  gestures: {} | palm up by {:+.2}\n",
             if жесты.is_empty() { "—".to_string() } else { жесты.join(", ") },
             р.ладонь_вверх_мера,
         ));
     }
     if let Some((_, x, y)) = вр.наведено {
-        из.push_str(&format!("наведено в пиксель ({x:.0},{y:.0})\n"));
+        из.push_str(&тф!("наведено в пиксель ({x:.0},{y:.0})\n", "aimed at pixel ({x:.0},{y:.0})\n"));
     } else {
-        из.push_str("ни одна панель не наведена\n");
+        из.push_str(т!("ни одна панель не наведена\n", "no panel is aimed at\n"));
     }
     из
 }
@@ -1724,13 +1739,13 @@ pub fn ввод_строкой(state: &Dawn) -> String {
 ///
 /// Работает и БЕЗ шлема — нарочно: раскладку надо проверять после правки
 /// конфига, а не после того, как её надели.
-pub fn жесты_строкой(state: &Dawn) -> String {
+pub fn жесты_строкой(state: &Parallax) -> String {
     let своё = &state.lua_config.vr.gestures;
-    let mut из = String::from("жест (ключ в vr{ gestures }) → действие\n");
+    let mut из = String::from(т!("жест (ключ в vr{ gestures }) → действие\n", "gesture (key in vr{ gestures }) → action\n"));
     for ж in input::Жест::все() {
         let (действие, откуда) = match своё.get(ж.имя()) {
             Some(д) => (д.clone(), "config.lua"),
-            None => (ж.по_умолчанию(), "по умолчанию"),
+            None => (ж.по_умолчанию(), т!("по умолчанию", "default")),
         };
         из.push_str(&format!(
             "  {:<13} {:<28} ({откуда})\n",
@@ -1738,33 +1753,43 @@ pub fn жесты_строкой(state: &Dawn) -> String {
             format!("{действие:?}")
         ));
     }
-    из.push_str(
+    из.push_str(т!(
         "щипок большим и указательным — левая кнопка мыши, он же выбор окна; \
          хват (squeeze) — тащить панель\n",
-    );
+        "a thumb-and-index pinch is the left mouse button and the window pick; \
+         squeeze drags a panel\n",
+    ));
     из
 }
 
 /// Строка для панели/лога: что сейчас в шлеме. Зовётся из `ctl.rs` (команда
 /// `vr`) — там и видно, жив ли режим и сколько кадров ушло в шлем.
-pub fn состояние(state: &Dawn) -> String {
+/// Как рантайм смешивает картинку с комнатой, словами. Пусто, если шлема нет.
+///
+/// Отдельной функцией, чтобы `config.rs` и `ctl.rs` не лезли в `вр.шлем`:
+/// в минимальной сборке типа `ВР` не существует вовсе (см. vr_stub/).
+pub fn смешивание_строкой(state: &Parallax) -> String {
+    state.vr.as_ref().map(|вр| вр.шлем.смешивание_строкой()).unwrap_or_default()
+}
+
+pub fn состояние(state: &Parallax) -> String {
     match state.vr.as_ref() {
         None => match state.vr_ожидание.as_ref() {
             // Ожидание — самостоятельное состояние, и молчать о нём нельзя:
             // иначе «VR выключен» сразу после `vr mode` читается как отказ,
-            // хотя на деле dawn как раз ждёт, когда наденут шлем.
+            // хотя на деле parallax как раз ждёт, когда наденут шлем.
             Some(ож) => {
                 let осталось = ож.до.saturating_duration_since(std::time::Instant::now());
-                format!(
-                    "VR: жду шлем ({} с; сервер {})",
+                тф!(
+                    "VR: жду шлем ({} с; сервер {})", "VR: waiting for the headset ({} s; server {})",
                     осталось.as_secs(),
-                    if wivrn::сервер_идёт() { "идёт" } else { "не идёт" },
+                    if wivrn::сервер_идёт() { т!("идёт", "running") } else { т!("не идёт", "not running") },
                 )
             }
-            None => "VR выключен".into(),
+            None => т!("VR выключен", "VR is off").into(),
         },
-        Some(вр) => format!(
-            "VR: {} панелей, раскладка {}, {}, кадров {}\nсмешивание: {}",
+        Some(вр) => тф!(
+            "VR: {} панелей, раскладка {}, {}, кадров {}\nсмешивание: {}", "VR: {} panels, layout {}, {}, frames {}\nblend: {}",
             вр.панелей(),
             вр.сцена.раскладка.имя(),
             if вр.шлем.ар_включена() { "AR" } else { "VR" },
@@ -1774,9 +1799,9 @@ pub fn состояние(state: &Dawn) -> String {
     }
 }
 
-// ── Мостик к остальному dawn ────────────────────────────────────────────────
+// ── Мостик к остальному parallax ────────────────────────────────────────────────
 
-impl Dawn {
+impl Parallax {
     /// Поставить курсор в точку ХОЛСТА и разослать движение клиентам.
     ///
     /// **Почему не через `process_input_event`.** Обычный путь мыши считает
@@ -1818,7 +1843,7 @@ impl Dawn {
 
     /// Курок указки как левая кнопка мыши.
     ///
-    /// Идёт через `process_input_event` намеренно: клик в dawn — это не только
+    /// Идёт через `process_input_event` намеренно: клик в parallax — это не только
     /// «отдать клиенту», это ещё меню, полка, обзор, перетаскивание окон и
     /// счётчик зажатых кнопок. Повторять всё это здесь значило бы завести
     /// вторую, неизбежно расходящуюся копию правил.
@@ -1836,7 +1861,7 @@ impl Dawn {
     /// в `process_input_event`, там же, где ловятся сочетания, и `Super+Enter`,
     /// набранный лучом в воздухе, открывает терминал ровно так же, как со
     /// стола. Если бы клавиши слались клиенту напрямую (`keyboard.input`), в
-    /// шлеме не работало бы ни одно сочетание dawn.
+    /// шлеме не работало бы ни одно сочетание parallax.
     pub(crate) fn vr_клавиша(&mut self, код: u32, нажата: bool) {
         self.process_input_event(smithay::backend::input::InputEvent::Keyboard::<
             crate::synth::Синтетика,
@@ -1845,13 +1870,4 @@ impl Dawn {
         });
     }
 
-    /// Короткое сообщение человеку. В шлеме его не видно — и это правильно:
-    /// сообщения про VR нужны ровно тогда, когда шлем НЕ надет (не включился,
-    /// не нашёлся рантайм), а тогда человек смотрит на монитор.
-    pub(crate) fn уведомить(&self, текст: &str) {
-        tracing::info!("dawn/vr: {текст}");
-        // Кавычки в тексте экранируем: он попадает в `sh -c`.
-        let без_кавычек = текст.replace('\'', "’");
-        self.spawn(&format!("notify-send -a dawn 'dawn' '{}'", без_кавычек));
-    }
 }

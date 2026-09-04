@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use crate::{
     canvas::VelocityTracker,
     grabs::{move_grab::MoveSurfaceGrab, resize_grab::{ResizeEdge, ResizeSurfaceGrab}},
-    state::Dawn,
+    state::Parallax,
     tiling::Layout,
 };
 
@@ -210,7 +210,7 @@ impl EdgeDrift {
             if !self.reported {
                 self.reported = true;
                 tracing::debug!(
-                    "ДОВОДКА нет: простой={}мс пик={:.0} (нужно {}) путь={:.0} (нужно {})",
+                    "plx/input: no edge assist: idle={}ms peak={:.0} (need {}) travel={:.0} (need {})",
                     now.duration_since(self.moving_at).as_millis(),
                     self.peak, EDGE_MIN_PEAK, self.travel, EDGE_MIN_TRAVEL,
                 );
@@ -221,7 +221,7 @@ impl EdgeDrift {
         let started = *self.started.get_or_insert(now);
         if fresh {
             tracing::debug!(
-                "ДОВОДКА старт: простой={}мс пик={:.0} курс=({:.2},{:.2}) путь={:.0}",
+                "plx/input: edge assist start: idle={}ms peak={:.0} heading=({:.2},{:.2}) travel={:.0}",
                 now.duration_since(self.moving_at).as_millis(),
                 self.peak, self.peak_dir.x, self.peak_dir.y, self.travel,
             );
@@ -230,7 +230,7 @@ impl EdgeDrift {
         if держится > EDGE_MAX_RUN {
             if !self.reported {
                 self.reported = true;
-                tracing::debug!("ДОВОДКА стоп: предохранитель {:?}", EDGE_MAX_RUN);
+                tracing::debug!("plx/input: edge-assist stop: safety {:?}", EDGE_MAX_RUN);
             }
             return None;
         }
@@ -248,7 +248,7 @@ impl EdgeDrift {
     }
 }
 
-impl Dawn {
+impl Parallax {
     /// Забирает ли окно в фокусе себе всю клавиатуру
     /// (`set{ keyboard_grab_apps = {...} }`).
     ///
@@ -305,10 +305,10 @@ impl Dawn {
     ///   * **Меню клиента держит захват** (XdgShellHandler::grab). Перевод
     ///     фокуса сорвал бы захват и закрыл меню — этим болели меню Steam.
     ///   * **Клавиатуру держит слой** — открыт fuzzel (лаунчер, строка поиска
-    ///     dwall, меню его фильтров). Иначе первое же движение мыши отдаёт
+    ///     plx-wall, меню его фильтров). Иначе первое же движение мыши отдаёт
     ///     ввод окну под курсором, слой теряет клавиатуру и ЗАКРЫВАЕТСЯ:
     ///     «строка поиска пропадает, стоит подвинуть мышь». В меню фильтров
-    ///     dwall это выглядело как «фильтры не применяются» — выбрать пункт
+    ///     plx-wall это выглядело как «фильтры не применяются» — выбрать пункт
     ///     мышью было физически нельзя, меню исчезало по дороге к нему.
     ///   * **Курсор над картой окон** — 25.08.2026, вместе с переездом карты из
     ///     угла в карточку во весь стол. Карта лежит ПОВЕРХ окон, и под ней
@@ -414,7 +414,7 @@ impl Dawn {
         }
         self.warp_pointer(want);
         let cursor = self.pointer_location;
-        // take/вернуть: drag_to берёт весь Dawn, а grab лежит внутри него.
+        // take/вернуть: drag_to берёт весь Parallax, а grab лежит внутри него.
         if let Some(mut grab) = self.touchpad_drag.take() {
             grab.drag_to(self, cursor, time);
             self.touchpad_drag = Some(grab);
@@ -456,14 +456,14 @@ impl Dawn {
                     .map(|tw| tw.window.clone()));
             if let Some(w) = w {
                 crate::xwin::close(&w);
-                tracing::info!("dawn: kill focused");
+                tracing::info!("plx: kill focused");
             } else {
-                tracing::info!("dawn: kill — фокусная поверхность есть, но окна для неё нет ни в space, ни в списке");
+                tracing::info!("plx: kill — there is a focused surface, but no window for it in space or in the list");
             }
         } else {
             // Win+q молча ничего не делает ровно здесь: клавиатурный фокус снят
             // (например, кликом по пустому холсту, см. ниже set_focus(None)).
-            tracing::info!("dawn: kill — фокуса нет, закрывать нечего");
+            tracing::info!("plx: kill — nothing is focused, nothing to close");
         }
     }
 
@@ -474,11 +474,10 @@ impl Dawn {
                 let time      = Event::time_msec(&event);
                 let key_state = event.state();
                 let keycode   = event.key_code();
-                // Трекаем Super вручную (как driftwm для logo_held)
+                // Super здесь не трекаем: и `logo_held`, и детект тапа живут в
+                // `разобрать_клавишу` — там же, где keysym уже разобран. Копия
+                // констант, стоявшая тут, разъезжалась бы с той молча.
                 let pressed = key_state == smithay::backend::input::KeyState::Pressed;
-                // XKB keysyms для Super
-                const SUPER_L: u32 = keysyms::KEY_Super_L;
-                const SUPER_R: u32 = keysyms::KEY_Super_R;
 
                 self.seat.get_keyboard().unwrap().input::<(), _>(
                     self,
@@ -598,7 +597,7 @@ impl Dawn {
                        self.pan_log_left -= 1;
                        let s = self.pointer_screen_physical();
                        tracing::debug!(
-                           "ПАН Alt+ЛКМ: курсор_экран=({:.1},{:.1}) камера=({:.1},{:.1}) дельта=({:.1},{:.1})",
+                           "plx/pan Alt+LMB: cursor_screen=({:.1},{:.1}) camera=({:.1},{:.1}) delta=({:.1},{:.1})",
                            s.x, s.y, self.viewport.cam_x, self.viewport.cam_y, delta.x, delta.y,
                        );
                    }
@@ -750,7 +749,7 @@ impl Dawn {
                // sloppy focus первое же шевеление мыши перебрасывало фокус
                // туда, куда пользователь не смотрел. У niri focus-follows-mouse
                // по той же причине выключен по умолчанию; остальные раскладки
-               // dawn работают как раньше.
+               // parallax работают как раньше.
                // Пока открыто меню клиента, оно держит захват (см.
                // XdgShellHandler::grab). Перевод фокуса под курсором в этот
                // момент сорвал бы захват и закрыл меню — ровно то, чем болели
@@ -879,7 +878,7 @@ impl Dawn {
                 // виновник и точка экрана) от «клик дошёл, но приложение его
                 // проигнорировало» — во втором случае здесь тихо.
                 let съел = |кто: &str, s: smithay::utils::Point<f64, smithay::utils::Physical>| {
-                    tracing::info!("КЛИК СЪЕДЕН: {} экран=({:.0},{:.0})", кто, s.x, s.y);
+                    tracing::info!("plx/input: click swallowed: {} screen=({:.0},{:.0})", кто, s.x, s.y);
                 };
 
                 // Выделение области для снимка экрана — ПЕРВЫМ и без оглядки на
@@ -891,7 +890,7 @@ impl Dawn {
                 if self.snip_идёт() {
                     let нажата = ButtonState::Pressed == btn_state;
                     if self.snip_click(button == BTN_LEFT, нажата) {
-                        съел("выделение снимка", self.pointer_screen_physical());
+                        съел("screenshot selection", self.pointer_screen_physical());
                         return;
                     }
                 }
@@ -899,7 +898,7 @@ impl Dawn {
                 if ButtonState::Pressed == btn_state && !курсор_у_клиента && self.bt_menu_open() {
                     let screen = self.pointer_screen_physical();
                     if self.bt_click(screen) {
-                        съел("меню блютуза", screen);
+                        съел("bluetooth menu", screen);
                         return;
                     }
                 }
@@ -908,7 +907,7 @@ impl Dawn {
                 if ButtonState::Pressed == btn_state && !курсор_у_клиента && self.search_open() {
                     let screen = self.pointer_screen_physical();
                     if self.search_click(screen) {
-                        съел("поиск окон", screen);
+                        съел("window search", screen);
                         return;
                     }
                 }
@@ -918,7 +917,7 @@ impl Dawn {
                     && (self.wifi_menu_open() || self.audio_menu_open()) {
                     let screen = self.pointer_screen_physical();
                     if self.wifi_click(screen) || self.audio_click(screen) {
-                        съел("меню вайфая/звука", screen);
+                        съел("wifi/audio menu", screen);
                         return;
                     }
                 }
@@ -930,7 +929,7 @@ impl Dawn {
                 if ButtonState::Pressed == btn_state && !курсор_у_клиента {
                     let screen = self.pointer_screen_physical();
                     if self.tray_click(screen, button == BTN_RIGHT) {
-                        съел("полка состояния", screen);
+                        съел("status shelf", screen);
                         return;
                     }
                 }
@@ -946,14 +945,14 @@ impl Dawn {
                 if ButtonState::Pressed == btn_state && !курсор_у_клиента {
                     let screen = self.pointer_screen_physical();
                     if self.bar_click(screen, button == BTN_RIGHT, button == BTN_MIDDLE) {
-                        съел("панель", screen);
+                        съел("bar", screen);
                         return;
                     }
                 }
 
                 if ButtonState::Pressed == btn_state && self.portal_picking() {
                     if self.portal_pick_click(button == BTN_RIGHT) {
-                        съел("выбор источника демонстрации", self.pointer_screen_physical());
+                        съел("screencast source picker", self.pointer_screen_physical());
                         return;
                     }
                 }
@@ -978,12 +977,12 @@ impl Dawn {
                             } else if !self.preview_activate(точка) {
                                 self.preview_begin_drag();
                             }
-                            съел("предпросмотр: нажатие", self.pointer_screen_physical());
+                            съел("preview: press", self.pointer_screen_physical());
                             return;
                         }
                     } else if self.preview_drag {
                         self.preview_end_drag();
-                        съел("предпросмотр", self.pointer_screen_physical());
+                        съел("preview", self.pointer_screen_physical());
                         return;
                     }
                 }
@@ -1007,12 +1006,12 @@ impl Dawn {
                             } else if !self.minimap_activate(точка) {
                                 self.minimap_begin_drag();
                             }
-                            съел("карта окон: нажатие", self.pointer_screen_physical());
+                            съел("window map: press", self.pointer_screen_physical());
                             return;
                         }
                     } else if self.minimap_drag {
                         self.minimap_end_drag();
-                        съел("карта окон", self.pointer_screen_physical());
+                        съел("window map", self.pointer_screen_physical());
                         return;
                     }
                 }
@@ -1063,7 +1062,7 @@ impl Dawn {
                     // Новый жест — новая порция строк замера.
                     self.pan_log_left = 60;
                     self.pan_start_screen = Some(self.pointer_screen_physical());
-                    tracing::debug!("dawn/canvas: pan started");
+                    tracing::debug!("plx/canvas: pan started");
                     return;
                 }
                 // Любое отпускание ЛКМ → завершаем pan, запускаем инерцию (1.1)
@@ -1077,7 +1076,7 @@ impl Dawn {
                         if let Some(start) = self.pan_start_screen.take() {
                             let now = self.pointer_screen_physical();
                             tracing::debug!(
-                                "ИТОГ ПАН: старт=({:.1},{:.1}) конец=({:.1},{:.1}) смещение=({:.1},{:.1})",
+                                "plx/pan total: start=({:.1},{:.1}) end=({:.1},{:.1}) offset=({:.1},{:.1})",
                                 start.x, start.y, now.x, now.y, now.x - start.x, now.y - start.y,
                             );
                         }
@@ -1094,7 +1093,7 @@ impl Dawn {
                     // видно, где именно это случается.
                     let s = self.pointer_screen_physical();
                     tracing::info!(
-                        "КЛИК В ЗАХВАТ: активен pointer grab, экран=({:.0},{:.0})", s.x, s.y,
+                        "plx/input: click into a grab: pointer grab active, screen=({:.0},{:.0})", s.x, s.y,
                     );
                 }
 
@@ -1145,6 +1144,23 @@ impl Dawn {
                         .space.element_under(pos)
                         .map(|(w, l)| (w.clone(), l))
                     {
+                        // Окно игры (plx-mine): кнопка уходит ЕМУ и только ему.
+                        //
+                        // Ни хватов parallax, ни смены фокуса, ни сброса выделения:
+                        // в этом режиме мышь принадлежит Minecraft, а окнами
+                        // человек правит изнутри мира — мод шлёт нам `Хват` и
+                        // `Кнопка` по сокету, узнавая о нажатии опросом GLFW.
+                        // Перехвати мы кнопку здесь, до игры она не доедет, и
+                        // мод промолчит (см. `mine::кнопки_игре` — из-за этого
+                        // Super+ПКМ живьём не менял размер вовсе).
+                        if crate::mine::кнопки_игре(self, &window) {
+                            pointer.button(self, &ButtonEvent {
+                                button, state: btn_state, serial, time: event.time_msec(),
+                            });
+                            pointer.frame(self);
+                            return;
+                        }
+
                         // ПКМ (без Super) по выделенному окну → сбросить выделение.
                         if button == BTN_RIGHT && !kb_mods.logo
                             && !self.selected_windows.is_empty()
@@ -1185,7 +1201,7 @@ impl Dawn {
                             );
                             pointer.set_grab(self, grab, serial, Focus::Keep);
                             self.request_plane_reset();
-                            tracing::debug!("dawn: move grab started");
+                            tracing::debug!("plx: move grab started");
                             return;
                         }
 
@@ -1195,7 +1211,7 @@ impl Dawn {
                         // колонки. Обзор: свободный ресайз миниатюры (см.
                         // resize_grab.rs, ветка overview_active). Monocle: no-op.
                         if kb_mods.logo && button == BTN_RIGHT {
-                            tracing::debug!("dawn: resize grab start");
+                            tracing::debug!("plx: resize grab start");
                             let geo = self.space.element_geometry(&window)
                                 .unwrap_or(Rectangle::new(window_loc, (100, 100).into()));
                             let rel = pos - window_loc.to_f64();
@@ -1235,15 +1251,15 @@ impl Dawn {
                             // точкой курсора окна нет (хотя стрелка может рисоваться
                             // поверх окна — тогда разъехались координаты).
                             tracing::debug!(
-                                "PTR: Win+клик без окна под курсором ({:.1},{:.1})", pos.x, pos.y
+                                "plx/ptr: Win+click with no window under the cursor ({:.1},{:.1})", pos.x, pos.y
                             );
                         }
                         // «Окна под курсором нет» — ещё не «под курсором пусто».
-                        // Layer-поверхности (меню обоев dwall, лаунчер) в space
+                        // Layer-поверхности (меню обоев plx-wall, лаунчер) в space
                         // не лежат, а рисуются поверх окон. Раньше клик по ним
                         // попадал сюда: фокус снимался, а ЛКМ вдобавок уходила
                         // в rubber-band c Focus::Clear и до клиента не доходила
-                        // ВООБЩЕ — в меню dwall работала только ПКМ, потому что
+                        // ВООБЩЕ — в меню plx-wall работала только ПКМ, потому что
                         // она grab не создаёт и проваливалась в общую пересылку
                         // ниже. Отдаём такой клик слою и не трогаем фокус.
                         if self.курсор_над_слоем(pos) {
@@ -1410,7 +1426,7 @@ impl Dawn {
                         // (ровно как EdgeMotion у synaptics вёл указатель
                         // «пока палец не поднят»).
                         tracing::debug!(
-                            "ЖЕСТ: нулевой кадр, простой перед ним={}мс, окно={}",
+                            "plx/gesture: zero frame, idle before it={}ms, window={}",
                             self.edge_drift.as_ref()
                                 .map(|d| d.moving_at.elapsed().as_millis())
                                 .unwrap_or(0),
@@ -1440,7 +1456,7 @@ impl Dawn {
                     if self.touchpad_drag.is_none() && !пусто_недавно {
                         self.start_touchpad_drag();
                         tracing::debug!(
-                            "ЖЕСТ: Super+2пальца → перенос окна, окно под курсором={}",
+                            "plx/gesture: Super+2 fingers → move window, window under cursor={}",
                             self.touchpad_drag.is_some(),
                         );
                     }
@@ -1510,7 +1526,7 @@ impl Dawn {
                             self.pan_log_left -= 1;
                             let s = self.pointer_screen_physical();
                             tracing::debug!(
-                                "ПАН Alt+2пальца: курсор_экран=({:.1},{:.1}) камера=({:.1},{:.1}) дельта=({:.1},{:.1})",
+                                "plx/pan Alt+2 fingers: cursor_screen=({:.1},{:.1}) camera=({:.1},{:.1}) delta=({:.1},{:.1})",
                                 s.x, s.y, self.viewport.cam_x, self.viewport.cam_y, h, v,
                             );
                         }
@@ -1518,7 +1534,7 @@ impl Dawn {
                     } else {
                         // libinput шлёт финальный кадр с амплитудой 0, когда пальцы
                         // отпущены — это сигнал "стоп", запускаем инерцию отсюда.
-                        tracing::debug!("ЖЕСТ: Alt+2пальца → пан холста завершён, инерция");
+                        tracing::debug!("plx/gesture: Alt+2 fingers → canvas pan finished, inertia");
                         self.momentum.launch();
                         self.pan_log_left = 60;
                     }
@@ -1559,7 +1575,7 @@ impl Dawn {
                     if self.touchpad_select_start.is_none() {
                         self.clear_selection();
                         self.touchpad_select_start = Some(self.pointer_location);
-                        tracing::debug!("ЖЕСТ: 2 пальца по пустому холсту → выделение");
+                        tracing::debug!("plx/gesture: 2 fingers on empty canvas → selection");
                     }
                     let zoom = self.viewport.zoom;
                     let step = Point::from((
@@ -1601,7 +1617,7 @@ impl Dawn {
                     let factor = if v < 0.0 { 1.1_f64 } else { 0.9_f64 };
                     self.zoom_step_at_cursor(factor);
                     tracing::debug!(
-                        "dawn/canvas: цель зума={:.3} (сейчас {:.3})",
+                        "plx/canvas: zoom target={:.3} (now {:.3})",
                         self.zoom_glide.as_ref().map(|g| g.target).unwrap_or(self.viewport.zoom),
                         self.viewport.zoom,
                     );
@@ -1639,9 +1655,9 @@ impl Dawn {
                 // в ветку axis.
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     tracing::debug!(
-                        "SCROLL→КЛИЕНТ: h={:.2} v={:.2} v120={:?} источник={:?} фокус={}",
+                        "plx/scroll→client: h={:.2} v={:.2} v120={:?} source={:?} focus={}",
                         h, v, event.amount_v120(Axis::Vertical), source,
-                        if ptr.current_focus().is_some() { "есть" } else { "нет" },
+                        if ptr.current_focus().is_some() { "yes" } else { "no" },
                     );
                 }
                 ptr.axis(self, frame);
@@ -1660,7 +1676,7 @@ impl Dawn {
                 if self.жест_начало(crate::gestures::ОсноваЖеста::Щипок, event.fingers()) {
                     return;
                 }
-                tracing::debug!("ЖЕСТ: pinch начат, logo_held={}", self.logo_held);
+                tracing::debug!("plx/gesture: pinch started, logo_held={}", self.logo_held);
                 self.pinch_last_scale = 1.0;
                 // Super+2-пальца pinch → resize окна под курсором (в любом режиме;
                 // вытаскиваем из тайлинга во floating, иначе arrange его сожмёт).
@@ -1703,7 +1719,7 @@ impl Dawn {
 
                 if let Some(window) = self.gesture_resize_window.clone() {
                     // Размеры считаются от опорных по АБСОЛЮТНОМУ scale жеста
-                    // (см. Dawn::gesture_resize_group), а показатель PINCH_GAIN
+                    // (см. Parallax::gesture_resize_group), а показатель PINCH_GAIN
                     // усиливает жест: пальцы на тачпаде разводятся максимум
                     // раза в полтора, а окно должно успевать вырасти вдвое.
                     const PINCH_GAIN: f64 = 3.0;
@@ -1752,7 +1768,7 @@ impl Dawn {
                 // своей цели поверх пальцев.
                 self.zoom_glide = None;
                 let old_zoom = self.viewport.zoom;
-                let new_zoom = (old_zoom * factor).clamp(Dawn::ZOOM_MIN, Dawn::ZOOM_MAX);
+                let new_zoom = (old_zoom * factor).clamp(Parallax::ZOOM_MIN, Parallax::ZOOM_MAX);
                 self.viewport.zoom = new_zoom;
 
                 // Якорь под курсором
@@ -1772,7 +1788,7 @@ impl Dawn {
                 }
                 self.pinch_last_scale = 1.0;
                 let group = std::mem::take(&mut self.gesture_resize_group);
-                tracing::debug!("ЖЕСТ: pinch закончен, окон в группе={}", group.len());
+                tracing::debug!("plx/gesture: pinch finished, windows in the group={}", group.len());
                 self.gesture_resize_window = None;
                 // Запоминаем итоговый размер КАЖДОМУ окну группы — иначе
                 // следующий переход Float→tiling→Float вернул бы соседям
@@ -1887,7 +1903,7 @@ impl Dawn {
             }
 
             // ── Удержание ────────────────────────────────────────────────
-            // Раньше `hold` не обрабатывался вовсе — libinput его слал, dawn
+            // Раньше `hold` не обрабатывался вовсе — libinput его слал, parallax
             // ронял в общий `_ =>`. Теперь это полноценный триггер таблицы
             // (`4-finger-hold` и подобные), но только через неё: без бинда обе
             // ветки по-прежнему не делают ничего.
@@ -1918,7 +1934,7 @@ impl Dawn {
 /// изнутри игры — верный способ остаться без панелей и без клавиатуры, чтобы
 /// вернуть их (хозяйская в этот момент у Minecraft).
 pub(crate) fn разобрать_клавишу(
-    state: &mut Dawn,
+    state: &mut Parallax,
     modifiers: &smithay::input::keyboard::ModifiersState,
     handle: smithay::input::keyboard::KeysymHandle<'_>,
     pressed: bool,
@@ -1986,7 +2002,7 @@ pub(crate) fn разобрать_клавишу(
     // Настраивается через set{bird_eye_key=...} (по умолчанию space).
     // Раньше это был hold-жест bird's-eye; теперь тумблер: вкл —
     // зум к центру, стрелки панорамируют, повторный Super+Space
-    // сбрасывает (см. Dawn::toggle_zoom_nav).
+    // сбрасывает (см. Parallax::toggle_zoom_nav).
     if raw == state.lua_config.bird_eye_key {
         if pressed && state.logo_held {
             state.toggle_zoom_nav();
@@ -2131,11 +2147,11 @@ pub(crate) fn разобрать_клавишу(
 
     // ── Захват клавиатуры приложением (keyboard_grab_apps) ──
     //
-    // Пока в фокусе окно из списка (по умолчанию `dshare`),
+    // Пока в фокусе окно из списка (по умолчанию `plx-share`),
     // ВСЕ клавиши принадлежат ему: ни один бинд композитора
     // не срабатывает. Без этого гость мультиюзера не мог бы
     // отдать чужому столу ни Super+D, ни Super+1, ни
-    // Super+Q — их съедал бы его собственный dawn.
+    // Super+Q — их съедал бы его собственный parallax.
     //
     // Super+Shift+Escape проверяется ПЕРЕД захватом и
     // никогда ему не отдаётся: это аварийный выход. Повисни
@@ -2144,8 +2160,8 @@ pub(crate) fn разобрать_клавишу(
     if logo && shift && raw_latin == keysyms::KEY_Escape {
         state.захват_клавиш_снят = !state.захват_клавиш_снят;
         tracing::info!(
-            "dawn: захват клавиш приложением {}",
-            if state.захват_клавиш_снят { "СНЯТ вручную" } else { "возвращён" },
+            "plx: keyboard grab by the application {}",
+            if state.захват_клавиш_снят { "released by hand" } else { "restored" },
         );
         return FilterResult::Intercept(());
     }
@@ -2157,7 +2173,7 @@ pub(crate) fn разобрать_клавишу(
     let mods = crate::config::ModMask { ctrl, alt, shift, logo };
     if let Some(action) = state.lua_config.find_action(mods, raw_latin) {
         if из_игры && matches!(action, crate::config::Action::MineMode) {
-            tracing::warn!("dawn/mine: выйти из режима можно только с клавиатуры хозяина");
+            tracing::warn!("plx/mine: the mode can only be left from the host keyboard");
             return FilterResult::Intercept(());
         }
         state.dispatch_action(action);

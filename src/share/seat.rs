@@ -17,7 +17,7 @@
 //! `поверхность=true окно=true цель=true` на клике и `фокус=true` на каждой
 //! клавише, то есть `wl_keyboard.enter` и `key` клиенту ушли). Ghostty (GTK4)
 //! берёт клавиатуру только у того `wl_seat`, который увидел первым. Чинить это
-//! в dawn нельзя: единственный способ — посадить всех на одно место, то есть
+//! в parallax нельзя: единственный способ — посадить всех на одно место, то есть
 //! отобрать у хозяина машины его собственный фокус. Признак у пользователя:
 //! «гость двигает окна мышью, но не может печатать ровно в этой программе».
 //!
@@ -35,32 +35,32 @@ use smithay::input::pointer::{ButtonEvent, MotionEvent};
 use smithay::input::Seat;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
-use crate::Dawn;
+use crate::Parallax;
 
 /// Завести место для гостя. `None` — если клавиатура не завелась (без неё
 /// место бессмысленно: печатать гость не сможет, а молчаливая половина
 /// функциональности хуже честного отказа).
-pub fn завести(state: &mut Dawn, id: u8, имя: &str) -> Option<Seat<Dawn>> {
+pub fn завести(state: &mut Parallax, id: u8, имя: &str) -> Option<Seat<Parallax>> {
     let dh = state.display_handle.clone();
-    let mut место = state.seat_state.new_wl_seat(&dh, format!("dshare-{id}-{имя}"));
+    let mut место = state.seat_state.new_wl_seat(&dh, format!("plx-share-{id}-{имя}"));
     // Раскладка гостя — та же, что у хозяина машины: клавиши приходят
     // скан-кодами evdev, и раскладку к ним применяет ХОСТ. Своя раскладка на
     // гостя — отдельная задача (нужно передавать её по протоколу).
     let раскладка = state.lua_config.xkb_config();
     if место.add_keyboard(раскладка, 200, 25).is_err() {
-        tracing::warn!("dawn/share: гостю {id} не завелась клавиатура");
+        tracing::warn!("plx/share: keyboard failed to start for guest {id}");
         return None;
     }
     место.add_pointer();
-    tracing::info!("dawn/share: у гостя {id} своё место");
+    tracing::info!("plx/share: guest {id} has its own seat");
     Some(место)
 }
 
 /// Курсор гостя поехал: рассказать клиенту под курсором.
 ///
 /// Позиция уже в координатах ХОЛСТА (перевод из экрана гостя сделан в
-/// `Dawn::раздача_курсор` — единственном месте, где известна камера гостя).
-pub fn движение(state: &mut Dawn, id: u8, точка: Point<f64, Logical>) {
+/// `Parallax::раздача_курсор` — единственном месте, где известна камера гостя).
+pub fn движение(state: &mut Parallax, id: u8, точка: Point<f64, Logical>) {
     let Some(место) = место_гостя(state, id) else { return };
     let Some(указатель) = место.get_pointer() else { return };
     let под = state.surface_under(точка);
@@ -76,7 +76,7 @@ pub fn движение(state: &mut Dawn, id: u8, точка: Point<f64, Logical
 
 /// Кнопка мыши гостя. Нажатие ещё и переводит клавиатурный фокус ЭТОГО места
 /// — иначе гость кликает в окно, а печатает в пустоту.
-pub fn кнопка(state: &mut Dawn, id: u8, код: u32, нажата: bool) {
+pub fn кнопка(state: &mut Parallax, id: u8, код: u32, нажата: bool) {
     let Some(место) = место_гостя(state, id) else { return };
     let точка = точка_гостя(state, id);
     let serial = SERIAL_COUNTER.next_serial();
@@ -100,7 +100,7 @@ pub fn кнопка(state: &mut Dawn, id: u8, код: u32, нажата: bool) {
                 .and_then(crate::focus::KeyboardFocusTarget::for_window)
                 .or_else(|| под.clone().map(Into::into));
             tracing::debug!(
-                "dawn/share: гость {id} жмёт в ({:.0},{:.0}): поверхность={} окно={} цель={}",
+                "plx/share: guest {id} clicks at ({:.0},{:.0}): surface={} window={} target={}",
                 точка.x, точка.y, под.is_some(), окно.is_some(), цель.is_some(),
             );
             клавиатура.set_focus(state, цель, serial);
@@ -128,7 +128,7 @@ pub fn кнопка(state: &mut Dawn, id: u8, код: u32, нажата: bool) {
 }
 
 /// Колесо гостя.
-pub fn колесо(state: &mut Dawn, id: u8, dx: f64, dy: f64) {
+pub fn колесо(state: &mut Parallax, id: u8, dx: f64, dy: f64) {
     use smithay::input::pointer::AxisFrame;
     let Some(место) = место_гостя(state, id) else { return };
     let Some(указатель) = место.get_pointer() else { return };
@@ -147,7 +147,7 @@ pub fn колесо(state: &mut Dawn, id: u8, dx: f64, dy: f64) {
 
 /// Клавиша гостя. Скан-код приходит в нумерации evdev — ту же поправку +8
 /// делает и синтетический ввод харнесса (см. synth.rs).
-pub fn клавиша(state: &mut Dawn, id: u8, код: u32, нажата: bool) {
+pub fn клавиша(state: &mut Parallax, id: u8, код: u32, нажата: bool) {
     let Some(место) = место_гостя(state, id) else { return };
     let Some(клавиатура) = место.get_keyboard() else { return };
     let serial = SERIAL_COUNTER.next_serial();
@@ -160,13 +160,13 @@ pub fn клавиша(state: &mut Dawn, id: u8, код: u32, нажата: bool)
     // trace!, а не debug!: строка на КАЖДОЕ нажатие и отпускание, а автоповтор
     // у зажатой клавиши идёт 25 раз в секунду — и это на каждого из пятерых.
     tracing::trace!(
-        "dawn/share: гость {id} клавиша {код} нажата={нажата}, фокус={}",
+        "plx/share: guest {id} key {код} pressed={нажата}, focus={}",
         клавиатура.current_focus().is_some(),
     );
     // Бинды композитора гостю ДАЮТСЯ — «сделай полный доступ», требование
     // Ярика 30.08.2026. До этого дня здесь стоял безусловный
     // `FilterResult::Forward`: гость мог печатать в приложения, но ни одна
-    // команда самого dawn ему не подчинялась.
+    // команда самого parallax ему не подчинялась.
     //
     // Модификаторы берём У ЕГО МЕСТА, а не у хозяйского. Это и есть главная
     // ценность отдельного seat: xkb-состояние своё, поэтому «гость держит
@@ -201,7 +201,7 @@ pub fn клавиша(state: &mut Dawn, id: u8, код: u32, нажата: bool)
                 return FilterResult::Forward;
             };
             if !гостю_можно(state, &действие) {
-                tracing::info!("dawn/share: гостю {id} не отдано действие {действие:?}");
+                tracing::info!("plx/share: action {действие:?} not granted to guest {id}");
                 // Перехватываем, а не пропускаем: клиенту под курсором эта
                 // комбинация тоже не нужна, а «ничего не произошло» — честный
                 // ответ на запрещённое.
@@ -225,7 +225,7 @@ pub fn клавиша(state: &mut Dawn, id: u8, код: u32, нажата: bool)
 /// * `Share*` — выключает раздачу изнутри неё же.
 ///
 /// Снимается одной строкой: `set{ share_guest_all = true }` в `config.lua`.
-fn гостю_можно(state: &Dawn, действие: &crate::config::Action) -> bool {
+fn гостю_можно(state: &Parallax, действие: &crate::config::Action) -> bool {
     use crate::config::Action as Д;
     if state.lua_config.share_guest_all {
         return true;
@@ -242,7 +242,7 @@ fn гостю_можно(state: &Dawn, действие: &crate::config::Action)
 }
 
 /// Место гостя по номеру (клон дешёвый — внутри Rc).
-fn место_гостя(state: &Dawn, id: u8) -> Option<Seat<Dawn>> {
+fn место_гостя(state: &Parallax, id: u8) -> Option<Seat<Parallax>> {
     state
         .раздача
         .as_ref()?
@@ -253,7 +253,7 @@ fn место_гостя(state: &Dawn, id: u8) -> Option<Seat<Dawn>> {
         .clone()
 }
 
-fn точка_гостя(state: &Dawn, id: u8) -> Point<f64, Logical> {
+fn точка_гостя(state: &Parallax, id: u8) -> Point<f64, Logical> {
     state
         .раздача
         .as_ref()
@@ -264,7 +264,7 @@ fn точка_гостя(state: &Dawn, id: u8) -> Point<f64, Logical> {
 
 /// Убрать место ушедшего гостя: без этого клиенты продолжали бы видеть
 /// `wl_seat`, за которым никого нет, и держали бы под него ресурсы.
-pub fn убрать(state: &mut Dawn, место: Seat<Dawn>) {
+pub fn убрать(state: &mut Parallax, место: Seat<Parallax>) {
     // Фокус снимаем явно: клиент, у которого он остался, ждал бы клавиш от
     // места, которого больше нет.
     if let Some(клавиатура) = место.get_keyboard() {
@@ -276,8 +276,8 @@ pub fn убрать(state: &mut Dawn, место: Seat<Dawn>) {
     drop(место);
 }
 
-/// Заглушки, чтобы обработчики Dawn могли звать это единообразно.
-impl Dawn {
+/// Заглушки, чтобы обработчики Parallax могли звать это единообразно.
+impl Parallax {
     pub fn гостевое_движение(&mut self, id: u8) {
         let точка = точка_гостя(self, id);
         движение(self, id, точка);

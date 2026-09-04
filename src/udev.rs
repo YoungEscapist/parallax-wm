@@ -56,24 +56,25 @@ use smithay_drm_extras::{
 };
 
 use smithay::backend::renderer::ImportDma;
-use crate::Dawn;
+use crate::Parallax;
+use crate::{т, тф};
 
 /// ВРЕМЕННАЯ ДИАГНОСТИКА (артефакты на анимированных обоях, 04.08.2026).
 ///
-/// Включается переменной `DAWN_DEBUG_FRAME=1`. Даёт две вещи, которых иначе
+/// Включается переменной `PLX_DEBUG_FRAME=1`. Даёт две вещи, которых иначе
 /// не увидеть:
 ///  · строку с damage-прямоугольниками КАЖДОГО кадра (что компоситор реально
 ///    считает изменившимся);
-///  · по появлению файла `/tmp/dawn_dump` — снимок НАСТОЯЩЕГО кадра со
-///    сканаута (`blit_frame_result`) в `/tmp/dawn_frame.raw`. Обычный grim
+///  · по появлению файла `/tmp/plx_dump` — снимок НАСТОЯЩЕГО кадра со
+///    сканаута (`blit_frame_result`) в `/tmp/plx_frame.raw`. Обычный grim
 ///    сюда не годится: screencopy перерисовывает кадр с нуля свежим damage
 ///    tracker'ом и артефактов частичной перерисовки не показывает.
 fn debug_frame_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DAWN_DEBUG_FRAME").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var("PLX_DEBUG_FRAME").is_ok_and(|v| v != "0"))
 }
 
-// Курсор в dawn всегда client-side (нет server-side cursor протокола) — клиент
+// Курсор в parallax всегда client-side (нет server-side cursor протокола) — клиент
 // сам рисует картинку в отдельном wl_surface через wl_pointer.set_cursor, и
 // компоситор обязан вставить эту поверхность как ещё один render-элемент
 // поверх обычных окон. SpaceRenderElements (окна) и WaylandSurfaceRenderElement
@@ -86,7 +87,7 @@ smithay::backend::renderer::element::render_elements! {
     // Текстурные элементы: курсор темы и плитки декораций (см. decor.rs).
     Memory = MemoryRenderBufferRenderElement<GlesRenderer>,
     Solid = SolidColorRenderElement,
-    // Layer-поверхности (обои, панели, меню dwall): обёрнуты в Rescale, чтобы
+    // Layer-поверхности (обои, панели, меню plx-wall): обёрнуты в Rescale, чтобы
     // не масштабироваться вместе с зумом холста (см. build_layer_elements).
     Layer = RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     // Живая миникарта: то же окно, что и на холсте, но ужатое до масштаба
@@ -175,6 +176,14 @@ pub struct RenderStats {
     /// Сколько кадр ждал GPU перед page flip (см. needs_sync в render_surface).
     sync_us: u64,
     sync_max_us: u64,
+    /// Размытие фона под плашками. Считается отдельной строкой, а не внутри
+    /// `total_us`, по итогам замера 03.09.2026: свёртка стояла ДО всех гейтов
+    /// отрисовки, то есть в `средний ... мс` не попадала вовсе — сводка
+    /// показывала 0.3 мс на кадр, а процесс ел 33% ядра. Свой счётчик нужен,
+    /// чтобы этот разрыв больше нельзя было не заметить.
+    blur_us: u64,
+    blur_max_us: u64,
+    blur_count: u32,
 }
 
 impl RenderStats {
@@ -184,6 +193,7 @@ impl RenderStats {
             frames: 0, skipped: 0, total_us: 0, max_us: 0, max_elements: 0,
             max_ui: 0, max_windows: 0, max_decor: 0, max_bg: 0,
             sync_us: 0, sync_max_us: 0,
+            blur_us: 0, blur_max_us: 0, blur_count: 0,
         }
     }
 
@@ -214,16 +224,23 @@ impl RenderStats {
         self.skipped += 1;
     }
 
+    fn record_blur(&mut self, us: u64) {
+        self.blur_us += us;
+        self.blur_max_us = self.blur_max_us.max(us);
+        self.blur_count += 1;
+    }
+
     fn flush(&mut self) {
         if self.since.elapsed() < Duration::from_secs(1) {
             return;
         }
         let secs = self.since.elapsed().as_secs_f64();
         tracing::debug!(
-            "dawn/render: {:.0} кадр/с, средний {:.1} мс, худший {:.1} мс, \
+            "plx/render: {:.0} кадр/с, средний {:.1} мс, худший {:.1} мс, \
              элементов до {} (интерфейс {}, окна {}, декор {}, фон {}), \
              пропущено (кадр уже в очереди) {}, \
-             ожидание GPU: среднее {:.2} мс, худшее {:.2} мс",
+             ожидание GPU: среднее {:.2} мс, худшее {:.2} мс, \
+             блюр: {} раз, средний {:.2} мс, худший {:.2} мс",
             self.frames as f64 / secs,
             self.total_us as f64 / self.frames.max(1) as f64 / 1000.0,
             self.max_us as f64 / 1000.0,
@@ -235,6 +252,9 @@ impl RenderStats {
             self.skipped,
             self.sync_us as f64 / self.frames.max(1) as f64 / 1000.0,
             self.sync_max_us as f64 / 1000.0,
+            self.blur_count,
+            self.blur_us as f64 / self.blur_count.max(1) as f64 / 1000.0,
+            self.blur_max_us as f64 / 1000.0,
         );
         *self = Self::new();
     }
@@ -249,7 +269,7 @@ const FRAME_QUEUE_STALE_MS: u128 = 100;
 ///
 /// Кадру нужен буфер из swapchain, а буфер выделяет GPU. На этой машине
 /// (RTX 5060, 8 ГБ) видеопамять кончается на ровном месте: dota2 занимает
-/// 2.4 ГБ, dwall с NVDEC ещё полгигабайта, — и `gbm_bo_create` начинает
+/// 2.4 ГБ, plx-wall с NVDEC ещё полгигабайта, — и `gbm_bo_create` начинает
 /// возвращать EINVAL, а ядро сыпать `nv_drm_gem_alloc_nvkms_memory_ioctl:
 /// Failed to allocate NVKMS memory for GEM object`. Само по себе это внешняя
 /// беда и проходит за секунду-другую.
@@ -282,13 +302,13 @@ pub struct Device {
 }
 
 pub fn init_udev(
-    event_loop: &mut EventLoop<Dawn>,
-    state: &mut Dawn,
+    event_loop: &mut EventLoop<Parallax>,
+    state: &mut Parallax,
 ) -> Result<(), Box<dyn std::error::Error>> {
 
     let (session, notifier) = LibSeatSession::new()?;
     let seat_name = session.seat();
-    tracing::info!("dawn/udev: seat={}", seat_name);
+    tracing::info!("plx/udev: seat={}", seat_name);
     state.session = Some(session.clone());
 
     // Тачпады открываем ВТОРЫМ читателем поверх libinput: сырых координат
@@ -312,7 +332,7 @@ pub fn init_udev(
     event_loop.handle().insert_source(notifier, move |event, _, state| {
         match event {
             SessionEvent::PauseSession => {
-                tracing::info!("dawn/udev: session paused");
+                tracing::info!("plx/udev: session paused");
                 state.session_active = false;
                 // Отпускание кнопки, случившееся на чужом VT, до нас не
                 // доедет, а счётчик удержания запрещает переход курсора на
@@ -326,7 +346,7 @@ pub fn init_udev(
                 }
             }
             SessionEvent::ActivateSession => {
-                tracing::info!("dawn/udev: session activated — acquiring DRM master");
+                tracing::info!("plx/udev: session activated — acquiring DRM master");
                 state.session_active = true;
                 let _ = libinput_for_notifier.resume();
                 // Берём DRM master обратно — теперь мы активный compositor
@@ -334,8 +354,8 @@ pub fn init_udev(
                 for device in devices.values_mut() {
                  // activate(false) = не отключать коннекторы, просто взять master
                 match device.drm.activate(false) {
-                    Ok(()) => tracing::info!("dawn/udev: DRM master acquired"),
-                    Err(e) => tracing::warn!("dawn/udev: activate failed: {:?}", e),
+                    Ok(()) => tracing::info!("plx/udev: DRM master acquired"),
+                    Err(e) => tracing::warn!("plx/udev: activate failed: {:?}", e),
                 }
                 // Сбрасываем состояние compositor'а после VT switch
                 for surface in device.surfaces.values_mut() {
@@ -383,7 +403,7 @@ pub fn init_udev(
                             // trace!, а не debug!: одна строка на КАЖДЫЙ кадр, а лог
                             // из launch_tty.zsh пишется через tee синхронно прямо из
                             // единственного потока рендера (см. queue_frame ниже).
-                            tracing::trace!("dawn/drm: VBlank crtc={:?}", crtc);
+                            tracing::trace!("plx/drm: VBlank crtc={:?}", crtc);
                             let mut devices = std::mem::take(&mut state.udev_devices);
                             if let Some(device) = devices.get_mut(&node) {
                                 if let Some(surface) = device.surfaces.get_mut(&crtc) {
@@ -391,7 +411,7 @@ pub fn init_udev(
                                     // что предыдущий frame ещё в flight
                                     match surface.compositor.frame_submitted() {
                                         Ok(_) => {}
-                                        Err(e) => tracing::warn!("dawn/drm: frame_submitted: {:?}", e),
+                                        Err(e) => tracing::warn!("plx/drm: frame_submitted: {:?}", e),
                                     }
                                     // Показанный кадр отпускает «шлагбаум»: следующий
                                     // рендер разрешён.
@@ -424,7 +444,7 @@ pub fn init_udev(
                             // пропускал и рассылку frame callback своим
                             // layer-поверхностям (см. хвост render_surface).
                             // Замер жалобы Ярика («обои анимируются только на
-                            // зуме/пане»): dwall на неактивном мониторе тактуется
+                            // зуме/пане»): plx-wall на неактивном мониторе тактуется
                             // именно этими callback'ами, и без них засыпает —
                             // а просыпался только когда движение камеры на
                             // ДРУГОМ мониторе гоняло needs_redraw достаточно
@@ -457,7 +477,7 @@ pub fn init_udev(
                                 render_all(state);
                             }
                         }
-                        DrmEvent::Error(e) => tracing::warn!("dawn/drm: error: {:?}", e),
+                        DrmEvent::Error(e) => tracing::warn!("plx/drm: error: {:?}", e),
                     }
                 }).unwrap();
 
@@ -467,8 +487,8 @@ pub fn init_udev(
                 // который может не прийти, если сессия уже была активна при старте
                 if let Some(dev) = state.udev_devices.get_mut(&node) {
                     match dev.drm.activate(false) {
-                        Ok(()) => tracing::info!("dawn/udev: DRM master acquired at startup"),
-                        Err(e) => tracing::warn!("dawn/udev: initial activate failed: {:?}", e),
+                        Ok(()) => tracing::info!("plx/udev: DRM master acquired at startup"),
+                        Err(e) => tracing::warn!("plx/udev: initial activate failed: {:?}", e),
                     }
                 }
 
@@ -482,22 +502,22 @@ pub fn init_udev(
                         ).build() {
                             Ok(feedback) => {
                                 let global = state.dmabuf_state
-                                    .create_global_with_default_feedback::<Dawn>(
+                                    .create_global_with_default_feedback::<Parallax>(
                                         &state.display_handle,
                                         &feedback,
                                     );
                                 state.dmabuf_global = Some(global);
-                                tracing::info!("dawn/udev: DMA-BUF global created");
+                                tracing::info!("plx/udev: DMA-BUF global created");
                             }
                             Err(e) => {
-                                tracing::warn!("dawn/udev: dmabuf feedback: {:?}", e);
+                                tracing::warn!("plx/udev: dmabuf feedback: {:?}", e);
                             }
                         }
                     }
                 }
                 let node_render = node;
                 event_loop.handle().insert_idle(move |state| {
-                    tracing::info!("dawn/udev: initial render (idle)");
+                    tracing::info!("plx/udev: initial render (idle)");
                     let mut devices = std::mem::take(&mut state.udev_devices);
                     if let Some(dev) = devices.get_mut(&node_render) {
                         let crtcs: Vec<_> = dev.surfaces.keys().cloned().collect();
@@ -511,7 +531,7 @@ pub fn init_udev(
                     state.udev_devices = devices;
                 });
             }
-            Err(e) => tracing::warn!("dawn/udev: skip {:?}: {}", path, e),
+            Err(e) => tracing::warn!("plx/udev: skip {:?}: {}", path, e),
         }
     }
 
@@ -544,12 +564,12 @@ pub fn init_udev(
                         // Симметрично scan_connectors::Disconnected — иначе
                         // при выдёргивании ЦЕЛОГО устройства (не одного
                         // коннектора: eGPU, докстанция) монитор оставался в
-                        // Dawn::мониторы навсегда: столы у него не отвязать,
+                        // Parallax::мониторы навсегда: столы у него не отвязать,
                         // apply_camera_all продолжал бы гонять камеру
                         // несуществующему выходу, а «активный» индекс мог до
                         // конца сессии указывать в пустоту. Раньше отсюда
                         // только снимался wl_output у клиентов — сам монитор
-                        // dawn считал живым.
+                        // parallax считал живым.
                         for (_, s) in dev.surfaces {
                             state.space.unmap_output(&s.output);
                             state.снять_монитор(&s.output);
@@ -578,7 +598,7 @@ pub fn init_udev(
 
 fn add_device(
     session: &mut LibSeatSession,
-    state: &mut Dawn,
+    state: &mut Parallax,
     dev_id: libc::dev_t,
     path: &std::path::Path,
 ) -> Result<(Device, smithay::backend::drm::DrmDeviceNotifier, DrmNode), Box<dyn std::error::Error>> {
@@ -604,7 +624,7 @@ fn add_device(
     // А рисуем на РЕНДЕР-узле (/dev/dri/renderD128), отдельным fd. Раньше
     // EGL/GLES строились поверх card0 — то есть весь рендер шёл через узел,
     // который требует DRM master и монопольно принадлежит владельцу экрана.
-    // Из-за этого dawn забирал видеокарту целиком и не мог делить её с чужой
+    // Из-за этого parallax забирал видеокарту целиком и не мог делить её с чужой
     // сессией (Xorg/другой Wayland): узел один, хозяин может быть только один.
     // Рендер-узел никакого master не требует (права crw-rw-rw-), это штатный
     // путь всех компоновщиков: KMS — на card0, GL — на renderD128.
@@ -613,7 +633,7 @@ fn add_device(
         Some(rgbm) => unsafe { EGLDisplay::new(rgbm)? },
         None => {
             tracing::warn!(
-                "dawn/udev: рендер-узел недоступен, EGL на первичном узле \
+                "plx/udev: рендер-узел недоступен, EGL на первичном узле \
                  (видеокарта будет занята монопольно)"
             );
             unsafe { EGLDisplay::new(gbm.clone())? }
@@ -630,7 +650,7 @@ fn add_device(
     };
 
     scan_connectors(&mut device, state);
-    tracing::info!("dawn/udev: added {:?}", path);
+    tracing::info!("plx/udev: added {:?}", path);
     Ok((device, notifier, drm_node))
 }
 
@@ -651,25 +671,25 @@ fn open_render_gbm(render_node: &DrmNode) -> Option<GbmDevice<DrmDeviceFd>> {
         .write(true)
         .custom_flags(libc::O_CLOEXEC)
         .open(&path)
-        .map_err(|e| tracing::warn!("dawn/udev: не открыть рендер-узел {:?}: {}", path, e))
+        .map_err(|e| tracing::warn!("plx/udev: cannot open render node {:?}: {}", path, e))
         .ok()?;
     let gbm = GbmDevice::new(DrmDeviceFd::new(DeviceFd::from(std::os::fd::OwnedFd::from(file))))
-        .map_err(|e| tracing::warn!("dawn/udev: GBM на рендер-узле {:?}: {}", path, e))
+        .map_err(|e| tracing::warn!("plx/udev: GBM on render node {:?}: {}", path, e))
         .ok()?;
-    tracing::info!("dawn/udev: рендер на {:?} (скан-аут на первичном узле)", path);
+    tracing::info!("plx/udev: rendering on {:?} (scanout on the primary node)", path);
     Some(gbm)
 }
 
-fn scan_connectors(device: &mut Device, state: &mut Dawn) {
+fn scan_connectors(device: &mut Device, state: &mut Parallax) {
     let scan = match device.drm_scanner.scan_connectors(&device.drm) {
         Ok(s) => s,
-        Err(e) => { tracing::warn!("dawn/udev: scan: {}", e); return; }
+        Err(e) => { tracing::warn!("plx/udev: scan: {}", e); return; }
     };
     for event in scan {
         match event {
             DrmScanEvent::Connected { connector, crtc: Some(crtc) } => {
                 if let Err(e) = add_surface(device, state, &connector, crtc) {
-                    tracing::warn!("dawn/udev: add_surface: {}", e);
+                    tracing::warn!("plx/udev: add_surface: {}", e);
                 }
             }
             DrmScanEvent::Disconnected { crtc: Some(crtc), .. } => {
@@ -685,7 +705,7 @@ fn scan_connectors(device: &mut Device, state: &mut Dawn) {
 
 fn add_surface(
     device: &mut Device,
-    state: &mut Dawn,
+    state: &mut Parallax,
     connector: &connector::Info,
     crtc: crtc::Handle,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -737,7 +757,7 @@ fn add_surface(
             match выбран {
                 Some(m) => {
                     tracing::info!(
-                        "dawn/udev: {}: режим из конфига {}x{}@{}Hz",
+                        "plx/udev: {}: mode from the config {}x{}@{}Hz",
                         connector_name, m.size().0, m.size().1, m.vrefresh(),
                     );
                     (*m, false)
@@ -763,7 +783,7 @@ fn add_surface(
                     let hz = if cfg.refresh > 0 { cfg.refresh as f64 } else { родной.vrefresh() as f64 };
                     let свой = crate::mode::cvt(cfg.width as u16, cfg.height as u16, hz);
                     tracing::info!(
-                        "dawn/udev: {}: режима {}x{} в EDID нет — синтезирую CVT {}x{}@{}Hz \
+                        "plx/udev: {}: режима {}x{} в EDID нет — синтезирую CVT {}x{}@{}Hz \
                          (панель {}x{} растянет его сама)",
                         connector_name, cfg.width, cfg.height,
                         свой.size().0, свой.size().1, свой.vrefresh(),
@@ -773,7 +793,7 @@ fn add_surface(
                 }
                 None => {
                     tracing::warn!(
-                        "dawn/udev: {}: {}x{} больше физической матрицы {}x{}, беру PREFERRED",
+                        "plx/udev: {}: {}x{} is larger than the physical panel {}x{}, using PREFERRED",
                         connector_name, cfg.width, cfg.height,
                         родной.size().0, родной.size().1,
                     );
@@ -806,7 +826,7 @@ fn add_surface(
             Ok(s) => (mode_info, s),
             Err(e) if синтетический => {
                 tracing::warn!(
-                    "dawn/udev: {}: железо отвергло синтезированный {}x{} ({:?}) — \
+                    "plx/udev: {}: железо отвергло синтезированный {}x{} ({:?}) — \
                      возвращаюсь на родной {}x{}@{}Hz",
                     connector_name, mode_info.size().0, mode_info.size().1, e,
                     родной.size().0, родной.size().1, родной.vrefresh(),
@@ -857,7 +877,7 @@ fn add_surface(
     };
     if scale_val != 1.0 {
         tracing::info!(
-            "dawn/udev: {}: масштаб выхода {} → логический стол {}×{}",
+            "plx/udev: {}: output scale {} → logical desktop {}×{}",
             connector_name, scale_val,
             (wl_mode.size.w as f64 / scale_val).round() as i32,
             (wl_mode.size.h as f64 / scale_val).round() as i32,
@@ -871,8 +891,8 @@ fn add_surface(
         model: model.clone(),
         serial_number: "Unknown".into(),
     });
-    let _global = output.create_global::<Dawn>(&state.display_handle);
-    // Позиция ВЫХОДА В SPACE — это камера (см. Dawn::apply_camera), а не место
+    let _global = output.create_global::<Parallax>(&state.display_handle);
+    // Позиция ВЫХОДА В SPACE — это камера (см. Parallax::apply_camera), а не место
     // монитора в раскладке: холст бесконечен, и «где стоит монитор» задаётся
     // отдельно (Монитор::раскладка). Поэтому в map_output идёт дом монитора —
     // угол его собственного прямоугольника холста, — а `monitor{ x =, y = }`
@@ -898,7 +918,7 @@ fn add_surface(
     // умеет хранить (CRTC x/y — 16-битные, 0..65535): Xwayland тихо брал её по
     // модулю 65536 (замер 27.08.2026: дом (1000000,0) → CRTC оказался на
     // x=16960 = 1000000 mod 65536, а root-экран раздувался вслед за этим до
-    // 19520 вместо разумных чисел). Итог — root Xwayland жил не там, где dawn
+    // 19520 вместо разумных чисел). Итог — root Xwayland жил не там, где parallax
     // рисует монитор, и указатель после определённых координат зажимался на
     // мусорный край («в Dota 2 после определённых координат курсор не
     // работает» — она всегда полноэкранная, то есть всегда X11). `дом` в
@@ -909,12 +929,12 @@ fn add_surface(
     output.set_preferred(wl_mode);
     state.space.map_output(&output, дом);
 
-    // Отдельный выход ТОЛЬКО для layer-поверхностей (обои, панели, меню dwall).
+    // Отдельный выход ТОЛЬКО для layer-поверхностей (обои, панели, меню plx-wall).
     //
-    // Зум холста у dawn сделан через output scale, а логический размер выхода
+    // Зум холста у parallax сделан через output scale, а логический размер выхода
     // делится на масштаб — то есть на «птичьем глазе» (zoom 0.2) LayerMap
     // выдавал обоям размер 12800×5400 и требовал от клиента отрисовать буфер в
-    // 25 раз больше экрана. dwall на этом просто ложился, обои и меню исчезали.
+    // 25 раз больше экрана. plx-wall на этом просто ложился, обои и меню исчезали.
     // У этого выхода масштаб всегда 1, поэтому слои всегда считаются в
     // ЭКРАННЫХ пикселях, независимо от зума. Глобал ему не создаём: клиенты о
     // нём не знают и знать не должны, он нужен только как ключ для LayerMap.
@@ -970,12 +990,12 @@ fn add_surface(
     state.visited_tags.insert(тег);
     state.tag_cameras.insert(тег, (дом.x as f64, дом.y as f64, 1.0));
     tracing::info!(
-        "dawn/monitors: {} → монитор {} стол {:#b} дом ({},{}) раскладка ({},{}) {}×{}",
+        "plx/monitors: {} → monitor {} workspace {:#b} home ({},{}) layout ({},{}) {}×{}",
         connector_name, индекс, тег, дом.x, дом.y,
         раскладка.x, раскладка.y, логический.w, логический.h,
     );
     if первый {
-        // Первый монитор — он же активный: его вид и есть Dawn::viewport.
+        // Первый монитор — он же активный: его вид и есть Parallax::viewport.
         state.активный = 0;
         state.viewport = вид;
         state.layer_output = Some(layer_output);
@@ -997,6 +1017,13 @@ fn add_surface(
             дом.y as f64 + логический.h as f64 / 2.0,
         ));
         state.pointer_warped();
+    }
+    if первый {
+        // Экрану впервые есть что показать — отсюда и начинается появление
+        // рабочего места. Место ниже ветки `primary` намеренно: заявка
+        // основного монитора подменяет активный вид целиком, и начатый до неё
+        // вход она бы обнулила.
+        state.начать_вход();
     }
     state.apply_camera();
 
@@ -1033,7 +1060,7 @@ fn add_surface(
     if state.blur_shape.is_none() {
         state.blur_shape = crate::rounded::Шейдер::new(&mut device.gles);
     }
-    tracing::info!("dawn/udev: output '{}' {}x{}@{}Hz",
+    tracing::info!("plx/udev: output '{}' {}x{}@{}Hz",
         output_name, wl_mode.size.w, wl_mode.size.h, wl_mode.refresh/1000);
     Ok(())
 }
@@ -1050,7 +1077,7 @@ fn add_surface(
 /// перекрасили», и тем сильнее, чем окно больше. Теперь заливка почти
 /// невидимая и нейтральная, а работу делает тонкий светлый кант по краю —
 /// заметный ровно там, где взгляд ищет границу выбора.
-fn build_selection_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
+fn build_selection_elements(state: &mut Parallax) -> Vec<OutputRenderElements> {
     let mut elements = Vec::new();
     if state.selected_windows.is_empty() && state.selection_drag.is_none() {
         return elements;
@@ -1123,7 +1150,7 @@ fn build_selection_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
 ///
 /// Последний прямоугольник в `призраки_группы` — общая рамка вокруг всей
 /// грозди (см. `MoveSurfaceGrab::обновить_призраков`), и рисуется он ярче.
-fn build_ghost_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
+fn build_ghost_elements(state: &mut Parallax) -> Vec<OutputRenderElements> {
     let mut elements = Vec::new();
     if state.призраки_группы.is_empty() {
         return elements;
@@ -1172,7 +1199,7 @@ fn build_ghost_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
 /// уехавшее или изменившее размер окно даёт частично чёрный кадр, а не рассыпавшийся
 /// поток.
 fn push_cast_frame<E>(
-    state: &mut Dawn,
+    state: &mut Parallax,
     output: &Output,
     renderer: &mut GlesRenderer,
     elements: &[E],
@@ -1252,7 +1279,7 @@ fn push_cast_frame<E>(
 /// 2»), и цифра на клавиатуре выбирает его напрямую (`portal_pick_monitor`) —
 /// не перевозя стрелку и не заводя новых биндов.
 fn build_portal_pick_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {
@@ -1305,7 +1332,7 @@ fn build_portal_pick_elements(
         let pool = &mut state.portal_pick_ids;
         let mut idx = 0usize;
         // Четыре полосы рамки + лёгкая заливка: сплошными прямоугольниками, как
-        // остальные оверлеи dawn (своего шейдера у нас нет).
+        // остальные оверлеи parallax (своего шейдера у нас нет).
         elements.push(pooled_solid(pool, &mut idx, (x, y), (w, РАМКА), цвет));
         elements.push(pooled_solid(pool, &mut idx, (x, y + h - РАМКА), (w, РАМКА), цвет));
         elements.push(pooled_solid(pool, &mut idx, (x, y), (РАМКА, h), цвет));
@@ -1319,15 +1346,15 @@ fn build_portal_pick_elements(
     // её человек будет одну-две секунды.
     let одинокий = state.мониторы.len() < 2;
     let заголовок = match (&окно, одинокий) {
-        (Some(_), _) => "Окно под курсором".to_string(),
-        (None, true) => "Весь экран".to_string(),
-        (None, false) => format!("Монитор {}", номер + 1),
+        (Some(_), _) => т!("Окно под курсором", "Window under the cursor").to_string(),
+        (None, true) => т!("Весь экран", "Whole screen").to_string(),
+        (None, false) => тф!("Монитор {}", "Monitor {}", номер + 1),
     };
     let подсказка = if одинокий {
-        "ЛКМ — показать, ПКМ или Esc — отмена".to_string()
+        т!("ЛКМ — показать, ПКМ или Esc — отмена", "LMB — share, RMB or Esc — cancel").to_string()
     } else {
-        format!(
-            "ЛКМ — показать · {} — монитор · ПКМ/Esc — отмена",
+        тф!(
+            "ЛКМ — показать · {} — монитор · ПКМ/Esc — отмена", "LMB — share · {} — monitor · RMB/Esc — cancel",
             (1..=state.мониторы.len()).map(|n| n.to_string()).collect::<Vec<_>>().join("/"),
         )
     };
@@ -1373,7 +1400,7 @@ fn build_portal_pick_elements(
 /// дырок не умеет), а четырьмя полосами вокруг выделения: так внутри рамки
 /// остаётся неискажённая картинка — по ней и целятся.
 fn build_snip_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {
@@ -1438,7 +1465,7 @@ fn build_snip_elements(
     const МАСШТАБ: i32 = 2;
     let (подпись, пx, пy) = match рамка {
         None if свой => (
-            "Обведите область · клик — весь экран · Esc — отмена".to_string(),
+            т!("Обведите область · клик — весь экран · Esc — отмена", "Drag out a region · click — whole screen · Esc — cancel").to_string(),
             None,
             высота / 12,
         ),
@@ -1473,7 +1500,7 @@ fn build_snip_elements(
 }
 
 /// Цифра 3×5 «пикселей» из сплошных прямоугольников, увеличенная в PX раз.
-/// Своего шрифта у dawn нет, а подпись нужна крошечная — этого хватает.
+/// Своего шрифта у parallax нет, а подпись нужна крошечная — этого хватает.
 ///
 /// Точки идут через переданную `полоса` — ту же, которой карта режет всё
 /// остальное шторкой: цифра у края карточки обязана обрезаться вместе с ней, а
@@ -1531,14 +1558,14 @@ struct МиникартаОкно {
 }
 
 fn build_minimap_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {
     let mut elements = Vec::new();
     let mode = match output.current_mode() { Some(m) => m, None => return elements };
 
-    // Геометрия одна на всех — и на отрисовку, и на ввод (`Dawn::minimap_hit`,
+    // Геометрия одна на всех — и на отрисовку, и на ввод (`Parallax::minimap_hit`,
     // `minimap_window_at`). Раскрытие режет ВСЁ: что не нарисовано, то и не
     // кликается.
     let g = crate::canvas::minimap_geom(mode.size);
@@ -1860,7 +1887,7 @@ fn с_альфой(c: [f32; 4], a: f32) -> [f32; 4] {
 /// Плашку кнопки рисует вызывающий (`build_minimap_elements`): она идёт через
 /// общий пул solid-слотов, а сюда попадает только текст.
 fn build_minimap_header(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     g: crate::canvas::MinimapGeom,
     видимая_часть: Rectangle<i32, Physical>,
@@ -1881,8 +1908,8 @@ fn build_minimap_header(
         state.tagged_windows.iter().filter(|tw| tw.tags & current != 0).count()
     };
     let заголовок = match сколько {
-        0 => "Открытых окон нет".to_string(),
-        n => format!("Открытые окна · {n}"),
+        0 => т!("Открытых окон нет", "No open windows").to_string(),
+        n => тф!("Открытые окна · {n}", "Open windows · {n}"),
     };
     draw_text_w(
         state, renderer, g.panel.loc.x + поле, y, &заголовок,
@@ -1900,12 +1927,12 @@ fn build_minimap_header(
             [1.0, 1.0, 1.0, 0.45]
         }, видимость);
         let tw = crate::text::width_of(
-            crate::state::MINIMAP_RESET_LABEL, bar::STRONG, bar::TEXT_SMALL,
+            crate::state::minimap_reset_label(), bar::STRONG, bar::TEXT_SMALL,
         );
         draw_text_w(
             state, renderer,
             кнопка.loc.x + (кнопка.size.w - tw) / 2, ty,
-            crate::state::MINIMAP_RESET_LABEL,
+            crate::state::minimap_reset_label(),
             crate::text::Weight::Semi, bar::TEXT_SMALL, цвет, 0, &mut out,
         );
     }
@@ -1923,7 +1950,7 @@ fn build_minimap_header(
 /// содержимое ещё не пришло или окно ужато до пары сантиметров.
 #[allow(clippy::type_complexity)]
 fn build_minimap_labels(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     окна: &[МиникартаОкно],
     proj: &crate::canvas::MinimapProjection,
@@ -2062,7 +2089,7 @@ const PARALLAX_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
 /// неподвижной картинке. Починка теней и масок углов до этого ничего не
 /// меняла, пока параллакс оставался таким.
 fn build_parallax_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     mode: Mode,
 ) -> Vec<OutputRenderElements> {
@@ -2095,7 +2122,7 @@ fn build_parallax_elements(
             renderer, loc, buf, None, None, Some(dst), Kind::Unspecified,
         ) {
             Ok(el) => out.push(OutputRenderElements::Memory(el)),
-            Err(e) => tracing::warn!("dawn/udev: параллакс: {:?}", e),
+            Err(e) => tracing::warn!("plx/udev: parallax: {:?}", e),
         }
         slot += 1;
         y += PARALLAX_SPACING_PX;
@@ -2183,7 +2210,7 @@ impl SolidSlot {
 /// заданная `[1,1,1,0.35]`, приходила на экран ровно (255,255,255).
 ///
 /// Домножение стоит ЗДЕСЬ, а не у вызывающих, нарочно: solid-элементы во всём
-/// dawn рождаются только в этой функции, и 34 места из 36 писали цвет обычным.
+/// parallax рождаются только в этой функции, и 34 места из 36 писали цвет обычным.
 /// Раньше `premul` звали руками ровно в двух (полка и `rounded_tex`) — то есть
 /// правило существовало, но соблюдалось в 6% случаев.
 fn pooled_solid(
@@ -2215,7 +2242,7 @@ fn pooled_solid(
 
 /// Полоска вкладок слева от вкладочной колонки (niri: tab indicator).
 /// Рисуется ТОЛЬКО в режиме Columns — остальные раскладки про вкладки не знают.
-fn build_tab_indicators(state: &mut Dawn) -> Vec<OutputRenderElements> {
+fn build_tab_indicators(state: &mut Parallax) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
     if state.tile_config.layout != crate::tiling::Layout::Columns {
         return els;
@@ -2253,7 +2280,7 @@ fn build_tab_indicators(state: &mut Dawn) -> Vec<OutputRenderElements> {
 
 /// Подсказка вставки при перетаскивании окна в Columns (niri: insert hint) —
 /// показывает шов между колонками или стопку, куда окно встанет на отпускании.
-fn build_insert_hint(state: &mut Dawn) -> Vec<OutputRenderElements> {
+fn build_insert_hint(state: &mut Parallax) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
     if state.tile_config.layout != crate::tiling::Layout::Columns {
         return els;
@@ -2274,7 +2301,7 @@ fn build_insert_hint(state: &mut Dawn) -> Vec<OutputRenderElements> {
 }
 
 /// Радиус скругления окон для текущей раскладки (логические px).
-fn corner_radius_logical(state: &Dawn) -> i32 {
+fn corner_radius_logical(state: &Parallax) -> i32 {
     let r = if state.tile_config.layout == crate::tiling::Layout::Tile {
         CORNER_RADIUS_LOGICAL_TILE
     } else {
@@ -2287,7 +2314,7 @@ fn corner_radius_logical(state: &Dawn) -> i32 {
 /// Виден ли на экране прямоугольник (в физических пикселях кадра) с запасом
 /// `margin` по краям.
 ///
-/// Холст в dawn бесконечен, а декорации (тени) строились для ВСЕХ окон текущих
+/// Холст в parallax бесконечен, а декорации (тени) строились для ВСЕХ окон текущих
 /// тегов — включая те, что стоят в тысячах пикселей от камеры.
 /// Каждое такое окно — это 11 элементов тени, которые
 /// создаются, попадают в список кадра и сравниваются damage tracker'ом с
@@ -2302,7 +2329,7 @@ fn on_screen(screen: Size<i32, Logical>, r: (f64, f64, f64, f64), margin: f64) -
         && y - margin < screen.h as f64
 }
 
-fn window_screen_rect(state: &Dawn, window: &Window) -> Option<(f64, f64, f64, f64)> {
+fn window_screen_rect(state: &Parallax, window: &Window) -> Option<(f64, f64, f64, f64)> {
     let geo = state.space.element_geometry(window)?;
     let zoom = state.viewport.zoom;
     // Размер берём ВИДИМЫЙ, а не тот, что нарисовал клиент. Упрямое окно
@@ -2340,7 +2367,7 @@ fn видимый_размер(window: &Window, факт: Size<i32, Logical>) ->
 /// Части НЕ перекрываются: полупрозрачные куски, наложившись, дали бы двойное
 /// затемнение по швам.
 fn build_shadow_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
 ) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
@@ -2402,7 +2429,7 @@ fn build_shadow_elements(
                 None, None, Some(dst_corner), Kind::Unspecified,
             ) {
                 Ok(el) => els.push(OutputRenderElements::Memory(el)),
-                Err(e) => tracing::warn!("dawn/udev: угол тени: {:?}", e),
+                Err(e) => tracing::warn!("plx/udev: shadow corner: {:?}", e),
             }
         }
 
@@ -2431,7 +2458,7 @@ fn build_shadow_elements(
                 None, None, Some(dst), Kind::Unspecified,
             ) {
                 Ok(el) => els.push(OutputRenderElements::Memory(el)),
-                Err(e) => tracing::warn!("dawn/udev: кромка тени: {:?}", e),
+                Err(e) => tracing::warn!("plx/udev: shadow edge: {:?}", e),
             }
         }
 
@@ -2465,7 +2492,7 @@ fn build_shadow_elements(
 
 /// Полупрозрачный «заметный» фон + тень под каждым воркспейсом — ТОЛЬКО в обзоре
 /// (тап Super), чтобы столы визуально читались как отдельные карточки.
-fn build_overview_bg_elements(state: &mut Dawn) -> Vec<OutputRenderElements> {
+fn build_overview_bg_elements(state: &mut Parallax) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
     if !state.overview_active {
         return els;
@@ -2649,7 +2676,7 @@ const BAR_SEP: [f32; 4] = [1.0, 1.0, 1.0, 0.16];
 /// путались: сплошные прямоугольники ждут домноженных компонент, маски — нет.
 #[allow(clippy::too_many_arguments)]
 fn rounded_tex(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     pool: &mut Vec<SolidSlot>,
     idx: &mut usize,
@@ -2678,7 +2705,7 @@ fn rounded_tex(
             Kind::Unspecified,
         ) {
             Ok(el) => out.push(OutputRenderElements::Memory(el)),
-            Err(e) => tracing::warn!("dawn/udev: угол плитки: {:?}", e),
+            Err(e) => tracing::warn!("plx/udev: tile corner: {:?}", e),
         }
     }
     *slot += 1;
@@ -2708,7 +2735,7 @@ fn rounded_tex(
 /// плашка с альфой 0.65 лежала ПОВЕРХ значков и гасила их на две трети; с
 /// текстом это стало бы совсем нечитаемо.
 fn build_bar_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {
@@ -3010,7 +3037,7 @@ fn build_bar_elements(
 /// **26.08.2026 — карточка стала маленькой миникартой.** Три правки по прямым
 /// жалобам, и все три об одном: карточка обязана показывать то же, что увидишь,
 /// перейдя на этот стол.
-/// 1. Кадр строится вокруг ПОСЛЕДНЕЙ КАМЕРЫ ЭТОГО СТОЛА (`Dawn::preview_base`),
+/// 1. Кадр строится вокруг ПОСЛЕДНЕЙ КАМЕРЫ ЭТОГО СТОЛА (`Parallax::preview_base`),
 ///    а не вокруг начала координат. Раньше сюда шёл `screen_area()` —
 ///    прямоугольник (0,0)…(экран); на бесконечном холсте это почти никогда не
 ///    то место, где стоят окна.
@@ -3019,8 +3046,8 @@ fn build_bar_elements(
 ///    показанного куска холста, вылезало серым квадратом прямо на стол — это и
 ///    была жалоба «показывает квадратами другие окна за пределами обзора».
 /// 3. По карточке можно панить (ЛКМ), зумить (колесо) и кликать по окнам, как
-///    по карте: вид живёт в `Dawn::preview_*`, геометрия — в
-///    `Dawn::preview_view`. ОДНА точка правды на кадр и на ввод: разъехавшись,
+///    по карте: вид живёт в `Parallax::preview_*`, геометрия — в
+///    `Parallax::preview_view`. ОДНА точка правды на кадр и на ввод: разъехавшись,
 ///    они унесут клик мимо окна.
 ///
 /// Содержимое — ЖИВОЕ, тем же приёмом, что и миниатюры карты: рендер
@@ -3029,7 +3056,7 @@ fn build_bar_elements(
 /// `CropRenderElement` по его краю. Совпасть эти две арифметики обязаны точно,
 /// иначе содержимое разъезжается с рамкой.
 fn build_bar_preview(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
 ) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
@@ -3124,8 +3151,8 @@ fn build_bar_preview(
     let подпись = match ячейка {
         bar::Cell::Window(i) => выделить.as_ref()
             .and_then(|w| crate::xwin::app_id(w).or_else(|| crate::xwin::title(w)))
-            .unwrap_or_else(|| format!("Окно {}", i + 1)),
-        bar::Cell::Tag(m) => format!("Стол {}", m.trailing_zeros() + 1),
+            .unwrap_or_else(|| тф!("Окно {}", "Window {}", i + 1)),
+        bar::Cell::Tag(m) => тф!("Стол {}", "Workspace {}", m.trailing_zeros() + 1),
         _ => String::new(),
     };
     let высота_подписи = crate::text::height(bar::TEXT_SMALL);
@@ -3203,11 +3230,11 @@ fn build_bar_preview(
 /// это единственное, что осталось от прежнего текстового заголовка (он и
 /// сообщал-то ровно «какое окно активно»).
 ///
-/// Значок приходит готовым буфером из `Dawn::chip_icons` — он собирается на
+/// Значок приходит готовым буфером из `Parallax::chip_icons` — он собирается на
 /// появлении окна, а не здесь: поиск по теме значков лезет в файловую систему,
 /// и делать это внутри кадра нельзя. Не нашлось — рисуем букву, как раньше.
 fn draw_bar_window_chip(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     cell: bar::Rect,
     чип: &bar::WindowChip,
@@ -3269,7 +3296,7 @@ fn draw_bar_window_chip(
                 out.push(OutputRenderElements::Memory(el));
                 return;
             }
-            Err(e) => tracing::warn!("dawn/udev: значок чипа: {:?}", e),
+            Err(e) => tracing::warn!("plx/udev: chip icon: {:?}", e),
         }
     }
 
@@ -3288,7 +3315,7 @@ fn draw_bar_window_chip(
 /// Буква в кружке осталась только на случай, когда нет ни того, ни другого:
 /// раньше её получал КАЖДЫЙ, кто не прислал пиксели.
 fn draw_tray_icon(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     index: usize,
     cell: bar::Rect,
@@ -3317,7 +3344,7 @@ fn draw_tray_icon(
             Kind::Unspecified,
         ) {
             Ok(el) => out.push(OutputRenderElements::Memory(el)),
-            Err(e) => tracing::warn!("dawn/udev: значок трея: {:?}", e),
+            Err(e) => tracing::warn!("plx/udev: tray icon: {:?}", e),
         }
         return;
     }
@@ -3336,12 +3363,12 @@ fn draw_tray_icon(
     draw_text_w(state, renderer, x, y, &буква, bar::STRONG, bar::TEXT, color, slot, out);
 }
 
-/// Закрыт ли экран целиком фоновой layer-поверхностью (обои dwall).
+/// Закрыт ли экран целиком фоновой layer-поверхностью (обои plx-wall).
 ///
 /// Если да, то параллакс-сетка под ней невидима, и строить её незачем: это
 /// ~8 элементов на КАЖДЫЙ кадр, которые damage tracker потом ещё и сравнивает
 /// с прошлым кадром. Обои — самый обычный случай, так что экономия постоянная.
-fn background_covers_output(state: &Dawn, output: &Output, screen: Size<i32, Logical>) -> bool {
+fn background_covers_output(state: &Parallax, output: &Output, screen: Size<i32, Logical>) -> bool {
     let output = state.layer_output.clone().unwrap_or_else(|| output.clone());
     let map = layer_map_for_output(&output);
     let covered = map
@@ -3363,7 +3390,7 @@ fn background_covers_output(state: &Dawn, output: &Output, screen: Size<i32, Log
 /// Обои на бесконечном холсте: ОДНА копия, едущая за камерой с затуханием.
 ///
 /// **Что было и почему поменялось.** Обои — это обычная layer-поверхность
-/// (`dwall`), приклеенная к экрану: она всегда ровно в размер выхода и никуда
+/// (`plx-wall`), приклеенная к экрану: она всегда ровно в размер выхода и никуда
 /// не двигается. На бесконечном холсте это читается как «картинка нарисована на
 /// стекле монитора» — окна уезжают, обои стоят. Поэтому картинку положили на
 /// холст и повторили сеткой во все стороны: холст покрыт целиком, обои едут с
@@ -3456,7 +3483,7 @@ fn wallpaper_placement(
         return None;
     }
     let (эw, эh) = (экран.0 as f64, экран.1 as f64);
-    // Накрываем экран целиком — тот же закон «заполнить», по которому dwall
+    // Накрываем экран целиком — тот же закон «заполнить», по которому plx-wall
     // кроит кадр своим viewport'ом, — и добавляем запас с каждой стороны:
     // именно в нём и живёт весь ход.
     let покрытие = (эw / картинка.0 as f64).max(эh / картинка.1 as f64);
@@ -3468,7 +3495,7 @@ fn wallpaper_placement(
     // Стол добавляется к пути камеры ВИРТУАЛЬНЫМ ходом, а не отдельным
     // слагаемым к сдвигу: так предел хода остаётся один на всех (его держит
     // `tanh`), и сумма двух источников не может вытолкнуть картинку за край.
-    // Столы в dawn стоят на одном месте холста — камера при Super+N не едет
+    // Столы в parallax стоят на одном месте холста — камера при Super+N не едет
     // никуда, — поэтому «расстояние» между ними приходится назначить.
     let путь_x = камера.0 + стол * эw * ОБОИ_ШАГ_СТОЛА;
     // Знак минус: холст уезжает вправо — обои уходят влево, как и окна.
@@ -3497,7 +3524,7 @@ fn картинка_негодна(картинка: (i32, i32)) -> bool {
 /// менять его форму ради одного элемента незачем: обоев в кадре бывает ноль или
 /// одна.
 fn wallpaper_screen_place(
-    state: &Dawn,
+    state: &Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
     экран: Size<i32, Physical>,
@@ -3553,11 +3580,11 @@ fn wallpaper_screen_place(
 /// кусок фона из другого места экрана, и заметно это будет сразу.
 ///
 /// **Номер заплаты закреплён за плашкой** (см. `БЛЮР_*` ниже): по нему берётся
-/// постоянный Id из `Dawn::blur_ids`. Две плашки с одним номером в одном кадре
+/// постоянный Id из `Parallax::blur_ids`. Две плашки с одним номером в одном кадре
 /// недопустимы — damage tracker индексируется по Id, и вторая затёрла бы
 /// историю первой.
 fn build_blur_patch(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     r: bar::Rect,
     radius: f32,
@@ -3586,7 +3613,7 @@ fn build_blur_patch(
         (r.x, r.y).into(),
         (r.w, r.h).into(),
     );
-    // Id — из пула по номеру заплаты, а не свежий на кадр (см. Dawn::blur_ids).
+    // Id — из пула по номеру заплаты, а не свежий на кадр (см. Parallax::blur_ids).
     while state.blur_ids.len() <= слот {
         state.blur_ids.push(Id::new());
     }
@@ -3638,7 +3665,7 @@ const БЛЮР_ОКНО: usize = 8;
 /// полупрозрачной заливкой.
 #[allow(clippy::too_many_arguments)]
 fn стекло(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     x: i32, y: i32, w: i32, h: i32,
     radius: i32,
@@ -3655,7 +3682,7 @@ fn стекло(
 /// Вид (`SurfaceView`) — это то, что клиент задал через `wp_viewporter`: `src`
 /// — какой кусок буфера показывать, `dst` — в какой логический размер его
 /// растягивать. Раньше отсюда возвращался `buffer_size`, и это было верно ровно
-/// до того дня, когда dwall перешёл на viewporter: буфер у него теперь равен
+/// до того дня, когда plx-wall перешёл на viewporter: буфер у него теперь равен
 /// КАДРУ ВИДЕО (1920×1080), а поверхность — экрану (1920×1280), растягивает
 /// композитор. Обои-плитки, считавшие шаг сетки по буферу, из-за этого
 /// повторялись поперёк экрана, не совпадая с ним ни размером, ни пропорцией.
@@ -3670,7 +3697,7 @@ fn wallpaper_texture_sized(
     // Буфер обоев импортируем в ЭТОТ рендерер САМИ, а не надеемся на прошлый
     // кадр. Раньше текстуру просто читали: она появлялась побочным действием
     // отрисовки фонового слоя (smithay импортирует буфер при сборке элементов).
-    // Пока dwall крутит ВИДЕО, каждый его коммит роняет прежнюю текстуру, и
+    // Пока plx-wall крутит ВИДЕО, каждый его коммит роняет прежнюю текстуру, и
     // если между двумя кадрами композитора пришёл новый буфер — на этом кадре
     // текстуры нет вовсе. У живого сеанса (200 кадр/с против 30 кадров видео)
     // это редкость, а вот в headless-харнессе, где кадр рисуется только по
@@ -3694,17 +3721,17 @@ fn wallpaper_texture_sized(
 
 /// Та же текстура, но по выходу: сама находит фоновый слой.
 fn wallpaper_texture(
-    state: &Dawn,
+    state: &Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Option<GlesTexture> {
     let слой_выход = state.layer_output.clone().unwrap_or_else(|| output.clone());
-    // Фоновый слой ищем ПО ВСЕМ мониторам, а не только в своей карте: dwall
-    // вешает обои на один-единственный выход (см. `Dawn::фоновая_поверхность`).
+    // Фоновый слой ищем ПО ВСЕМ мониторам, а не только в своей карте: plx-wall
+    // вешает обои на один-единственный выход (см. `Parallax::фоновая_поверхность`).
     let Some(поверхность) = state.фоновая_поверхность() else {
         let слоёв = layer_map_for_output(&слой_выход).layers().count();
         почему_нет_блюра(&format!(
-            "нигде нет слоя Background (на выходе {:?} слоёв {})", слой_выход.name(), слоёв,
+            "there is no Background layer anywhere (output {:?} has {} layers)", слой_выход.name(), слоёв,
         ));
         return None;
     };
@@ -3724,14 +3751,14 @@ fn wallpaper_texture(
         (true, сост.buffer_size())
     });
     почему_нет_блюра(&format!(
-        "у слоя Background нет текстуры даже после импорта (состояние={} размер буфера={:?})",
+        "the Background layer has no texture even after the import (state={} buffer size={:?})",
         есть_состояние, размер,
     ));
     None
 }
 
 fn build_wallpaper_backdrop(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Option<Vec<OutputRenderElements>> {
@@ -3742,7 +3769,7 @@ fn build_wallpaper_backdrop(
     let экран = (mode.size.w, mode.size.h);
 
     // Текстура фонового слоя. Берём ПЕРВЫЙ Background-слой ЛЮБОГО монитора:
-    // обои у dwall одни на весь сеанс и лежат в карте одного выхода, а если их
+    // обои у plx-wall одни на весь сеанс и лежат в карте одного выхода, а если их
     // вдруг несколько, тайлить стопку смысла нет.
     let поверхность = state.фоновая_поверхность()?;
     // ContextId — у трейта Renderer, а он в этом файле не в области видимости
@@ -3786,7 +3813,7 @@ fn build_wallpaper_backdrop(
     // Со СВОИМ снимком повреждений, а не `from_static_texture`: у статического
     // элемента счётчик коммитов не растёт никогда, damage tracker считает обои
     // неизменными и новый кадр видео на экран не попадает, пока не поедет
-    // камера (см. `Dawn::wallpaper_damage`).
+    // камера (см. `Parallax::wallpaper_damage`).
     let снимок = state.wallpaper_damage.snapshot();
     let el = TextureRenderElement::from_texture_with_damage(
         id,
@@ -3796,7 +3823,7 @@ fn build_wallpaper_backdrop(
         1,
         Transform::Normal,
         Some(1.0),
-        // Крой из viewporter: dwall берёт из кадра видео центральный кусок
+        // Крой из viewporter: plx-wall берёт из кадра видео центральный кусок
         // нужной пропорции, и без этого обои показывали бы кадр целиком,
         // растянутым под экран.
         //
@@ -3836,8 +3863,8 @@ fn build_wallpaper_backdrop(
 /// нечем. Устройства на время вызова ВЫНУТЫ из `state` (`mem::take`), так что
 /// добраться до того же рендерера вторым путём изнутри замыкания невозможно.
 pub fn with_primary_renderer<R>(
-    state: &mut Dawn,
-    f: impl FnOnce(&mut Dawn, &mut GlesRenderer) -> R,
+    state: &mut Parallax,
+    f: impl FnOnce(&mut Parallax, &mut GlesRenderer) -> R,
 ) -> Option<R> {
     let mut devices = std::mem::take(&mut state.udev_devices);
     let итог = devices.values_mut().next().map(|device| {
@@ -3851,7 +3878,7 @@ pub fn with_primary_renderer<R>(
 /// Гаснущие снимки закрытых окон (см. close.rs). Кладутся туда же, где стояли
 /// окна, — то есть на холст, а не на экран: пока снимок гаснет, камера
 /// продолжает ездить, и привязка к экрану уводила бы картинку с места.
-fn build_closing_elements(state: &mut Dawn, screen: Size<i32, Physical>) -> Vec<OutputRenderElements> {
+fn build_closing_elements(state: &mut Parallax, screen: Size<i32, Physical>) -> Vec<OutputRenderElements> {
     if state.закрытия.is_empty() {
         return Vec::new();
     }
@@ -3896,7 +3923,7 @@ fn build_closing_elements(state: &mut Dawn, screen: Size<i32, Physical>) -> Vec<
 }
 
 fn build_layer_elements(
-    _state: &mut Dawn,
+    _state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
     layers: &[WlrLayer],
@@ -3909,7 +3936,7 @@ fn build_layer_elements(
     let to_render: Vec<_> = map.layers().filter(|l| layers.contains(&l.layer())).cloned().collect();
     for layer_surface in to_render {
         let Some(geo) = map.layer_geometry(&layer_surface) else { continue };
-        // Геометрия слоёв ЛОГИЧЕСКАЯ, а логический размер выхода у dawn
+        // Геометрия слоёв ЛОГИЧЕСКАЯ, а логический размер выхода у parallax
         // делится на зум (зум сделан через output scale, см. apply_camera).
         // Раньше её клали в кадр как физическую и рисовали в масштабе 1:1 —
         // при отдалении обои сжимались в угол экрана, а меню Win+W уезжало
@@ -3932,7 +3959,7 @@ fn build_layer_elements(
     els
 }
 
-/// ВРЕМЕННАЯ ДИАГНОСТИКА: выкладывает в `/tmp/dawn_frame.raw` содержимое того
+/// ВРЕМЕННАЯ ДИАГНОСТИКА: выкладывает в `/tmp/plx_frame.raw` содержимое того
 /// буфера, который РЕАЛЬНО уходит на монитор (`blit_frame_result` копирует сам
 /// сканаут, а не перерисовывает сцену). Формат — плотный RGBA, размер экрана.
 fn dump_scanout<B, F, E>(
@@ -3957,30 +3984,30 @@ where
 
     let mut target: GlesRenderbuffer = match renderer.create_buffer(Fourcc::Abgr8888, bsize) {
         Ok(t) => t,
-        Err(e) => { tracing::warn!("dawn/dbg: create_buffer: {:?}", e); return }
+        Err(e) => { tracing::warn!("plx/dbg: create_buffer: {:?}", e); return }
     };
     let mut fb = match renderer.bind(&mut target) {
         Ok(fb) => fb,
-        Err(e) => { tracing::warn!("dawn/dbg: bind: {:?}", e); return }
+        Err(e) => { tracing::warn!("plx/dbg: bind: {:?}", e); return }
     };
     if let Err(e) = res.blit_frame_result(
         size, Transform::Normal, 1.0, renderer, &mut fb,
         [Rectangle::from_size(size)], [],
     ) {
-        tracing::warn!("dawn/dbg: blit_frame_result: {:?}", e);
+        tracing::warn!("plx/dbg: blit_frame_result: {:?}", e);
         return;
     }
     let mapping = match renderer.copy_framebuffer(&fb, Rectangle::from_size(bsize), Fourcc::Abgr8888) {
         Ok(m) => m,
-        Err(e) => { tracing::warn!("dawn/dbg: copy_framebuffer: {:?}", e); return }
+        Err(e) => { tracing::warn!("plx/dbg: copy_framebuffer: {:?}", e); return }
     };
     drop(fb);
     match renderer.map_texture(&mapping) {
         Ok(data) => {
-            let _ = std::fs::write(format!("/tmp/dawn_frame_{:02}.raw", idx), data);
-            tracing::debug!("dawn/dbg: снимок сканаута #{} {}x{} записан", idx, size.w, size.h);
+            let _ = std::fs::write(format!("/tmp/plx_frame_{:02}.raw", idx), data);
+            tracing::debug!("plx/dbg: scanout dump #{} {}x{} written", idx, size.w, size.h);
         }
-        Err(e) => tracing::warn!("dawn/dbg: map_texture: {:?}", e),
+        Err(e) => tracing::warn!("plx/dbg: map_texture: {:?}", e),
     }
 }
 
@@ -4008,13 +4035,13 @@ where
 /// котором сдвинулся только курсор, в EmptyFrame — стрелка начала бы отставать
 /// от руки.
 ///
-/// Запасной выход без пересборки: `DAWN_NO_PLANES=1` возвращает прежнее
+/// Запасной выход без пересборки: `PLX_NO_PLANES=1` возвращает прежнее
 /// поведение.
 fn flags_кадра() -> FrameFlags {
     static ФЛАГИ: std::sync::OnceLock<FrameFlags> = std::sync::OnceLock::new();
     *ФЛАГИ.get_or_init(|| {
-        if std::env::var_os("DAWN_NO_PLANES").is_some() {
-            tracing::info!("dawn/udev: аппаратные слои выключены (DAWN_NO_PLANES)");
+        if std::env::var_os("PLX_NO_PLANES").is_some() {
+            tracing::info!("plx/udev: hardware planes disabled (PLX_NO_PLANES)");
             FrameFlags::empty()
         } else {
             FrameFlags::DEFAULT
@@ -4027,14 +4054,14 @@ fn flags_кадра() -> FrameFlags {
 /// чтобы тот же шаг делал headless-бэкенд, см. `собрать_элементы`).
 ///
 /// Отказ на ОТДЕЛЬНОМ кадре текстуру НЕ сбрасывает, и это не мелочь: живые обои
-/// (dwall крутит видео) отдают буфер не на каждый кадр композитора, и в такие
+/// (plx-wall крутит видео) отдают буфер не на каждый кадр композитора, и в такие
 /// кадры `wallpaper_texture` возвращает None — остров панели остался бы без
 /// заплаты, то есть выглядел бы иначе, а на следующем кадре заплата вернулась
 /// бы. Снаружи это и есть «мигает маска скругления на баре»: моргает не маска,
 /// а то, что под ней. Держим прошлую размытую картинку — она отстаёт на кадр,
 /// чего под панелью не видно.
 pub fn пересчитать_блюр(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     блюр: Option<&mut crate::blur::Блюр>,
     output: &Output,
@@ -4051,7 +4078,7 @@ pub fn пересчитать_блюр(
                         renderer, &исходник, &плитки, mode.size, crate::blur::РАДИУС,
                     ) {
                         Some(новая) => state.blur_tex = Some(новая),
-                        None => почему_нет_блюра("свёртка не удалась"),
+                        None => почему_нет_блюра("the convolution failed"),
                     }
                 }
                 // Молчать здесь нельзя: «блюра нет» выглядит снаружи одинаково
@@ -4059,7 +4086,7 @@ pub fn пересчитать_блюр(
                 // текстуре обоев — а причина каждый раз разная (замер
                 // 24.08.2026: блюр был ВКЛЮЧЁН, шейдер собран, а фона у
                 // размытия не было вовсе).
-                None => почему_нет_блюра("нет текстуры фонового слоя (обои)"),
+                None => почему_нет_блюра("no texture on the background layer (wallpaper)"),
             }
         }
         // Блюра нет совсем (выключен, не завёлся, выход без режима) — вот
@@ -4067,7 +4094,7 @@ pub fn пересчитать_блюр(
         // после смены выхода или VT нельзя.
         (вкл, шейдер, режим) => {
             почему_нет_блюра(&format!(
-                "set{{blur}}={} шейдер={} режим={}",
+                "set{{blur}}={} shader={} mode={}",
                 вкл, шейдер.is_some(), режим.is_some(),
             ));
             state.blur_tex = None;
@@ -4088,7 +4115,7 @@ fn почему_нет_блюра(причина: &str) {
         return;
     }
     *последнее = Some((причина.to_string(), std::time::Instant::now()));
-    tracing::debug!("dawn/blur: блюра в кадре нет: {}", причина);
+    tracing::debug!("plx/blur: no blur in this frame: {}", причина);
 }
 
 /// Стрелка чужого курсора. Ширина маски — 12, строк 18.
@@ -4096,7 +4123,9 @@ fn почему_нет_блюра(причина: &str) {
 /// Своя, а не курсор темы: тема отдаёт готовый растр одного цвета, а чужие
 /// стрелки обязаны различаться цветом участника — иначе на холсте пять
 /// одинаковых указателей, и непонятно, чей какой.
+#[cfg(feature = "share")]
 const ЧУЖОЙ_КУРСОР_W: i32 = 12;
+#[cfg(feature = "share")]
 const ЧУЖОЙ_КУРСОР: [u32; 18] = [
     0b100000000000,
     0b110000000000,
@@ -4121,6 +4150,7 @@ const ЧУЖОЙ_КУРСОР: [u32; 18] = [
 /// Высота чужой стрелки в ЭКРАННЫХ пикселях. Не зависит от зума — ровно как
 /// свой курсор: указатель принадлежит человеку, а не холсту, и на отдалённом
 /// зуме съёжившаяся в точку стрелка была бы просто не видна.
+#[cfg(feature = "share")]
 const ЧУЖОЙ_КУРСОР_H: i32 = 22;
 
 /// Стрелки гостей на экране хозяина: где кто водит мышью, своим цветом и с
@@ -4132,8 +4162,20 @@ const ЧУЖОЙ_КУРСОР_H: i32 = 22;
 /// приходят отдельными короткими сообщениями, которые не роняются, тогда как
 /// видео и роняется, и отстаёт. Вмороженный в видеокадр курсор дёргался бы
 /// вместе с потоком.
+// Курсоры гостей: в минимальной сборке гостей не бывает, и элементов не
+// возникает вовсе. Двойником, а не `#[cfg]` по месту вызова, — чтобы кадр
+// собирался в обеих сборках одним и тем же кодом (см. share_stub/).
+#[cfg(not(feature = "share"))]
 fn build_guest_cursors(
-    state: &mut Dawn,
+    _state: &mut Parallax,
+    _renderer: &mut GlesRenderer,
+) -> Vec<OutputRenderElements> {
+    Vec::new()
+}
+
+#[cfg(feature = "share")]
+fn build_guest_cursors(
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
 ) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
@@ -4143,8 +4185,8 @@ fn build_guest_cursors(
     let гости: Vec<(u8, String, u32, (f64, f64))> = раздача
         .гости
         .iter()
-        .filter(|г| г.жив && г.впущен)
-        .map(|г| (г.id, г.имя.clone(), г.цвет, г.курсор))
+        .filter(|гость| гость.жив && гость.впущен)
+        .map(|гость| (гость.id, гость.имя.clone(), гость.цвет, гость.курсор))
         .collect();
     if гости.is_empty() {
         return els;
@@ -4178,7 +4220,7 @@ fn build_guest_cursors(
                 Kind::Unspecified,
             ) {
                 Ok(el) => els.push(OutputRenderElements::Memory(el)),
-                Err(e) => tracing::warn!("dawn/udev: чужой курсор: {:?}", e),
+                Err(e) => tracing::warn!("plx/udev: guest cursor: {:?}", e),
             }
         }
     }
@@ -4212,7 +4254,7 @@ fn крась(argb: u32) -> [f32; 4] {
 /// экрана снимает кадр с курсором и без него из одного и того же списка
 /// (см. screencopy::serve_pending).
 pub fn собрать_элементы(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
     скругление: Option<&crate::rounded::Шейдер>,
@@ -4247,7 +4289,7 @@ pub fn собрать_элементы(
             state.render_cursor_logged = std::time::Instant::now();
             let anchor = state.space.output_geometry(output).map(|g| g.loc);
             tracing::debug!(
-                "КАДР: курсор_экран=({},{}) привязка_окон={:?} камера=({:.1},{:.1}) zoom={:.2}",
+                "plx/frame: cursor_screen=({},{}) window_anchor={:?} camera=({:.1},{:.1}) zoom={:.2}",
                 cursor_pos_physical.x, cursor_pos_physical.y, anchor, cam.0, cam.1,
                 state.viewport.zoom,
             );
@@ -4314,7 +4356,7 @@ pub fn собрать_элементы(
             // большой»: он прыгал в размере на каждой границе окна.
             //
             // Правильное место починки — не размер картинки, а протокол:
-            // wp_cursor_shape_v1 (см. Dawn::new) уводит все такие «просто дай
+            // wp_cursor_shape_v1 (см. Parallax::new) уводит все такие «просто дай
             // мне стрелку» в ветку Named, где рисуем МЫ. Здесь остаётся
             // страховка для тех, кто протокола не знает (XWayland, GTK3):
             // ужимаем к cursor_client_max, по умолчанию равному нашему размеру.
@@ -4346,9 +4388,9 @@ pub fn собрать_элементы(
             // Строка на КАЖДЫЙ кадр, а под курсором клиента (браузер, Steam,
             // игра) это 190 строк в секунду синхронной записью на диск прямо из
             // потока рендера: в сеансе 05.08.2026 таких строк набежало 17 632 на
-            // каждые 20 МБ лога, а лог за сеанс вырос до 775 МБ. RUST_LOG у dawn
+            // каждые 20 МБ лога, а лог за сеанс вырос до 775 МБ. RUST_LOG у parallax
             // штатно стоит в debug, поэтому уровня мало — включаем только по
-            // DAWN_DEBUG_FRAME, вместе с остальной покадровой диагностикой.
+            // PLX_DEBUG_FRAME, вместе с остальной покадровой диагностикой.
             if debug_frame_enabled() {
                 let размер = crate::xwin::surface_buffer_size(cursor_surface);
                 let buf_scale = smithay::wayland::compositor::with_states(
@@ -4417,7 +4459,7 @@ pub fn собрать_элементы(
                     renderer, pos, &buf, None, None, None, Kind::Cursor,
                 ) {
                     Ok(el) => elements.push(OutputRenderElements::Memory(el)),
-                    Err(e) => tracing::warn!("dawn/udev: cursor render element: {:?}", e),
+                    Err(e) => tracing::warn!("plx/udev: cursor render element: {:?}", e),
                 }
             }
         }
@@ -4439,7 +4481,7 @@ pub fn собрать_элементы(
     elements.extend(build_layer_elements(state, renderer, output, &[WlrLayer::Overlay]));
 
     // Тот ли это монитор, на котором стоит стрелка. Нужен всему, что живёт в
-    // ОДНОМ поле на весь `Dawn` и потому не подменяется `войти_в_монитор`:
+    // ОДНОМ поле на весь `Parallax` и потому не подменяется `войти_в_монитор`:
     // карточке предпросмотра и миникарте. Сверяемся с `курсор_монитор`, а не с
     // `активный` — `активный` здесь уже равен рисуемому монитору (его
     // подменяет `войти_в_монитор` чуть выше по стеку), а `курсор_монитор`
@@ -4462,7 +4504,7 @@ pub fn собрать_элементы(
         //
         // Только на мониторе с курсором, ровно по тем же граблям, что и у
         // миникарты ниже: `preview_cell`/`preview_anim` — одно поле на весь
-        // `Dawn`, и без гейта карточка выезжала на ОБОИХ экранах разом.
+        // `Parallax`, и без гейта карточка выезжала на ОБОИХ экранах разом.
         // Мало того, что синхронно: на чужом мониторе она рисуется его
         // подменённым видом, то есть показывает стол ЧУЖОГО экрана над
         // здешней панелью — это и читается как «столы смешиваются».
@@ -4477,7 +4519,7 @@ pub fn собрать_элементы(
     // главное на экране, и клавиши принадлежат ему (см. input.rs).
     //
     // Все пять — тот же случай, что и карточка выше: состояние меню одно на
-    // весь `Dawn` (`bt_menu`, `wifi_open`, `audio_open`, …), а `output` им
+    // весь `Parallax` (`bt_menu`, `wifi_open`, `audio_open`, …), а `output` им
     // нужен только ради размера экрана. Без гейта одна команда открывала меню
     // на ОБОИХ мониторах разом — замер 30.08.2026 двухмониторным харнессом:
     // `action audio_menu` при курсоре на первом мониторе рисовал список
@@ -4498,10 +4540,10 @@ pub fn собрать_элементы(
     // доехать до края экрана, и пока она в пути, её обязаны рисовать (см.
     // anim::tick). По тумблеру она бы просто исчезала на месте.
     //
-    // `minimap_slide` — ОДНО поле на весь Dawn, а не своё у каждого монитора
+    // `minimap_slide` — ОДНО поле на весь Parallax, а не своё у каждого монитора
     // (в отличие от viewport/layer_output, которые войти_в_монитор подменяет
     // на время сборки этого самого кадра). Без явной проверки монитора карта
-    // рисовалась на КАЖДОМ выходе разом — жалоба Ярика «мини-карта и dwall
+    // рисовалась на КАЖДОМ выходе разом — жалоба Ярика «мини-карта и plx-wall
     // открываются на втором мониторе»: пока он работал на первом, карта той
     // же командой всплывала и на втором, который в этот момент никто не
     // смотрел. Гейт — общий `свой_монитор`, посчитанный выше (см. панель).
@@ -4705,7 +4747,7 @@ pub fn собрать_элементы(
                 // Разово на кадр и только на debug: без этой строки «почему
                 // окно всё ещё не ужимается» опять пришлось бы искать снаружи.
                 tracing::debug!(
-                    "dawn/кроп: {:?} просили {:?}, клиент рисует {:?}",
+                    "plx/crop: {:?} asked for {:?}, the client draws {:?}",
                     crate::xwin::app_id(&window).unwrap_or_default(),
                     целевой.unwrap(), факт,
                 );
@@ -4909,11 +4951,37 @@ pub fn собрать_элементы(
     if let Some(mode) = output.current_mode() {
         // Под обоями во весь экран сетку не строим — её всё равно не видно.
         // Плитки кроют холст по определению, а вот `background_covers_output`
-        // спрашивает СВОЮ карту слоёв: у монитора, которому dwall поверхность не
+        // спрашивает СВОЮ карту слоёв: у монитора, которому plx-wall поверхность не
         // вешал, она пуста, и сетка строилась бы под чужими обоями впустую.
         if !плитками && !background_covers_output(state, output, state.screen_size()) {
             elements.extend(build_parallax_elements(state, renderer, mode));
         }
+    }
+
+    // ── Пелена входа: поверх ВСЕГО, включая курсор ──────────────────────────
+    //
+    // Вставка в начало, а не push: список идёт от переднего плана к заднему.
+    // Курсор тоже под ней намеренно — в первые полсекунды сеанса стрелка,
+    // висящая над чернотой, выдаёт, что «темнота» это плашка, а не ещё не
+    // нарисованный экран.
+    if let Some(альфа) = state.вход.as_ref().map(|в| в.пелена()).filter(|a| *a > 0.001) {
+        // Размер — режим ВЫХОДА (физические пиксели этого экрана), как у всех
+        // прочих полноэкранных плашек кадра: логический размер с зумом здесь
+        // не при чём, пелена приклеена к стеклу, а не к холсту.
+        let (ширина, высота) = match output.current_mode() {
+            Some(m) => (m.size.w, m.size.h),
+            None => (0, 0),
+        };
+        let mut idx = 0;
+        let плашка = pooled_solid(
+            &mut state.вход_ids, &mut idx,
+            (0, 0), (ширина, высота),
+            // Тот же цвет, которым чистится кадр: пелена обязана быть
+            // НЕОТЛИЧИМОЙ от пустого экрана, иначе в начале входа видна её
+            // граница на фоне незакрытых ею краёв.
+            [CLEAR_COLOR[0], CLEAR_COLOR[1], CLEAR_COLOR[2], альфа],
+        );
+        elements.insert(0, плашка);
     }
 
     let element_count = elements.len();
@@ -4927,7 +4995,7 @@ pub fn собрать_элементы(
     (elements, cursor_elements)
 }
 
-pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state: &mut Dawn) {
+pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state: &mut Parallax) {
     // Кадр собирается ТОЧКОЙ ЗРЕНИЯ СВОЕГО монитора: своя камера, свой зум,
     // свой рабочий стол, своя карта слоёв (см. monitors::войти_в_монитор).
     // Без этого второй монитор рисовал бы вид первого — то самое «второй
@@ -4964,24 +5032,7 @@ pub fn render_surface(surface: &mut Surface, renderer: &mut GlesRenderer, state:
     state.покинуть_монитор(вернуть);
 }
 
-fn рисовать_поверхность(surface: &mut Surface, renderer: &mut GlesRenderer, state: &mut Dawn) {
-    // ── Размытый фон под плашками ────────────────────────────────────────────
-    // Считается ОДИН раз на кадр и до сборки элементов: под островами панели,
-    // меню и миникартой лежит одна и та же картинка, и размывать её по разу на
-    // плашку было бы чистым перерасходом. Готовая текстура живёт в state, её
-    // берут все, кому надо. Любой отказ (шейдер не собрался, обоев ещё нет,
-    // буфер не завёлся) даёт None — и плашки просто рисуются как раньше.
-    //
-    // Отказ на ОТДЕЛЬНОМ кадре текстуру НЕ сбрасывает, и это не мелочь.
-    // Раньше здесь стояло `blur_tex = None` перед попыткой: живые обои
-    // (dwall крутит видео) отдают буфер не на каждый кадр композитора, и в
-    // такие кадры `wallpaper_texture` возвращала None — остров панели
-    // оставался без заплаты, то есть выглядел иначе, а на следующем кадре
-    // заплата возвращалась. Снаружи это и есть «мигает маска скругления на
-    // баре»: моргает не маска, а то, что под ней. Держим прошлую размытую
-    // картинку — она отстаёт на кадр, чего под панелью не видно.
-    пересчитать_блюр(state, renderer, surface.blur.as_mut(), &surface.output);
-
+fn рисовать_поверхность(surface: &mut Surface, renderer: &mut GlesRenderer, state: &mut Parallax) {
     // Не рисуем чаще, чем экран показывает: пока предыдущий кадр ждёт VBlank,
     // рисовать второй бессмысленно — queue_frame его же и затрёт (см. поле
     // Surface::frame_queued). Запрос на перерисовку не теряем: возвращаем
@@ -4995,7 +5046,7 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
         }
         // Страховка: VBlank не пришёл слишком долго — считаем цепочку порванной
         // и рисуем, иначе экран замёрзнет навсегда.
-        tracing::debug!("dawn/udev: frame_queued завис на {:?}, рисуем принудительно",
+        tracing::debug!("plx/udev: frame_queued stuck for {:?}, forcing a redraw",
             surface.frame_queued_at.elapsed());
         surface.frame_queued = false;
     }
@@ -5011,6 +5062,34 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
         }
         surface.отказ_до = None;
     }
+
+    // ── Размытый фон под плашками ────────────────────────────────────────────
+    // Считается ОДИН раз на кадр и до сборки элементов: под островами панели,
+    // меню и миникартой лежит одна и та же картинка, и размывать её по разу на
+    // плашку было бы чистым перерасходом. Готовая текстура живёт в state, её
+    // берут все, кому надо. Любой отказ (шейдер не собрался, обоев ещё нет,
+    // буфер не завёлся) даёт None — и плашки просто рисуются как раньше.
+    //
+    // Отказ на ОТДЕЛЬНОМ кадре текстуру НЕ сбрасывает, и это не мелочь.
+    // Раньше здесь стояло `blur_tex = None` перед попыткой: живые обои
+    // (plx-wall крутит видео) отдают буфер не на каждый кадр композитора, и в
+    // такие кадры `wallpaper_texture` возвращала None — остров панели
+    // оставался без заплаты, то есть выглядел иначе, а на следующем кадре
+    // заплата возвращалась. Снаружи это и есть «мигает маска скругления на
+    // баре»: моргает не маска, а то, что под ней. Держим прошлую размытую
+    // картинку — она отстаёт на кадр, чего под панелью не видно.
+    //
+    // Стоит СТРОГО ПОСЛЕ гейтов отрисовки, и это не косметика (замер
+    // 03.09.2026). Раньше вызов был первой строкой функции — то есть свёртка
+    // (три офскрин-буфера, сборка сцены обоев плюс два прохода) считалась и на
+    // тех заходах, которые тут же выходили по `frame_queued`. При живой Dota
+    // это 500-900 пропусков в секунду против ~190 показанных кадров: до 4/5
+    // всей работы размытия уходило в кадр, который никто не собирал. Сводка
+    // это скрывала — таймер начинается ниже, и блюр в `средний ... мс` не
+    // попадал (0.3 мс на кадр в логе против 33% ядра у процесса).
+    let blur_started = std::time::Instant::now();
+    пересчитать_блюр(state, renderer, surface.blur.as_mut(), &surface.output);
+    state.render_stats.record_blur(blur_started.elapsed().as_micros() as u64);
 
     let render_started = std::time::Instant::now();
     // Где курсор был в ЭТОМ кадре — то, что пользователь реально увидит на
@@ -5052,15 +5131,15 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
         Ok(res) => {
             // Кадр выделился — память вернулась, откат снимаем.
             if surface.отказов_подряд > 0 {
-                tracing::info!("dawn/udev: render_frame[{}]: кадр снова рисуется после {} отказов",
+                tracing::info!("plx/udev: render_frame[{}]: drawing again after {} failures",
                     output_name, surface.отказов_подряд);
                 surface.отказов_подряд = 0;
                 surface.отказ_лог = None;
             }
             // trace!, а не debug!: это две строки на КАЖДЫЙ кадр (при 60 Гц —
             // ~50 КБ/с), а лог из launch_tty.zsh идёт через tee синхронной
-            // записью на диск прямо из потока рендера, который у dawn один.
-            tracing::trace!("dawn/udev: render_frame[{}]: is_empty={}", output_name, res.is_empty);
+            // записью на диск прямо из потока рендера, который у parallax один.
+            tracing::trace!("plx/udev: render_frame[{}]: is_empty={}", output_name, res.is_empty);
 
             // ── ВРЕМЕННАЯ ДИАГНОСТИКА (см. debug_frame_enabled) ──────────────
             if debug_frame_enabled() {
@@ -5072,12 +5151,12 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
                             let area: i64 = rects.iter()
                                 .map(|r| r.size.w as i64 * r.size.h as i64).sum();
                             tracing::debug!(
-                                "dawn/dbg: damage[{}]: n={} площадь={} needs_sync={} {:?}",
+                                "plx/dbg: damage[{}]: n={} area={} needs_sync={} {:?}",
                                 output_name, rects.len(), area, res.needs_sync(),
                                 rects.iter().take(6).collect::<Vec<_>>(),
                             );
                         }
-                        None => tracing::debug!("dawn/dbg: damage[{}]: пусто", output_name),
+                        None => tracing::debug!("plx/dbg: damage[{}]: empty", output_name),
                     }
                 }
                 // Флаг взводит ПАЧКУ снимков подряд: одиночный кадр не поймает
@@ -5085,8 +5164,8 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
                 static BURST: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
                 use std::sync::atomic::Ordering;
-                if std::path::Path::new("/tmp/dawn_dump").exists() {
-                    let _ = std::fs::remove_file("/tmp/dawn_dump");
+                if std::path::Path::new("/tmp/plx_dump").exists() {
+                    let _ = std::fs::remove_file("/tmp/plx_dump");
                     BURST.store(16, Ordering::Relaxed);
                 }
                 let n = BURST.load(Ordering::Relaxed);
@@ -5101,7 +5180,7 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
             // отрисовки вместе с флипом (либо плоскость не умеет IN_FENCE_FD,
             // либо EGL-fence не экспортируется), и по контракту ждать обязан
             // сам компоситор — ровно это делает `DrmOutput::render_frame` в
-            // smithay. В dawn этого шага не было: `queue_frame` ставил буфер на
+            // smithay. В parallax этого шага не было: `queue_frame` ставил буфер на
             // page flip, пока GPU его ещё дорисовывал, и на монитор уходил
             // НЕДОРИСОВАННЫЙ кадр — прямоугольные чёрные блоки размером с тайл
             // растеризатора.
@@ -5127,13 +5206,13 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
                     // Кадр ушёл на показ — до его VBlank новые рендеры не нужны.
                     surface.frame_queued = true;
                     surface.frame_queued_at = std::time::Instant::now();
-                    tracing::trace!("dawn/udev: queue_frame[{}]: committed", output_name);
+                    tracing::trace!("plx/udev: queue_frame[{}]: committed", output_name);
                 }
                 // EmptyFrame — на экране ничего не изменилось, VBlank НЕ придёт;
                 // шлагбаум обязан остаться открытым, иначе следующее изменение
                 // упрётся в него и будет ждать страховочные 100 мс.
-                Err(FrameError::EmptyFrame) => tracing::trace!("dawn/udev: queue_frame[{}]: EmptyFrame", output_name),
-                Err(e) => tracing::warn!("dawn/udev: queue_frame[{}]: {:?}", output_name, e),
+                Err(FrameError::EmptyFrame) => tracing::trace!("plx/udev: queue_frame[{}]: EmptyFrame", output_name),
+                Err(e) => tracing::warn!("plx/udev: queue_frame[{}]: {:?}", output_name, e),
             }
         }
         Err(e) => {
@@ -5150,7 +5229,7 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
             if пора {
                 surface.отказ_лог = Some(std::time::Instant::now());
                 tracing::warn!(
-                    "dawn/udev: render_frame[{}]: {:?} (отказов подряд {}, пауза {} мс)",
+                    "plx/udev: render_frame[{}]: {:?} ({} failures in a row, backoff {} ms)",
                     output_name, e, surface.отказов_подряд, пауза,
                 );
             }
@@ -5239,8 +5318,8 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
     // Frame callbacks для layer-поверхностей
     {
         // Обои под полноэкранным окном не видно вовсе — и будить их незачем:
-        // dwall тактуется кадровыми callback'ами, без них он засыпает, а за ним
-        // встаёт и ffmpeg (см. Dawn::wallpaper_hidden). Запрос на callback при
+        // plx-wall тактуется кадровыми callback'ами, без них он засыпает, а за ним
+        // встаёт и ffmpeg (см. Parallax::wallpaper_hidden). Запрос на callback при
         // этом никуда не девается: он ждёт в поверхности и уедет клиенту первым
         // же кадром, когда обои снова покажутся.
         let фон_скрыт = state.wallpaper_hidden();
@@ -5273,7 +5352,7 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
 /// Поэтому любой источник новых изменений на экране (commit клиента, новое
 /// окно, движение курсора) обязан сам дёрнуть рендер через эту функцию —
 /// иначе изменение останется в state, но никогда не попадёт на экран.
-pub fn render_all(state: &mut Dawn) {
+pub fn render_all(state: &mut Parallax) {
     // Пока сессия не активна (VT-переключение, DRM master у другого
     // compositor'а), PrepareFrame гарантированно вернёт DrmError(DeviceInactive) —
     // не тратим кадры и не спамим лог, просто ждём ActivateSession.
@@ -5569,7 +5648,7 @@ const BT_KEY_GAP: i32 = 8;
 /// Начертание — Regular: им набрано всё, что читают глазами (заголовки окон,
 /// имена устройств, подписи пунктов).
 fn draw_text(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     x: i32, y: i32,
     text: &str,
@@ -5587,7 +5666,7 @@ fn draw_text(
 /// то, что просвечивает снизу, и подпись читается хуже подложки.
 #[allow(clippy::too_many_arguments)]
 fn draw_text_w(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     x: i32, y: i32,
     text: &str,
@@ -5606,7 +5685,7 @@ fn draw_text_w(
         None, None, Some(Size::<i32, Logical>::from((w, h))), Kind::Unspecified,
     ) {
         Ok(el) => out.push(OutputRenderElements::Memory(el)),
-        Err(e) => tracing::warn!("dawn/udev: строка текста: {:?}", e),
+        Err(e) => tracing::warn!("plx/udev: text line: {:?}", e),
     }
     w
 }
@@ -5616,7 +5695,7 @@ fn draw_text_w(
 /// Приклеено к ЭКРАНУ, как панель столов: камера и зум на него не влияют, и
 /// хит-тест (см. bluetooth.rs::bt_click) считает в тех же экранных пикселях.
 fn build_bluetooth_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {
@@ -5887,7 +5966,7 @@ const MENU_BG_СТЕКЛО: [f32; 4] = [0.030, 0.030, 0.045, 0.55];
 /// Возвращает цвет, которым дальше рисуется сама плашка.
 #[allow(clippy::too_many_arguments)]
 fn меню_фон(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     x: i32, y: i32, w: i32, h: i32,
     глухой: [f32; 4],
@@ -5908,7 +5987,7 @@ fn меню_фон(
 /// хит-тест ловит клики (порядок совпадает с `rows`).
 #[allow(clippy::too_many_arguments)]
 fn build_list_menu(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
     title: &str,
@@ -6023,8 +6102,11 @@ fn build_list_menu(
     (els, hits)
 }
 
+#[cfg(feature = "share")]
 const SHARE_W: i32 = 660;
+#[cfg(feature = "share")]
 const SHARE_ROW_H: i32 = 40;
+#[cfg(feature = "share")]
 const SHARE_TEXT: i32 = 2;
 
 /// Цвет участника (0xAARRGGBB из `share::ЦВЕТА`) в цвет заливки.
@@ -6032,6 +6114,7 @@ const SHARE_TEXT: i32 = 2;
 /// Альфа единица, поэтому домножать на неё нечего — но помнить про
 /// premultiplied всё равно надо: возьми кто-нибудь отсюда полупрозрачный
 /// цвет, точка засветилась бы сквозь панель (см. `pooled_solid`).
+#[cfg(feature = "share")]
 fn цвет_участника(c: u32) -> [f32; 4] {
     [
         ((c >> 16) & 0xff) as f32 / 255.0,
@@ -6045,11 +6128,22 @@ fn цвет_участника(c: u32) -> [f32; 4] {
 ///
 /// Открывается ПОВТОРНЫМ Super+Shift+S у хозяина машины. У гостя то же
 /// сочетание значит «выйти» и до хоста не доходит вовсе — его перехватывает
-/// сам `dshare` (единственная клавиша, которую он оставляет себе).
+/// сам `plx-share` (единственная клавиша, которую он оставляет себе).
 ///
 /// Приклеена к экрану, как остальные меню: камера и зум на неё не влияют.
+// Панель раздачи — то же самое: без фичи её нечем открыть.
+#[cfg(not(feature = "share"))]
 fn build_share_panel_elements(
-    state: &mut Dawn,
+    _state: &mut Parallax,
+    _renderer: &mut GlesRenderer,
+    _output: &Output,
+) -> Vec<OutputRenderElements> {
+    Vec::new()
+}
+
+#[cfg(feature = "share")]
+fn build_share_panel_elements(
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {
@@ -6066,24 +6160,24 @@ fn build_share_panel_elements(
         let строки: Vec<(String, [f32; 4], String, String, bool)> = раздача
             .гости
             .iter()
-            .map(|г| {
+            .map(|гость| {
                 (
-                    г.имя.clone(),
-                    цвет_участника(г.цвет),
-                    г.адрес.to_string(),
-                    if !г.впущен {
-                        "здоровается…".to_string()
+                    гость.имя.clone(),
+                    цвет_участника(гость.цвет),
+                    гость.адрес.to_string(),
+                    if !гость.впущен {
+                        т!("здоровается…", "saying hello…").to_string()
                     } else {
                         // Долг очереди показываем только когда он есть: это
                         // единственный видимый признак «гость не успевает»,
                         // и в норме он должен быть пуст.
-                        let долг = г.долг();
+                        let долг = гость.долг();
                         match долг {
-                            0 => format!("{}×{}", г.кадр_кодировщика.0, г.кадр_кодировщика.1),
-                            n => format!("{}×{}  очередь {n}", г.кадр_кодировщика.0, г.кадр_кодировщика.1),
+                            0 => format!("{}×{}", гость.кадр_кодировщика.0, гость.кадр_кодировщика.1),
+                            n => тф!("{}×{}  очередь {n}", "{}×{}  queue {n}", гость.кадр_кодировщика.0, гость.кадр_кодировщика.1),
                         }
                     },
-                    г.впущен,
+                    гость.впущен,
                 )
             })
             .collect();
@@ -6126,7 +6220,7 @@ fn build_share_panel_elements(
     state.share_ids = pool;
 
     let mut slot = 0usize;
-    let шапка = format!("РАЗДАЧА — код {код}, порт {порт}");
+    let шапка = тф!("РАЗДАЧА — код {код}, порт {порт}", "SHARING — code {код}, port {порт}");
     draw_text_w(
         state, renderer, x + 22, y + 16, &шапка,
         crate::text::Weight::Semi, SHARE_TEXT, WHITE, slot, &mut els,
@@ -6135,7 +6229,7 @@ fn build_share_panel_elements(
 
     if строки.is_empty() {
         draw_text(
-            state, renderer, x + 22, y + head_h + 10, "никто не подключён",
+            state, renderer, x + 22, y + head_h + 10, т!("никто не подключён", "nobody is connected"),
             SHARE_TEXT, DIM, slot, &mut els,
         );
         slot += 1;
@@ -6159,9 +6253,9 @@ fn build_share_panel_elements(
     }
 
     let подвал = if забанено > 0 {
-        format!("x выгнать   b забанить   s закончить   Esc закрыть        в бане: {забанено}")
+        тф!("x выгнать   b забанить   s закончить   Esc закрыть        в бане: {забанено}", "x kick   b ban   s stop   Esc close        banned: {забанено}")
     } else {
-        "x выгнать   b забанить   s закончить   Esc закрыть".to_string()
+        т!("x выгнать   b забанить   s закончить   Esc закрыть", "x kick   b ban   s stop   Esc close").to_string()
     };
     draw_text(
         state, renderer, x + 22, y + menu_h - foot_h + 12, &подвал,
@@ -6176,7 +6270,7 @@ fn build_share_panel_elements(
 
 /// Меню вайфая: список сетей, ввод пароля и подсказка по клавишам.
 fn build_wifi_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {
@@ -6259,7 +6353,7 @@ fn build_wifi_elements(
 
 /// Меню звука: устройства вывода и ввода двумя разделами.
 fn build_audio_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {
@@ -6340,7 +6434,7 @@ fn build_audio_elements(
 /// ведёт себя как ещё одно приклеенное к экрану меню, и человеку не приходится
 /// заново учить, где тут выбранная строка и где подсказка.
 fn build_search_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {
@@ -6370,7 +6464,7 @@ fn build_search_elements(
                 if !right.is_empty() {
                     right.push_str("  ");
                 }
-                right.push_str(&format!("стол {}", h.tags.trailing_zeros() + 1));
+                right.push_str(&тф!("стол {}", "workspace {}", h.tags.trailing_zeros() + 1));
             }
             MenuRow {
                 header: false,
@@ -6384,13 +6478,13 @@ fn build_search_elements(
         .collect();
 
     // Курсор в конце строки — видно, что поле принимает ввод, даже когда пусто.
-    let title = format!("ПОИСК ОКНА: {query}_");
-    // Стрелок ↑↓ в битмап-шрифте dawn нет — на экране вместо них выходили «??»
+    let title = тф!("ПОИСК ОКНА: {query}_", "FIND WINDOW: {query}_");
+    // Стрелок ↑↓ в битмап-шрифте parallax нет — на экране вместо них выходили «??»
     // (проверено снимком 05.08.2026). Пишем словами.
     let foot = if rows.is_empty() && !query.is_empty() {
-        ("ничего не нашлось  -  Esc отмена".to_string(), DIM)
+        (т!("ничего не нашлось  -  Esc отмена", "nothing found  -  Esc cancel").to_string(), DIM)
     } else {
-        ("Enter перейти  Tab выбор  Esc отмена".to_string(), ACCENT)
+        (т!("Enter перейти  Tab выбор  Esc отмена", "Enter go  Tab select  Esc cancel").to_string(), ACCENT)
     };
 
     let (els, hits) = build_list_menu(
@@ -6419,7 +6513,7 @@ fn premul(c: [f32; 4]) -> [f32; 4] {
 /// Значок-маска по центру ячейки: высота задана, ширина берётся из пропорций
 /// самой маски (см. text.rs::bitmap_fit).
 fn draw_mask(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     name: &str,
     rows: &[u32],
@@ -6443,7 +6537,7 @@ fn draw_mask(
         Kind::Unspecified,
     ) {
         Ok(el) => out.push(OutputRenderElements::Memory(el)),
-        Err(e) => tracing::warn!("dawn/udev: значок полки {}: {:?}", name, e),
+        Err(e) => tracing::warn!("plx/udev: shelf icon {}: {:?}", name, e),
     }
 }
 
@@ -6486,7 +6580,7 @@ fn mask_h_fit(mask_w: i32, rows: i32, want_h: i32, max_w: i32) -> i32 {
 /// намеренно: именно так однажды разъехались клики по окнам — на экране одно,
 /// в проверке другое.
 fn build_tray_elements(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {

@@ -1,0 +1,18 @@
+[package]
+name = "plx-minimal"
+version = "0.1.0"
+edition = "2021"
+description = "Parallax without the optional parts: no VR, no Minecraft, no guest sharing"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/mifaroslav-dotcom/parallax"
+
+[[bin]]
+name = "plx-minimal"
+path = "src/main.rs"
+
+# default-features = false — здесь это и есть весь смысл сборки: композитор,
+# тайлинг, лента, обзор, обои, панель, трей, блютуз, вайфай, звук, портал,
+# снимок, X11 и жесты, но БЕЗ шлема, Minecraft и мультиюзера. Вместе с ними из
+# дерева уходят openxr и sha2 (см. `[features]` в корневом Cargo.toml).
+[dependencies]
+parallax = { path = "../..", default-features = false }

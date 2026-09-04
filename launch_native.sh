@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# launch_native.sh — запуск dawn напрямую, БЕЗ nix-shell.
+# launch_native.sh — запуск parallax напрямую, БЕЗ nix-shell.
 #
 # Бинарь собирается через build.sh ЧИСТО системным тулчейном (cargo/rustc/
 # mold из xbps, без nix-shell) — все зависимости (libinput, libseat, libdrm,
@@ -16,16 +16,27 @@
 # Использование: ./launch_native.sh [--debug] [--winit]
 set -euo pipefail
 
-DAWN_DIR="$(cd -- "$(dirname -- "$(realpath -- "$0")")" && pwd)"
-BUILD_DIR="/mnt/dawn-build/target"
-BINARY="$BUILD_DIR/release/dawn"
-[[ "${1:-}" == --debug ]] && BINARY="$BUILD_DIR/debug/dawn"
+PLX_DIR="$(cd -- "$(dirname -- "$(realpath -- "$0")")" && pwd)"
+BUILD_DIR="/mnt/plx-build/target"
+# Сеанс идёт на ПОЛНОЙ сборке: шлем, окна в Minecraft и мультиюзер нужны
+# именно здесь. Минимальная лежит рядом — plx-minimal, тот же композитор без них.
+#
+# Каталог — ИМЕННО `extra/release`, тот, куда пишет build.sh. Пока здесь стоял
+# `release/plx-extra`, Super+R работал вхолостую: build.sh с разделением на две
+# сборки кладёт бинари в `extra/` и `minimal/`, а запускался остаток от прежней
+# общей сборки одним `--workspace` (в `release/` лежат оба бинаря с одним
+# временем — по ним это и видно). Пересборка проходила, `свежие_исходники`
+# продолжали видеть исходники новее ЗАПУСКАЕМОГО файла, и сессия поднималась на
+# старом бинаре с руганью «Сборка отчиталась об успехе, но бинарь не обновился».
+# Поймано 03.09.2026 при разборе расхода процессора.
+BINARY="$BUILD_DIR/extra/release/plx-extra"
+[[ "${1:-}" == --debug ]] && BINARY="$BUILD_DIR/debug/parallax"
 
-DWALL_BIN="$HOME/.local/bin/dwall"
+DWALL_BIN="$HOME/.local/bin/plx-wall"
 
 if [[ ! -x "$BINARY" ]]; then
     echo "Бинарь не найден: $BINARY" >&2
-    echo "Сборка: cd $DAWN_DIR && ./build_env.sh build" >&2
+    echo "Сборка: cd $PLX_DIR && ./build_env.sh build" >&2
     exit 1
 fi
 
@@ -45,38 +56,38 @@ fi
 #
 # Пути берём из shell.nix, а не хардкодом: после nix-collect-garbage хеши
 # в /nix/store меняются, и любой зафиксированный путь протухает.
-if [[ -e /etc/NIXOS && -z "${LD_LIBRARY_PATH:-}" && -f "$DAWN_DIR/shell.nix" ]]; then
+if [[ -e /etc/NIXOS && -z "${LD_LIBRARY_PATH:-}" && -f "$PLX_DIR/shell.nix" ]]; then
     echo "NixOS: беру LD_LIBRARY_PATH из shell.nix (dlopen-библиотеки)…"
-    LD_LIBRARY_PATH="$(nix-shell "$DAWN_DIR/shell.nix" --run 'printf %s "$LD_LIBRARY_PATH"')"
+    LD_LIBRARY_PATH="$(nix-shell "$PLX_DIR/shell.nix" --run 'printf %s "$LD_LIBRARY_PATH"')"
     export LD_LIBRARY_PATH
 fi
 
 # ── Приветствие zsh в терминалах сессии ──────────────────────────────────────
 # .zshrc показывает fastfetch один раз на цепочку шеллов и помечает это
-# экспортом __FASTFETCH_SHOWN. Но dawn запускают ИЗ логин-шелла tty, который
-# приветствие уже показал, — и флаг наследовался дальше: в dawn, в каждый
+# экспортом __FASTFETCH_SHOWN. Но parallax запускают ИЗ логин-шелла tty, который
+# приветствие уже показал, — и флаг наследовался дальше: в parallax, в каждый
 # ghostty, в каждый zsh внутри него. Итог: приветствия не было НИ В ОДНОМ
 # терминале сессии. Сессия компоновщика — новый контекст, флаг предыдущего
 # шелла к ней отношения не имеет.
 unset __FASTFETCH_SHOWN
 
-LOG_DIR="$DAWN_DIR/logs"
+LOG_DIR="$PLX_DIR/logs"
 mkdir -p "$LOG_DIR"
-LOG="$LOG_DIR/dawn_native_$(date +%Y%m%d_%H%M%S).log"
+LOG="$LOG_DIR/plx_native_$(date +%Y%m%d_%H%M%S).log"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 # ── Сессионная шина D-Bus ────────────────────────────────────────────────────
 # Без неё в сессии нет ни портала (демонстрация экрана, выбор файлов), ни
 # уведомлений: xdg-desktop-portal живёт ТОЛЬКО на сессионной шине. Замер
-# 03.08.2026: у dawn не было DBUS_SESSION_BUS_ADDRESS вовсе, /run/user/1000/bus
+# 03.08.2026: у parallax не было DBUS_SESSION_BUS_ADDRESS вовсе, /run/user/1000/bus
 # не существовал, а единственный запущенный xdg-desktop-portal висел в чужой
 # сессии (XDG_RUNTIME_DIR=/tmp/runtime-1000, шина /tmp/dbus-*) — приложения из
-# dawn его не видели.
+# parallax его не видели.
 #
 # Перезапускаем сам скрипт под dbus-run-session: она поднимает шину, ставит
 # DBUS_SESSION_BUS_ADDRESS и умирает вместе с сессией.
-if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -z "${DAWN_NO_DBUS:-}" ]]; then
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -z "${PLX_NO_DBUS:-}" ]]; then
     if [[ -S "$XDG_RUNTIME_DIR/bus" ]]; then
         export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
     elif command -v dbus-run-session >/dev/null; then
@@ -90,15 +101,15 @@ fi
 # ── PipeWire ─────────────────────────────────────────────────────────────────
 # Демонстрация экрана идёт потоком через PipeWire; без него портал ScreenCast
 # соглашается на сессию, но кадры отдать не может. Стартуем только если ещё не
-# запущен (в сессии он один на пользователя) и глушим вместе с dawn.
+# запущен (в сессии он один на пользователя) и глушим вместе с parallax.
 #
 # Живость проверяем ПО СОКЕТАМ, а не по именам процессов. `pipewire-pulse` —
 # это тот же бинарь, запущенный как `pipewire -c pipewire-pulse.conf`, и comm у
-# него тоже "pipewire". Осиротевший мост от прошлой сессии (dawn убили, мост
+# него тоже "pipewire". Осиротевший мост от прошлой сессии (parallax убили, мост
 # пережил) ловился прежним `pgrep -x pipewire`, скрипт считал ядро поднятым и
 # не запускал ни его, ни wireplumber. В итоге сессия оставалась совсем без
 # звука: сокета pipewire-0 нет, устройств нет, `pactl` отвечает Connection
-# refused, меню звука dawn пишет «no output device» (разобрано 05.08.2026).
+# refused, меню звука parallax пишет «no output device» (разобрано 05.08.2026).
 #
 # Где аудио держит systemd (NixOS с services.pipewire), руками не лезем ВООБЩЕ:
 # юниты стартуют параллельно с этим скриптом, и проверка «жив ли» неизбежно
@@ -107,7 +118,7 @@ fi
 # в одну и ту же секунду не видел ещё не стартовавший юнит и поднимал ВТОРОЙ
 # экземпляр. Два сессионных менеджера на одном ядре дерутся за устройства, граф
 # встаёт колом: `pw-dump` и `wpctl status` висят по таймауту, аудио-узлов нет
-# ни одного, `pactl` отвечает Timeout, и меню звука dawn снова пустое —
+# ни одного, `pactl` отвечает Timeout, и меню звука parallax снова пустое —
 # ровно тот же симптом, что и от осиротевшего моста, но причина обратная
 # (разобрано 15.08.2026: PID 974 от скрипта против PID 981 от systemd).
 #
@@ -115,13 +126,13 @@ fi
 # и гонку снимает, и заменяет собой весь ручной путь. Ручной путь остаётся для
 # машин без systemd (портативная сборка, Void) — там юнитов просто нет.
 PIPEWIRE_PIDS=()
-if [[ -z "${DAWN_NO_PIPEWIRE:-}" ]] \
+if [[ -z "${PLX_NO_PIPEWIRE:-}" ]] \
    && command -v systemctl >/dev/null \
    && systemctl --user cat wireplumber.service >/dev/null 2>&1; then
     echo "PipeWire: аудио под systemd — поднимаю юнитами, руками не трогаю"
     systemctl --user start pipewire.service wireplumber.service pipewire-pulse.service \
         >/dev/null 2>&1 || true
-elif [[ -z "${DAWN_NO_PIPEWIRE:-}" ]]; then
+elif [[ -z "${PLX_NO_PIPEWIRE:-}" ]]; then
     # Ядра нет — значит всё, что осталось от прошлой сессии, мёртвый груз, и
     # к тому же держит сокет pulse, куда иначе не встанет новый мост.
     if [[ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]]; then
@@ -130,14 +141,14 @@ elif [[ -z "${DAWN_NO_PIPEWIRE:-}" ]]; then
         sleep 0.5
     fi
     # $1 — бинарь, $2 — сокет-признак того, что он уже работает.
-    dawn_start_audio() {
+    plx_start_audio() {
         command -v "$1" >/dev/null || return 0
         [[ -S "$2" ]] && return 0
         "$1" >/dev/null 2>&1 &
         PIPEWIRE_PIDS+=("$!")
         sleep 0.5
     }
-    dawn_start_audio pipewire "$XDG_RUNTIME_DIR/pipewire-0"
+    plx_start_audio pipewire "$XDG_RUNTIME_DIR/pipewire-0"
     # wireplumber — сессионный менеджер: без него ядро живо, но НИ ОДНОГО
     # устройства не создаёт. Своего сокета у него нет, зато имя уникальное,
     # так что здесь pgrep как раз уместен.
@@ -147,7 +158,7 @@ elif [[ -z "${DAWN_NO_PIPEWIRE:-}" ]]; then
         PIPEWIRE_PIDS+=("$!")
         sleep 0.5
     fi
-    dawn_start_audio pipewire-pulse "$XDG_RUNTIME_DIR/pulse/native"
+    plx_start_audio pipewire-pulse "$XDG_RUNTIME_DIR/pulse/native"
 fi
 # XCURSOR_PATH нарочно НЕ задаём: если он установлен, крейт xcursor
 # полностью игнорирует стандартные XDG-пути (~/.icons, /usr/share/icons)
@@ -163,18 +174,18 @@ export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
 # debug по умолчанию: диагностические строки (PTR HIT, PTR КАДР, PTR ЛОКАЛЬ,
 # КУРСОР КЛИЕНТА) пишутся в файл лога, а не на экран, зато после жалобы
 # «кликаю не туда» данные уже собраны — переспрашивать и повторять не надо.
-export RUST_LOG="${RUST_LOG:-dawn=debug,info}"
-# Протокольный лог Xwayland по метке-файлу: `touch ~/.dawn_wldebug` + перезапуск
-# (Super+R). WAYLAND_DEBUG наследует ИМЕННО Xwayland — сам dawn сервер, его
+export RUST_LOG="${RUST_LOG:-parallax=debug,info}"
+# Протокольный лог Xwayland по метке-файлу: `touch ~/.plx_wldebug` + перезапуск
+# (Super+R). WAYLAND_DEBUG наследует ИМЕННО Xwayland — сам parallax сервер, его
 # libwayland-client не касается. Нужен, когда картинка курсора у X-сервера одна,
 # а на экране другая: в логе видно, шлёт ли Xwayland set_cursor вообще и с каким
 # серийником (см. dawn-x11-cursor-stuck в памяти). Лог растёт быстро — метку
 # снимать сразу после замера.
-if [ -f "$HOME/.dawn_wldebug" ]; then
+if [ -f "$HOME/.plx_wldebug" ]; then
     export WAYLAND_DEBUG=1
 fi
 # По этому имени xdg-desktop-portal выбирает бэкенд (см. launch_tty.zsh).
-export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-dawn}"
+export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-parallax}"
 # Именно "=", а НЕ ":-": elogind заводит сессию с tty и выставляет
 # XDG_SESSION_TYPE=tty ещё до нас, поэтому значение по умолчанию не
 # срабатывало никогда. Цена ошибки — вся демонстрация экрана: libwebrtc
@@ -182,19 +193,19 @@ export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-dawn}"
 # переменной (IsRunningUnderWayland: XDG_SESSION_TYPE=wayland И
 # WAYLAND_DISPLAY). Со значением tty он берёт X11-захват через DISPLAY=:0,
 # то есть корневое окно XWayland — а оно у rootless-сервера пустое:
-# Discord показывал ЧЁРНЫЙ экран с одним курсором, и портал dawn при этом
+# Discord показывал ЧЁРНЫЙ экран с одним курсором, и портал parallax при этом
 # не получал ни одного вызова.
 export XDG_SESSION_TYPE=wayland
 export NIXOS_OZONE_WL="${NIXOS_OZONE_WL:-1}"
 
-# dwall (обои) запускается ПОСЛЕ dawn — см. ниже, после старта компоновщика.
+# plx-wall (обои) запускается ПОСЛЕ parallax — см. ниже, после старта компоновщика.
 DWALL_PID=""
 
 MODE_ARGS=()
 [[ "${1:-}" == --winit || "${2:-}" == --winit ]] && MODE_ARGS+=(--winit)
 
 # ── Перезапуск по Super+R ────────────────────────────────────────────────────
-# dawn с этим кодом выходит по действию "restart" (см. state::RESTART_EXIT_CODE):
+# parallax с этим кодом выходит по действию "restart" (см. state::RESTART_EXIT_CODE):
 # сессия сохранена, компоновщик ушёл — а логин в ly остался, и мы поднимаем его
 # заново прямо здесь. Так свежая сборка забирается без перелогина.
 #
@@ -203,7 +214,7 @@ MODE_ARGS=()
 RESTART_CODE=42
 
 # Уборка живёт до цикла: её зовёт и каждая итерация, и trap на выходе.
-# dwall переживал смерть dawn и потом крутил ядро на 80% в цикле
+# plx-wall переживал смерть parallax и потом крутил ядро на 80% в цикле
 # переподключения к мёртвому сокету — добиваем обоих вместе с компоновщиком.
 cleanup() {
     [[ -n "${WATCHDOG_PID:-}" ]] && kill "$WATCHDOG_PID" 2>/dev/null || true
@@ -217,7 +228,7 @@ cleanup() {
     # PipeWire гасим только тот, что подняли САМИ: если он уже работал до нас,
     # он общий для всей пользовательской сессии и не наш, чтобы его убивать.
     # Переживает перезапуск: между итерациями цикла его гасить незачем — новый
-    # dawn найдёт готовый звук (см. dawn_start_audio выше).
+    # parallax найдёт готовый звук (см. plx_start_audio выше).
     if [[ "${1:-}" != --keep-audio ]]; then
         for pid in "${PIPEWIRE_PIDS[@]:-}"; do
             [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
@@ -229,7 +240,7 @@ trap cleanup EXIT INT TERM
 # Пересборка перед перезапуском — только если исходники новее бинаря: когда
 # менять нечего, Super+R это просто мгновенный перезапуск.
 свежие_исходники() {
-    find "$DAWN_DIR/src" "$DAWN_DIR/Cargo.toml" "$DAWN_DIR/default_config.lua" \
+    find "$PLX_DIR/src" "$PLX_DIR/Cargo.toml" "$PLX_DIR/default_config.lua" \
          -newer "$BINARY" -print -quit 2>/dev/null || true
 }
 
@@ -243,10 +254,10 @@ rebuild_if_stale() {
     local ok=0
     local build_log="$LOG_DIR/rebuild_$(date +%Y%m%d_%H%M%S).log"
     set -o pipefail
-    if [[ "$BINARY" == */debug/dawn ]]; then
-        (cd "$DAWN_DIR" && cargo build --target-dir "$BUILD_DIR") 2>&1 | tee "$build_log" || ok=1
+    if [[ "$BINARY" == */debug/parallax ]]; then
+        (cd "$PLX_DIR" && cargo build --target-dir "$BUILD_DIR") 2>&1 | tee "$build_log" || ok=1
     else
-        "$DAWN_DIR/build.sh" 2>&1 | tee "$build_log" || ok=1
+        "$PLX_DIR/build.sh" 2>&1 | tee "$build_log" || ok=1
     fi
     set +o pipefail
     # Мало нулевого кода возврата: сборка может пройти и НЕ обновить бинарь —
@@ -269,53 +280,53 @@ rebuild_if_stale() {
 }
 
 while :; do
-    LOG="$LOG_DIR/dawn_native_$(date +%Y%m%d_%H%M%S).log"
+    LOG="$LOG_DIR/plx_native_$(date +%Y%m%d_%H%M%S).log"
     DWALL_PID=""
     CLIPHIST_PID=""
     WATCHDOG_PID=""
 
     echo "Бинарь:  $BINARY"
-    echo "dwall:   $DWALL_BIN"
+    echo "plx-wall:   $DWALL_BIN"
     echo "Лог:     $LOG"
     echo ""
 
     "$BINARY" "${MODE_ARGS[@]}" > >(tee "$LOG") 2>&1 &
-    DAWN_PID=$!
+    PLX_PID=$!
 
     # ── Сторожевой таймер старта ─────────────────────────────────────────────────
-    # dawn умеет намертво залипать на ПЕРВОМ кадре (futex-дедлок в одном потоке,
+    # parallax умеет намертво залипать на ПЕРВОМ кадре (futex-дедлок в одном потоке,
     # 0% CPU, ни строчки в лог — см. логи 115942/121144). К этому моменту он уже
     # забрал у seat'а клавиатуру с мышью и держит DRM master, так что машина
     # становится недоступна целиком: ни ввода, ни переключения VT, только жёсткий
     # ресет или вход по сети. Сторож ждёт START_TIMEOUT секунд признака жизни
-    # (любая строка после «initial render») и, не дождавшись, убивает dawn — VT
-    # возвращается в шелл сам. Порог задаётся DAWN_START_TIMEOUT.
-    # ── dwall (обои и меню выбора) ───────────────────────────────────────────────
+    # (любая строка после «initial render») и, не дождавшись, убивает parallax — VT
+    # возвращается в шелл сам. Порог задаётся PLX_START_TIMEOUT.
+    # ── plx-wall (обои и меню выбора) ───────────────────────────────────────────────
     # Ждём не САМ ФАЙЛ сокета, а строчку о нём в логе ЭТОГО запуска. Разница
-    # принципиальная: файл сокета остаётся на диске от прошлой сессии (dawn его не
+    # принципиальная: файл сокета остаётся на диске от прошлой сессии (parallax его не
     # всегда прибирает, если его убили), проверка на -S проходила мгновенно, и
-    # dwall стартовал в пустоту — до того, как новый компоновщик вообще начал
+    # plx-wall стартовал в пустоту — до того, как новый компоновщик вообще начал
     # слушать. Он падал, перезапускался по кругу, и нажатие Win+W в этот момент
     # уходило в никуда: pkill не находил процесса.
     #
-    # Дальше держим dwall под присмотром, пока жив dawn: если он умрёт (или его
+    # Дальше держим plx-wall под присмотром, пока жив parallax: если он умрёт (или его
     # уронит смена обоев), поднимаем заново, а не оставляем сессию без обоев.
     if [[ -x "$DWALL_BIN" ]]; then
         (
             for _ in $(seq 1 100); do
-                grep -q "dawn socket:" "$LOG" 2>/dev/null && break
+                grep -q "parallax socket:" "$LOG" 2>/dev/null && break
                 sleep 0.1
             done
-            grep -q "dawn socket:" "$LOG" 2>/dev/null || exit 0
+            grep -q "parallax socket:" "$LOG" 2>/dev/null || exit 0
             export WAYLAND_DISPLAY=wayland-1
             # DISPLAY, унаследованный от логин-шелла (например от параллельной
-            # X-сессии на другом VT), уводил GTK-диалоги dwall в ЧУЖОЙ X-сервер:
-            # проводник по плюсику открывался там и на экране dawn не появлялся
+            # X-сессии на другом VT), уводил GTK-диалоги plx-wall в ЧУЖОЙ X-сервер:
+            # проводник по плюсику открывался там и на экране parallax не появлялся
             # вовсе. В wayland-сессии его быть не должно.
             unset DISPLAY
-            while kill -0 "$DAWN_PID" 2>/dev/null; do
+            while kill -0 "$PLX_PID" 2>/dev/null; do
                 # || true обязателен: скрипт под set -e, а упавший (или убитый)
-                # dwall возвращает ненулевой код — без этого умирал сам сторож,
+                # plx-wall возвращает ненулевой код — без этого умирал сам сторож,
                 # и обои больше не поднимались до конца сессии.
                 "$DWALL_BIN" >/dev/null 2>&1 || true
                 sleep 0.5
@@ -323,7 +334,7 @@ while :; do
         ) &
         DWALL_PID=$!
     else
-        echo "dwall не найден по пути $DWALL_BIN — обои не запустятся" >&2
+        echo "plx-wall не найден по пути $DWALL_BIN — обои не запустятся" >&2
     fi
 
     # ── История буфера обмена (Super+C) ─────────────────────────────────────────
@@ -333,15 +344,15 @@ while :; do
     # экрана (image/png) мимо текстового сторожа прошёл бы незамеченным — а он тут
     # главный жилец (PrtScr кладёт скрин ровно сюда).
     #
-    # Ждём ту же строчку сокета, что и dwall: до неё композитора ещё нет, и
+    # Ждём ту же строчку сокета, что и plx-wall: до неё композитора ещё нет, и
     # wl-paste просто вышел бы с ошибкой.
     if command -v cliphist >/dev/null 2>&1 && command -v wl-paste >/dev/null 2>&1; then
         (
             for _ in $(seq 1 100); do
-                grep -q "dawn socket:" "$LOG" 2>/dev/null && break
+                grep -q "parallax socket:" "$LOG" 2>/dev/null && break
                 sleep 0.1
             done
-            grep -q "dawn socket:" "$LOG" 2>/dev/null || exit 0
+            grep -q "parallax socket:" "$LOG" 2>/dev/null || exit 0
             export WAYLAND_DISPLAY=wayland-1
             unset DISPLAY
             wl-paste --type text --watch cliphist store >/dev/null 2>&1 &
@@ -360,23 +371,23 @@ while :; do
     if [[ -n "$REBUILD_FAILED" ]]; then
         (
             for _ in $(seq 1 100); do
-                grep -q "dawn socket:" "$LOG" 2>/dev/null && break
+                grep -q "parallax socket:" "$LOG" 2>/dev/null && break
                 sleep 0.1
             done
             echo "⚠ ПЕРЕСБОРКА НЕ ПРОШЛА: сессия идёт на ПРЕЖНЕМ бинаре. Лог сборки: $REBUILD_FAILED" >> "$LOG"
             unset DISPLAY
             # Всплывашка — по возможности: демона уведомлений может и не быть.
-            notify-send -u critical "dawn: пересборка не прошла" \
+            notify-send -u critical "plx: пересборка не прошла" \
                 "Сессия на прежнем бинаре. Лог: $REBUILD_FAILED" >/dev/null 2>&1 || true
         ) &
         REBUILD_FAILED=""
     fi
 
-    START_TIMEOUT="${DAWN_START_TIMEOUT:-25}"
+    START_TIMEOUT="${PLX_START_TIMEOUT:-25}"
     (
         for _ in $(seq 1 "$START_TIMEOUT"); do
             sleep 1
-            kill -0 "$DAWN_PID" 2>/dev/null || exit 0   # сам завершился — сторож не нужен
+            kill -0 "$PLX_PID" 2>/dev/null || exit 0   # сам завершился — сторож не нужен
             last=$(grep -v '^[[:space:]]*$' "$LOG" 2>/dev/null | tail -1 || true)
             case "$last" in
                 *"initial render"*) ;;                   # всё ещё на первом кадре
@@ -384,20 +395,20 @@ while :; do
                 *) exit 0 ;;                             # жизнь есть, сторож не нужен
             esac
         done
-        kill -0 "$DAWN_PID" 2>/dev/null || exit 0
-        echo "⚠ СТОРОЖ: за ${START_TIMEOUT}с dawn не прошёл первый кадр — убиваю (SIGKILL)." | tee -a "$LOG"
-        kill -KILL "$DAWN_PID" 2>/dev/null || true
+        kill -0 "$PLX_PID" 2>/dev/null || exit 0
+        echo "⚠ СТОРОЖ: за ${START_TIMEOUT}с parallax не прошёл первый кадр — убиваю (SIGKILL)." | tee -a "$LOG"
+        kill -KILL "$PLX_PID" 2>/dev/null || true
     ) &
     WATCHDOG_PID=$!
 
     # Код возврата нужен целым: он и решает, перезапускаться ли (Super+R).
-    # `|| DAWN_RC=$?` обязателен — скрипт под set -e.
-    DAWN_RC=0
-    wait "$DAWN_PID" || DAWN_RC=$?
-    if [[ "$DAWN_RC" == "$RESTART_CODE" ]]; then
+    # `|| PLX_RC=$?` обязателен — скрипт под set -e.
+    PLX_RC=0
+    wait "$PLX_PID" || PLX_RC=$?
+    if [[ "$PLX_RC" == "$RESTART_CODE" ]]; then
         cleanup --keep-audio
         echo ""
-        echo "══ Super+R: перезапуск dawn ══"
+        echo "══ Super+R: перезапуск parallax ══"
         rebuild_if_stale
         continue
     fi

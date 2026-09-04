@@ -1,4 +1,4 @@
--- dawn compositor config
+-- parallax compositor config
 --
 -- This file is Lua. It's evaluated once at startup (and again on
 -- Super+Shift+C, "reload_config"). Two functions are available:
@@ -46,7 +46,7 @@ set{ close_anim = true }
 --     Копия ОДНА: она чуть больше экрана и сдвигается затухающе, поэтому
 --     повторов и швов не бывает ни при какой камере. false — прежнее
 --     поведение (картинка всегда ровно в размер выхода и не двигается вовсе).
---     Если текстуру обоев достать не удалось, dawn молча возвращается к
+--     Если текстуру обоев достать не удалось, parallax молча возвращается к
 --     прежнему поведению — без обоев экран был бы чёрным.
 --
 --   set{ pan_drift = 0.5 }
@@ -95,7 +95,7 @@ set{ close_anim = true }
 --   spawn            cmd = "ghostty"
 --   quit             (saves session, stops the compositor)
 --   restart          (saves session and restarts the compositor in place:
---                     dawn exits with code 42 and launch_native.sh brings it
+--                     parallax exits with code 42 and launch_native.sh brings it
 --                     back up, rebuilding first if the sources are newer than
 --                     the binary. Picks up a fresh build without logging out;
 --                     clients do NOT survive — the wayland socket dies with
@@ -176,6 +176,17 @@ set{ close_anim = true }
 
 xkb{ layout = "us,ru", variant = "", options = "grp:alt_shift_toggle" }
 
+-- Interface language / язык интерфейса: "en" (default) or "ru".
+--
+-- Covers what you read on screen — the bar, the wifi/bluetooth/audio menus,
+-- the screenshot and overview hints, notifications — and the replies of the
+-- terminal commands (plx-host, the control socket). Re-read on Super+Shift+C,
+-- so you can switch without restarting.
+--
+-- Logs are ALWAYS English and this knob does not touch them: a log ends up in
+-- someone else's bug report, and it has to be readable by more than its author.
+set{ lang = "en" }
+
 -- Клавиша режима лупы (Super+Space по умолчанию).
 set{ bird_eye_key = "space" }
 
@@ -196,6 +207,23 @@ set{ infinite_wallpaper = true }
 
 -- Блюр под панелью. Выключен: не отсмотрен живьём, см. описание выше.
 set{ blur = false }
+
+-- Появление рабочего места при запуске: холст выплывает из темноты и доезжает
+-- до своего зума, панель приезжает сверху. Секунда с небольшим, ровно один раз
+-- за сеанс. Длительность тянется общим темпом (anim_speed выше).
+set{ intro = true }
+
+-- Звук уведомления: короткий тон на каждое всплывающее сообщение — parallax
+-- слышит их сам, на сессионной шине, поэтому демон уведомлений может быть
+-- любым (mako, dunst, свой).
+--   notify_sound  — путь к файлу; пусто = вшитый тон (мягкий стеклянный,
+--                   CC0, см. assets/sounds/README.md), "off" = молчать.
+--                   Рядом с вшитым лежат ещё два: notify-cloud.ogg потеплее,
+--                   notify-polite.ogg — три тихих деревянных щелчка.
+--   notify_volume — громкость, 0.0…1.0.
+-- Приложение, попросившее тишины подсказкой suppress-sound (плееры на смену
+-- трека), звучать не будет.
+set{ notify_sound = "", notify_volume = 0.35 }
 
 -- ── VT switching ─────────────────────────────────────────────────────────
 for i = 1, 12 do
@@ -269,7 +297,7 @@ bind{ mods = "super+shift", key = "v", action = "column_toggle_tabbed" }
 
 -- Фокус между плавающим слоем и полосой колонок
 -- (niri: switch-focus-between-floating-and-tiling). У niri это Mod+Space, но
--- в dawn Super+Space занят режимом лупы (bird_eye_key, перехватывается раньше
+-- в parallax Super+Space занят режимом лупы (bird_eye_key, перехватывается раньше
 -- биндингов), поэтому здесь Super+Shift+Space.
 bind{ mods = "super+shift", key = "space", action = "focus_floating_or_tiling" }
 -- Как вести вид за активной колонкой: never (по умолчанию, как в niri),
@@ -320,7 +348,7 @@ bind{ mods = "super+ctrl", key = "j",   action = "move_focused", dx = 0, dy = 20
 bind{ mods = "super+ctrl", key = "Down", action = "move_focused", dx = 0, dy = 20 }
 
 -- Note: Super+Shift+H/L are taken by set_mfact above, so resize only binds
--- j/k/arrows here (matches the historical behavior of dawn's hardcoded
+-- j/k/arrows here (matches the historical behavior of parallax's hardcoded
 -- keymap, where the mfact bind shadowed the resize bind for h/l).
 bind{ mods = "super+shift", key = "k",     action = "resize_focused", dw = 0, dh = -30 }
 bind{ mods = "super+shift", key = "Up",    action = "resize_focused", dw = 0, dh = -30 }
@@ -361,7 +389,7 @@ bind{ mods = "super", key = "m", action = "toggle_magnetism" }
 -- ── Мультиюзер: раздача стола гостям ─────────────────────────────────────
 -- Тумблер: включает раздачу и показывает шестизначный код на панели (справа,
 -- «код 123456 · N»), второе нажатие выключает. Гость подключается программой
--- dshare по адресу этой машины и коду; порт по умолчанию 7373 (задать свой —
+-- plx-share по адресу этой машины и коду; порт по умолчанию 7373 (задать свой —
 -- `port = 1234`). Пока раздача идёт, тайлинг и рабочие столы выключены: у
 -- каждого участника своя камера по общему бесконечному холсту.
 bind{ mods = "super+shift", key = "s", action = "share_toggle" }
@@ -374,19 +402,19 @@ bind{ mods = "ctrl+shift", key = "space", action = "layout_prev" }
 bind{ mods = "super+shift", key = "c", action = "reload_config" }
 
 -- ── Обновление компоновщика (Super+R) ────────────────────────────────────
--- Перезапуск на месте: сессия окон сохраняется в session.json, dawn выходит с
+-- Перезапуск на месте: сессия окон сохраняется в session.json, parallax выходит с
 -- кодом 42, а launch_native.sh поднимает его заново — пересобрав, если
 -- исходники новее бинаря. Так свежая сборка забирается без перелогина в ly.
 -- Окна при этом закрываются: вэйландовый сокет умирает вместе с компоновщиком.
 -- Настройки одного config.lua перечитываются дешевле — Super+Shift+C.
 bind{ mods = "super", key = "r", action = "restart" }
 
--- ── Обои (dwall) ────────────────────────────────────────────────────────────
+-- ── Обои (plx-wall) ────────────────────────────────────────────────────────────
 -- Win+W открывает меню выбора: карточки обоев + плитка «+» для добавления.
 -- Наведи курсор на карточку — в углу появится крестик удаления; то же самое
 -- делает правый клик по карточке. Win+Shift+W листает обои без меню.
-bind{ mods = "super", key = "w", action = "spawn", cmd = "pkill -USR2 -x dwall" }
-bind{ mods = "super+shift", key = "w", action = "spawn", cmd = "pkill -USR1 -x dwall" }
+bind{ mods = "super", key = "w", action = "spawn", cmd = "pkill -USR2 -x plx-wall" }
+bind{ mods = "super+shift", key = "w", action = "spawn", cmd = "pkill -USR1 -x plx-wall" }
 
 -- ── Плавающий слой ─────────────────────────────────────────────────────────
 -- Win+V: выбранные окна (или сфокусированное) — в плавающий слой и обратно.
@@ -419,7 +447,7 @@ bind{ mods = "", key = "XF86Bluetooth", action = "bluetooth_menu" }
 bind{ mods = "super+ctrl", key = "b", action = "bluetooth_power" }
 
 -- При старте сессии поднять адаптер и подключить устройство, которым
--- пользовались последним (адрес запоминается в ~/.local/state/dawn/bluetooth
+-- пользовались последним (адрес запоминается в ~/.local/state/parallax/bluetooth
 -- при каждом подключении из меню). set{ bluetooth_autoconnect = false } — выкл.
 set{ bluetooth_autoconnect = true }
 
@@ -440,7 +468,7 @@ set{ bluetooth_autoconnect = true }
 -- В шлеме: курок контроллера — левая кнопка мыши, хват — тащить панель,
 -- стик вперёд/назад — приблизить и отдалить её, вбок — размер. Клавиатура и
 -- мышь работают как обычно; без контроллеров указкой служит взгляд.
--- Win+Alt+V — ВЕСЬ вход в шлем: dawn сам поднимет wivrn-server, сам найдёт
+-- Win+Alt+V — ВЕСЬ вход в шлем: parallax сам поднимет wivrn-server, сам найдёт
 -- рантайм OpenXR и будет две минуты ждать, пока ты наденешь Quest и запустишь
 -- на нём WiVRn, — и войдёт в VR в ту же секунду, как шлем появится. Нажать
 -- ещё раз: пока ждём — отменить ожидание, в шлеме — снять шлем.
@@ -451,8 +479,8 @@ bind{ mods = "super+alt", key = "a", action = "vr_ar" }
 bind{ mods = "super+alt", key = "g", action = "vr_layout" }
 bind{ mods = "super+alt", key = "h", action = "vr_recenter" }
 
--- Minecraft: окна dawn панелями в мире игры (см. mine/). Бинд включает режим —
--- дальше нужен запущенный Minecraft с модом dmine, который сам подключится к
+-- Minecraft: окна parallax панелями в мире игры (см. mine/). Бинд включает режим —
+-- дальше нужен запущенный Minecraft с модом plx-mine, который сам подключится к
 -- сокету. Выйти — тем же сочетанием: изнутри игры режим не гасится намеренно,
 -- иначе панели пропадут, а клавиатура в этот момент у Minecraft.
 bind{ mods = "super+alt", key = "m", action = "mine_mode" }
@@ -464,11 +492,11 @@ bind{ mods = "super+alt", key = "m", action = "mine_mode" }
 -- radius — на каком расстоянии стоят панели, метры (0 — считать по
 --          охраняемой зоне шлема, её отдаёт сам рантайм);
 -- ar     — входить сразу в passthrough;
--- auto   — надевать шлем при старте dawn.
+-- auto   — надевать шлем при старте parallax.
 vr{ layout = "дуга", scale = 0.0008, radius = 0, ar = false, auto = false }
 
--- Жесты и кнопки контроллера — обычные действия dawn, те же, что в bind{}.
--- Ключи (полный список — `dawnctl vr gestures`):
+-- Жесты и кнопки контроллера — обычные действия parallax, те же, что в bind{}.
+-- Ключи (полный список — `plxctl vr gestures`):
 --   контроллер: menu_button (☰ и нажатие на стик), button_a, button_b,
 --               stick_left / stick_right / stick_up / stick_down;
 --   рука:       fist (кулак), two_fists, thumb_up (палец вверх), palm_up,
@@ -538,7 +566,7 @@ bind{ mods = "super", key = "c", action = "spawn",
 --             модель из EDID ("Redmi 30 HFCW"). Коннектор надёжнее.
 --   width/height/refresh — режим. Точное совпадение по размеру, ближайшая к
 --             refresh частота из тех, что коннектор реально отдаёт. Если
---             такого размера у коннектора НЕТ, dawn строит его сам по CVT и
+--             такого размера у коннектора НЕТ, parallax строит его сам по CVT и
 --             отдаёт ядру: меньший режим железо растягивает своим скейлером на
 --             всю матрицу. Так на 4K-панели получается настоящий FullHD —
 --             вчетверо меньше пикселей на отрисовку, а не просто крупнее
@@ -574,7 +602,7 @@ monitor{ name = "DP-2", width = 2560, height = 1080, refresh = 200, x = 0, y = 0
 monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- ЖЕСТЫ ТАЧПАДА (gesture{}) — модель driftwm, перенесённая в dawn 30.08.2026
+-- ЖЕСТЫ ТАЧПАДА (gesture{}) — модель driftwm, перенесённая в parallax 30.08.2026
 -- ═══════════════════════════════════════════════════════════════════════════
 --
 -- Жест — такой же бинд, как клавиатурный, только триггер у него пальцы:
@@ -583,7 +611,7 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 --            where = "window", action = "resize-window" }
 --
 --   mods    — как у bind{}: "alt", "super", "shift", "ctrl" и их сочетания
---   fingers — сколько пальцев (2–5; 2 приходят прокруткой, dawn это скрывает)
+--   fingers — сколько пальцев (2–5; 2 приходят прокруткой, parallax это скрывает)
 --   kind    — swipe, swipe-up/down/left/right, doubletap-swipe,
 --             pinch, pinch-in, pinch-out, hold
 --   where   — window (под курсором окно), canvas (пусто), anywhere (по умолчанию)
@@ -604,14 +632,14 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 -- ВСЁ НИЖЕ ЗАКОММЕНТИРОВАНО НАМЕРЕННО, и это не лень.
 --
 -- Пока таблица пуста, жесты обрабатывают прежние ветки input.rs — то есть
--- поведение dawn ровно такое, каким было до появления gesture{}. Стоит
+-- поведение parallax ровно такое, каким было до появления gesture{}. Стоит
 -- раскомментировать строку, и её жест переходит к таблице ЦЕЛИКОМ, отменяя
 -- встроенный. Там, где это отменяет что-то существующее, стоит пометка
 -- «ПЕРЕБИВАЕТ» — читать перед тем, как включать.
 -- ───────────────────────────────────────────────────────────────────────────
 
 -- ВНИМАНИЕ (01.09.2026): всё, что ниже, теперь РАБОТАЕТ БЕЗ ВАС — этот список
--- встроен в dawn как умолчание (`ЖЕСТЫ_ПО_УМОЛЧАНИЮ` в config.rs) и включается
+-- встроен в parallax как умолчание (`ЖЕСТЫ_ПО_УМОЛЧАНИЮ` в config.rs) и включается
 -- после вашего конфига. Строки оставлены здесь как справочник и как заготовка
 -- для правки: свой `gesture{}` с тем же триггером, модификаторами и контекстом
 -- ОТМЕНЯЕТ умолчание, а не добавляется к нему. Чтобы жеста не было вовсе,
@@ -642,14 +670,14 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 -- gesture{ mods = "super", fingers = 3, kind = "hold", action = "center_window" }
 
 -- ── Чего из driftwm перенести НЕ ВО ЧТО ────────────────────────────────────
--- Эти его действия в dawn не существуют, и придумывать им смысл было бы хуже,
+-- Эти его действия в parallax не существуют, и придумывать им смысл было бы хуже,
 -- чем сказать прямо:
 --   fit-window, fit-window-snapped   — «вырасти в свободное место»
 --   zoom-to-fit, zoom-to-fit-snapped — «вписать всё в экран»
 -- Триггеры под них есть (pinch-in/out на 2 и 4 пальца) — нужны сами действия.
 --
 -- Отдельно: 3-finger-doubletap-swipe (тап тремя, потом свайп) требует задержки
--- среднего клика с тачпада, а средний клик в dawn уже занят — им, например,
+-- среднего клика с тачпада, а средний клик в parallax уже занят — им, например,
 -- останавливают раздачу с панели. Триггер разбирается, но пока не срабатывает.
 
 -- ═══════════════════════════════════════════════════════════════════════════

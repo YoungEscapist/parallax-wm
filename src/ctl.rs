@@ -1,12 +1,12 @@
-//! Управляющий сокет: дёргать действия dawn и снимать кадры без клавиатуры.
+//! Управляющий сокет: дёргать действия parallax и снимать кадры без клавиатуры.
 //!
 //! **Зачем.** Проверить правку рендера можно было только руками за машиной:
-//! действия dawn достижимы исключительно с физической клавиатуры, а второй
+//! действия parallax достижимы исключительно с физической клавиатуры, а второй
 //! экземпляр на свободном VT читает те же evdev-устройства, что и живой сеанс,
 //! то есть ловит чужие нажатия (и умеет, например, увести VT). Сокет разрывает
 //! эту связку: тот же `dispatch_action`, но по строке в UNIX-сокет.
 //!
-//! **Где включается.** Только по `DAWN_CTL=1` (и всегда — в `--headless`).
+//! **Где включается.** Только по `PLX_CTL=1` (и всегда — в `--headless`).
 //! В живом сеансе по умолчанию выключен: это дыра ровно того размера, что и
 //! права на сокет, — кто может писать в него, тот может выполнить любое
 //! действие композитора.
@@ -32,26 +32,27 @@ use smithay::reexports::calloop::{
     generic::Generic, Interest, LoopHandle, Mode, PostAction,
 };
 
-use crate::Dawn;
+use crate::Parallax;
+use crate::{т, тф};
 
-/// Путь сокета: `DAWN_CTL_SOCKET`, иначе `$XDG_RUNTIME_DIR/dawn-<сокет>.ctl`.
+/// Путь сокета: `PLX_CTL_SOCKET`, иначе `$XDG_RUNTIME_DIR/plx-<сокет>.ctl`.
 ///
 /// Имя вейландовского сокета в пути не случайно: на машине может идти живой
 /// сеанс и харнесс разом, и попасть командой не в тот экземпляр — ровно та
 /// ошибка, ради избежания которой всё это и написано.
-pub fn путь_сокета(state: &Dawn) -> std::path::PathBuf {
-    if let Some(явный) = std::env::var_os("DAWN_CTL_SOCKET") {
+pub fn путь_сокета(state: &Parallax) -> std::path::PathBuf {
+    if let Some(явный) = std::env::var_os("PLX_CTL_SOCKET") {
         return std::path::PathBuf::from(явный);
     }
     let каталог = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    каталог.join(format!("dawn-{}.ctl", state.socket_name.to_string_lossy()))
+    каталог.join(format!("plx-{}.ctl", state.socket_name.to_string_lossy()))
 }
 
 pub fn init(
-    handle: &LoopHandle<'static, Dawn>,
-    state: &Dawn,
+    handle: &LoopHandle<'static, Parallax>,
+    state: &Parallax,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let путь = путь_сокета(state);
     // Остаток от прошлого запуска: bind по занятому пути падает с EADDRINUSE,
@@ -59,17 +60,17 @@ pub fn init(
     let _ = std::fs::remove_file(&путь);
     let listener = UnixListener::bind(&путь)?;
     listener.set_nonblocking(true)?;
-    tracing::info!("dawn/ctl: слушаю {:?}", путь);
+    tracing::info!("plx/ctl: listening on {:?}", путь);
 
     handle.insert_source(
         Generic::new(listener, Interest::READ, Mode::Level),
-        |_, listener, state: &mut Dawn| {
+        |_, listener, state: &mut Parallax| {
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => обслужить(stream, state),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => {
-                        tracing::warn!("dawn/ctl: accept: {}", e);
+                        tracing::warn!("plx/ctl: accept: {}", e);
                         break;
                     }
                 }
@@ -80,7 +81,7 @@ pub fn init(
     Ok(())
 }
 
-fn обслужить(stream: UnixStream, state: &mut Dawn) {
+fn обслужить(stream: UnixStream, state: &mut Parallax) {
     // Блокирующее чтение — сознательно: команда это одна короткая строка от
     // своего же харнесса, а неблокирующий разбор по кускам стоил бы буфера
     // состояния на соединение ради нулевой выгоды.
@@ -89,7 +90,7 @@ fn обслужить(stream: UnixStream, state: &mut Dawn) {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("dawn/ctl: clone: {}", e);
+            tracing::warn!("plx/ctl: clone: {}", e);
             return;
         }
     });
@@ -115,7 +116,7 @@ fn обслужить(stream: UnixStream, state: &mut Dawn) {
     let _ = stream.flush();
 }
 
-fn выполнить(строка: &str, state: &mut Dawn) -> String {
+fn выполнить(строка: &str, state: &mut Parallax) -> String {
     let (команда, хвост) = match строка.split_once(char::is_whitespace) {
         Some((имя, остаток)) => (имя, остаток.trim()),
         None => (строка, ""),
@@ -123,11 +124,11 @@ fn выполнить(строка: &str, state: &mut Dawn) -> String {
     match команда {
         "shot" => {
             if хвост.is_empty() {
-                return "ошибка: shot без пути".into();
+                return т!("ошибка: shot без пути", "error: shot without a path").into();
             }
             state.shot_request = Some(std::path::PathBuf::from(хвост));
             state.request_redraw();
-            format!("ok: снимок будет в {}", хвост)
+            тф!("ok: снимок будет в {}", "ok: the screenshot will go to {}", хвост)
         }
         "action" => {
             let (имя, аргументы) = match хвост.split_once(char::is_whitespace) {
@@ -136,12 +137,12 @@ fn выполнить(строка: &str, state: &mut Dawn) -> String {
             };
             match crate::config::action_from_str(имя, аргументы) {
                 Some(действие) => {
-                    tracing::info!("dawn/ctl: действие {} {{{}}}", имя, аргументы);
+                    tracing::info!("plx/ctl: action {} {{{}}}", имя, аргументы);
                     state.dispatch_action(действие);
                     state.request_redraw();
                     "ok".into()
                 }
-                None => format!("ошибка: не разобрал действие '{}' {{{}}}", имя, аргументы),
+                None => тф!("ошибка: не разобрал действие '{}' {{{}}}", "error: could not parse the action '{}' {{{}}}", имя, аргументы),
             }
         }
         "windows" => окна(state),
@@ -152,14 +153,28 @@ fn выполнить(строка: &str, state: &mut Dawn) -> String {
         "portal" => портал(хвост, state),
         "vr" => шлем(хвост, state),
         "mine" => шахта(хвост, state),
-        "help" => "shot <путь> | action <имя> [k=v ...] | windows | \
-                   mouse to X Y | mouse move DX DY | mouse down|up|click [левая|правая|средняя] | \
-                   mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
-                   key [logo+shift+]<имя> | key down|up <имя> | pointer | \
-                   share [start [порт] | stop | status] | \
-                   portal pick [типы] | portal cancel | \
-                   vr [mode|on|off|ar|layout|status]".into(),
-        иное => format!("ошибка: не знаю команду '{}'", иное),
+        "help" => т!(
+            "shot <путь> | action <имя> [k=v ...] | windows | pointer | \
+             mouse to X Y | mouse move DX DY | mouse down|up|click [левая|правая|средняя] | \
+             mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
+             key [logo+shift+]<имя> | key down|up <имя> | \
+             share [start [порт] | stop | status] | \
+             portal [pick [типы] | cancel] | \
+             vr [mode|on|off|ar|layout|recenter|menu|keys|pults|press <пульт> <n>|\
+             status|panels|input|gestures|shot <путь>] | \
+             mine [on|off|mode|layout|status|panels|ray x y z dx dy dz|pin ключ x y|game номер]",
+            "shot <path> | action <name> [k=v ...] | windows | pointer | \
+             mouse to X Y | mouse move DX DY | mouse down|up|click [left|right|middle] | \
+             mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
+             key [logo+shift+]<name> | key down|up <name> | \
+             share [start [port] | stop | status] | \
+             portal [pick [types] | cancel] | \
+             vr [mode|on|off|ar|layout|recenter|menu|keys|pults|press <panel> <n>|\
+             status|panels|input|gestures|shot <path>] | \
+             mine [on|off|mode|layout|status|panels|ray x y z dx dy dz|pin key x y|game number]"
+        )
+        .into(),
+        иное => тф!("ошибка: не знаю команду '{}'", "error: unknown command '{}'", иное),
     }
 }
 
@@ -170,7 +185,7 @@ fn выполнить(строка: &str, state: &mut Dawn) -> String {
 /// когда Discord или OBS просят экран, — иначе можно было посмотреть лишь на
 /// живом сеансе. `типы` те же, что в спецификации: 1 — только мониторы (так
 /// шлёт OBS), 2 — только окна, 3 — и то и другое.
-fn портал(хвост: &str, state: &mut Dawn) -> String {
+fn портал(хвост: &str, state: &mut Parallax) -> String {
     let (что, довод) = match хвост.split_once(char::is_whitespace) {
         Some((первое, остаток)) => (первое, остаток.trim()),
         None => (хвост, ""),
@@ -179,16 +194,16 @@ fn портал(хвост: &str, state: &mut Dawn) -> String {
         "" | "pick" | "выбор" => {
             let типы = довод.parse::<u32>().unwrap_or(3).clamp(1, 3);
             state.portal_pick_debug(типы);
-            format!("ok: выбор источника (типы={типы})")
+            тф!("ok: выбор источника (типы={типы})", "ok: source picker (types={типы})")
         }
         "cancel" | "отмена" => {
             if !state.portal_picking() {
-                return "выбор и так не идёт".into();
+                return т!("выбор и так не идёт", "no pick is running anyway").into();
             }
             state.portal_pick_click(true);
-            "ok: выбор отменён".into()
+            т!("ok: выбор отменён", "ok: pick cancelled").into()
         }
-        иное => format!("ошибка: portal [pick [типы] | cancel], а не '{иное}'"),
+        иное => тф!("ошибка: portal [pick [типы] | cancel], а не '{иное}'", "error: portal [pick [types] | cancel], not '{иное}'"),
     }
 }
 
@@ -198,7 +213,7 @@ fn портал(хвост: &str, state: &mut Dawn) -> String {
 /// умеет сказать только «ok»: код доступа и адрес, которые человек диктует
 /// гостю, остаются в логе композитора, куда из терминала не заглянешь.
 /// Здесь всё нужное возвращается прямо в терминал одной строкой.
-fn раздача(хвост: &str, state: &mut Dawn) -> String {
+fn раздача(хвост: &str, state: &mut Parallax) -> String {
     let (что, довод) = match хвост.split_once(char::is_whitespace) {
         Some((первое, остаток)) => (первое, остаток.trim()),
         None => (хвост, ""),
@@ -209,30 +224,36 @@ fn раздача(хвост: &str, state: &mut Dawn) -> String {
             let порт = довод.parse::<u16>().unwrap_or(0);
             match state.раздача_начать(порт) {
                 Ok(_) => состояние_раздачи(state),
-                Err(причина) => format!("ошибка: {причина}"),
+                Err(причина) => тф!("ошибка: {причина}", "error: {причина}"),
             }
         }
         "stop" | "off" | "выкл" => {
             if !state.раздача_идёт() {
-                return "раздача и так выключена".into();
+                return т!("раздача и так выключена", "sharing is already off").into();
             }
             state.раздача_закончить();
-            "ok: раздача выключена".into()
+            т!("ok: раздача выключена", "ok: sharing stopped").into()
         }
-        иное => format!("ошибка: share [start [порт] | stop | status], а не '{иное}'"),
+        иное => тф!("ошибка: share [start [порт] | stop | status], а не '{иное}'", "error: share [start [port] | stop | status], not '{иное}'"),
     }
 }
 
-fn состояние_раздачи(state: &Dawn) -> String {
+#[cfg(not(feature = "share"))]
+fn состояние_раздачи(_state: &Parallax) -> String {
+    crate::share::нет_фичи().into()
+}
+
+#[cfg(feature = "share")]
+fn состояние_раздачи(state: &Parallax) -> String {
     let Some(раздача) = state.раздача.as_ref() else {
-        return "раздача выключена".into();
+        return т!("раздача выключена", "sharing is off").into();
     };
-    let mut ответ = format!(
-        "раздача идёт: код {}, порт {}, кадр {}×{}",
+    let mut ответ = тф!(
+        "раздача идёт: код {}, порт {}, кадр {}×{}", "sharing is on: code {}, port {}, frame {}×{}",
         раздача.код, раздача.порт, раздача.кадр.0, раздача.кадр.1,
     );
     for адрес in адреса_машины() {
-        ответ.push_str(&format!("\n  гостю: dshare {}:{} {}", адрес, раздача.порт, раздача.код));
+        ответ.push_str(&тф!("\n  гостю: plx-share {}:{} {}", "\n  for the guest: plx-share {}:{} {}", адрес, раздача.порт, раздача.код));
     }
     let гости: Vec<String> = раздача
         .гости
@@ -243,12 +264,12 @@ fn состояние_раздачи(state: &Dawn) -> String {
                 "{} «{}»{}",
                 гость.id,
                 гость.имя,
-                if гость.за_хостом { ", за хостом" } else { "" },
+                if гость.за_хостом { т!(", за хостом", ", following the host") } else { "" },
             )
         })
         .collect();
-    ответ.push_str(&format!(
-        "\n  гостей: {}{}",
+    ответ.push_str(&тф!(
+        "\n  гостей: {}{}", "\n  guests: {}{}",
         гости.len(),
         if гости.is_empty() { String::new() } else { format!(" — {}", гости.join(", ")) },
     ));
@@ -258,8 +279,9 @@ fn состояние_раздачи(state: &Dawn) -> String {
 /// Адреса этой машины, по которым до неё дотянется гость.
 ///
 /// Читаем `getifaddrs`, а не зовём `ip`: команда есть не везде, а формат её
-/// вывода — не договор. Отбрасываемloopback (по нему придёт только тот, кто уже
-/// сидит за этой же машиной) и не-IP семейства.
+/// вывода — не договор. Отбрасываем loopback (по нему придёт только тот, кто
+/// уже сидит за этой же машиной) и не-IP семейства.
+#[cfg(feature = "share")]
 fn адреса_машины() -> Vec<String> {
     let mut список = Vec::new();
     let mut головной: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -323,23 +345,23 @@ fn адреса_машины() -> Vec<String> {
 /// объяснение, почему не через `pointer.motion` напрямую).
 ///
 /// Координаты — ЭКРАННЫЕ физические, как их видит глаз на снимке `shot`.
-/// Перевод в холст делает сам dawn (`pointer_location` += дельта ⁄ зум),
+/// Перевод в холст делает сам parallax (`pointer_location` += дельта ⁄ зум),
 /// поэтому «навести в точку» — это ровно одно событие с разностью координат.
-fn мышь(хвост: &str, state: &mut Dawn) -> String {
+fn мышь(хвост: &str, state: &mut Parallax) -> String {
     let слова: Vec<&str> = хвост.split_whitespace().collect();
     let число = |i: usize| слова.get(i).and_then(|s| s.parse::<f64>().ok());
 
     match слова.first().copied() {
         Some("to") => {
             let (Some(x), Some(y)) = (число(1), число(2)) else {
-                return "ошибка: mouse to X Y".into();
+                return т!("ошибка: mouse to X Y", "error: mouse to X Y").into();
             };
             навести(state, x, y);
             указатель(state)
         }
         Some("move") => {
             let (Some(dx), Some(dy)) = (число(1), число(2)) else {
-                return "ошибка: mouse move DX DY".into();
+                return т!("ошибка: mouse move DX DY", "error: mouse move DX DY").into();
             };
             state.process_input_event(двинуть(dx, dy));
             указатель(state)
@@ -349,7 +371,7 @@ fn мышь(хвост: &str, state: &mut Dawn) -> String {
                 None => crate::synth::КНОПКА_ЛКМ,
                 Some(имя) => match crate::synth::кнопка_по_имени(имя) {
                     Some(к) => к,
-                    None => return format!("ошибка: не знаю кнопку '{}'", имя),
+                    None => return тф!("ошибка: не знаю кнопку '{}'", "error: unknown button '{}'", имя),
                 },
             };
             match движение {
@@ -366,11 +388,11 @@ fn мышь(хвост: &str, state: &mut Dawn) -> String {
             let (Some(x1), Some(y1), Some(x2), Some(y2)) =
                 (число(1), число(2), число(3), число(4))
             else {
-                return "ошибка: mouse drag X1 Y1 X2 Y2".into();
+                return т!("ошибка: mouse drag X1 Y1 X2 Y2", "error: mouse drag X1 Y1 X2 Y2").into();
             };
             навести(state, x1, y1);
             нажать(state, crate::synth::КНОПКА_ЛКМ, true);
-            // Дробим на шаги, а не прыгаем разом: dawn считает драг по потоку
+            // Дробим на шаги, а не прыгаем разом: parallax считает драг по потоку
             // событий (порог 4 px у миникарты, инерция у пана, расталкивание
             // окон), и один прыжок прошёл бы мимо всей этой логики.
             const ШАГОВ: i32 = 12;
@@ -385,7 +407,7 @@ fn мышь(хвост: &str, state: &mut Dawn) -> String {
         }
         Some("scroll") => {
             let Some(n) = число(1) else {
-                return "ошибка: mouse scroll N (зубцы, вниз > 0)".into();
+                return т!("ошибка: mouse scroll N (зубцы, вниз > 0)", "error: mouse scroll N (detents, down > 0)").into();
             };
             state.process_input_event(smithay::backend::input::InputEvent::PointerAxis::<
                 crate::synth::Синтетика,
@@ -395,7 +417,7 @@ fn мышь(хвост: &str, state: &mut Dawn) -> String {
             state.request_redraw();
             "ok".into()
         }
-        _ => "ошибка: mouse to|move|down|up|click|drag|scroll".into(),
+        _ => т!("ошибка: mouse to|move|down|up|click|drag|scroll", "error: mouse to|move|down|up|click|drag|scroll").into(),
     }
 }
 
@@ -411,7 +433,7 @@ fn мышь(хвост: &str, state: &mut Dawn) -> String {
 /// а проверять, что взгляд попадает в ту панель и в тот её пиксель, надо — это
 /// ровно то место, где ошибка выглядит как «клик уходит не туда», и найти её
 /// глазами в игре почти невозможно.
-fn шахта(хвост: &str, state: &mut Dawn) -> String {
+fn шахта(хвост: &str, state: &mut Parallax) -> String {
     let слова: Vec<&str> = хвост.split_whitespace().collect();
     match слова.first().copied() {
         None | Some("status") => crate::mine::состояние(state),
@@ -421,24 +443,24 @@ fn шахта(хвост: &str, state: &mut Dawn) -> String {
         }
         Some("on") => match crate::mine::включить(state) {
             Ok(()) => crate::mine::состояние(state),
-            Err(e) => format!("ошибка: {e}"),
+            Err(e) => тф!("ошибка: {e}", "error: {e}"),
         },
         Some("off") => {
             crate::mine::выключить(state);
-            "ok: режим выключен".into()
+            т!("ok: режим выключен", "ok: mode off").into()
         }
         Some("layout") => {
             let новая = crate::mine::сменить_раскладку(state);
-            format!("ok: раскладка {}", новая.имя())
+            тф!("ok: раскладка {}", "ok: layout {}", новая.имя())
         }
         Some("panels") => crate::mine::панели_строкой(state),
         Some("ray") => {
             let числа: Vec<f32> = слова[1..]
                 .iter()
-                .filter_map(|с| с.parse::<f32>().ok())
+                .filter_map(|сл| сл.parse::<f32>().ok())
                 .collect();
             if числа.len() != 6 {
-                return "ошибка: mine ray <x y z> <dx dy dz>".into();
+                return т!("ошибка: mine ray <x y z> <dx dy dz>", "error: mine ray <x y z> <dx dy dz>").into();
             }
             crate::mine::луч_снаружи(
                 state,
@@ -451,9 +473,9 @@ fn шахта(хвост: &str, state: &mut Dawn) -> String {
         // отпускает. Без этой команды закрепление проверялось бы только живой
         // игрой — а это ровно тот путь ввода, где промах не видно глазами.
         Some("pin") => {
-            let ключ: u64 = слова.get(1).and_then(|с| с.parse().ok()).unwrap_or(0);
-            let x: f32 = слова.get(2).and_then(|с| с.parse().ok()).unwrap_or(0.0);
-            let y: f32 = слова.get(3).and_then(|с| с.parse().ok()).unwrap_or(0.0);
+            let ключ: u64 = слова.get(1).and_then(|сл| сл.parse().ok()).unwrap_or(0);
+            let x: f32 = слова.get(2).and_then(|сл| сл.parse().ok()).unwrap_or(0.0);
+            let y: f32 = слова.get(3).and_then(|сл| сл.parse().ok()).unwrap_or(0.0);
             crate::mine::закрепить_снаружи(state, ключ, x, y)
         }
         // `mine game <номер из windows>` — объявить окно окном игры («-» снять).
@@ -461,25 +483,27 @@ fn шахта(хвост: &str, state: &mut Dawn) -> String {
         // вовсе, и без этой команды правило «игра всегда сверху и клавиатура её»
         // проверялось бы только запуском Minecraft.
         Some("game") => {
-            let номер = слова.get(1).and_then(|с| с.parse::<usize>().ok());
+            let номер = слова.get(1).and_then(|сл| сл.parse::<usize>().ok());
             crate::mine::назначить_игру(state, номер)
         }
-        иное => format!(
+        иное => тф!(
             "ошибка: mine on|off|mode|layout|status|panels|ray x y z dx dy dz|pin ключ x y|\
              game номер (было '{:?}')",
+            "error: mine on|off|mode|layout|status|panels|ray x y z dx dy dz|pin key x y|\
+             game number (got '{:?}')",
             иное
         ),
     }
 }
 
 /// шлеме: сколько панелей, какая раскладка, идёт ли passthrough.
-fn шлем(хвост: &str, state: &mut Dawn) -> String {
+fn шлем(хвост: &str, state: &mut Parallax) -> String {
     let слова: Vec<&str> = хвост.split_whitespace().collect();
     match слова.first().copied() {
         None | Some("status") => crate::vr::состояние(state),
         Some("on") => match crate::vr::включить(state) {
-            Ok(()) => "ok: шлем запрошен, подключение на ближайшем тике".into(),
-            Err(e) => format!("ошибка: {e}"),
+            Ok(()) => т!("ok: шлем запрошен, подключение на ближайшем тике", "ok: headset requested, it will connect on the next tick").into(),
+            Err(e) => тф!("ошибка: {e}", "error: {e}"),
         },
         Some("off") => {
             crate::vr::выключить(state);
@@ -492,25 +516,21 @@ fn шлем(хвост: &str, state: &mut Dawn) -> String {
         }
         Some("ar") => {
             if state.vr.is_none() {
-                return "ошибка: шлем не включён".into();
+                return т!("ошибка: шлем не включён", "error: the headset is not on").into();
             }
-            use crate::vr::Ар;
+            use crate::vr::АР;
             match crate::vr::переключить_ар(state) {
-                Ар::Включена => "ok: дополненная реальность включена".into(),
-                Ар::Выключена => "ok: дополненная реальность выключена".into(),
-                Ар::НеУмеет => format!(
-                    "ok: рантайм не показывает комнату — остались в VR ({})",
-                    state
-                        .vr
-                        .as_ref()
-                        .map(|вр| вр.шлем.смешивание_строкой())
-                        .unwrap_or_default()
+                АР::Включена => т!("ok: дополненная реальность включена", "ok: passthrough on").into(),
+                АР::Выключена => т!("ok: дополненная реальность выключена", "ok: passthrough off").into(),
+                АР::НеУмеет => тф!(
+                    "ok: рантайм не показывает комнату — остались в VR ({})", "ok: the runtime has no passthrough — staying in VR ({})",
+                    crate::vr::смешивание_строкой(state)
                 ),
             }
         }
         Some("layout") => {
-            let р = crate::vr::сменить_раскладку(state);
-            format!("ok: раскладка «{}»", р.имя())
+            let раскл = crate::vr::сменить_раскладку(state);
+            тф!("ok: раскладка «{}»", "ok: layout '{}'", раскл.имя())
         }
         Some("recenter") => {
             crate::vr::пересобрать(state);
@@ -525,12 +545,12 @@ fn шлем(хвост: &str, state: &mut Dawn) -> String {
                 crate::vr::ui::Вид::Клавиатура
             };
             match crate::vr::пульт(state, вид) {
-                Ok(открыт) => format!(
-                    "ok: пульт «{}» {}",
+                Ok(открыт) => тф!(
+                    "ok: пульт «{}» {}", "ok: control panel '{}' {}",
                     вид.имя(),
-                    if открыт { "открыт" } else { "спрятан" }
+                    if открыт { т!("открыт", "opened") } else { т!("спрятан", "hidden") }
                 ),
-                Err(e) => format!("ошибка: {e}"),
+                Err(e) => тф!("ошибка: {e}", "error: {e}"),
             }
         }
         Some("pults") => crate::vr::пульты_строкой(state),
@@ -540,14 +560,14 @@ fn шлем(хвост: &str, state: &mut Dawn) -> String {
             let вид = match слова.get(1).copied() {
                 Some("menu") | Some("пуск") => crate::vr::ui::Вид::Пуск,
                 Some("keys") | Some("клавиатура") => crate::vr::ui::Вид::Клавиатура,
-                _ => return "ошибка: vr press menu|keys <номер кнопки>".into(),
+                _ => return т!("ошибка: vr press menu|keys <номер кнопки>", "error: vr press menu|keys <button number>").into(),
             };
             let Some(номер) = слова.get(2).and_then(|слово| слово.parse::<usize>().ok()) else {
-                return "ошибка: vr press menu|keys <номер кнопки>".into();
+                return т!("ошибка: vr press menu|keys <номер кнопки>", "error: vr press menu|keys <button number>").into();
             };
             match crate::vr::нажать(state, вид, номер) {
-                Ok(подпись) => format!("ok: нажата «{подпись}»"),
-                Err(e) => format!("ошибка: {e}"),
+                Ok(подпись) => тф!("ok: нажата «{подпись}»", "ok: pressed '{подпись}'"),
+                Err(e) => тф!("ошибка: {e}", "error: {e}"),
             }
         }
         Some("panels") => crate::vr::панели_строкой(state),
@@ -558,16 +578,18 @@ fn шлем(хвост: &str, state: &mut Dawn) -> String {
         Some("gestures") => crate::vr::жесты_строкой(state),
         Some("shot") => {
             let Some(путь) = слова.get(1) else {
-                return "ошибка: vr shot <путь.png>".into();
+                return т!("ошибка: vr shot <путь.png>", "error: vr shot <path.png>").into();
             };
             match crate::vr::снимок(state, std::path::PathBuf::from(путь)) {
-                Ok(()) => format!("ok: снимок глаза будет в {путь}"),
-                Err(e) => format!("ошибка: {e}"),
+                Ok(()) => тф!("ok: снимок глаза будет в {путь}", "ok: the eye screenshot will go to {путь}"),
+                Err(e) => тф!("ошибка: {e}", "error: {e}"),
             }
         }
-        иное => format!(
+        иное => тф!(
             "ошибка: vr mode|on|off|ar|layout|recenter|menu|keys|pults|press <пульт> <n>|\
              status|panels|input|gestures|shot <путь> (было '{:?}')",
+            "error: vr mode|on|off|ar|layout|recenter|menu|keys|pults|press <panel> <n>|\
+             status|panels|input|gestures|shot <path> (got '{:?}')",
             иное
         ),
     }
@@ -579,12 +601,12 @@ fn двинуть(dx: f64, dy: f64) -> smithay::backend::input::InputEvent<crate
     }
 }
 
-fn навести(state: &mut Dawn, x: f64, y: f64) {
+fn навести(state: &mut Parallax, x: f64, y: f64) {
     let сейчас = state.pointer_screen_physical();
     state.process_input_event(двинуть(x - сейчас.x, y - сейчас.y));
 }
 
-fn нажать(state: &mut Dawn, код: u32, нажата: bool) {
+fn нажать(state: &mut Parallax, код: u32, нажата: bool) {
     state.process_input_event(smithay::backend::input::InputEvent::PointerButton::<
         crate::synth::Синтетика,
     > {
@@ -596,9 +618,9 @@ fn нажать(state: &mut Dawn, код: u32, нажата: bool) {
 /// Клавиша или сочетание: `key logo+shift+d`, `key esc`, `key 32` (evdev-код).
 /// Модификаторы нажимаются и отпускаются вокруг основной клавиши — иначе
 /// бинды, завязанные на удержание Super, не срабатывают.
-fn клавиша(хвост: &str, state: &mut Dawn) -> String {
+fn клавиша(хвост: &str, state: &mut Parallax) -> String {
     if хвост.is_empty() {
-        return "ошибка: key [logo+shift+]<имя>".into();
+        return т!("ошибка: key [logo+shift+]<имя>", "error: key [logo+shift+]<name>").into();
     }
     // `key down logo` / `key up logo` — клавиша ОСТАЁТСЯ зажатой между
     // командами. Без этого из сокета нельзя воспроизвести ни одного жеста с
@@ -608,10 +630,10 @@ fn клавиша(хвост: &str, state: &mut Dawn) -> String {
         let нажата = match что {
             "down" => true,
             "up" => false,
-            _ => return format!("ошибка: key down|up <имя>, а не '{}'", что),
+            _ => return тф!("ошибка: key down|up <имя>, а не '{}'", "error: key down|up <name>, not '{}'", что),
         };
         let Some(код) = код_клавиши(имя.trim()) else {
-            return format!("ошибка: не знаю клавишу '{}'", имя.trim());
+            return тф!("ошибка: не знаю клавишу '{}'", "error: unknown key '{}'", имя.trim());
         };
         нажать_клавишу(state, код, нажата);
         return "ok".into();
@@ -619,13 +641,13 @@ fn клавиша(хвост: &str, state: &mut Dawn) -> String {
     let части: Vec<&str> = хвост.split('+').map(|s| s.trim()).collect();
     let (последняя, модификаторы) = части.split_last().unwrap();
     let Some(основная) = код_клавиши(последняя) else {
-        return format!("ошибка: не знаю клавишу '{}'", последняя);
+        return тф!("ошибка: не знаю клавишу '{}'", "error: unknown key '{}'", последняя);
     };
     let mut коды = Vec::new();
     for м in модификаторы {
         match код_клавиши(м) {
             Some(к) => коды.push(к),
-            None => return format!("ошибка: не знаю модификатор '{}'", м),
+            None => return тф!("ошибка: не знаю модификатор '{}'", "error: unknown modifier '{}'", м),
         }
     }
     for &к in &коды {
@@ -639,7 +661,7 @@ fn клавиша(хвост: &str, state: &mut Dawn) -> String {
     "ok".into()
 }
 
-fn нажать_клавишу(state: &mut Dawn, код: u32, нажата: bool) {
+fn нажать_клавишу(state: &mut Parallax, код: u32, нажата: bool) {
     state.process_input_event(smithay::backend::input::InputEvent::Keyboard::<
         crate::synth::Синтетика,
     > {
@@ -718,16 +740,18 @@ fn код_клавиши(имя: &str) -> Option<u32> {
 /// Где сейчас указатель и что под ним. Первое, что нужно после `mouse to`:
 /// без этого «клик ушёл не туда» отличить от «клик дошёл, но обработчик
 /// промолчал» нечем.
-fn указатель(state: &mut Dawn) -> String {
+fn указатель(state: &mut Parallax) -> String {
     let экран = state.pointer_screen_physical();
     let холст = state.pointer_location;
     let под = state
         .surface_under(холст)
-        .map(|(_, точка)| format!("есть, локально ({:.0},{:.0})", точка.x, точка.y))
-        .unwrap_or_else(|| "нет".into());
-    format!(
+        .map(|(_, точка)| тф!("есть, локально ({:.0},{:.0})", "yes, locally ({:.0},{:.0})", точка.x, точка.y))
+        .unwrap_or_else(|| т!("нет", "no").into());
+    тф!(
         "экран=({:.1},{:.1}) холст=({:.1},{:.1}) камера=({:.1},{:.1}) зум={:.2} \
          поверхность={} панель={:?} миникарта_ручная={}",
+        "screen=({:.1},{:.1}) canvas=({:.1},{:.1}) camera=({:.1},{:.1}) zoom={:.2} \
+         surface={} bar={:?} minimap_manual={}",
         экран.x, экран.y, холст.x, холст.y,
         state.viewport.cam_x, state.viewport.cam_y, state.viewport.zoom,
         под, state.bar_hover, state.minimap_manual,
@@ -737,14 +761,14 @@ fn указатель(state: &mut Dawn) -> String {
 /// Список окон в том виде, в каком его надо мерить: что попросили у клиента и
 /// что клиент реально нарисовал — расхождение этих двух чисел и есть «окно не
 /// ужимается» (см. udev.rs, поиск "нужен_кроп").
-fn окна(state: &Dawn) -> String {
+fn окна(state: &Parallax) -> String {
     use smithay::desktop::WindowSurface;
     let mut out = String::new();
     let фокус = state.focused_surface();
     for (i, window) in state.space.elements().enumerate() {
         let geo = state.space.element_geometry(window)
             .map(|g| format!("{},{} {}x{}", g.loc.x, g.loc.y, g.size.w, g.size.h))
-            .unwrap_or_else(|| "нет".into());
+            .unwrap_or_else(|| т!("нет", "no").into());
         let свой = window.geometry().size;
         let запрошено = match crate::xwin::requested_size(window) {
             Some(s) => format!("{}x{}", s.w, s.h),
@@ -775,8 +799,8 @@ fn окна(state: &Dawn) -> String {
                 (n.to_string(), m)
             })
             .unwrap_or_else(|| ("—".into(), "—".into()));
-        out.push_str(&format!(
-            "{}{} {} app={} стол={} монитор={} слот={} своя={}x{} запрошено={} буфер={}\n",
+        out.push_str(&тф!(
+            "{}{} {} app={} стол={} монитор={} слот={} своя={}x{} запрошено={} буфер={}\n", "{}{} {} app={} workspace={} monitor={} slot={} own={}x{} asked={} buffer={}\n",
             активно, i, класс,
             crate::xwin::app_id(window).unwrap_or_else(|| "—".into()),
             стол, монитор,
@@ -784,7 +808,7 @@ fn окна(state: &Dawn) -> String {
         ));
     }
     if out.is_empty() {
-        out.push_str("окон нет");
+        out.push_str(т!("окон нет", "no windows"));
     }
     out.trim_end().to_string()
 }

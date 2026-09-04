@@ -12,11 +12,11 @@ use smithay::{
     utils::{Rectangle, Transform},
 };
 
-use crate::Dawn;
+use crate::Parallax;
 
 pub fn init_winit(
-    event_loop: &mut EventLoop<Dawn>,
-    state: &mut Dawn,
+    event_loop: &mut EventLoop<Parallax>,
+    state: &mut Parallax,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut backend, winit) = winit::init()?;
 
@@ -35,7 +35,7 @@ pub fn init_winit(
             serial_number: "Unknown".into(),
         },
     );
-    let _global = output.create_global::<Dawn>(&state.display_handle);
+    let _global = output.create_global::<Parallax>(&state.display_handle);
     output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
     output.set_preferred(mode);
 
@@ -95,7 +95,7 @@ pub fn init_winit(
                 // застревает навсегда после первого кадра: он просит
                 // wl_surface.frame и до ответа не рисует. В логе протокола
                 // mako это видно как wl_callback без единого .done (замер
-                // 10.08.2026 во вложенном dawn).
+                // 10.08.2026 во вложенном parallax).
                 {
                     let layer_out = state.layer_output.clone().unwrap_or_else(|| output.clone());
                     let map = smithay::desktop::layer_map_for_output(&layer_out);

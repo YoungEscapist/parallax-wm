@@ -18,16 +18,16 @@ use smithay::{
     },
 };
 
-use crate::{state::Dawn, tiling::Layout};
+use crate::{state::Parallax, tiling::Layout};
 
-impl XdgShellHandler for Dawn {
+impl XdgShellHandler for Parallax {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         // Размер предвычисляем ДО первого configure, чтобы arrange() не слал
-        // второй (см. Dawn::predict_new_window_size).
+        // второй (см. Parallax::predict_new_window_size).
         let size = self.predict_new_window_size();
         let is_tile = self.tile_config.layout != Layout::Float;
 
@@ -54,7 +54,7 @@ impl XdgShellHandler for Dawn {
         if let Some(window) = window {
             self.forget_window(&window);
         }
-        tracing::info!("dawn: toplevel_destroyed count={}", self.tagged_windows.len());
+        tracing::info!("plx: toplevel_destroyed count={}", self.tagged_windows.len());
     }
 
     /// Восстановление позиции из сохранённой сессии (4.3): app_id обычно
@@ -63,7 +63,7 @@ impl XdgShellHandler for Dawn {
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
         // Значок для чипа в панели ищем ЗДЕСЬ по той же причине, по которой
         // здесь же восстанавливается позиция: на `new_toplevel` app_id ещё
-        // пустой, а без него искать нечего (см. Dawn::ensure_chip_icon).
+        // пустой, а без него искать нечего (см. Parallax::ensure_chip_icon).
         if let Some(window) = self.tagged_windows.iter()
             .find(|tw| crate::xwin::is_surface(&tw.window, surface.wl_surface()))
             .map(|tw| tw.window.clone())
@@ -74,21 +74,48 @@ impl XdgShellHandler for Dawn {
             Some(id) => id,
             None => return,
         };
-        let saved_pos = match self.pending_session.get_mut(&app_id).and_then(|v| v.pop()) {
-            Some(p) => p,
-            None => return,
+        // Позиции берутся В ПОРЯДКЕ СОХРАНЕНИЯ: у одного app_id их бывает
+        // несколько (два терминала), и `pop()` отдавал бы последнее окно
+        // прошлого сеанса первому окну нового — то есть заведомо не то место.
+        let saved_pos = match self.pending_session.get_mut(&app_id) {
+            Some(v) if !v.is_empty() => v.remove(0),
+            _ => return,
         };
-        if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-            crate::xwin::is_surface(&tw.window, &surface.wl_surface())
-        }) {
-            tw.position = saved_pos;
-            tw.float_position = saved_pos;
-            tw.float_position_set = true;
-            self.space.map_element(tw.window.clone(), saved_pos, false);
-            self.request_plane_reset();
-            tracing::info!("dawn/session: восстановлена позиция app_id={} → {:?}", app_id, saved_pos);
-            self.request_redraw();
+        // Место из прошлого сеанса могло остаться далеко на холсте: камера
+        // тогда стояла там, а при запуске она в доме монитора. Класть туда
+        // окно — значит потерять его с глаз (см. `место_обитаемо`).
+        if !self.место_обитаемо(saved_pos) {
+            tracing::info!(
+                "plx/session: place {:?} of app_id={} is off-canvas — ignored",
+                saved_pos, app_id,
+            );
+            return;
         }
+        let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
+            crate::xwin::is_surface(&tw.window, &surface.wl_surface())
+        }) else {
+            return;
+        };
+        // Плавающему окну место возвращаем целиком; ТАЙЛОВОМУ — только как
+        // «дом» на случай Super+V/Super+D. Иначе восстановление дерётся с
+        // раскладкой: `arrange()` уже поставил окно в слот дерева, а телепорт
+        // отсюда уводил его из слота — ровно то, что видно глазом как «первое
+        // окно при запуске уехало в угол».
+        tw.float_position = saved_pos;
+        tw.float_position_set = true;
+        if !tw.floating {
+            tracing::info!(
+                "plx/session: place {:?} of app_id={} kept as float home (window is tiled)",
+                saved_pos, app_id,
+            );
+            return;
+        }
+        tw.position = saved_pos;
+        let window = tw.window.clone();
+        self.space.map_element(window, saved_pos, false);
+        self.request_plane_reset();
+        tracing::info!("plx/session: restored position app_id={} → {:?}", app_id, saved_pos);
+        self.request_redraw();
     }
 
     /// Клиент сам просится на весь экран: полноэкранное видео, игра,
@@ -130,7 +157,7 @@ impl XdgShellHandler for Dawn {
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         self.unconstrain_popup(&surface);
         if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface)) {
-            tracing::warn!("dawn: не удалось завести попап: {}", err);
+            tracing::warn!("plx: could not create the popup: {}", err);
         }
     }
 
@@ -138,7 +165,7 @@ impl XdgShellHandler for Dawn {
     /// ему, а клик мимо — закрывает. Без этого меню не закрывается по щелчку
     /// снаружи и не отдаёт клавиатуру (стрелки, Escape).
     fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
-        let Some(seat) = Seat::<Dawn>::from_resource(&seat) else { return };
+        let Some(seat) = Seat::<Parallax>::from_resource(&seat) else { return };
         let kind = PopupKind::Xdg(surface);
         let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
             self.space
@@ -193,7 +220,7 @@ impl XdgShellHandler for Dawn {
     }
 }
 
-impl Dawn {
+impl Parallax {
     /// Подвинуть меню так, чтобы оно поместилось на экране.
     ///
     /// Клиент выбирает место сам, относительно своего окна, и без поправки
@@ -231,7 +258,7 @@ impl Dawn {
         });
 
         tracing::debug!(
-            "dawn/popup: окно={:?} рамка={:?} просили={:?}×{:?} стало={:?} по_центру={}",
+            "plx/popup: window={:?} frame={:?} asked={:?}×{:?} got={:?} centred={}",
             window_geo,
             target,
             было.loc,
@@ -314,9 +341,9 @@ mod tests {
     }
 }
 
-delegate_xdg_shell!(Dawn);
+delegate_xdg_shell!(Parallax);
 
-/// xdg-decoration: dawn рисует рамки, тени и подсветку фокуса сам (см.
+/// xdg-decoration: parallax рисует рамки, тени и подсветку фокуса сам (см.
 /// decor.rs), поэтому всем клиентам отвечаем «декорации серверные».
 ///
 /// Без этого протокола GTK-приложения (ghostty, nautilus, любой libadwaita)
@@ -325,7 +352,7 @@ delegate_xdg_shell!(Dawn);
 /// становился уже — и окно, не умея сжаться, лезло на соседей (замер: слот
 /// 63×115 → окно 315×126, перелив 252 px). Alacritty своего заголовка не
 /// рисует, поэтому у него пол ~23 px и проблема не проявлялась.
-impl XdgDecorationHandler for Dawn {
+impl XdgDecorationHandler for Parallax {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         self.set_server_decoration(&toplevel);
     }
@@ -342,7 +369,7 @@ impl XdgDecorationHandler for Dawn {
     }
 }
 
-impl Dawn {
+impl Parallax {
     fn set_server_decoration(&mut self, toplevel: &ToplevelSurface) {
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(DecorationMode::ServerSide);
@@ -353,4 +380,4 @@ impl Dawn {
     }
 }
 
-delegate_xdg_decoration!(Dawn);
+delegate_xdg_decoration!(Parallax);

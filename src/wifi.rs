@@ -1,7 +1,7 @@
 //! Вайфай внутри композитора: NetworkManager по D-Bus, меню сетей и значок.
 //!
 //! Устроено как блютуз (см. bluetooth.rs) и по той же причине: панели и трея в
-//! сессии dawn нет, а «подключись к сети» нужно каждый день. Поток D-Bus —
+//! сессии parallax нет, а «подключись к сети» нужно каждый день. Поток D-Bus —
 //! свой (zbus блокирующий, главный цикл однопоточный calloop), состояние течёт
 //! в композитор каналом calloop, команды обратно обычным `mpsc`.
 //!
@@ -92,16 +92,16 @@ pub enum Cmd {
 
 // ── Поток D-Bus ──────────────────────────────────────────────────────────────
 
-pub fn spawn(to_dawn: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
+pub fn spawn(to_plx: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
     let (tx, rx) = mpsc::channel::<Cmd>();
     let ok = std::thread::Builder::new()
-        .name("dawn-wifi".into())
-        .spawn(move || serve(to_dawn, rx))
+        .name("plx-wifi".into())
+        .spawn(move || serve(to_plx, rx))
         .is_ok();
     ok.then_some(tx)
 }
 
-fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
+fn serve(to_plx: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
     let mut conn = zbus::blocking::Connection::system().ok();
     let mut last: Option<Snapshot> = None;
     let (mut tray, mut menu) = (false, false);
@@ -136,11 +136,11 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
                 last = None;
             } else if let Some(c) = conn.as_ref() {
                 if let Err(err) = run_cmd(c, &cmd) {
-                    let _ = to_dawn.send(Event::Notice(human_error(&err)));
+                    let _ = to_plx.send(Event::Notice(human_error(&err)));
                 }
                 last = None;
             } else {
-                let _ = to_dawn.send(Event::Notice("NetworkManager is not available".into()));
+                let _ = to_plx.send(Event::Notice("NetworkManager is not available".into()));
             }
             next_poll = Instant::now();
             if !(tray || menu) {
@@ -171,7 +171,7 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
                 next_poll = Instant::now() + if menu { POLL_MENU } else { POLL_IDLE };
                 if last.as_ref() != Some(&snap) {
                     last = Some(snap.clone());
-                    if to_dawn.send(Event::State(snap)).is_err() {
+                    if to_plx.send(Event::State(snap)).is_err() {
                         return;
                     }
                 }
@@ -455,7 +455,7 @@ impl WifiUi {
     }
 }
 
-impl crate::state::Dawn {
+impl crate::state::Parallax {
     pub fn init_wifi(&mut self, tx: mpsc::Sender<Cmd>) {
         self.wifi = Some(WifiUi {
             tx,
@@ -482,7 +482,7 @@ impl crate::state::Dawn {
                     .min(w.snap.aps.len().saturating_sub(1));
             }
             Event::Notice(text) => {
-                tracing::info!("dawn/wifi: {}", text);
+                tracing::info!("plx/wifi: {}", text);
                 w.notice = Some((text, Instant::now()));
             }
         }
@@ -500,7 +500,7 @@ impl crate::state::Dawn {
     pub fn wifi_send(&mut self, cmd: Cmd) {
         if let Some(w) = self.wifi.as_ref() {
             if w.tx.send(cmd).is_err() {
-                tracing::warn!("dawn/wifi: поток NetworkManager не отвечает");
+                tracing::warn!("plx/wifi: NetworkManager thread not responding");
             }
         }
         self.request_redraw();
@@ -517,7 +517,7 @@ impl crate::state::Dawn {
 
     pub fn wifi_toggle_menu(&mut self) {
         let Some(w) = self.wifi.as_mut() else {
-            tracing::warn!("dawn/wifi: поток не поднят (нет системной шины?)");
+            tracing::warn!("plx/wifi: thread not started (no system bus?)");
             return;
         };
         w.open = !w.open;

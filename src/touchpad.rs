@@ -176,7 +176,7 @@ impl Тачпад {
         };
 
         tracing::info!(
-            "dawn/touchpad: {} — тачпад, X {}..{}, Y {}..{}",
+            "plx/touchpad: {} — touchpad, X {}..{}, Y {}..{}",
             путь.display(), диапазон_x.0, диапазон_x.1, диапазон_y.0, диапазон_y.1,
         );
         Ok(Self {
@@ -278,7 +278,7 @@ pub fn найти() -> Vec<Тачпад> {
     let mut найденные = Vec::new();
     let mut запретов = 0usize;
     let Ok(каталог) = std::fs::read_dir("/dev/input") else {
-        tracing::warn!("dawn/touchpad: /dev/input не читается — автодовода не будет");
+        tracing::warn!("plx/touchpad: /dev/input is not readable — no edge assist");
         return найденные;
     };
     for запись in каталог.flatten() {
@@ -324,13 +324,12 @@ pub fn найти() -> Vec<Тачпад> {
     if найденные.is_empty() {
         if запретов > 0 {
             tracing::warn!(
-                "dawn/touchpad: нет доступа к /dev/input ({} устройств) — \
-                 автодовода по краям накладки не будет. Лечится членством \
-                 пользователя в группе input.",
+                "plx/touchpad: no access to /dev/input ({} devices) — there will \
+                 be no edge motion. Fix it by adding the user to the input group.",
                 запретов,
             );
         } else {
-            tracing::info!("dawn/touchpad: тачпадов не нашлось");
+            tracing::info!("plx/touchpad: no touchpads found");
         }
     }
     найденные
@@ -392,13 +391,13 @@ pub fn довод(пальцы: &[Палец], н: &Автодовод) -> (f64,
     let mut dx = 0.0f64;
     let mut dy = 0.0f64;
     for п in пальцы {
-        let гx = мимо(п.x);
-        let гy = мимо(п.y);
-        if гx.abs() > dx.abs() {
-            dx = гx;
+        let край_x = мимо(п.x);
+        let край_y = мимо(п.y);
+        if край_x.abs() > dx.abs() {
+            dx = край_x;
         }
-        if гy.abs() > dy.abs() {
-            dy = гy;
+        if край_y.abs() > dy.abs() {
+            dy = край_y;
         }
     }
     // Квадрат глубины, а не сама глубина: у самой кромки зоны довод должен
@@ -409,9 +408,9 @@ pub fn довод(пальцы: &[Палец], н: &Автодовод) -> (f64,
 
 // ── Привод ───────────────────────────────────────────────────────────────────
 
-use crate::Dawn;
+use crate::Parallax;
 
-impl Dawn {
+impl Parallax {
     /// Идёт ли автодовод прямо сейчас.
     ///
     /// Входит в `anim_busy`, и это обязательно: палец, ЛЕЖАЩИЙ у края, не

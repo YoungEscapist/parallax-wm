@@ -1,22 +1,22 @@
-//! Свой бэкенд xdg-desktop-portal — демонстрация экрана из самого dawn.
+//! Свой бэкенд xdg-desktop-portal — демонстрация экрана из самого parallax.
 //!
 //! Зачем свой. Портал устроен из двух половин: фронтенд
 //! (`xdg-desktop-portal`, общий для всех) и бэкенд, который умеет разговаривать
 //! с конкретным композитором. Фронтенд у нас поднимается и отвечает, а вот
-//! бэкенда для dawn не было: единственный установленный,
+//! бэкенда для parallax не было: единственный установленный,
 //! `xdg-desktop-portal-hyprland`, снимает кадры через `zwlr_screencopy` и ходит
-//! за списком окон в Hyprland IPC. dawn же отдаёт кадры по
+//! за списком окон в Hyprland IPC. parallax же отдаёт кадры по
 //! `ext-image-copy-capture` (см. screencopy.rs) и никакого IPC Hyprland не
 //! имеет — поэтому `AvailableSourceTypes` приходил нулём, список источников
 //! оказывался пуст, и меню выбора окон не открывалось вовсе.
 //!
 //! Бэкенд живёт ВНУТРИ композитора намеренно: список окон, их эскизы и меню
-//! выбора — это ровно то, что dawn уже рисует (обзор столов), а кадры он и так
+//! выбора — это ровно то, что parallax уже рисует (обзор столов), а кадры он и так
 //! готовит для screencopy. Отдельному процессу пришлось бы всё это спрашивать
 //! по несуществующему IPC.
 //!
 //! Устройство. D-Bus живёт в своём потоке (zbus, блокирующий API): главный цикл
-//! dawn — calloop и однопоточный, пускать в него асинхронный рантайм нельзя.
+//! parallax — calloop и однопоточный, пускать в него асинхронный рантайм нельзя.
 //! Поток общается с композитором двумя каналами: запрос уходит в calloop
 //! (`channel::Sender`), ответ возвращается обычным `mpsc` — вызов D-Bus при этом
 //! честно блокируется, как того и ждёт фронтенд.
@@ -32,8 +32,8 @@ use smithay::reexports::calloop::channel;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 /// Имя бэкенда на шине. По нему фронтенд его и находит — оно же прописано в
-/// `dawn.portal` (см. `install_portal_files`).
-pub const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.dawn";
+/// `parallax.portal` (см. `install_portal_files`).
+pub const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.parallax";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 
 /// Типы источников из спецификации ScreenCast: 1 — монитор, 2 — окно.
@@ -51,7 +51,7 @@ const RESPONSE_FAILED: u32 = 2;
 /// Что пользователь выбрал в меню.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Source {
-    /// Целый монитор — по его номеру в `Dawn::мониторы`.
+    /// Целый монитор — по его номеру в `Parallax::мониторы`.
     ///
     /// Номер здесь появился 31.08.2026 вместе со вторым монитором. Раньше
     /// вариант назывался просто «весь экран» и означал «тот выход, который
@@ -92,14 +92,14 @@ pub struct StreamInfo {
 /// Сессия захвата, какой её видит фронтенд. Живёт по своему пути на шине,
 /// закрывается методом `Close` (или когда клиент отвалился).
 struct Session {
-    to_dawn: channel::Sender<Request>,
+    to_plx: channel::Sender<Request>,
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.Session")]
 impl Session {
     fn close(&self) {
-        let _ = self.to_dawn.send(Request::StopCast);
-        tracing::info!("dawn/portal: сессия закрыта");
+        let _ = self.to_plx.send(Request::StopCast);
+        tracing::info!("plx/portal: session closed");
     }
 
     #[zbus(property, name = "version")]
@@ -110,7 +110,7 @@ impl Session {
 
 /// Собственно бэкенд ScreenCast.
 struct ScreenCast {
-    to_dawn: channel::Sender<Request>,
+    to_plx: channel::Sender<Request>,
     /// Что выбрано в каждой сессии: SelectSources спрашивает пользователя,
     /// Start потом отдаёт по этому выбору поток.
     selected: std::sync::Mutex<HashMap<OwnedObjectPath, Source>>,
@@ -128,14 +128,14 @@ impl ScreenCast {
         _options: HashMap<String, OwnedValue>,
         #[zbus(object_server)] server: &zbus::ObjectServer,
     ) -> (u32, HashMap<String, OwnedValue>) {
-        let session = Session { to_dawn: self.to_dawn.clone() };
+        let session = Session { to_plx: self.to_plx.clone() };
         match server.at(&session_handle, session).await {
             Ok(_) => {
-                tracing::info!("dawn/portal: новая сессия захвата для «{}»", app_id);
+                tracing::info!("plx/portal: new capture session for '{}'", app_id);
                 (RESPONSE_OK, HashMap::new())
             }
             Err(err) => {
-                tracing::warn!("dawn/portal: не завёл объект сессии: {}", err);
+                tracing::warn!("plx/portal: could not create the session object: {}", err);
                 (RESPONSE_FAILED, HashMap::new())
             }
         }
@@ -158,24 +158,24 @@ impl ScreenCast {
 
         let (tx, rx) = mpsc::channel();
         let request = Request::Pick { app_id: app_id.clone(), types, reply: tx };
-        if self.to_dawn.send(request).is_err() {
-            tracing::warn!("dawn/portal: композитор не принял запрос выбора");
+        if self.to_plx.send(request).is_err() {
+            tracing::warn!("plx/portal: compositor rejected the source-picker request");
             return (RESPONSE_FAILED, HashMap::new());
         }
         // Ждём человека. Таймаут — чтобы висящее меню не держало вызов вечно.
         let choice = rx.recv_timeout(std::time::Duration::from_secs(120));
         match choice {
             Ok(Some(source)) => {
-                tracing::info!("dawn/portal: выбран источник {:?} для «{}»", source, app_id);
+                tracing::info!("plx/portal: source {:?} picked for '{}'", source, app_id);
                 self.selected.lock().unwrap().insert(session_handle, source);
                 (RESPONSE_OK, HashMap::new())
             }
             Ok(None) => {
-                tracing::info!("dawn/portal: выбор отменён");
+                tracing::info!("plx/portal: pick cancelled");
                 (RESPONSE_CANCELLED, HashMap::new())
             }
             Err(_) => {
-                tracing::warn!("dawn/portal: меню выбора не ответило за 120 с");
+                tracing::warn!("plx/portal: source picker did not answer within 120 s");
                 (RESPONSE_CANCELLED, HashMap::new())
             }
         }
@@ -193,18 +193,18 @@ impl ScreenCast {
     ) -> (u32, HashMap<String, OwnedValue>) {
         let choice = self.selected.lock().unwrap().get(&session_handle).cloned();
         let Some(source) = choice else {
-            tracing::warn!("dawn/portal: Start без выбранного источника");
+            tracing::warn!("plx/portal: Start with no source picked");
             return (RESPONSE_FAILED, HashMap::new());
         };
         let (tx, rx) = mpsc::channel();
-        if self.to_dawn.send(Request::StartCast { reply: tx }).is_err() {
+        if self.to_plx.send(Request::StartCast { reply: tx }).is_err() {
             return (RESPONSE_FAILED, HashMap::new());
         }
         // Нода поднимается в своём потоке; ждём её номер.
         let info = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(Some(info)) => info,
             _ => {
-                tracing::warn!("dawn/portal: поток не поднялся для {:?}", source);
+                tracing::warn!("plx/portal: stream did not start for {:?}", source);
                 return (RESPONSE_FAILED, HashMap::new());
             }
         };
@@ -223,7 +223,7 @@ impl ScreenCast {
         let stream = match structure.build() {
             Ok(st) => Value::from(st),
             Err(err) => {
-                tracing::warn!("dawn/portal: не собрал структуру потока: {}", err);
+                tracing::warn!("plx/portal: could not build the stream struct: {}", err);
                 return (RESPONSE_FAILED, HashMap::new());
             }
         };
@@ -233,7 +233,7 @@ impl ScreenCast {
         let element = zbus::zvariant::Signature::try_from("(ua{sv})").expect("сигнатура потока");
         let mut array = zbus::zvariant::Array::new(&element);
         if let Err(err) = array.append(stream) {
-            tracing::warn!("dawn/portal: streams: {}", err);
+            tracing::warn!("plx/portal: streams: {}", err);
             return (RESPONSE_FAILED, HashMap::new());
         }
         let mut results = HashMap::new();
@@ -241,13 +241,13 @@ impl ScreenCast {
             Ok(streams) => {
                 results.insert("streams".to_string(), streams);
                 tracing::info!(
-                    "dawn/portal: поток отдан клиенту: нода {}, {}×{}",
+                    "plx/portal: stream handed to the client: node {}, {}×{}",
                     info.node_id, info.width, info.height,
                 );
                 (RESPONSE_OK, results)
             }
             Err(err) => {
-                tracing::warn!("dawn/portal: не собрал ответ streams: {}", err);
+                tracing::warn!("plx/portal: could not build the streams reply: {}", err);
                 (RESPONSE_FAILED, HashMap::new())
             }
         }
@@ -273,29 +273,29 @@ impl ScreenCast {
 }
 
 /// Поднять бэкенд в отдельном потоке. Возвращает `false`, если сессионной шины
-/// нет (dawn запущен без dbus-run-session) — это не повод падать, просто
+/// нет (parallax запущен без dbus-run-session) — это не повод падать, просто
 /// демонстрации экрана в такой сессии не будет.
-pub fn spawn(to_dawn: channel::Sender<Request>) -> bool {
+pub fn spawn(to_plx: channel::Sender<Request>) -> bool {
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
         tracing::warn!(
-            "dawn/portal: нет DBUS_SESSION_BUS_ADDRESS — портал не поднимаю \
+            "plx/portal: нет DBUS_SESSION_BUS_ADDRESS — портал не поднимаю \
              (запускайте через launch_native.sh, он поднимает шину)"
         );
         return false;
     }
     std::thread::Builder::new()
-        .name("dawn-portal".into())
+        .name("plx-portal".into())
         .spawn(move || {
-            if let Err(err) = serve(to_dawn) {
-                tracing::warn!("dawn/portal: бэкенд остановлен: {}", err);
+            if let Err(err) = serve(to_plx) {
+                tracing::warn!("plx/portal: backend stopped: {}", err);
             }
         })
         .is_ok()
 }
 
-fn serve(to_dawn: channel::Sender<Request>) -> zbus::Result<()> {
+fn serve(to_plx: channel::Sender<Request>) -> zbus::Result<()> {
     let backend = ScreenCast {
-        to_dawn,
+        to_plx,
         selected: std::sync::Mutex::new(HashMap::new()),
     };
     // Имя берём ПОСЛЕ того, как объект выставлен: фронтенд, увидев имя на шине,
@@ -304,7 +304,7 @@ fn serve(to_dawn: channel::Sender<Request>) -> zbus::Result<()> {
         .serve_at(PORTAL_PATH, backend)?
         .name(BUS_NAME)?
         .build()?;
-    tracing::info!("dawn/portal: бэкенд ScreenCast на шине как {}", BUS_NAME);
+    tracing::info!("plx/portal: ScreenCast backend on the bus as {}", BUS_NAME);
     // Соединение живёт, пока жив поток; zbus обслуживает вызовы своим
     // исполнителем в фоне.
     loop {
@@ -314,10 +314,10 @@ fn serve(to_dawn: channel::Sender<Request>) -> zbus::Result<()> {
 
 /// Разложить файлы, по которым фронтенд узнаёт про наш бэкенд.
 ///
-/// `dawn.portal` объявляет, какие интерфейсы мы реализуем, а `dawn-portals.conf`
+/// `parallax.portal` объявляет, какие интерфейсы мы реализуем, а `parallax-portals.conf`
 /// говорит, кого предпочесть для ScreenCast в сессии с
-/// `XDG_CURRENT_DESKTOP=dawn`. Без второго файла фронтенд взял бы правило по
-/// умолчанию (`default=*`) и мог уйти к hyprland-бэкенду, который с dawn
+/// `XDG_CURRENT_DESKTOP=parallax`. Без второго файла фронтенд взял бы правило по
+/// умолчанию (`default=*`) и мог уйти к hyprland-бэкенду, который с parallax
 /// разговаривать не умеет.
 pub fn install_portal_files() {
     let home = match std::env::var("HOME") {
@@ -327,20 +327,20 @@ pub fn install_portal_files() {
     let portal = format!(
         "[portal]\nDBusName={BUS_NAME}\n\
          Interfaces=org.freedesktop.impl.portal.ScreenCast;\n\
-         UseIn=dawn;\n"
+         UseIn=parallax;\n"
     );
     let conf = "[preferred]\n\
-                default=dawn;gtk\n\
-                org.freedesktop.impl.portal.ScreenCast=dawn\n";
+                default=parallax;gtk\n\
+                org.freedesktop.impl.portal.ScreenCast=parallax\n";
     let files = [
-        (format!("{home}/.local/share/xdg-desktop-portal/portals/dawn.portal"), portal),
-        (format!("{home}/.config/xdg-desktop-portal/dawn-portals.conf"), conf.to_string()),
+        (format!("{home}/.local/share/xdg-desktop-portal/portals/parallax.portal"), portal),
+        (format!("{home}/.config/xdg-desktop-portal/parallax-portals.conf"), conf.to_string()),
     ];
     for (path, body) in files {
         let path = std::path::PathBuf::from(path);
         if let Some(dir) = path.parent() {
             if let Err(err) = std::fs::create_dir_all(dir) {
-                tracing::warn!("dawn/portal: {}: {}", dir.display(), err);
+                tracing::warn!("plx/portal: {}: {}", dir.display(), err);
                 continue;
             }
         }
@@ -350,9 +350,9 @@ pub fn install_portal_files() {
             continue;
         }
         if let Err(err) = std::fs::write(&path, &body) {
-            tracing::warn!("dawn/portal: {}: {}", path.display(), err);
+            tracing::warn!("plx/portal: {}: {}", path.display(), err);
         } else {
-            tracing::info!("dawn/portal: записан {}", path.display());
+            tracing::info!("plx/portal: wrote {}", path.display());
         }
     }
 }
@@ -374,7 +374,7 @@ pub struct Pick {
 
 /// Что выбрано и будет показано: конкретное окно или конкретный монитор.
 ///
-/// Монитор держим самим `Output`, а не номером в `Dawn::мониторы`: список
+/// Монитор держим самим `Output`, а не номером в `Parallax::мониторы`: список
 /// переупорядочивается при подключении и отключении экранов (см.
 /// [[dawn-two-monitors]] — порядок выходов не постоянен), а идущий поток
 /// обязан остаться на том же физическом мониторе.
@@ -384,7 +384,7 @@ pub enum Capture {
     Window(smithay::desktop::Window),
 }
 
-impl crate::state::Dawn {
+impl crate::state::Parallax {
     /// Пришёл запрос от бэкенда (он ждёт в своём потоке).
     pub fn handle_portal_request(&mut self, request: Request) {
         match request {
@@ -395,7 +395,7 @@ impl crate::state::Dawn {
                     let _ = prev.reply.send(None);
                 }
                 tracing::info!(
-                    "dawn/portal: «{}» просит выбрать источник (типы={})", app_id, types,
+                    "plx/portal: '{}' asks to pick a source (types={})", app_id, types,
                 );
                 self.portal_pick = Some(Pick { app_id, types, reply });
                 self.request_redraw();
@@ -403,13 +403,13 @@ impl crate::state::Dawn {
             Request::StartCast { reply } => {
                 let info = self.start_portal_cast();
                 if info.is_none() {
-                    tracing::warn!("dawn/portal: не поднял поток кадров");
+                    tracing::warn!("plx/portal: could not start the frame stream");
                 }
                 let _ = reply.send(info);
             }
             Request::StopCast => {
                 if self.portal_cast.take().is_some() {
-                    tracing::info!("dawn/portal: поток кадров остановлен");
+                    tracing::info!("plx/portal: frame stream stopped");
                 }
                 self.portal_capture = None;
             }
@@ -481,7 +481,7 @@ impl crate::state::Dawn {
             None => self.выход_монитора(self.курсор_монитор).map(Capture::Output),
         };
         let Some(capture) = capture else {
-            tracing::warn!("dawn/portal: у монитора {} нет выхода", self.курсор_монитор + 1);
+            tracing::warn!("plx/portal: monitor {} has no output", self.курсор_монитор + 1);
             let _ = pick.reply.send(None);
             self.request_redraw();
             return true;
@@ -505,7 +505,7 @@ impl crate::state::Dawn {
             let _ = prev.reply.send(None);
         }
         self.portal_pick = Some(Pick { app_id: "ctl".into(), types, reply });
-        tracing::info!("dawn/portal: выбор источника поднят из ctl (типы={})", types);
+        tracing::info!("plx/portal: source picker opened from ctl (types={})", types);
         self.request_redraw();
     }
 
@@ -522,7 +522,7 @@ impl crate::state::Dawn {
         let pick = self.portal_pick.take().expect("проверено выше");
         self.portal_capture = Some(Capture::Output(output));
         let _ = pick.reply.send(Some(Source::Output(n)));
-        tracing::info!("dawn/portal: выбран монитор {} клавишей", n + 1);
+        tracing::info!("plx/portal: monitor {} picked by key", n + 1);
         self.request_redraw();
         true
     }

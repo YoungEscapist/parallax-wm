@@ -118,7 +118,7 @@ pub struct TaggedWindow {
 
 /// Зеркальный портал: живая копия удалённого окна, закреплённая в фиксированной
 /// точке экрана. Клик/движение мыши внутри рамки портала перенаправляются на
-/// оригинальную поверхность (см. Dawn::surface_under).
+/// оригинальную поверхность (см. Parallax::surface_under).
 pub struct Portal {
     pub surface: WlSurface,
     pub screen_pos: Point<i32, Physical>,
@@ -132,19 +132,19 @@ pub enum CursorMode { Normal, Move, Resize, Pan }
 
 // ── ExitAction ───────────────────────────────────────────────────────────────
 
-/// Чем кончается работа компоновщика. Ставится в `Dawn::exit`, а разбирает его
+/// Чем кончается работа компоновщика. Ставится в `Parallax::exit`, а разбирает его
 /// главный цикл в main.rs.
 ///
 /// `LoopSignal::stop()` для этого НЕ годится: цикл в main.rs крутится вручную
 /// (`event_loop.dispatch()` в `loop {}`), а флаг сигнала смотрит только
-/// `EventLoop::run()`. Именно поэтому Super+Shift+Q писал в лог «dawn: quit»,
+/// `EventLoop::run()`. Именно поэтому Super+Shift+Q писал в лог «parallax: quit»,
 /// сохранял сессию — и продолжал работать как ни в чём не бывало (логи от
 /// 17.08 и 22.08.2026).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitAction {
     /// Обычный выход: сессия закрывается, launch_native.sh доводит уборку.
     Quit,
-    /// Перезапуск (Super+R): dawn выходит с кодом [`RESTART_EXIT_CODE`], и
+    /// Перезапуск (Super+R): parallax выходит с кодом [`RESTART_EXIT_CODE`], и
     /// скрипт запуска поднимает его заново — пересобрав, если исходники
     /// новее бинаря. Без перелогина в ly.
     Restart,
@@ -155,8 +155,14 @@ pub const RESTART_EXIT_CODE: i32 = 42;
 
 /// Подпись кнопки сброса вида в шапке карты окон. Одна на отрисовку
 /// (`udev::build_minimap_header`) и на замер её плашки
-/// (`Dawn::minimap_reset_button`) — иначе кнопка разъедется с надписью.
-pub const MINIMAP_RESET_LABEL: &str = "Сбросить вид";
+/// (`Parallax::minimap_reset_button`) — иначе кнопка разъедется с надписью.
+///
+/// Функция, а не `const`: текст зависит от языка (`lang`), а `const` считается
+/// на сборке, когда языка ещё нет. Возвращает `&'static str` — оба варианта
+/// литералы, так что звать её на каждый кадр ничего не стоит.
+pub fn minimap_reset_label() -> &'static str {
+    crate::т!("Сбросить вид", "Reset the view")
+}
 
 /// Окно на карточке предпросмотра: где оно лежит на СВОЁМ столе и куда класть
 /// его живое содержимое до масштабирования.
@@ -170,9 +176,9 @@ pub struct ПредпросмотрОкно {
     pub rect: Rectangle<i32, Logical>,
 }
 
-// ── Dawn ─────────────────────────────────────────────────────────────────────
+// ── Parallax ─────────────────────────────────────────────────────────────────────
 
-pub struct Dawn {
+pub struct Parallax {
     pub start_time: std::time::Instant,
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
@@ -183,7 +189,7 @@ pub struct Dawn {
     pub раздача: Option<crate::share::Раздача>,
     /// Ручка цикла событий: нужна тем, кто заводит источники не на старте, а
     /// по ходу дела (мультиюзер: сокет на каждого гостя, см. share/net.rs).
-    pub петля: smithay::reexports::calloop::LoopHandle<'static, Dawn>,
+    pub петля: smithay::reexports::calloop::LoopHandle<'static, Parallax>,
     /// Пока `None` — работаем; см. [`ExitAction`].
     pub exit: Option<ExitAction>,
     pub compositor_state: CompositorState,
@@ -202,7 +208,7 @@ pub struct Dawn {
    pub dmabuf_state: DmabufState,
    pub dmabuf_global: Option<DmabufGlobal>,
     pub output_manager_state: OutputManagerState,
-    pub seat_state: SeatState<Dawn>,
+    pub seat_state: SeatState<Parallax>,
     pub data_device_state: DataDeviceState,
     /// wlr-data-control: менеджеры буфера обмена (cliphist за Super+C) читают
     /// и пишут буфер, не имея фокуса. См. handlers::DataControlHandler.
@@ -211,13 +217,13 @@ pub struct Dawn {
     /// X11-окнами (см. xwayland.rs).
     pub xwayland_shell_state: XWaylandShellState,
     /// Оконный менеджер X11. None пока Xwayland не поднялся (или если он
-    /// отвалился) — тогда dawn просто чисто wayland-компоситор.
+    /// отвалился) — тогда parallax просто чисто wayland-компоситор.
     pub xwm: Option<X11Wm>,
     /// Номер X-дисплея (`DISPLAY=:N`) поднятого Xwayland.
     pub xdisplay: Option<u32>,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
-    // dawn state
+    // parallax state
     pub viewport: Viewport,
     pub cursor_mode: CursorMode,
     pub pointer_location: Point<f64, Logical>,
@@ -251,7 +257,7 @@ pub struct Dawn {
    /// обрабатывают прежние ветки `input.rs`.
    pub жест: Option<crate::gestures::Идёт>,
    /// Захват клавиатуры приложением (`keyboard_grab_apps`) снят вручную —
-   /// Super+Shift+Escape. Аварийный выход: пока окно вроде `dshare` держит
+   /// Super+Shift+Escape. Аварийный выход: пока окно вроде `plx-share` держит
    /// фокус, ни один бинд не работает, и повисни оно — человек остался бы в
    /// собственном сеансе без единой команды. Возвращается тем же сочетанием.
    pub захват_клавиш_снят: bool,
@@ -346,6 +352,12 @@ pub struct Dawn {
     /// выглядел как мигание. Теперь она спокойно уезжает вверх, пока внизу
     /// собирается предпросмотр столов.
     pub bar_hide: f64,
+    /// Появление рабочего места при запуске (см. `anim::Вход`). `None` — вход
+    /// кончился либо выключен настройкой `set{ intro = false }`.
+    pub вход: Option<crate::anim::Вход>,
+    /// Плашка пелены входа. Пул (как у всех прочих плашек кадра) — просто
+    /// потому, что `pooled_solid` берёт пул; элемент в нём один.
+    pub вход_ids: Vec<crate::udev::SolidSlot>,
     /// Прогресс раскрытия карточки карты окон: 0 — закрыта, 1 — раскрыта
     /// целиком. Тумблер выше только задаёт цель, саму долю ведёт `anim::tick`.
     /// Карта рисуется, пока доля > 0, — иначе выключение срезало бы её
@@ -362,9 +374,9 @@ pub struct Dawn {
     /// ЛИНЕЙНО за фиксированное время, всю форму движения задают эти кривые.
     pub minimap_slide: f64,
     // ── Шлем (см. vr/) ───────────────────────────────────────────────────────
-    /// Живая VR-сессия. `None` — dawn обычный композитор, и ни одна строка
+    /// Живая VR-сессия. `None` — parallax обычный композитор, и ни одна строка
     /// VR-кода не выполняется вовсе. В боксе, потому что структура крупная
-    /// (swapchain'ы, полотна окон), а `Dawn` копируется по стеку в каждом
+    /// (swapchain'ы, полотна окон), а `Parallax` копируется по стеку в каждом
     /// обработчике.
     pub vr: Option<Box<crate::vr::ВР>>,
     /// Человек попросил шлем, а сессии ещё нет. Подключение делает ближайший
@@ -389,9 +401,9 @@ pub struct Dawn {
     /// наденет шлем.
     pub vr_раскладка: crate::vr::scene::Раскладка,
     // ── Minecraft (см. mine/) ────────────────────────────────────────────────
-    /// Живой режим dmine. `None` — сокета нет и ни одна строка mine-кода не
+    /// Живой режим plx-mine. `None` — сокета нет и ни одна строка mine-кода не
     /// выполняется. В боксе по той же причине, что и шлем: структура крупная
-    /// (полотна окон), а `Dawn` ездит по стеку в каждом обработчике.
+    /// (полотна окон), а `Parallax` ездит по стеку в каждом обработчике.
     pub mine: Option<Box<crate::mine::Шахта>>,
     /// Зум миникарты (см. canvas::MinimapView): 1.0 — MINIMAP_SPAN_SCREENS
     /// экранов по ширине. ОТОБРАЖАЕМОЕ значение — доводится к
@@ -475,7 +487,7 @@ pub struct Dawn {
     pub bar_clock: String,
     pub bar_date: String,
     /// Короткое имя активной раскладки («RU»); пусто — раскладка одна.
-    /// Обновляется в `Dawn::refresh_kb_layout`.
+    /// Обновляется в `Parallax::refresh_kb_layout`.
     pub bar_kb: String,
     /// Идущий прямо сейчас перебор стопки по Alt+Tab (см. switcher.rs).
     /// Живёт, пока держат Alt.
@@ -500,7 +512,7 @@ pub struct Dawn {
     /// Все подключённые выходы: у каждого свой вид на холст, своя карта слоёв
     /// и свои столы (см. src/monitors.rs). Порядок — порядок подключения.
     pub мониторы: Vec<crate::monitors::Монитор>,
-    /// Индекс монитора, на котором курсор и клавиатурный фокус. `Dawn::viewport`
+    /// Индекс монитора, на котором курсор и клавиатурный фокус. `Parallax::viewport`
     /// — ЖИВОЙ вид именно этого монитора, у остальных вид лежит в их записи.
     pub активный: usize,
     /// На каком мониторе СТРЕЛКА. Почти всегда равен `активный` (фокус идёт за
@@ -529,7 +541,7 @@ pub struct Dawn {
     /// Они уже сняты с текущего набора тегов (refresh_tags их не покажет), но
     /// на холсте остаются до конца анимации — иначе уходящий стол не уезжал бы,
     /// а просто исчезал. Снимает их с холста `anim::tick`, когда их пружины
-    /// доехали (см. `Dawn::слайд_прибрать`).
+    /// доехали (см. `Parallax::слайд_прибрать`).
     pub слайд_уходят: Vec<Window>,
     /// Куда встанут ОСТАЛЬНЫЕ окна группы, пока одно из них тащат.
     ///
@@ -589,9 +601,9 @@ pub struct Dawn {
     /// и VBlank, интервал плавает).
     pub anim_last_tick: Option<std::time::Instant>,
     /// Когда фоновый слой (обои) в последний раз прислал кадр. По свежести
-    /// этой отметки видно, что обои ЖИВЫЕ (dwall крутит видео), а не картинка:
+    /// этой отметки видно, что обои ЖИВЫЕ (plx-wall крутит видео), а не картинка:
     /// живым нужен частый тик и сторож кадровых callback'ов, см.
-    /// `Dawn::будить_фоновые_слои`.
+    /// `Parallax::будить_фоновые_слои`.
     pub фон_коммит: Option<std::time::Instant>,
     /// Повреждения бесконечных обоев. Элемент обоев рисуется НАШЕЙ текстурой
     /// (`build_wallpaper_backdrop`), а не поверхностью клиента, поэтому damage
@@ -607,7 +619,7 @@ pub struct Dawn {
     /// Отдельная отметка нужна, чтобы холодная побудка шла редко и не сыпала
     /// callback'ами 60 раз в секунду в тех случаях, когда фоновый слой на них
     /// не отвечает вовсе (статичная картинка, обоев нет), см.
-    /// `Dawn::будить_фоновые_слои`.
+    /// `Parallax::будить_фоновые_слои`.
     pub фон_побудка: Option<std::time::Instant>,
     /// Анимации появления новых окон "с ростом" (Float-режим).
     pub window_open_anims: Vec<(Window, crate::anim::OpenAnim)>,
@@ -615,7 +627,7 @@ pub struct Dawn {
     /// буферов — см. decor.rs.
     pub decor: crate::decor::DecorCache,
     /// Камера (cam_x, cam_y, zoom) на момент входа Float→тайлинг. Выход обратно
-    /// во Float возвращает холст сюда — см. Dawn::set_layout.
+    /// во Float возвращает холст сюда — см. Parallax::set_layout.
     pub pre_tiling_view: Option<(f64, f64, f64)>,
     /// Super+2-палец swipe → перемещение окна (новый жест, под курсором на начале).
     pub gesture_move_window: Option<Window>,
@@ -699,7 +711,7 @@ pub struct Dawn {
     pub icon_cache: crate::icons::Кэш,
     /// Готовые буферы значков для чипов окон в панели, по `app_id`.
     ///
-    /// Собираются НЕ в отрисовке, а при появлении окна (`Dawn::ensure_chip_icon`):
+    /// Собираются НЕ в отрисовке, а при появлении окна (`Parallax::ensure_chip_icon`):
     /// поиск значка обходит каталоги темы, и делать это внутри кадра значило бы
     /// подвесить рендер на первом же новом приложении. Буфер живёт до конца
     /// сеанса: приложений на столе десятки, а не тысячи, и каждый — это
@@ -723,7 +735,7 @@ pub struct Dawn {
     /// вчерашний — исчезнувший, и область под панелью то перерисовывалась
     /// целиком, то бралась из буфера позапрошлого кадра. Снаружи это ровно то
     /// самое «маска скругления мигает на баре». Все остальные текстурные
-    /// элементы dawn (плитки обоев, миниатюры миникарты) держат Id в пуле
+    /// элементы parallax (плитки обоев, миниатюры миникарты) держат Id в пуле
     /// именно поэтому — заплата была единственным исключением.
     pub blur_ids: Vec<smithay::backend::renderer::element::Id>,
     pub portal_ids: Vec<crate::udev::SolidSlot>,
@@ -847,7 +859,7 @@ pub struct Dawn {
     ///
     /// Протокол позволяет клиенту сказать «мой буфер такого-то размера, но
     /// показывай его вот в этом прямоугольнике» — масштабирование делает GPU
-    /// при отрисовке. Заведён ради dwall: живые обои 1280×720 он растягивал до
+    /// при отрисовке. Заведён ради plx-wall: живые обои 1280×720 он растягивал до
     /// 3840×2160 на процессоре и держал этим полъядра. Smithay применяет src и
     /// dst сам, при построении вида поверхности (SurfaceView::from_states), так
     /// что рендеру дополнительной работы не досталось.
@@ -959,11 +971,11 @@ pub fn load_theme_cursor(names: &[&str], want: i32) -> Option<ThemeCursor> {
     let loaded = try_load();
     match &loaded {
         Some((_, _, sz)) => tracing::info!(
-            "dawn: курсор {:?} загружен {}x{} (тема {:?}, запрошен {})",
+            "plx: cursor {:?} loaded {}x{} (theme {:?}, requested {})",
             names.first().copied().unwrap_or("?"), sz.w, sz.h,
             std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into()), want,
         ),
-        None => tracing::warn!("dawn: в теме нет курсора {:?}", names),
+        None => tracing::warn!("plx: the theme has no cursor {:?}", names),
     }
     loaded
 }
@@ -973,13 +985,13 @@ fn load_default_cursor(want: i32) -> (Option<MemoryRenderBuffer>, Point<i32, Log
     match load_theme_cursor(&["left_ptr", "default", "arrow"], want) {
         Some((buf, hs, sz)) => (Some(buf), hs, sz),
         None => {
-            tracing::warn!("dawn: could not load xcursor 'left_ptr', cursor will be invisible");
+            tracing::warn!("plx: could not load xcursor 'left_ptr', cursor will be invisible");
             (None, Point::from((0, 0)), Size::from((24, 24)))
         }
     }
 }
 
-impl Dawn {
+impl Parallax {
     /// Курсор темы для формы, которую попросил клиент через
     /// wp_cursor_shape_v1. Тема лежит на диске, поэтому каждую форму читаем
     /// один раз и держим здесь; None = такой формы в теме нет (тогда рисуем
@@ -998,7 +1010,7 @@ impl Dawn {
     }
 
     /// `'static` у цикла — не украшение: `LoopHandle` кладётся в состояние и
-    /// живёт столько же, сколько сам dawn. Без него нельзя добавлять источники
+    /// живёт столько же, сколько сам parallax. Без него нельзя добавлять источники
     /// НА ХОДУ, а мультиюзеру это нужно на каждое подключение гостя
     /// (см. share/net.rs).
     pub fn new(event_loop: &mut EventLoop<'static, Self>, display: Display<Self>) -> Self {
@@ -1009,7 +1021,7 @@ impl Dawn {
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
-        // primary_selection нам не нужен (его глобала у dawn нет), фильтр
+        // primary_selection нам не нужен (его глобала у parallax нет), фильтр
         // клиентов — «пускать всех»: сессия своя, посторонних клиентов в ней
         // не бывает.
         let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
@@ -1031,7 +1043,7 @@ impl Dawn {
         let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
         let lua_config = crate::config::Config::load();
         let mut seat_state = SeatState::new();
-        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "dawn");
+        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "parallax");
         seat.add_keyboard(lua_config.xkb_config(), 200, 25).unwrap();
         seat.add_pointer();
         // wp_cursor_shape_v1: клиент называет ФОРМУ курсора ("text", "pointer"),
@@ -1237,6 +1249,8 @@ impl Dawn {
             hint_ids: Vec::new(),
             overview_bg_ids: Vec::new(),
             minimap_ids: Vec::new(),
+            вход: None,
+            вход_ids: Vec::new(),
             selection_ids: Vec::new(),
             ghost_ids: Vec::new(),
             preview_ids: Vec::new(),
@@ -1275,7 +1289,7 @@ impl Dawn {
         self.needs_redraw = true;
     }
 
-    fn init_wayland_listener(display: Display<Dawn>, event_loop: &mut EventLoop<Self>) -> OsString {
+    fn init_wayland_listener(display: Display<Parallax>, event_loop: &mut EventLoop<Self>) -> OsString {
         let listening_socket = ListeningSocketSource::new_auto().unwrap();
         let socket_name = listening_socket.socket_name().to_os_string();
         let loop_handle = event_loop.handle();
@@ -1425,7 +1439,7 @@ impl Dawn {
         let cam_x = self.viewport.cam_x.round() as i32;
         let cam_y = self.viewport.cam_y.round() as i32;
         let zoom = self.viewport.zoom;
-        // Выход АКТИВНОГО монитора: `Dawn::viewport` — его вид, и двигать по
+        // Выход АКТИВНОГО монитора: `Parallax::viewport` — его вид, и двигать по
         // нему чужой выход значило бы утащить второй монитор за первым.
         let output = self.монитор().map(|m| m.output.clone())
             .or_else(|| self.space.outputs().next().cloned());
@@ -1702,7 +1716,7 @@ impl Dawn {
             self.pointer_sync_logged = std::time::Instant::now();
             let got = self.pointer_screen_physical();
             tracing::debug!(
-                "СИНХ КУРСОР: держим экран=({:.0},{:.0}) было=({:.0},{:.0}) снос=({:.1},{:.1}) камера=({:.0},{:.0}) zoom={:.2}",
+                "plx/cursor sync: holding screen=({:.0},{:.0}) was=({:.0},{:.0}) drift=({:.1},{:.1}) camera=({:.0},{:.0}) zoom={:.2}",
                 screen.x, screen.y, got.x, got.y, got.x - screen.x, got.y - screen.y,
                 cam.0, cam.1, cam.2,
             );
@@ -1720,7 +1734,7 @@ impl Dawn {
             }
         }
         // Overlay/Top — НАД окнами, поэтому спрашиваем их первыми. Background и
-        // Bottom намеренно не опрашиваем: в dawn пустой холст — это орган
+        // Bottom намеренно не опрашиваем: в parallax пустой холст — это орган
         // управления (пан, жесты, рамка выделения), и обои, растянутые на весь
         // выход, съедали бы каждый такой клик.
         if let Some(hit) = self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top]) {
@@ -1736,7 +1750,7 @@ impl Dawn {
     ///
     /// Нужно там, где «под курсором нет ОКНА» ошибочно принималось за «под
     /// курсором пусто»: layer-поверхности не лежат в `space`, поэтому меню
-    /// обоев (dwall) или лаунчер считались голым холстом — клик по ним снимал
+    /// обоев (plx-wall) или лаунчер считались голым холстом — клик по ним снимал
     /// фокус и запускал рамку выделения, а до клиента не доходил.
     pub fn курсор_над_слоем(&self, pos: Point<f64, Logical>) -> bool {
         self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
@@ -1795,7 +1809,7 @@ impl Dawn {
     /// видит наш зум как `wl_output.scale`.
     pub fn log_pointer_local(&self, pos: Point<f64, Logical>) {
         let Some((surface, origin)) = self.surface_under(pos) else {
-            tracing::debug!("PTR ЛОКАЛЬ: под курсором нет поверхности");
+            tracing::debug!("plx/ptr: no surface under the cursor");
             return;
         };
         let local = pos - origin;
@@ -1867,7 +1881,7 @@ impl Dawn {
     pub fn toggle_portal(&mut self) {
         if self.portal.is_some() {
             self.portal = None;
-            tracing::info!("dawn: portal closed");
+            tracing::info!("plx: portal closed");
             self.request_redraw();
             return;
         }
@@ -1884,7 +1898,7 @@ impl Dawn {
             screen_pos: Point::from((экран.w - PORTAL_W - MARGIN, MARGIN)),
             box_size: Size::from((PORTAL_W, PORTAL_H)),
         });
-        tracing::info!("dawn: portal opened");
+        tracing::info!("plx: portal opened");
         self.request_redraw();
     }
 
@@ -1977,7 +1991,7 @@ impl Dawn {
     /// нуле), оба экрана показывали одни и те же окна, а стрелка с клавиатурой
     /// оставались на покинутом.
     ///
-    /// Стрелку уводим следом за фокусом: dawn живёт на sloppy focus (фокус идёт
+    /// Стрелку уводим следом за фокусом: parallax живёт на sloppy focus (фокус идёт
     /// за мышью), поэтому курсор, брошенный на прежнем мониторе, первым же
     /// движением руки отобрал бы фокус обратно.
     pub fn view_tag(&mut self, tag: u32) {
@@ -2022,7 +2036,7 @@ impl Dawn {
     /// Перенести стрелку на монитор, который только что стал активным.
     ///
     /// **Зачем.** Переход на стол соседнего экрана делается с клавиатуры, и
-    /// никакого движения мыши за ним не следует — а фокус в dawn идёт за мышью
+    /// никакого движения мыши за ним не следует — а фокус в parallax идёт за мышью
     /// (`input::sloppy_focus`). Стрелка, брошенная на прежнем мониторе, — это
     /// «смотрю на один экран, печатаю в другой», и первое же шевеление руки
     /// утаскивает фокус обратно.
@@ -2059,7 +2073,7 @@ impl Dawn {
         // тоже не поможет — окно покинутого монитора остаётся в `space` (там
         // лежат окна ВСЕХ видимых столов, см. `видимые_теги`), и он считает
         // фокус живым. Слой, держащий клавиатуру (открытый fuzzel, строка поиска
-        // dwall), — исключение: отобрать у него ввод значит закрыть его.
+        // plx-wall), — исключение: отобрать у него ввод значит закрыть его.
         if self.layer_keyboard.is_none() {
             match окно {
                 Some(w) => crate::xwin::focus(self, &w),
@@ -2075,7 +2089,7 @@ impl Dawn {
     }
 
     /// Собственно переход на стол — уже на том мониторе, которому он
-    /// принадлежит (см. [`Dawn::view_tag`]).
+    /// принадлежит (см. [`Parallax::view_tag`]).
     fn view_tag_inner(&mut self, tag: u32) {
         use crate::tiling::Layout;
         // Обзор столов сюда не доходит: guard стоит в `view_tag`, а он —
@@ -2186,7 +2200,7 @@ impl Dawn {
                     ));
                 }
             }
-            tracing::info!("dawn: view_tag → {:#b} (columns workspace)", tag);
+            tracing::info!("plx: view_tag → {:#b} (columns workspace)", tag);
             return;
         }
 
@@ -2197,7 +2211,7 @@ impl Dawn {
             // см. tiling::set_layout_inner).
             //
             // Угол — это ДОМ СВОЕГО МОНИТОРА, а не начало координат холста.
-            // Пока dawn был одномониторным, это было одно и то же; со вторым
+            // Пока parallax был одномониторным, это было одно и то же; со вторым
             // монитором дом уезжает на `ШАГ_ДОМА` (см. monitors.rs), окна
             // нового стола раскладываются от него (`tiling::screen_area`), а
             // камера, оставленная в нуле, смотрела бы на чужой дом — свои окна
@@ -2211,7 +2225,7 @@ impl Dawn {
             self.viewport.cam_x = дом.x as f64;
             self.viewport.cam_y = дом.y as f64;
             self.apply_camera();
-            tracing::info!("dawn: view_tag → {:#b} (new workspace → {})", tag, target_layout.symbol());
+            tracing::info!("plx: view_tag → {:#b} (new workspace → {})", tag, target_layout.symbol());
             return;
         }
 
@@ -2222,7 +2236,7 @@ impl Dawn {
             // Именно restore_layout: переход на стол не двигает его окна
             // (см. tiling::restore_layout — иначе плавающие слетались в точку).
             self.restore_layout(target_layout);
-            tracing::info!("dawn: view_tag → {:#b} (layout {})", tag, target_layout.symbol());
+            tracing::info!("plx: view_tag → {:#b} (layout {})", tag, target_layout.symbol());
         }
 
         // Плавный "перелёт" в кадр стола вместо мгновенного прыжка. Кадр — это
@@ -2266,14 +2280,14 @@ impl Dawn {
             self.слайд_столов(old_tag, tag, уходящие);
         }
         tracing::info!(
-            "dawn: view_tag → {:#b} (кадр {:.0},{:.0} zoom {:.2})", tag, x, y, zoom,
+            "plx: view_tag → {:#b} (frame {:.0},{:.0} zoom {:.2})", tag, x, y, zoom,
         );
     }
 
     /// Перелистывание столов вбок, как в Hyprland: уходящий стол уезжает за
     /// край экрана, приходящий въезжает с противоположной стороны.
     ///
-    /// **Почему движутся ОКНА, а не камера.** В dawn все столы собираются в
+    /// **Почему движутся ОКНА, а не камера.** В parallax все столы собираются в
     /// одном прямоугольнике холста — экран от (0,0), см. `tiling::screen_area`
     /// (там же и разгадка обзора «как есть»). То есть между столами нет
     /// пространственного отношения, которое камера могла бы проехать: сдвинуть
@@ -2455,7 +2469,7 @@ impl Dawn {
         let all: u32 = !0;
         self.viewport.tagset[self.viewport.seltags] = all;
         self.refresh_tags();
-        tracing::info!("dawn: view_all_tags");
+        tracing::info!("plx: view_all_tags");
     }
 
     /// Toggle тег в текущем представлении (Super+Ctrl+N)
@@ -2469,7 +2483,7 @@ impl Dawn {
         if new != 0 {
             self.viewport.tagset[self.viewport.seltags] = new;
             self.refresh_tags();
-            tracing::info!("dawn: toggle_view → {:#b}", new);
+            tracing::info!("plx: toggle_view → {:#b}", new);
         }
     }
 
@@ -2504,7 +2518,7 @@ impl Dawn {
         // остаются плавающими поверх полосы (см. columns_pin_floating).
         if !floating && self.columns_is_strip_tag(tag) {
             if self.columns_adopt_window(&window, tag) {
-                tracing::info!("dawn: tag_window → {:#b} (в ленту)", tag);
+                tracing::info!("plx: tag_window → {:#b} (into the ribbon)", tag);
                 return;
             }
         }
@@ -2515,7 +2529,7 @@ impl Dawn {
         // его дома ШАГ_ДОМА пикселей). Перенос делает `перенести_окно_на_стол`,
         // он же вынимает окно из дерева донора.
         let сменил_монитор = self.перенести_окно_на_стол(&window, tag, true);
-        tracing::info!("dawn: tag_window → {:#b}", tag);
+        tracing::info!("plx: tag_window → {:#b}", tag);
         // Окно ушло со СВОЕГО стола — донор обязан сомкнуться сразу. Полоса
         // держит его в колонке, дерево dwindle — в листе, и вычищают их только
         // columns_reconcile / sync_dwindle_tree, то есть arrange. Без него на
@@ -2554,7 +2568,7 @@ impl Dawn {
                 let new = tw.tags ^ tag;
                 if new != 0 {
                     tw.tags = new;
-                    tracing::info!("dawn: toggle_tag → {:#b}", new);
+                    tracing::info!("plx: toggle_tag → {:#b}", new);
                 }
             }
         }
@@ -2710,7 +2724,7 @@ impl Dawn {
                 anchor_canvas, screen_center, self.viewport.zoom, 0.6, crate::anim::дуг::смена_зума(),
             ));
         }
-        tracing::info!("dawn: bird's-eye on");
+        tracing::info!("plx: bird's-eye on");
     }
 
     pub fn end_bird_eye(&mut self) {
@@ -2720,7 +2734,7 @@ impl Dawn {
                 anchor_canvas, screen_center, self.viewport.zoom, 1.0, crate::anim::дуг::смена_зума(),
             ));
         }
-        tracing::info!("dawn: bird's-eye off");
+        tracing::info!("plx: bird's-eye off");
     }
 
     // ── Режим обзора (Super+Space, тумблер) ──────────────────────────────────
@@ -2771,7 +2785,7 @@ impl Dawn {
                         zoom,
                         crate::anim::дуг::смена_зума(),
                     ));
-                    tracing::info!("dawn: zoom-nav off → кадр ({x:.0},{y:.0}) zoom {zoom:.2}");
+                    tracing::info!("plx: zoom-nav off → frame ({x:.0},{y:.0}) zoom {zoom:.2}");
                 }
                 None => {
                     // Кадра не запомнили (вход был ещё до этой правки или
@@ -2782,7 +2796,7 @@ impl Dawn {
                             crate::anim::дуг::смена_зума(),
                         ));
                     }
-                    tracing::info!("dawn: zoom-nav off (кадра не было, zoom → 1)");
+                    tracing::info!("plx: zoom-nav off (there was no frame, zoom → 1)");
                 }
             }
         } else {
@@ -2800,7 +2814,7 @@ impl Dawn {
                     crate::anim::дуг::смена_зума(),
                 ));
             }
-            tracing::info!("dawn: zoom-nav on (вернуться в {x:.0},{y:.0} zoom {zoom:.2})");
+            tracing::info!("plx: zoom-nav on (returning to {x:.0},{y:.0} zoom {zoom:.2})");
         }
         self.request_redraw();
     }
@@ -2999,7 +3013,7 @@ impl Dawn {
 
     /// Колесо над панелью — крутит ЕЁ СОБСТВЕННЫЙ зум (25.08.2026: возвращено
     /// по прямой просьбе — «миникарта должна быть мини копией мира со своим
-    /// паном и зумом, не зависящем от основного dawn»). Тот же шаг 1.1/0.9,
+    /// паном и зумом, не зависящем от основного parallax»). Тот же шаг 1.1/0.9,
     /// что и у зума холста колесом в обзоре (см. `zoom_step_at_cursor`), но
     /// цель не анимируется через `ZoomGlide` — доводит её тот же плавный
     /// доезд, что и автоподгонку (`anim::tick`, minimap_zoom_omega).
@@ -3161,7 +3175,7 @@ impl Dawn {
         let g = self.minimap_geom();
         let поле = crate::canvas::MINIMAP_PADDING_PX.round() as i32;
         let w = crate::text::width_of(
-            MINIMAP_RESET_LABEL, crate::bar::STRONG, crate::bar::TEXT_SMALL,
+            minimap_reset_label(), crate::bar::STRONG, crate::bar::TEXT_SMALL,
         ) + PAD_X * 2;
         Rectangle::new(
             Point::from((
@@ -3672,7 +3686,7 @@ impl Dawn {
     pub fn save_camera_bookmark(&mut self, slot: u32) {
         let anchor = self.bookmark_anchor_for_screen_center();
         self.camera_bookmarks.insert(slot, anchor);
-        tracing::info!("dawn: camera bookmark {} saved (center)", slot);
+        tracing::info!("plx: camera bookmark {} saved (center)", slot);
     }
 
     /// Alt+B: закрепить закладку камеры на текущей позиции курсора, в наименьший
@@ -3682,7 +3696,7 @@ impl Dawn {
         let slot = (1u32..=9).find(|s| !self.camera_bookmarks.contains_key(s))
             .unwrap_or(((self.camera_bookmarks.len() as u32) % 9) + 1);
         self.camera_bookmarks.insert(slot, anchor);
-        tracing::info!("dawn: camera bookmark {} pinned at cursor ({:.0},{:.0})", slot, anchor.x, anchor.y);
+        tracing::info!("plx: camera bookmark {} pinned at cursor ({:.0},{:.0})", slot, anchor.x, anchor.y);
     }
 
     /// Alt+Super+B: убрать ближайшую к курсору закладку.
@@ -3699,11 +3713,11 @@ impl Dawn {
                 da.total_cmp(&db)
             })
         else {
-            tracing::info!("dawn: закладок нет — удалять нечего");
+            tracing::info!("plx: no bookmarks — nothing to remove");
             return;
         };
         self.camera_bookmarks.remove(&slot);
-        tracing::info!("dawn: удалена закладка {} (ближайшая к курсору)", slot);
+        tracing::info!("plx: removed bookmark {} (nearest to the cursor)", slot);
         self.request_plane_reset();
         self.request_redraw();
     }
@@ -3719,7 +3733,7 @@ impl Dawn {
             ));
             let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
             self.camera_anim = Some(CameraAnim::new(from, target, crate::anim::дуг::прыжок_к_закладке()));
-            tracing::info!("dawn: jump to camera bookmark {}", slot);
+            tracing::info!("plx: jump to camera bookmark {}", slot);
         }
     }
 

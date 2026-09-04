@@ -1,6 +1,6 @@
-# dawn — сборка на другом ПК (без NixOS / без nix-shell)
+# parallax — сборка на другом ПК (без NixOS / без nix-shell)
 
-Dawn — Wayland-компоситор на Rust (smithay, TTY/DRM backend).
+Parallax — Wayland-компоситор на Rust (smithay, TTY/DRM backend).
 
 ## 1. Зависимости
 
@@ -19,7 +19,8 @@ Lua отдельно ставить не надо — `mlua` собирает Lu
 ./build_portable.sh --verbose  # доп. аргументы уходят в cargo
 ```
 
-Бинарь: `target/release/dawn`. Если в системе нет линкера `mold`, скрипт сам
+Бинари: `target/release/plx-extra` (всё) и `target/release/plx-minimal`
+(без шлема, Minecraft и мультиюзера). Если в системе нет линкера `mold`, скрипт сам
 откатится на системный `ld` (правило mold лежит в `.cargo/config.toml`).
 
 Первая сборка тянет smithay с гита (rev зафиксирован в `Cargo.toml`) и много
@@ -28,11 +29,12 @@ Lua отдельно ставить не надо — `mlua` собирает Lu
 ## 3. Запуск
 
 Только с **чистого TTY** (Ctrl+Alt+F3, вход в консоль без графического DE —
-dawn забирает DRM master):
+parallax забирает DRM master):
 
 ```sh
-./launch_portable.sh           # release
-./launch_portable.sh --debug   # debug-бинарь
+./launch_native.sh             # release
+./launch_native.sh --debug     # debug-бинарь
+./launch_native.sh --winit     # вложенно в идущий сеанс, для разработки
 ```
 
 Выход из компоситора — `Super+Shift+Q`. Логи — в `logs/`.
@@ -40,11 +42,11 @@ dawn забирает DRM master):
 ## 4. Конфиг
 
 Клавиши/поведение настраиваются в Lua. Пример — `default_config.lua` в комплекте;
-рабочий конфиг кладётся в `~/.config/dawn/config.lua`:
+рабочий конфиг кладётся в `~/.config/parallax/config.lua`:
 
 ```sh
-mkdir -p ~/.config/dawn
-cp default_config.lua ~/.config/dawn/config.lua
+mkdir -p ~/.config/parallax
+cp default_config.lua ~/.config/parallax/config.lua
 ```
 
 Терминал по `Super+Return` задаётся строкой `spawn` в конфиге (по умолчанию в

@@ -20,7 +20,7 @@ struct PersistedSession {
 
 fn session_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".local/state/dawn/session.json"))
+    Some(PathBuf::from(home).join(".local/state/parallax/session.json"))
 }
 
 pub fn toplevel_app_id(surface: &ToplevelSurface) -> Option<String> {
@@ -60,10 +60,10 @@ pub fn save(tagged_windows: &[crate::state::TaggedWindow]) {
     let session = PersistedSession { windows };
     match serde_json::to_string_pretty(&session) {
         Ok(json) => match std::fs::write(&path, json) {
-            Ok(()) => tracing::info!("dawn/session: сохранено в {:?}", path),
-            Err(e) => tracing::warn!("dawn/session: не удалось записать {:?}: {}", path, e),
+            Ok(()) => tracing::info!("plx/session: saved to {:?}", path),
+            Err(e) => tracing::warn!("plx/session: could not write {:?}: {}", path, e),
         },
-        Err(e) => tracing::warn!("dawn/session: сериализация: {}", e),
+        Err(e) => tracing::warn!("plx/session: serialisation: {}", e),
     }
 }
 
@@ -82,7 +82,7 @@ pub fn load() -> HashMap<String, Vec<Point<i32, Logical>>> {
     let session: PersistedSession = match serde_json::from_str(&data) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("dawn/session: разбор {:?}: {}", path, e);
+            tracing::warn!("plx/session: parsing {:?}: {}", path, e);
             return HashMap::new();
         }
     };
@@ -90,6 +90,6 @@ pub fn load() -> HashMap<String, Vec<Point<i32, Logical>>> {
     for w in session.windows {
         map.entry(w.app_id).or_default().push(Point::from((w.x, w.y)));
     }
-    tracing::info!("dawn/session: загружено {:?}", path);
+    tracing::info!("plx/session: loaded {:?}", path);
     map
 }

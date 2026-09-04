@@ -3,7 +3,7 @@ mod layer_shell;
 mod xdg_shell;
 
 use crate::focus::KeyboardFocusTarget;
-use crate::state::Dawn;
+use crate::state::Parallax;
 use smithay::input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source};
 use smithay::input::pointer::Focus;
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -17,23 +17,23 @@ use smithay::wayland::selection::data_device::{
 use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
 use smithay::{delegate_data_control, delegate_data_device, delegate_output, delegate_seat};
 
-impl SeatHandler for Dawn {
+impl SeatHandler for Parallax {
     // Клавиатурный фокус — не просто поверхность: X11-окну нужен ещё и фокус
     // на стороне X-сервера, см. focus.rs.
     type KeyboardFocus = KeyboardFocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
-    fn seat_state(&mut self) -> &mut SeatState<Dawn> { &mut self.seat_state }
+    fn seat_state(&mut self) -> &mut SeatState<Parallax> { &mut self.seat_state }
     fn cursor_image(&mut self, seat: &Seat<Self>, image: smithay::input::pointer::CursorImageStatus) {
-        // ЧУЖОЕ МЕСТО СВОЮ ФОРМУ КУРСОРА НАМ НЕ НАЗНАЧАЕТ. Мест в dawn больше
+        // ЧУЖОЕ МЕСТО СВОЮ ФОРМУ КУРСОРА НАМ НЕ НАЗНАЧАЕТ. Мест в parallax больше
         // одного: своё у каждого гостя раздачи (`share/seat.rs`) и своё у мода
         // Minecraft (`mine/seat.rs`). Клиент ставит форму НА МЕСТО, а здесь она
         // молча записывалась в одну общую переменную — и стрелка хозяина
         // менялась от того, что кто-то другой навёл указку на терминал.
         //
-        // Живьём это и была жалоба 01.09.2026 «нажал в игре — на экране dawn
+        // Живьём это и была жалоба 01.09.2026 «нажал в игре — на экране parallax
         // появился курсор»: клик по панели уводил фокус клиенту, тот ставил
-        // курсор месту `dmine`, и спрятанная Minecraft'ом стрелка (Xwayland
+        // курсор месту `plx-mine`, и спрятанная Minecraft'ом стрелка (Xwayland
         // держит её `Hidden`, пока курсор захвачен) вылезала обратно поверх
         // игры. Гости раздачи рисуют свои стрелки сами (`build_guest_cursors`),
         // мод — свою у себя в мире; хозяйскую задаёт только хозяйское место.
@@ -49,18 +49,18 @@ impl SeatHandler for Dawn {
         // wp_cursor_shape_v1. Стрелка вместо прицела в игре различается прямо
         // по этой строке: `тема "default"` — потеряли форму сами, `клиент` —
         // её прислал Xwayland, и разбираться надо на его стороне.
-        let вид = |с: &smithay::input::pointer::CursorImageStatus| match с {
-            smithay::input::pointer::CursorImageStatus::Surface(_) => "клиент".to_string(),
-            smithay::input::pointer::CursorImageStatus::Named(i) => format!("тема {:?}", i),
-            smithay::input::pointer::CursorImageStatus::Hidden => "скрыт".to_string(),
+        let вид = |статус: &smithay::input::pointer::CursorImageStatus| match статус {
+            smithay::input::pointer::CursorImageStatus::Surface(_) => "client".to_string(),
+            smithay::input::pointer::CursorImageStatus::Named(i) => format!("theme {:?}", i),
+            smithay::input::pointer::CursorImageStatus::Hidden => "hidden".to_string(),
         };
         let (было, стало) = (вид(&self.cursor_status), вид(&image));
         if было != стало {
-            tracing::debug!("dawn/курсор: {} → {}", было, стало);
+            tracing::debug!("plx/cursor: {} → {}", было, стало);
         }
         self.cursor_status = image;
         // Без этого новая форма курсора не доедет до экрана, пока что-нибудь
-        // ДРУГОЕ не попросит кадр: dawn рисует по изменениям, а смена формы —
+        // ДРУГОЕ не попросит кадр: parallax рисует по изменениям, а смена формы —
         // изменение ничем не хуже прочих. На неподвижном экране (меню игры,
         // пауза, статичное окно) это ровно «курсор не поменялся».
         self.request_redraw();
@@ -73,19 +73,19 @@ impl SeatHandler for Dawn {
         set_data_device_focus(dh, seat, client);
     }
 }
-delegate_seat!(Dawn);
+delegate_seat!(Parallax);
 
 // wp_cursor_shape_v1 умеет назначать форму не только указателю, но и перу
 // планшета, поэтому смитеевский delegate требует и этот трейт. Планшета у нас
 // нет — форму пера просто игнорируем (реализация по умолчанию).
-impl smithay::wayland::tablet_manager::TabletSeatHandler for Dawn {}
+impl smithay::wayland::tablet_manager::TabletSeatHandler for Parallax {}
 
 // wp_cursor_shape_v1: клиент присылает не картинку, а имя формы, и оно
 // приходит сюда же, в cursor_image, как CursorImageStatus::Named — рисуем её
 // своей темой и своего размера (см. state::cursor_for_icon).
-smithay::delegate_cursor_shape!(Dawn);
+smithay::delegate_cursor_shape!(Parallax);
 
-impl SelectionHandler for Dawn {
+impl SelectionHandler for Parallax {
     type SelectionUserData = ();
 
     /// Wayland-клиент положил что-то в буфер обмена — сообщаем об этом
@@ -93,7 +93,7 @@ impl SelectionHandler for Dawn {
     fn new_selection(&mut self, ty: SelectionTarget, source: Option<SelectionSource>, _seat: Seat<Self>) {
         if let Some(xwm) = self.xwm.as_mut() {
             if let Err(err) = xwm.new_selection(ty, source.map(|s| s.mime_types())) {
-                tracing::warn!("dawn/xwayland: не удалось отдать буфер обмена X11: {}", err);
+                tracing::warn!("plx/xwayland: could not hand over the X11 clipboard: {}", err);
             }
         }
     }
@@ -110,19 +110,19 @@ impl SelectionHandler for Dawn {
     ) {
         if let Some(xwm) = self.xwm.as_mut() {
             if let Err(err) = xwm.send_selection(ty, mime_type, fd) {
-                tracing::warn!("dawn/xwayland: чтение буфера обмена X11: {}", err);
+                tracing::warn!("plx/xwayland: reading the X11 clipboard: {}", err);
             }
         }
     }
 }
 
-impl DataDeviceHandler for Dawn {
+impl DataDeviceHandler for Parallax {
     fn data_device_state(&mut self) -> &mut DataDeviceState { &mut self.data_device_state }
 }
 
-impl DndGrabHandler for Dawn {}
+impl DndGrabHandler for Parallax {}
 
-impl WaylandDndGrabHandler for Dawn {
+impl WaylandDndGrabHandler for Parallax {
     fn dnd_requested<S: Source>(&mut self, source: S, _icon: Option<WlSurface>,
         seat: Seat<Self>, serial: Serial, type_: GrabType) {
         match type_ {
@@ -136,7 +136,7 @@ impl WaylandDndGrabHandler for Dawn {
         }
     }
 }
-delegate_data_device!(Dawn);
+delegate_data_device!(Parallax);
 
 /// `wlr-data-control`: доступ к буферу обмена БЕЗ фокуса на окне.
 ///
@@ -148,10 +148,10 @@ delegate_data_device!(Dawn);
 /// Без него `wl-paste --watch` выходит с «Watch mode requires a compositor that
 /// supports the data-control protocol» (замер 12.08.2026) — история буфера не
 /// набивалась вовсе.
-impl DataControlHandler for Dawn {
+impl DataControlHandler for Parallax {
     fn data_control_state(&mut self) -> &mut DataControlState { &mut self.data_control_state }
 }
-delegate_data_control!(Dawn);
+delegate_data_control!(Parallax);
 
-impl OutputHandler for Dawn {}
-delegate_output!(Dawn);
+impl OutputHandler for Parallax {}
+delegate_output!(Parallax);

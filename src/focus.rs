@@ -25,7 +25,7 @@ use smithay::{
     xwayland::X11Surface,
 };
 
-use crate::state::Dawn;
+use crate::state::Parallax;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyboardFocusTarget {
@@ -67,7 +67,7 @@ impl From<smithay::desktop::PopupKind> for KeyboardFocusTarget {
     }
 }
 
-/// Цель клавиатуры → цель указателя (у dawn это просто поверхность).
+/// Цель клавиатуры → цель указателя (у parallax это просто поверхность).
 ///
 /// Нужно ровно одному месту: захвату меню (`PopupPointerGrab`), который по
 /// цепочке попапов вычисляет, кому отдавать движения мыши. Требование
@@ -106,15 +106,15 @@ impl WaylandFocus for KeyboardFocusTarget {
     }
 }
 
-impl KeyboardTarget<Dawn> for KeyboardFocusTarget {
-    fn enter(&self, seat: &Seat<Dawn>, data: &mut Dawn, keys: Vec<KeysymHandle<'_>>, serial: Serial) {
+impl KeyboardTarget<Parallax> for KeyboardFocusTarget {
+    fn enter(&self, seat: &Seat<Parallax>, data: &mut Parallax, keys: Vec<KeysymHandle<'_>>, serial: Serial) {
         match self {
             Self::Wayland(s) => KeyboardTarget::enter(s, seat, data, keys, serial),
             Self::X11(s) => KeyboardTarget::enter(s, seat, data, keys, serial),
         }
     }
 
-    fn leave(&self, seat: &Seat<Dawn>, data: &mut Dawn, serial: Serial) {
+    fn leave(&self, seat: &Seat<Parallax>, data: &mut Parallax, serial: Serial) {
         match self {
             Self::Wayland(s) => KeyboardTarget::leave(s, seat, data, serial),
             Self::X11(s) => KeyboardTarget::leave(s, seat, data, serial),
@@ -123,8 +123,8 @@ impl KeyboardTarget<Dawn> for KeyboardFocusTarget {
 
     fn key(
         &self,
-        seat: &Seat<Dawn>,
-        data: &mut Dawn,
+        seat: &Seat<Parallax>,
+        data: &mut Parallax,
         key: KeysymHandle<'_>,
         state: KeyState,
         serial: Serial,
@@ -138,8 +138,8 @@ impl KeyboardTarget<Dawn> for KeyboardFocusTarget {
 
     fn modifiers(
         &self,
-        seat: &Seat<Dawn>,
-        data: &mut Dawn,
+        seat: &Seat<Parallax>,
+        data: &mut Parallax,
         modifiers: ModifiersState,
         serial: Serial,
     ) {
@@ -150,8 +150,8 @@ impl KeyboardTarget<Dawn> for KeyboardFocusTarget {
     }
 }
 
-impl Dawn {
-    /// Поверхность, у которой сейчас клавиатурный фокус. Почти весь код dawn
+impl Parallax {
+    /// Поверхность, у которой сейчас клавиатурный фокус. Почти весь код parallax
     /// оперирует именно поверхностями (сравнить с окном, найти окно) — тип
     /// цели фокуса им не интересен.
     pub fn focused_surface(&self) -> Option<WlSurface> {
@@ -159,18 +159,15 @@ impl Dawn {
         //
         // Пока мод на связи, фокус хозяйского места принадлежит ИГРЕ (иначе она
         // не получила бы ни клавиши движения, ни F7), а «окно, с которым сейчас
-        // работают» — это панель под взглядом, и держит её место `dmine`.
+        // работают» — это панель под взглядом, и держит её место `plx-mine`.
         //
         // Без этой развилки из игры работала только та половина биндов, которой
         // окно не нужно (переключить стол, открыть терминал). Всё, что метит в
         // «сфокусированное окно» — закрыть, ресайз, перенос, полный экран,
         // плавающий режим, отправить на тег — молча било по окну Minecraft:
         // Super+Q из игры закрывал бы саму игру.
-        let шахта = self.mine.as_ref().filter(|ш| ш.мод_на_связи());
-        if let Some(место) = шахта.and_then(|ш| ш.место.as_ref()) {
-            if let Some(s) = место.get_keyboard().and_then(|kb| kb.current_focus()).and_then(|f| f.surface()) {
-                return Some(s);
-            }
+        if let Some(s) = crate::mine::фокус_панели_мода(self) {
+            return Some(s);
         }
         let хозяйский = self
             .seat
@@ -181,14 +178,12 @@ impl Dawn {
         // (или та панель закрылась). Хозяйский фокус в этот момент — ОКНО ИГРЫ,
         // и отдавать его биндам нельзя: `Super+Q` из игры закрыл бы Minecraft, а
         // ресайз молча менял бы её размер под полным экраном — ровно так и
-        // выглядела жалоба 01.09.2026 «в dmine не работает ресайз и часть
+        // выглядела жалоба 01.09.2026 «в plx-mine не работает ресайз и часть
         // биндов» (замер на харнессе: окно «игры» 2560×1050 → 2560×1020, панель
         // не тронута). Лучше пусть бинд не сделает ничего, чем сделает это с
         // игрой: окна нет — значит, работать не с чем.
-        if let (Some(шахта), Some(s)) = (шахта, хозяйский.as_ref()) {
-            if шахта.окно_игры.as_ref().is_some_and(|и| crate::xwin::is_surface(и, s)) {
-                return None;
-            }
+        if хозяйский.as_ref().is_some_and(|s| crate::mine::это_окно_игры(self, s)) {
+            return None;
         }
         хозяйский
     }

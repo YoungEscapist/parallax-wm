@@ -1,11 +1,11 @@
-//! Отрисовка сцены в глаза шлема — сырым GL поверх контекста dawn.
+//! Отрисовка сцены в глаза шлема — сырым GL поверх контекста parallax.
 //!
-//! **Почему не через smithay.** Весь рендер dawn идёт `GlesFrame`'ом, а тот
+//! **Почему не через smithay.** Весь рендер parallax идёт `GlesFrame`'ом, а тот
 //! умеет ровно одну проекцию — ортографическую «экран как есть». Для VR нужна
 //! перспектива с матрицей на каждый глаз и глубина, поэтому здесь свой
 //! маленький конвейер: одна программа на панели, одна на линии, один FBO,
 //! один буфер глубины. Всё это живёт в ТОМ ЖЕ EGL-контексте (см. `egl.rs`),
-//! поэтому текстуры окон, отрисованные обычным путём dawn, видны напрямую —
+//! поэтому текстуры окон, отрисованные обычным путём parallax, видны напрямую —
 //! ни копирований, ни dmabuf-мостов.
 //!
 //! **Порядок в кадре одного глаза.**
@@ -153,7 +153,7 @@ impl Рендер {
     pub fn собрать(renderer: &mut GlesRenderer) -> Result<Рендер, String> {
         renderer
             .with_context(|gl| unsafe { собрать_в_контексте(gl) })
-            .map_err(|e| format!("контекст недоступен: {e:?}"))?
+            .map_err(|e| format!("the context is unavailable: {e:?}"))?
     }
 
     /// Отдать GL-ресурсы. Явно, а не в `Drop`: удалять объекты GL можно только
@@ -192,7 +192,7 @@ impl Рендер {
         if self.размер_глубины != (ширина, высота) {
             let (fbo_глубина, ошибка) = renderer
                 .with_context(|gl| unsafe { пересоздать_глубину(gl, self.глубина, ширина, высота) })
-                .map_err(|e| format!("контекст: {e:?}"))?;
+                .map_err(|e| format!("context: {e:?}"))?;
             if let Some(e) = ошибка {
                 return Err(e);
             }
@@ -214,7 +214,7 @@ impl Рендер {
                     панели, линии, прозрачный_фон,
                 )
             })
-            .map_err(|e| format!("контекст: {e:?}"))?
+            .map_err(|e| format!("context: {e:?}"))?
     }
 }
 
@@ -287,7 +287,7 @@ unsafe fn пересоздать_глубину(
         gl.RenderbufferStorage(ffi::RENDERBUFFER, ffi::DEPTH_COMPONENT16, ширина, высота);
         gl.BindRenderbuffer(ffi::RENDERBUFFER, 0);
         if rb == 0 {
-            (0, Some("буфер глубины не создался".into()))
+            (0, Some("the depth buffer was not created".into()))
         } else {
             (rb, None)
         }
@@ -331,7 +331,7 @@ unsafe fn нарисовать(
         //
         // Swapchain шлема — `GL_SRGB8_ALPHA8` (иначе рантайм затемняет
         // картинку при подмешивании к миру), а текстуры окон у нас уже
-        // ЗАКОДИРОВАНЫ в sRGB: это обычные буферы клиентов, которые dawn
+        // ЗАКОДИРОВАНЫ в sRGB: это обычные буферы клиентов, которые parallax
         // рисует один в один и на монитор. Записывая их в sRGB-таргет с
         // включённым `GL_FRAMEBUFFER_SRGB`, драйвер кодирует значения ЕЩЁ раз,
         // и тёмный фон терминала уезжает в серый — ровно это и было видно на
@@ -364,7 +364,7 @@ unsafe fn нарисовать(
         let статус = gl.CheckFramebufferStatus(ffi::FRAMEBUFFER);
         if статус != ffi::FRAMEBUFFER_COMPLETE {
             gl.BindFramebuffer(ffi::FRAMEBUFFER, прежний_fbo as u32);
-            return Err(format!("FBO не собрался: 0x{:X}", статус));
+            return Err(format!("FBO is not complete: 0x{:X}", статус));
         }
 
         gl.Viewport(0, 0, ширина, высота);
@@ -374,7 +374,7 @@ unsafe fn нарисовать(
         gl.DepthMask(ffi::TRUE);
         gl.Enable(ffi::BLEND);
         // Премультиплицированная альфа — та же договорённость, что и во всём
-        // остальном dawn (см. заметку про pooled_solid): текстуры окон приходят
+        // остальном parallax (см. заметку про pooled_solid): текстуры окон приходят
         // премультиплицированными, и SRC_ALPHA здесь дал бы светлую кайму.
         gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
 
@@ -384,7 +384,7 @@ unsafe fn нарисовать(
         } else {
             // Не чистый чёрный: в шлеме абсолютная чернота выглядит «дырой»,
             // и человек теряет ощущение пространства. Очень тёмный синий —
-            // то же, чем dawn заливает пустой холст.
+            // то же, чем parallax заливает пустой холст.
             gl.ClearColor(0.02, 0.02, 0.04, 1.0);
         }
         gl.Clear(ffi::COLOR_BUFFER_BIT | ffi::DEPTH_BUFFER_BIT);
@@ -499,7 +499,7 @@ pub fn прочитать_глаз(
             let статус = gl.CheckFramebufferStatus(ffi::FRAMEBUFFER);
             if статус != ffi::FRAMEBUFFER_COMPLETE {
                 gl.BindFramebuffer(ffi::FRAMEBUFFER, прежний as u32);
-                return Err(format!("FBO для снимка: 0x{:X}", статус));
+                return Err(format!("FBO for the screenshot: 0x{:X}", статус));
             }
             let mut пиксели = vec![0u8; (ширина * высота * 4) as usize];
             gl.PixelStorei(ffi::PACK_ALIGNMENT, 1);
@@ -523,7 +523,7 @@ pub fn прочитать_глаз(
             }
             Ok(перевёрнутые)
         })
-        .map_err(|e| format!("контекст: {e:?}"))?
+        .map_err(|e| format!("context: {e:?}"))?
 }
 
 impl Рендер {
@@ -549,7 +549,7 @@ unsafe fn программа(
         // Атрибут привязываем к нулю ДО линковки: так не нужно спрашивать его
         // место и можно писать `0` в отрисовке.
         for (i, имя) in атрибуты.iter().enumerate() {
-            let c = std::ffi::CString::new(*имя).map_err(|_| "имя атрибута".to_string())?;
+            let c = std::ffi::CString::new(*имя).map_err(|_| "attribute name".to_string())?;
             gl.BindAttribLocation(p, i as u32, c.as_ptr() as *const _);
         }
         gl.LinkProgram(p);
@@ -570,7 +570,7 @@ unsafe fn программа(
             );
             gl.DeleteProgram(p);
             return Err(format!(
-                "программа не слинковалась: {}",
+                "the program did not link: {}",
                 String::from_utf8_lossy(&буфер)
             ));
         }
@@ -601,7 +601,7 @@ unsafe fn шейдер(gl: &ffi::Gles2, вид: u32, исходник: &str) -> 
             gl.GetShaderInfoLog(ш, длина, std::ptr::null_mut(), буфер.as_mut_ptr() as *mut _);
             gl.DeleteShader(ш);
             return Err(format!(
-                "шейдер не собрался: {}",
+                "the shader did not compile: {}",
                 String::from_utf8_lossy(&буфер)
             ));
         }

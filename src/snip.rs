@@ -2,11 +2,11 @@
 //!
 //! **Почему не grim/slurp.** Раньше PrtScr был `grim - | wl-copy`, и на двух
 //! мониторах это ломалось дважды. Во-первых, `grim` без `-o` снимает ВЕСЬ
-//! layout, а холст dawn бесконечен и дома мониторов разнесены на
+//! layout, а холст parallax бесконечен и дома мониторов разнесены на
 //! [`crate::monitors::ШАГ_ДОМА`] = 1 000 000 пикселей — «весь экран» в таких
 //! координатах не имеет смысла. Во-вторых, выделение области рисует `slurp`
 //! своей layer-поверхностью поверх ОДНОГО выхода и в тех же координатах
-//! layout'а. Оба инструмента считают мир плоским прямоугольником, а у dawn это
+//! layout'а. Оба инструмента считают мир плоским прямоугольником, а у parallax это
 //! неверно по построению.
 //!
 //! Поэтому выделение живёт внутри композитора: он один знает, где сейчас стоит
@@ -20,7 +20,7 @@
 //!
 //! **Кадр снимается не здесь.** Пиксели живут в GlesRenderer, который
 //! принадлежит циклу отрисовки в udev.rs, — тем же приёмом, что и
-//! `screencopy::serve_pending`, запрос кладётся в [`Dawn::snip_ждёт`] и
+//! `screencopy::serve_pending`, запрос кладётся в [`Parallax::snip_ждёт`] и
 //! обслуживается сразу после того, как кадр ушёл на монитор. Заодно это решает
 //! вопрос «затемнение не должно попасть в снимок»: к моменту захвата выделение
 //! уже снято, и рисуется чистый кадр.
@@ -28,7 +28,8 @@
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 
-use crate::state::Dawn;
+use crate::state::Parallax;
+use crate::тф;
 
 /// Меньше этого по любой стороне — считаем, что протяжки не было и человек
 /// просто щёлкнул: снимаем монитор целиком.
@@ -53,7 +54,7 @@ pub struct Запрос {
     pub область: Rectangle<i32, Physical>,
 }
 
-impl Dawn {
+impl Parallax {
     /// Идёт ли выделение прямо сейчас (по нему input.rs забирает себе мышь и
     /// Escape, а udev.rs рисует затемнение).
     pub fn snip_идёт(&self) -> bool {
@@ -61,15 +62,15 @@ impl Dawn {
     }
 
     /// PrtScr: включить режим выделения. Второе нажатие — отмена, как у всех
-    /// остальных тумблеров dawn (лаунчер, меню).
+    /// остальных тумблеров parallax (лаунчер, меню).
     pub fn snip_start(&mut self) {
         if self.snip.take().is_some() {
-            tracing::info!("dawn/snip: выделение отменено повторным нажатием");
+            tracing::info!("plx/snip: selection cancelled by pressing again");
             self.request_redraw();
             return;
         }
         self.snip = Some(Выделение { начало: None, монитор: self.курсор_монитор });
-        tracing::info!("dawn/snip: выделение области, монитор {}", self.курсор_монитор + 1);
+        tracing::info!("plx/snip: region selection, monitor {}", self.курсор_монитор + 1);
         self.request_redraw();
     }
 
@@ -85,7 +86,7 @@ impl Dawn {
             // отпускание той же кнопки прилетело бы уже в пустоту.
             if нажата {
                 self.snip = None;
-                tracing::info!("dawn/snip: отменено");
+                tracing::info!("plx/snip: cancelled");
                 self.request_redraw();
             }
             return true;
@@ -149,7 +150,7 @@ impl Dawn {
                         (x0.min(x1).round() as i32, y0.min(y1).round() as i32).into(),
                         (w.round().max(1.0) as i32, h.round().max(1.0) as i32).into(),
                     );
-                    // Рамку могли увести за край экрана (курсор у dawn ходит по
+                    // Рамку могли увести за край экрана (курсор у parallax ходит по
                     // холсту, а не по монитору) — режем по выходу.
                     match рамка.intersection(полный) {
                         Some(r) if r.size.w > 0 && r.size.h > 0 => r,
@@ -161,19 +162,19 @@ impl Dawn {
         };
         let _ = (дом, размер);
         tracing::info!(
-            "dawn/snip: снимаю {}×{} с {} (позиция {},{})",
+            "plx/snip: capturing {}×{} from {} (position {},{})",
             область.size.w, область.size.h, output.name(), область.loc.x, область.loc.y,
         );
         self.snip_ждёт = Some(Запрос { output, область });
         // Кадр снимается ПОСЛЕ отрисовки, а отрисовку надо ещё попросить:
-        // на неподвижном экране dawn кадров не рисует вовсе.
+        // на неподвижном экране parallax кадров не рисует вовсе.
         self.request_redraw();
     }
 
     /// Escape во время выделения.
     pub fn snip_cancel(&mut self) {
         if self.snip.take().is_some() {
-            tracing::info!("dawn/snip: отменено (Escape)");
+            tracing::info!("plx/snip: cancelled (Escape)");
             self.request_redraw();
         }
     }
@@ -182,7 +183,7 @@ impl Dawn {
 /// Отдать ждущий снимок: зовётся из цикла отрисовки сразу после кадра, теми же
 /// элементами, что ушли на монитор (но БЕЗ курсора — как в Windows).
 pub fn serve<E>(
-    state: &mut Dawn,
+    state: &mut Parallax,
     output: &Output,
     renderer: &mut smithay::backend::renderer::gles::GlesRenderer,
     elements: &[E],
@@ -201,7 +202,7 @@ pub fn serve<E>(
     let Some(mode) = output.current_mode() else { return };
     let экран = Size::<i32, smithay::utils::Buffer>::from((mode.size.w, mode.size.h));
     let Some(кадр) = crate::screencopy::capture(renderer, output, elements, экран) else {
-        tracing::warn!("dawn/snip: кадр не снялся");
+        tracing::warn!("plx/snip: the frame was not captured");
         return;
     };
     let (w, h) = (запрос.область.size.w, запрос.область.size.h);
@@ -222,9 +223,9 @@ fn вырезать(кадр: &[u8], sw: i32, sh: i32, обл: Rectangle<i32, Ph
     out
 }
 
-/// Куда класть снимки. Тот же каталог, что у dwall и прочих: `~/Pictures`.
+/// Куда класть снимки. Тот же каталог, что у plx-wall и прочих: `~/Pictures`.
 fn каталог() -> std::path::PathBuf {
-    // dawn запускается через `sudo openvt`, поэтому HOME=/root — файл лёг бы
+    // parallax запускается через `sudo openvt`, поэтому HOME=/root — файл лёг бы
     // туда, где его никто не найдёт. Та же поправка, что в config::config_path.
     let дом = match std::env::var("SUDO_USER") {
         Ok(u) if !u.is_empty() && u != "root" => format!("/home/{u}"),
@@ -233,15 +234,17 @@ fn каталог() -> std::path::PathBuf {
     std::path::PathBuf::from(дом).join("Pictures/Screenshots")
 }
 
-/// «снимок-20260831-174204.png».
+/// «screenshot-20260831-174204.png». Имя всегда английское и от языка
+/// интерфейса НЕ зависит: файлы потом ищут глазами в каталоге и сортируют,
+/// и переехавшее посреди истории имя сломало бы и то, и другое.
 fn имя_файла() -> String {
     match crate::bar::local_time() {
         Some(tm) => format!(
-            "снимок-{:04}{:02}{:02}-{:02}{:02}{:02}.png",
+            "screenshot-{:04}{:02}{:02}-{:02}{:02}{:02}.png",
             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
             tm.tm_hour, tm.tm_min, tm.tm_sec,
         ),
-        None => "снимок.png".to_string(),
+        None => "screenshot.png".to_string(),
     }
 }
 
@@ -257,9 +260,9 @@ pub(crate) fn png_bytes(пиксели: &[u8], w: u32, h: u32) -> Option<Vec<u8>
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         let mut writer = enc.write_header()
-            .map_err(|e| tracing::warn!("dawn/snip: PNG: {}", e)).ok()?;
+            .map_err(|e| tracing::warn!("plx/snip: PNG: {}", e)).ok()?;
         writer.write_image_data(&rgba)
-            .map_err(|e| tracing::warn!("dawn/snip: PNG: {}", e)).ok()?;
+            .map_err(|e| tracing::warn!("plx/snip: PNG: {}", e)).ok()?;
     }
     Some(out)
 }
@@ -271,34 +274,34 @@ pub(crate) fn png_bytes(пиксели: &[u8], w: u32, h: u32) -> Option<Vec<u8>
 /// бы сам композитор — свой источник он держал бы до конца сессии, и первая же
 /// копия текста в другом приложении молча выкинула бы картинку. `wl-copy` для
 /// этого и написан: он форкается, держит буфер и умирает, когда буфер заняли.
-fn сохранить(пиксели: Vec<u8>, w: u32, h: u32, state: &Dawn) {
+fn сохранить(пиксели: Vec<u8>, w: u32, h: u32, state: &Parallax) {
     if w == 0 || h == 0 {
         return;
     }
     let Some(png) = png_bytes(&пиксели, w, h) else { return };
     let каталог = каталог();
     if let Err(e) = std::fs::create_dir_all(&каталог) {
-        tracing::warn!("dawn/snip: {}: {}", каталог.display(), e);
+        tracing::warn!("plx/snip: {}: {}", каталог.display(), e);
         return;
     }
     let путь = каталог.join(имя_файла());
     if let Err(e) = std::fs::write(&путь, &png) {
-        tracing::warn!("dawn/snip: {}: {}", путь.display(), e);
+        tracing::warn!("plx/snip: {}: {}", путь.display(), e);
         return;
     }
-    // Файл принадлежит пользователю, а не root: dawn крутится под sudo, и
+    // Файл принадлежит пользователю, а не root: parallax крутится под sudo, и
     // иначе снимки было бы не удалить из файлового менеджера.
     вернуть_владельца(&путь);
-    tracing::info!("dawn/snip: {} ({}×{})", путь.display(), w, h);
+    tracing::info!("plx/snip: {} ({}×{})", путь.display(), w, h);
     let экранированный = путь.to_string_lossy().replace('\'', "'\\''");
     state.spawn(&format!("wl-copy -t image/png < '{экранированный}'"));
-    state.spawn(&format!(
-        "notify-send -a dawn -i '{экранированный}' 'Снимок экрана' '{}×{} — в буфере обмена'",
+    state.spawn(&тф!(
+        "notify-send -a parallax -i '{экранированный}' 'Снимок экрана' '{}×{} — в буфере обмена'", "notify-send -a parallax -i '{экранированный}' 'Screenshot' '{}×{} — copied to the clipboard'",
         w, h,
     ));
 }
 
-/// chown на SUDO_UID/SUDO_GID, если dawn поднят через sudo.
+/// chown на SUDO_UID/SUDO_GID, если parallax поднят через sudo.
 fn вернуть_владельца(путь: &std::path::Path) {
     let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) else {
         return;

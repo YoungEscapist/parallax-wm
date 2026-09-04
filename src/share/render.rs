@@ -1,6 +1,6 @@
 //! Кадр каждому гостю: та же сцена, что на мониторе, но с ЕГО камерой.
 //!
-//! **Как это вообще возможно так дёшево.** Камера у dawn не живёт в масштабе
+//! **Как это вообще возможно так дёшево.** Камера у parallax не живёт в масштабе
 //! выхода и не размазана по коду: весь кадр собирается одной функцией
 //! `udev::собрать_элементы`, которая читает `state.viewport` и привязку выхода
 //! в `space`. Значит «нарисуй то же самое, но с другой точки» — это подменить
@@ -30,7 +30,7 @@
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 
-use crate::Dawn;
+use crate::Parallax;
 
 /// Насколько две камеры считаются одной и той же (логические пиксели холста и
 /// доли зума). Полпикселя: ближе — картинки не отличить, а пружина камеры
@@ -44,7 +44,7 @@ const ДОПУСК_ЗУМА: f64 = 0.001;
 /// Зовётся из `udev::render_surface` (после того, как кадр ушёл на монитор) и
 /// из `headless::такт` — то есть и на живом железе, и в харнессе.
 pub fn кадры_гостям(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
     скругление: Option<&crate::rounded::Шейдер>,
@@ -54,7 +54,7 @@ pub fn кадры_гостям(
     if раздача.выход != output.name() {
         if пора_сказать(ЧУЖОЙ_ВЫХОД) {
             tracing::debug!(
-                "dawn/share: кадра гостям нет: выход {:?} не тот, кадр считается с {:?}",
+                "plx/share: no frame for the guests: output {:?} is the wrong one, the frame comes from {:?}",
                 output.name(), раздача.выход,
             );
         }
@@ -74,10 +74,10 @@ pub fn кадры_гостям(
     if ждут.is_empty() {
         if !раздача.гости.is_empty() && пора_сказать(НИКОМУ_НЕ_ПОРА) {
             tracing::debug!(
-                "dawn/share: кадра гостям нет: никому не пора: {}",
+                "plx/share: no frame for the guests: nobody is due yet: {}",
                 раздача.гости.iter()
                     .map(|г| format!(
-                        "{}: впущен={} кодировщик={} жив={} пора={} отдано={} уронено={}",
+                        "{}: let_in={} encoder={} alive={} due={} sent={} dropped={}",
                         г.id, г.впущен, г.кодировщик.is_some(),
                         г.кодировщик.as_ref().is_some_and(|к| к.жив()),
                         г.кодировщик.as_ref().is_some_and(|к| к.пора()),
@@ -160,8 +160,8 @@ fn пора_сказать(вид: &str) -> bool {
     }
 }
 
-const ЧУЖОЙ_ВЫХОД: &str = "чужой выход";
-const НИКОМУ_НЕ_ПОРА: &str = "никому не пора";
+const ЧУЖОЙ_ВЫХОД: &str = "wrong output";
+const НИКОМУ_НЕ_ПОРА: &str = "nobody is due";
 
 fn одна_камера(a: (f64, f64, f64), b: (f64, f64, f64)) -> bool {
     (a.0 - b.0).abs() < ДОПУСК_КАМЕРЫ
@@ -181,7 +181,7 @@ fn одна_камера(a: (f64, f64, f64), b: (f64, f64, f64)) -> bool {
 /// записывает текущий `viewport` в активный монитор, и чужая камера уехала бы
 /// в память монитора хозяина насовсем.
 fn снимок(
-    state: &mut Dawn,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
     скругление: Option<&crate::rounded::Шейдер>,

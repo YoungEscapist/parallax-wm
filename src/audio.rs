@@ -71,16 +71,16 @@ pub enum Cmd {
 
 // ── Поток опроса ─────────────────────────────────────────────────────────────
 
-pub fn spawn(to_dawn: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
+pub fn spawn(to_plx: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
     let (tx, rx) = mpsc::channel::<Cmd>();
     let ok = std::thread::Builder::new()
-        .name("dawn-audio".into())
-        .spawn(move || serve(to_dawn, rx))
+        .name("plx-audio".into())
+        .spawn(move || serve(to_plx, rx))
         .is_ok();
     ok.then_some(tx)
 }
 
-fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
+fn serve(to_plx: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
     let mut last: Option<Snapshot> = None;
     let (mut tray, mut menu) = (false, false);
     let mut next_poll = Instant::now();
@@ -111,7 +111,7 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
                 }
                 Cmd::SetDefault { sink, name } => {
                     let text = switch_default(sink, &name);
-                    let _ = to_dawn.send(Event::Notice(text));
+                    let _ = to_plx.send(Event::Notice(text));
                 }
             }
         }
@@ -127,7 +127,7 @@ fn serve(to_dawn: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
             };
         if last.as_ref() != Some(&snap) {
             last = Some(snap.clone());
-            if to_dawn.send(Event::State(snap)).is_err() {
+            if to_plx.send(Event::State(snap)).is_err() {
                 return;
             }
         }
@@ -139,7 +139,7 @@ fn pactl(args: &[&str]) -> Option<String> {
         .env("LC_ALL", "C")
         .args(args)
         .output()
-        .map_err(|e| tracing::warn!("dawn/audio: pactl не запустился: {}", e))
+        .map_err(|e| tracing::warn!("plx/audio: pactl did not start: {}", e))
         .ok()?;
     out.status
         .success()
@@ -283,7 +283,7 @@ impl AudioUi {
     }
 }
 
-impl crate::state::Dawn {
+impl crate::state::Parallax {
     pub fn init_audio(&mut self, tx: mpsc::Sender<Cmd>) {
         self.audio = Some(AudioUi {
             tx,
@@ -304,7 +304,7 @@ impl crate::state::Dawn {
                 a.sel = a.sel.min(n.saturating_sub(1));
             }
             Event::Notice(text) => {
-                tracing::info!("dawn/audio: {}", text);
+                tracing::info!("plx/audio: {}", text);
                 a.notice = Some((text, Instant::now()));
             }
         }
@@ -322,7 +322,7 @@ impl crate::state::Dawn {
     pub fn audio_send(&mut self, cmd: Cmd) {
         if let Some(a) = self.audio.as_ref() {
             if a.tx.send(cmd).is_err() {
-                tracing::warn!("dawn/audio: поток pactl не отвечает");
+                tracing::warn!("plx/audio: pactl thread not responding");
             }
         }
         self.request_redraw();

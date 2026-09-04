@@ -1,4 +1,4 @@
-use crate::Dawn;
+use crate::Parallax;
 use crate::canvas::VelocityTracker;
 use crate::tiling::Layout;
 use smithay::{
@@ -31,7 +31,7 @@ const SWAP_INSET: f64 = 0.18;
 /// толчок), берём цель анимации, а не текущий кадр полёта. Все решения драга
 /// (что толкать, с чем свапаться) должны считаться от покоя — иначе они
 /// зависят от фазы анимации и сами себя подхлёстывают.
-fn resting_rect(data: &Dawn, window: &Window) -> Option<Rectangle<i32, Logical>> {
+fn resting_rect(data: &Parallax, window: &Window) -> Option<Rectangle<i32, Logical>> {
     let geo = data.space.element_geometry(window)?;
     let loc = data.window_anim_target(window).unwrap_or(geo.loc);
     Some(Rectangle::new(loc, geo.size))
@@ -40,7 +40,7 @@ fn resting_rect(data: &Dawn, window: &Window) -> Option<Rectangle<i32, Logical>>
 /// Тайловое окно текущего тега, в «ядро» которого попал курсор (см. SWAP_INSET).
 /// Считается по покоящимся слотам, а не по space.element_under: во время
 /// перелёта окон hit-test по живой геометрии ловил случайных соседей.
-fn tiled_swap_target(data: &Dawn, dragged: &Window, cursor: Point<f64, Logical>) -> Option<Window> {
+fn tiled_swap_target(data: &Parallax, dragged: &Window, cursor: Point<f64, Logical>) -> Option<Window> {
     // В монокле у всех окон стопки ОДИН И ТОТ ЖЕ прямоугольник во весь экран:
     // «окно под курсором» там не определено, и свап по позиции просто
     // перемешивал бы стопку каждые SWAP_COOLDOWN. Порядок стопки меняется
@@ -78,7 +78,7 @@ const SNAP_DISTANCE: i32 = 20;
 const SNAP_MAX_SPEED: f64 = 600.0;
 
 pub struct MoveSurfaceGrab {
-    pub start_data: PointerGrabStartData<Dawn>,
+    pub start_data: PointerGrabStartData<Parallax>,
     pub window: Window,
     pub initial_window_location: Point<i32, Logical>,
     /// (2.5) уже вырвано из горизонтальной ленты в этом драге — сшивание
@@ -100,7 +100,7 @@ pub struct MoveSurfaceGrab {
 
 impl MoveSurfaceGrab {
     pub fn new(
-        start_data: PointerGrabStartData<Dawn>,
+        start_data: PointerGrabStartData<Parallax>,
         window: Window,
         initial_window_location: Point<i32, Logical>,
         group_initial: Vec<(Window, Point<i32, Logical>)>,
@@ -121,7 +121,7 @@ impl MoveSurfaceGrab {
     /// перетаскиваемое. Нужно там, где окно под курсором доводят «руками»
     /// (магнитирование): группа обязана приехать тем же смещением, иначе
     /// строй, который держался весь драг, ломается на последнем шаге.
-    fn shift_group(&self, data: &mut Dawn, shift: Point<i32, Logical>) {
+    fn shift_group(&self, data: &mut Parallax, shift: Point<i32, Logical>) {
         if shift.x == 0 && shift.y == 0 {
             return;
         }
@@ -148,7 +148,7 @@ const RIBBON_ROW_TOLERANCE: i32 = 20;
 /// все окна ленты правее вытащенного подтягиваются влево на его ширину —
 /// лента "сшивается" без образования дыры.
 fn stitch_ribbon_gap(
-    data: &mut Dawn,
+    data: &mut Parallax,
     dragged: &Window,
     dragged_initial_loc: Point<i32, Logical>,
     dragged_width: i32,
@@ -183,14 +183,14 @@ fn stitch_ribbon_gap(
         }
     }
     data.request_plane_reset();
-    tracing::info!("dawn: ribbon stitched ({} windows shifted)", to_shift.len());
+    tracing::info!("plx: ribbon stitched ({} windows shifted)", to_shift.len());
 }
 
 /// Ищет ближайший "магнитный" край среди остальных окон для каждой оси
 /// независимо (X и Y примагничиваются отдельно). Возвращает Some только по
 /// тем осям, где нашлось окно в пределах SNAP_DISTANCE.
 fn find_snap_target(
-    data: &Dawn,
+    data: &Parallax,
     window: &Window,
     free_loc: Point<i32, Logical>,
     riding: &[Window],
@@ -254,10 +254,10 @@ fn find_snap_target(
 /// `drag_vel` — текущая скорость перетаскивания (px/сек): окно, которого
 /// коснулись первый раз (оно ещё стоит), получает не только сдвиг из-под
 /// курсора, но и ИМПУЛЬС — уезжает по инерции и сам расталкивает дальше
-/// (см. Dawn::impulse_window и resolve_fling_collisions). Раньше сосед просто
+/// (см. Parallax::impulse_window и resolve_fling_collisions). Раньше сосед просто
 /// доезжал ровно до края и вставал — «пинка» не чувствовалось.
 fn push_colliding_windows(
-    data: &mut Dawn,
+    data: &mut Parallax,
     dragged: &Window,
     dragged_loc: Point<i32, Logical>,
     drag_vel: Point<f64, Logical>,
@@ -372,7 +372,7 @@ impl MoveSurfaceGrab {
     /// только свободный перенос и потому в Tile и Columns просто отказывалась
     /// работать (см. `плавающее` в старой ветке). Теперь у мыши и у тачпада
     /// один и тот же код, а значит и одно и то же поведение.
-    pub fn drag_to(&mut self, data: &mut Dawn, cursor: Point<f64, Logical>, time: u32) {
+    pub fn drag_to(&mut self, data: &mut Parallax, cursor: Point<f64, Logical>, time: u32) {
         let event = MotionEvent {
             location: cursor,
             serial: smithay::utils::SERIAL_COUNTER.next_serial(),
@@ -381,7 +381,7 @@ impl MoveSurfaceGrab {
         let event = &event;
 
         // Пока идёт драг, окно принадлежит мыши: анимации (в т.ч. толчок от
-        // прилетевшего по инерции соседа) его не двигают — см. Dawn::dragged_window.
+        // прилетевшего по инерции соседа) его не двигают — см. Parallax::dragged_window.
         data.dragged_window = Some(self.window.clone());
 
         // В обзоре столов раскладку держит overview.rs (arrange там выходит
@@ -429,7 +429,7 @@ impl MoveSurfaceGrab {
                         self.last_swap = Some(Instant::now());
                         data.arrange();
                         data.request_redraw();
-                        tracing::debug!("dawn: tiled drag swap");
+                        tracing::debug!("plx: tiled drag swap");
                     }
                 }
             }
@@ -567,7 +567,7 @@ impl MoveSurfaceGrab {
     /// вслепую. Тонкий контур по каждому члену ПЛЮС общая рамка вокруг всей
     /// грозди показывают её целиком — рамка видна даже тогда, когда сами окна
     /// не видны: она пересекает экран.
-    fn обновить_призраков(&self, data: &mut Dawn) {
+    fn обновить_призраков(&self, data: &mut Parallax) {
         let mut рамки: Vec<Rectangle<i32, Logical>> = Vec::new();
         for (member, _) in &self.group_initial {
             if let Some(g) = data.space.element_geometry(member) {
@@ -597,7 +597,7 @@ impl MoveSurfaceGrab {
     /// обзоре, вставка в ленту, доводка тайловой раскладки, магнитирование и
     /// инерция. Раньше это было телом `PointerGrab::button`, и тачпадному
     /// жесту не доставалось ничего из перечисленного.
-    pub fn finish(&mut self, data: &mut Dawn) {
+    pub fn finish(&mut self, data: &mut Parallax) {
         // Драг кончился — окно снова принадлежит анимациям (в пути мыши это
         // делает PointerGrab::unset, но жест туда не заходит).
         data.dragged_window = None;
@@ -753,11 +753,11 @@ impl MoveSurfaceGrab {
     }
 }
 
-impl PointerGrab<Dawn> for MoveSurfaceGrab {
+impl PointerGrab<Parallax> for MoveSurfaceGrab {
     fn motion(
         &mut self,
-        data: &mut Dawn,
-        handle: &mut PointerInnerHandle<'_, Dawn>,
+        data: &mut Parallax,
+        handle: &mut PointerInnerHandle<'_, Parallax>,
         _focus: Option<(WlSurface, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
@@ -767,8 +767,8 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
 
     fn relative_motion(
         &mut self,
-        data: &mut Dawn,
-        handle: &mut PointerInnerHandle<'_, Dawn>,
+        data: &mut Parallax,
+        handle: &mut PointerInnerHandle<'_, Parallax>,
         focus: Option<(WlSurface, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
@@ -777,8 +777,8 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
 
     fn button(
         &mut self,
-        data: &mut Dawn,
-        handle: &mut PointerInnerHandle<'_, Dawn>,
+        data: &mut Parallax,
+        handle: &mut PointerInnerHandle<'_, Parallax>,
         event: &ButtonEvent,
     ) {
         handle.button(data, event);
@@ -790,40 +790,40 @@ impl PointerGrab<Dawn> for MoveSurfaceGrab {
         }
     }
 
-    fn axis(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, details: AxisFrame) {
+    fn axis(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, details: AxisFrame) {
         handle.axis(data, details)
     }
-    fn frame(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>) {
+    fn frame(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>) {
         handle.frame(data);
     }
-    fn gesture_swipe_begin(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GestureSwipeBeginEvent) {
+    fn gesture_swipe_begin(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GestureSwipeBeginEvent) {
         handle.gesture_swipe_begin(data, event)
     }
-    fn gesture_swipe_update(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GestureSwipeUpdateEvent) {
+    fn gesture_swipe_update(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GestureSwipeUpdateEvent) {
         handle.gesture_swipe_update(data, event)
     }
-    fn gesture_swipe_end(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GestureSwipeEndEvent) {
+    fn gesture_swipe_end(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GestureSwipeEndEvent) {
         handle.gesture_swipe_end(data, event)
     }
-    fn gesture_pinch_begin(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GesturePinchBeginEvent) {
+    fn gesture_pinch_begin(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GesturePinchBeginEvent) {
         handle.gesture_pinch_begin(data, event)
     }
-    fn gesture_pinch_update(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GesturePinchUpdateEvent) {
+    fn gesture_pinch_update(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GesturePinchUpdateEvent) {
         handle.gesture_pinch_update(data, event)
     }
-    fn gesture_pinch_end(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GesturePinchEndEvent) {
+    fn gesture_pinch_end(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GesturePinchEndEvent) {
         handle.gesture_pinch_end(data, event)
     }
-    fn gesture_hold_begin(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GestureHoldBeginEvent) {
+    fn gesture_hold_begin(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GestureHoldBeginEvent) {
         handle.gesture_hold_begin(data, event)
     }
-    fn gesture_hold_end(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GestureHoldEndEvent) {
+    fn gesture_hold_end(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GestureHoldEndEvent) {
         handle.gesture_hold_end(data, event)
     }
-    fn start_data(&self) -> &PointerGrabStartData<Dawn> {
+    fn start_data(&self) -> &PointerGrabStartData<Parallax> {
         &self.start_data
     }
-    fn unset(&mut self, data: &mut Dawn) {
+    fn unset(&mut self, data: &mut Parallax) {
         data.dragged_window = None;
     }
 }

@@ -1,7 +1,7 @@
 //! Два способа добраться до окна, которого сейчас не видно.
 //!
 //! · **Alt+Tab** — перебор СТОПКИ: окон, лежащих друг под другом в одном месте
-//!   холста. В dawn холст бесконечен и окна расставлены по нему свободно, но
+//!   холста. В parallax холст бесконечен и окна расставлены по нему свободно, но
 //!   ровно в одной точке их обычно несколько (плавающая раскладка, окна одного
 //!   приложения, схлопнутая стопка 2.4), и верхнее закрывает остальные.
 //!   Пространственная навигация (Super+стрелки, focus_direction) до них не
@@ -15,7 +15,8 @@
 use smithay::desktop::Window;
 use smithay::utils::{IsAlive, Logical, Point, Rectangle};
 
-use crate::state::Dawn;
+use crate::state::Parallax;
+use crate::т;
 
 // ── Alt+Tab: перебор стопки ──────────────────────────────────────────────────
 
@@ -30,7 +31,7 @@ pub struct AltTab {
     pub idx: usize,
 }
 
-impl Dawn {
+impl Parallax {
     /// Окна текущих столов, лежащие в одной точке холста с `pivot`, сверху вниз.
     fn overlap_stack(&self, pivot: &Window) -> Vec<Window> {
         let Some(base) = self.space.element_geometry(pivot) else { return Vec::new() };
@@ -86,7 +87,7 @@ impl Dawn {
                 .position(|w| crate::dwindle::same_window(w, &pivot))
                 .unwrap_or(0);
             tracing::debug!(
-                "dawn: alt-tab: стопка из {} окон, старт с {}", order.len(), idx,
+                "plx: alt-tab: stack of {} windows, starting at {}", order.len(), idx,
             );
             self.alt_tab = Some(AltTab { order, idx });
         }
@@ -223,7 +224,7 @@ fn score(title: &str, app: &str, query: &str) -> Option<i32> {
     [по_заголовку, по_приложению, нечёткое].into_iter().flatten().min()
 }
 
-impl Dawn {
+impl Parallax {
     pub fn search_open(&self) -> bool {
         self.search.is_some()
     }
@@ -258,7 +259,7 @@ impl Dawn {
             .filter_map(|tw| {
                 let app = crate::xwin::app_id(&tw.window).unwrap_or_default();
                 let title = crate::xwin::title(&tw.window)
-                    .unwrap_or_else(|| if app.is_empty() { "окно".into() } else { app.clone() });
+                    .unwrap_or_else(|| if app.is_empty() { т!("окно", "window").into() } else { app.clone() });
                 let score = score(&title, &app, &ui.query)?;
                 Some(Hit { window: tw.window.clone(), title, app, tags: tw.tags, score })
             })
@@ -306,7 +307,7 @@ impl Dawn {
         // замаплено в space и фокусировать нечего.
         if tags & self.viewport.current_tags() == 0 && tags != 0 {
             let первый = 1u32 << tags.trailing_zeros();
-            tracing::debug!("dawn: поиск: окно на столе {:#b}, переключаемся", первый);
+            tracing::debug!("plx: search: the window is on workspace {:#b}, switching", первый);
             self.view_tag(первый);
         }
         // Камеру ведём к окну ДО фокуса: focus() поднимает окно и активирует
@@ -377,7 +378,7 @@ impl Dawn {
                 }
                 self.search_activate();
             }
-            // Мимо списка — закрываем, как и все остальные меню dawn.
+            // Мимо списка — закрываем, как и все остальные меню parallax.
             None => self.search_toggle(),
         }
         true
@@ -422,8 +423,8 @@ mod tests {
     /// Заголовок весит больше app_id: человек помнит, что было НАПИСАНО в окне.
     #[test]
     fn заголовок_важнее_приложения() {
-        let по_заголовку = score("dawn — исходники", "ghostty", "dawn").unwrap();
-        let по_приложению = score("исходники", "dawn", "dawn").unwrap();
+        let по_заголовку = score("parallax — исходники", "ghostty", "parallax").unwrap();
+        let по_приложению = score("исходники", "parallax", "parallax").unwrap();
         assert!(по_заголовку < по_приложению);
     }
 }

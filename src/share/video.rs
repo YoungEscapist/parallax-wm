@@ -6,7 +6,7 @@
 //! потока BGRA». Процесс отделён границей ОС: он может умереть, зависнуть,
 //! быть убитым — хост это переживёт и просто перезапустит кодировщик. Цена —
 //! копия кадра через трубу; на 1080p это единицы миллисекунд.
-//! (В dwall кодек как раз в процессе — там обратная задача: декодировать
+//! (В plx-wall кодек как раз в процессе — там обратная задача: декодировать
 //! обои, и падение декодера означает лишь чёрный фон.)
 //!
 //! **Почему кадр рисуется на каждого отдельно.** У гостя своя камера по
@@ -69,11 +69,11 @@ fn есть_nvenc() -> bool {
             Ok(в) => {
                 let текст = String::from_utf8_lossy(&в.stdout);
                 let есть = текст.contains("h264_nvenc");
-                tracing::info!("dawn/share: h264_nvenc {}", if есть { "есть" } else { "нет, беру libx264" });
+                tracing::info!("plx/share: h264_nvenc {}", if есть { "yes" } else { "no, falling back to libx264" });
                 есть
             }
             Err(e) => {
-                tracing::warn!("dawn/share: ffmpeg не запускается ({e}) — видео гостям не поедет");
+                tracing::warn!("plx/share: ffmpeg will not start ({e}) — guests will get no video");
                 false
             }
         }
@@ -202,7 +202,7 @@ impl Кодировщик {
         let mut процесс = match команда.spawn() {
             Ok(п) => п,
             Err(e) => {
-                tracing::warn!("dawn/share: ffmpeg не запустился для гостя {id}: {e}");
+                tracing::warn!("plx/share: ffmpeg failed to start for guest {id}: {e}");
                 return None;
             }
         };
@@ -223,13 +223,13 @@ impl Кодировщик {
                 запустить_писателя(id, вход, ячейка.clone(), живой.clone());
             }
             None => {
-                tracing::warn!("dawn/share: у ffmpeg гостя {id} нет входа — кадров не будет");
+                tracing::warn!("plx/share: ffmpeg for guest {id} has no stdin — no frames");
                 живой.store(false, Ordering::Relaxed);
             }
         }
 
         tracing::info!(
-            "dawn/share: кодировщик гостя {id}: {ширина}x{высота}@{КАДРОВ}, {}",
+            "plx/share: encoder for guest {id}: {ширина}x{высота}@{КАДРОВ}, {}",
             if аппаратный { "h264_nvenc" } else { "libx264" },
         );
         Some(Self {
@@ -266,7 +266,7 @@ impl Кодировщик {
         let ждём = (self.ширина * self.высота * 4) as usize;
         if пиксели.len() != ждём {
             tracing::warn!(
-                "dawn/share: кадр {} байт вместо {} — пропуск",
+                "plx/share: frame is {} bytes instead of {} — skipped",
                 пиксели.len(), ждём,
             );
             return false;
@@ -303,7 +303,7 @@ impl Drop for Кодировщик {
 /// это ровно то, что нужно: ждёт не композитор, а этот поток.
 fn запустить_писателя(id: u8, mut вход: ChildStdin, ячейка: Arc<Ячейка>, живой: Arc<AtomicBool>) {
     std::thread::Builder::new()
-        .name(format!("dshare-raw-{id}"))
+        .name(format!("plx-share-raw-{id}"))
         .spawn(move || {
             while let Some(кадр) = ячейка.взять() {
                 if let Err(e) = вход.write_all(&кадр) {
@@ -316,9 +316,9 @@ fn запустить_писателя(id: u8, mut вход: ChildStdin, яче�
                     // тяге окна гостя за угол. Замер 30.08.2026: один
                     // ресайз — один `WARN … Broken pipe` на ровном месте.
                     if живой.load(Ordering::Relaxed) {
-                        tracing::warn!("dawn/share: запись кадра гостю {id}: {e}");
+                        tracing::warn!("plx/share: writing a frame for guest {id}: {e}");
                     } else {
-                        tracing::debug!("dawn/share: кодировщик гостя {id} закрыт нами: {e}");
+                        tracing::debug!("plx/share: encoder for guest {id} closed by us: {e}");
                     }
                     живой.store(false, Ordering::Relaxed);
                     return;
@@ -328,7 +328,7 @@ fn запустить_писателя(id: u8, mut вход: ChildStdin, яче�
             // выходит сам.
             drop(вход);
         })
-        .map_err(|e| tracing::warn!("dawn/share: поток записи кадров не завёлся: {e}"))
+        .map_err(|e| tracing::warn!("plx/share: frame writer thread failed to start: {e}"))
         .ok();
 }
 
@@ -341,7 +341,7 @@ fn запустить_писателя(id: u8, mut вход: ChildStdin, яче�
 /// места картинку можно показывать.
 fn запустить_читателя(id: u8, mut выход: ChildStdout, исходящие: Arc<Очередь>, живой: Arc<AtomicBool>) {
     std::thread::Builder::new()
-        .name(format!("dshare-enc-{id}"))
+        .name(format!("plx-share-enc-{id}"))
         .spawn(move || {
             use std::io::Read;
             let mut буфер = vec![0u8; 256 * 1024];
@@ -366,15 +366,15 @@ fn запустить_читателя(id: u8, mut выход: ChildStdout, ис
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        tracing::warn!("dawn/share: чтение из ffmpeg (гость {id}): {e}");
+                        tracing::warn!("plx/share: reading from ffmpeg (guest {id}): {e}");
                         break;
                     }
                 }
             }
             живой.store(false, Ordering::Relaxed);
-            tracing::info!("dawn/share: кодировщик гостя {id} закончился");
+            tracing::info!("plx/share: encoder for guest {id} finished");
         })
-        .map_err(|e| tracing::warn!("dawn/share: поток кодировщика не завёлся: {e}"))
+        .map_err(|e| tracing::warn!("plx/share: encoder thread failed to start: {e}"))
         .ok();
 }
 
@@ -426,7 +426,7 @@ fn расширить_трубу(файл: &ChildStdin) {
     let вышло = unsafe { libc::fcntl(fd, F_SETPIPE_SZ, предел) };
     if вышло < 0 {
         tracing::debug!(
-            "dawn/share: труба ffmpeg осталась прежнего размера: {}",
+            "plx/share: the ffmpeg pipe kept its previous size: {}",
             std::io::Error::last_os_error(),
         );
     }

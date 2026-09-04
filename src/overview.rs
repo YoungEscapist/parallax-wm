@@ -27,7 +27,7 @@ use smithay::{
 };
 
 use crate::anim::CameraAnim;
-use crate::state::Dawn;
+use crate::state::Parallax;
 use crate::tiling::{GAP_INNER, GAP_OUTER, Layout};
 
 /// Зазор между ячейками сетки столов (canvas px).
@@ -40,7 +40,7 @@ fn same_window(a: &Window, b: &Window) -> bool {
     a == b
 }
 
-impl Dawn {
+impl Parallax {
     /// Можно ли СЕЙЧАС войти в обзор. Во Float — нет: там окна и так свободно
     /// разбросаны по бесконечному холсту, камера ходит куда угодно, и обзор
     /// столов ничего не добавляет — зато случайный тап по Super (он ловится при
@@ -223,7 +223,7 @@ impl Dawn {
         }
         self.request_plane_reset();
         self.request_redraw();
-        tracing::info!("dawn: overview off");
+        tracing::info!("plx: overview off");
     }
 
     /// Снимает позиции/размеры ВСЕХ окон перед тем, как обзор разложит их
@@ -463,7 +463,7 @@ impl Dawn {
             // (overview_allowed выше), а сообщение осталось прежним и в логе
             // 20260729_190042 одиннадцать раз врало про «тайловый режим».
             tracing::debug!(
-                "dawn: обзор не открывается в раскладке {:?} (разрешён везде, кроме Float)",
+                "plx: overview does not open in the {:?} layout (allowed everywhere except Float)",
                 self.tile_config.layout,
             );
             return;
@@ -525,7 +525,7 @@ impl Dawn {
                     continue;
                 }
                 // ТОЛЬКО СВОИ столы. Стол принадлежит монитору
-                // (`Dawn::монитор_стола`), а обзор раскладывает окна по ячейкам
+                // (`Parallax::монитор_стола`), а обзор раскладывает окна по ячейкам
                 // сетки на холсте СВОЕГО монитора: взяв сюда чужой стол, он
                 // физически утаскивал окна соседнего экрана к себе — за миллион
                 // пикселей от их дома, — и после выхода они там и оставались.
@@ -599,7 +599,7 @@ impl Dawn {
         ));
         self.request_plane_reset();
         self.request_redraw();
-        tracing::info!("dawn: overview on ({} workspaces, fit_zoom={:.3})", order.len(), fit_zoom);
+        tracing::info!("plx: overview on ({} workspaces, fit_zoom={:.3})", order.len(), fit_zoom);
     }
 
     /// «Домашняя» геометрия окна: где и какого размера оно стоит на СВОЁМ столе,
@@ -1094,7 +1094,7 @@ impl Dawn {
         self.request_plane_reset();
         self.request_redraw();
         tracing::info!(
-            "dawn: overview (лента) on ({} этажей, zoom={:.3})",
+            "plx: overview (ribbon) on ({} rows, zoom={:.3})",
             self.overview_order.len(), zoom,
         );
     }
@@ -1170,7 +1170,7 @@ impl Dawn {
         self.apply_camera();
         self.request_plane_reset();
         self.request_redraw();
-        tracing::info!("dawn: overview (лента) off");
+        tracing::info!("plx: overview (ribbon) off");
     }
 
     /// Отпустили перетаскивание окна в ленточном обзоре: окно встаёт в полосу

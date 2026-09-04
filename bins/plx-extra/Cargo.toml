@@ -1,0 +1,16 @@
+[package]
+name = "plx-extra"
+version = "0.1.0"
+edition = "2021"
+description = "Parallax with everything optional: VR headset, windows inside Minecraft, guest sharing"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/mifaroslav-dotcom/parallax"
+
+[[bin]]
+name = "plx-extra"
+path = "src/main.rs"
+
+# То же самое плюс всё необязательное: шлем (vr), окна в Minecraft (mine) и
+# мультиюзер (share). Ровно то, что раньше собиралось безусловно.
+[dependencies]
+parallax = { path = "../..", default-features = false, features = ["extra"] }

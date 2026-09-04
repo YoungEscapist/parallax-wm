@@ -7,12 +7,12 @@
 //!
 //! **Как это включается.** Никак не автоматически. `Шлем::подключиться`
 //! зовётся по действию `vr_toggle` (Super+Alt+V по умолчанию) или ключом
-//! командной строки `--vr`. Пока никто не попросил, dawn даже не грузит
+//! командной строки `--vr`. Пока никто не попросил, parallax даже не грузит
 //! `libopenxr_loader.so`: VR — гость в этом композиторе, а не условие работы.
 //!
 //! **Три состояния, которые важно не перепутать.**
 //!
-//! · сессии нет вовсе — `Dawn::vr == None`, dawn обычный композитор;
+//! · сессии нет вовсе — `Parallax::vr == None`, parallax обычный композитор;
 //! · сессия есть, но рантайм ещё не сказал «можно рисовать» (`IDLE`/`READY`):
 //!   кадры не отдаём, но событийный цикл крутим — иначе не дождёмся `READY`;
 //! · сессия идёт (`SYNCHRONIZED`/`VISIBLE`/`FOCUSED`) — рисуем каждый кадр.
@@ -115,7 +115,7 @@ pub enum Кадр {
 /// **Зачем этот раздел вообще существует.** Под WiVRn `xrCreateInstance` — это
 /// не «создать объект», а «дождаться шлема»: клиент Monado соединяется с
 /// `wivrn-server` по unix-сокету и висит в `recvmsg` до тех пор, пока к серверу
-/// не подключится живой Quest. Замер 31.08.2026: главный поток dawn стоял в
+/// не подключится живой Quest. Замер 31.08.2026: главный поток parallax стоял в
 /// `ipc_client_setup_shm` минутами, весь композитор был мёртв (ни курсора, ни
 /// ctl, ни кадров) — ровно то, что Ярик увидел как «нажал Super+Alt+V и всё
 /// зависло». Никакого таймаута у этого ожидания нет и быть не может: оно и есть
@@ -142,12 +142,12 @@ impl Заготовка {
     pub fn нащупать() -> Result<Заготовка, Ошибка> {
         // `load` небезопасен по одной причине: он делает dlopen чужой библиотеки,
         // и та вправе выполнить свой код инициализации. Ровно то же самое делает
-        // любой драйвер GL, который dawn уже грузит.
+        // любой драйвер GL, который parallax уже грузит.
         let entry = unsafe { xr::Entry::load() }
             .map_err(|e| Ошибка::Загрузчик(format!("{e:?}")))?;
         let доступные = entry
             .enumerate_extensions()
-            .map_err(|e| Ошибка::Xr("список расширений", e))?;
+            .map_err(|e| Ошибка::Xr("extension list", e))?;
 
         // ── Расширения ──────────────────────────────────────────────────────
         // `mndx_egl_enable` — то, чем мы вообще живём (см. egl.rs). Без него
@@ -167,46 +167,46 @@ impl Заготовка {
         просим.fb_display_refresh_rate = доступные.fb_display_refresh_rate;
 
         let инфо = xr::ApplicationInfo {
-            application_name: "dawn",
+            application_name: "parallax",
             application_version: 1,
-            engine_name: "dawn",
+            engine_name: "parallax",
             engine_version: 1,
             api_version: xr::Version::new(1, 0, 0),
         };
         let instance = entry
             .create_instance(&инфо, &просим, &[])
-            .map_err(|e| Ошибка::Xr("создание инстанса", e))?;
+            .map_err(|e| Ошибка::Xr("instance creation", e))?;
         let свойства = instance
             .properties()
-            .map_err(|e| Ошибка::Xr("свойства рантайма", e))?;
+            .map_err(|e| Ошибка::Xr("runtime properties", e))?;
         tracing::info!(
-            "dawn/vr: рантайм {} {}",
+            "plx/vr: runtime {} {}",
             свойства.runtime_name,
             свойства.runtime_version
         );
 
         let system = instance
             .system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)
-            .map_err(|e| Ошибка::Xr("поиск шлема", e))?;
+            .map_err(|e| Ошибка::Xr("headset lookup", e))?;
 
         let умеет_смешивать = instance
             .enumerate_environment_blend_modes(system, ВИД)
-            .map_err(|e| Ошибка::Xr("режимы смешивания", e))?;
+            .map_err(|e| Ошибка::Xr("blend modes", e))?;
 
         // Требования обязаны быть спрошены до создания сессии (см. egl.rs).
         let треб = <Egl as xr::Graphics>::requirements(&instance, system)
-            .map_err(|e| Ошибка::Xr("требования графики", e))?;
+            .map_err(|e| Ошибка::Xr("graphics requirements", e))?;
         tracing::info!(
-            "dawn/vr: рантайм хочет GLES {}..{}",
+            "plx/vr: the runtime wants GLES {}..{}",
             треб.мин_версия,
             треб.макс_версия
         );
 
         let виды = instance
             .enumerate_view_configuration_views(system, ВИД)
-            .map_err(|e| Ошибка::Xr("конфигурация видов", e))?;
+            .map_err(|e| Ошибка::Xr("view configuration", e))?;
         if виды.len() < 2 {
-            return Err(Ошибка::Странно("рантайм отдал меньше двух видов"));
+            return Err(Ошибка::Странно("the runtime returned fewer than two views"));
         }
 
         Ok(Заготовка { entry, instance, system, умеет_смешивать, виды })
@@ -223,12 +223,12 @@ impl Шлем {
         Шлем::поднять(Заготовка::нащупать()?, renderer)
     }
 
-    /// Поднять сессию поверх контекста, в котором рисует dawn.
+    /// Поднять сессию поверх контекста, в котором рисует parallax.
     ///
     /// `renderer` нужен ровно за одним: у него берутся EGLDisplay, EGLConfig и
     /// EGLContext. Ничего в нём не меняется.
     ///
-    /// Зовётся с ГЛАВНОГО потока — и только он: EGL-контекст dawn привязан к
+    /// Зовётся с ГЛАВНОГО потока — и только он: EGL-контекст parallax привязан к
     /// нему, `xrCreateSession` обязан видеть его текущим. Всё, что могло
     /// заснуть надолго, к этому моменту уже сделано в `Заготовка::нащупать`.
     pub fn поднять(заготовка: Заготовка, renderer: &mut GlesRenderer) -> Result<Шлем, Ошибка> {
@@ -246,25 +246,25 @@ impl Шлем {
                 &СозданиеСессии { display, config, context },
             )
         }
-        .map_err(|e| Ошибка::Xr("создание сессии", e))?;
+        .map_err(|e| Ошибка::Xr("session creation", e))?;
 
         let сцена = session
             .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
             .or_else(|_| {
                 // У шлема без охраняемой зоны (или у симулятора) STAGE может не
                 // быть — тогда LOCAL, начало координат в точке старта.
-                tracing::warn!("dawn/vr: STAGE недоступен, беру LOCAL");
+                tracing::warn!("plx/vr: STAGE unavailable, falling back to LOCAL");
                 session.create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)
             })
-            .map_err(|e| Ошибка::Xr("опорное пространство", e))?;
+            .map_err(|e| Ошибка::Xr("reference space", e))?;
         let голова = session
             .create_reference_space(xr::ReferenceSpaceType::VIEW, xr::Posef::IDENTITY)
-            .map_err(|e| Ошибка::Xr("пространство головы", e))?;
+            .map_err(|e| Ошибка::Xr("head space", e))?;
 
         // ── Swapchain на каждый глаз ────────────────────────────────────────
         let форматы = session
             .enumerate_swapchain_formats()
-            .map_err(|e| Ошибка::Xr("форматы swapchain", e))?;
+            .map_err(|e| Ошибка::Xr("swapchain formats", e))?;
         let формат = if форматы.contains(&GL_SRGB8_ALPHA8) {
             GL_SRGB8_ALPHA8
         } else if форматы.contains(&GL_RGBA8) {
@@ -272,10 +272,10 @@ impl Шлем {
         } else {
             // Берём первый предложенный: спецификация обещает, что список
             // непуст и отсортирован по предпочтению рантайма.
-            *форматы.first().ok_or(Ошибка::Странно("пустой список форматов"))?
+            *форматы.first().ok_or(Ошибка::Странно("the runtime returned an empty swapchain format list"))?
         };
         tracing::info!(
-            "dawn/vr: формат swapchain 0x{:X} (sRGB={})",
+            "plx/vr: swapchain format 0x{:X} (sRGB={})",
             формат,
             формат == GL_SRGB8_ALPHA8
         );
@@ -299,11 +299,11 @@ impl Шлем {
                     array_size: 1,
                     mip_count: 1,
                 })
-                .map_err(|e| Ошибка::Xr("создание swapchain", e))?;
+                .map_err(|e| Ошибка::Xr("swapchain creation", e))?;
             let образы = swapchain
                 .enumerate_images()
-                .map_err(|e| Ошибка::Xr("образы swapchain", e))?;
-            tracing::info!("dawn/vr: глаз {} — {}×{}, образов {}", i, ш, вы, образы.len());
+                .map_err(|e| Ошибка::Xr("swapchain images", e))?;
+            tracing::info!("plx/vr: eye {} — {}×{}, {} swapchain images", i, ш, вы, образы.len());
             Ok(Глаз { swapchain, образы, ширина: ш, высота: вы })
         };
         let глаза = [создать_глаз(0)?, создать_глаз(1)?];
@@ -331,7 +331,7 @@ impl Шлем {
         // xrAttachSessionActionSets, а он делается один раз на сессию.
         match super::input::Ввод::поднять(&шлем.instance, &шлем.session) {
             Ok(в) => шлем.ввод = Some(в),
-            Err(e) => tracing::warn!("dawn/vr: ввод не поднялся ({e:?}) — останутся мышь и клавиатура"),
+            Err(e) => tracing::warn!("plx/vr: input did not start ({e:?}) — mouse and keyboard remain"),
         }
         Ok(шлем)
     }
@@ -344,7 +344,7 @@ impl Шлем {
             .instance
             .poll_event(&mut буфер)
             .unwrap_or_else(|e| {
-                tracing::warn!("dawn/vr: poll_event: {e}");
+                tracing::warn!("plx/vr: poll_event: {e}");
                 None
             })
         {
@@ -352,18 +352,18 @@ impl Шлем {
             match событие {
                 SessionStateChanged(e) => {
                     self.состояние = e.state();
-                    tracing::info!("dawn/vr: состояние сессии → {:?}", self.состояние);
+                    tracing::info!("plx/vr: session state → {:?}", self.состояние);
                     match self.состояние {
                         xr::SessionState::READY => {
                             if let Err(e) = self.session.begin(ВИД) {
-                                tracing::error!("dawn/vr: begin_session: {e}");
+                                tracing::error!("plx/vr: begin_session: {e}");
                                 return false;
                             }
                             self.идёт = true;
                         }
                         xr::SessionState::STOPPING => {
                             if let Err(e) = self.session.end() {
-                                tracing::error!("dawn/vr: end_session: {e}");
+                                tracing::error!("plx/vr: end_session: {e}");
                             }
                             self.идёт = false;
                         }
@@ -374,7 +374,7 @@ impl Шлем {
                     }
                 }
                 InstanceLossPending(_) => {
-                    tracing::warn!("dawn/vr: рантайм уходит");
+                    tracing::warn!("plx/vr: the runtime is going away");
                     return false;
                 }
                 InteractionProfileChanged(_) => {
@@ -400,13 +400,13 @@ impl Шлем {
         let состояние = match self.ожидание.wait() {
             Ok(с) => с,
             Err(e) => {
-                tracing::warn!("dawn/vr: wait_frame: {e}");
+                tracing::warn!("plx/vr: wait_frame: {e}");
                 return Кадр::Спим;
             }
         };
         self.время = состояние.predicted_display_time;
         if let Err(e) = self.поток.begin() {
-            tracing::warn!("dawn/vr: begin_frame: {e}");
+            tracing::warn!("plx/vr: begin_frame: {e}");
             return Кадр::Спим;
         }
         if !состояние.should_render {
@@ -415,7 +415,7 @@ impl Шлем {
         let (флаги, виды) = match self.session.locate_views(ВИД, self.время, &self.сцена) {
             Ok(в) => в,
             Err(e) => {
-                tracing::warn!("dawn/vr: locate_views: {e}");
+                tracing::warn!("plx/vr: locate_views: {e}");
                 return Кадр::Пропуск;
             }
         };
@@ -437,7 +437,7 @@ impl Шлем {
     pub fn закрыть_пустой(&mut self) {
         let пусто: [&xr::CompositionLayerBase<Egl>; 0] = [];
         if let Err(e) = self.поток.end(self.время, self.смешивание, &пусто) {
-            tracing::warn!("dawn/vr: end_frame (пустой): {e}");
+            tracing::warn!("plx/vr: end_frame (empty): {e}");
         }
     }
 
@@ -476,7 +476,7 @@ impl Шлем {
         // видно. Причём `xrEndFrame` при этом отвечает успехом: ни ошибки, ни
         // предупреждения, просто чёрный экран вместо passthrough.
         //
-        // `UNPREMULTIPLIED_ALPHA` не ставим намеренно: dawn рисует
+        // `UNPREMULTIPLIED_ALPHA` не ставим намеренно: parallax рисует
         // премультиплицированным цветом (`glBlendFunc(ONE,
         // ONE_MINUS_SRC_ALPHA)`), а этот флаг сказал бы рантайму обратное.
         if self.ар_включена() {
@@ -487,7 +487,7 @@ impl Шлем {
             .поток
             .end(self.время, self.смешивание, &[&proj_as_base(&проекция)])
         {
-            tracing::warn!("dawn/vr: end_frame: {e}");
+            tracing::warn!("plx/vr: end_frame: {e}");
         }
     }
 
@@ -517,7 +517,7 @@ impl Шлем {
                 м != xr::EnvironmentBlendMode::OPAQUE
             }
             None => {
-                tracing::warn!("dawn/vr: рантайм не умеет смешивать с реальностью: {:?}", self.умеет_смешивать);
+                tracing::warn!("plx/vr: the runtime cannot blend with reality: {:?}", self.умеет_смешивать);
                 false
             }
         }
@@ -543,8 +543,8 @@ impl Шлем {
             xr::EnvironmentBlendMode::ALPHA_BLEND => "ALPHA_BLEND".to_string(),
             иное => format!("{iное:?}", iное = иное),
         };
-        format!(
-            "сейчас {}, умеет [{}]",
+        crate::тф!(
+            "сейчас {}, умеет [{}]", "now {}, supports [{}]",
             имя(&self.смешивание),
             self.умеет_смешивать
                 .iter()
@@ -612,12 +612,12 @@ pub fn поза_из_xr(п: xr::Posef) -> Поза {
     }
 }
 
-fn углы_в_xr(у: Углы) -> xr::Fovf {
+fn углы_в_xr(уг: Углы) -> xr::Fovf {
     xr::Fovf {
-        angle_left: у.левый,
-        angle_right: у.правый,
-        angle_up: у.верхний,
-        angle_down: у.нижний,
+        angle_left: уг.левый,
+        angle_right: уг.правый,
+        angle_up: уг.верхний,
+        angle_down: уг.нижний,
     }
 }
 
@@ -668,11 +668,11 @@ impl std::fmt::Display for Ошибка {
         match self {
             Ошибка::Загрузчик(e) => write!(
                 f,
-                "загрузчик OpenXR не открылся ({e}); нужен пакет openxr и рантайм (WiVRn или Monado)"
+                "the OpenXR loader did not open ({e}); the openxr package and a runtime (WiVRn or Monado) are required"
             ),
             Ошибка::НетEgl => write!(
                 f,
-                "рантайм без XR_MNDX_egl_enable: dawn рисует в GLES/EGL и умеет отдавать кадр только такому рантайму (WiVRn, Monado)"
+                "the runtime lacks XR_MNDX_egl_enable: parallax draws in GLES/EGL and can only hand a frame to such a runtime (WiVRn, Monado)"
             ),
             Ошибка::Xr(где, e) => write!(f, "{где}: {e}"),
             Ошибка::Странно(с) => write!(f, "{с}"),

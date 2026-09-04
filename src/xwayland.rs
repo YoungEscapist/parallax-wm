@@ -1,5 +1,5 @@
 //! Интеграция XWayland: запуск сервера, оконный менеджер X11 (XWM) и сшивка
-//! X11-окон с моделью dawn (теги, раскладки, бесконечный холст).
+//! X11-окон с моделью parallax (теги, раскладки, бесконечный холст).
 //!
 //! Как это устроено:
 //!   * [`start`] поднимает процесс `Xwayland` и вешает его в event loop; когда
@@ -7,13 +7,13 @@
 //!   * X11-окна становятся обычными `desktop::Window` (`new_x11_window`) и
 //!     дальше живут в тех же `tagged_windows`/`space`, что и Wayland-окна
 //!     (см. xwin.rs — там абстракция над обоими протоколами);
-//!   * позиции X11-окнам досылает [`Dawn::sync_x11_geometry`] один раз за
+//!   * позиции X11-окнам досылает [`Parallax::sync_x11_geometry`] один раз за
 //!     итерацию главного цикла — см. комментарий у функции.
 //!
 //! Ограничение бесконечного холста: у X-сервера корневое окно конечно (размер
 //! выхода), а указатель вне него стоять не может — X зажимает его на край.
 //! Поэтому позиции X11-окон зажимаются в экран, а координаты, которые клиент
-//! выбирает сам (меню, тултипы), переводятся обратно через [`Dawn::x11_to_canvas`].
+//! выбирает сам (меню, тултипы), переводятся обратно через [`Parallax::x11_to_canvas`].
 //! Сами окна от этого не двигаются: на холсте их рисуем мы.
 
 use std::process::Stdio;
@@ -42,18 +42,18 @@ use smithay::{
 
 use crate::{
     grabs::{move_grab::MoveSurfaceGrab, resize_grab::ResizeEdge, resize_grab::ResizeSurfaceGrab},
-    state::Dawn,
+    state::Parallax,
     xwin,
 };
 
 /// Запустить XWayland. Всё асинхронно: процесс поднимается сразу, а XWM
 /// стартует уже по событию `Ready` — до этого X11-клиенты просто не смогут
 /// подключиться.
-pub fn start(event_loop: &mut EventLoop<'static, Dawn>, state: &mut Dawn) {
+pub fn start(event_loop: &mut EventLoop<'static, Parallax>, state: &mut Parallax) {
     // Окружение Xwayland smithay ЧИСТИТ, оставляя только PATH и
     // XDG_RUNTIME_DIR (см. `xserver.rs`: `command.env_clear()`), а всё
     // остальное берёт из этого итератора. Тема курсора туда не попадала вовсе,
-    // и X11-часть сеанса жила со стандартной стрелкой, пока dawn и
+    // и X11-часть сеанса жила со стандартной стрелкой, пока parallax и
     // wayland-клиенты показывали Bibata (замер 29.08.2026: в окружении живого
     // Xwayland нет ни одной переменной XCURSOR_*).
     let курсорные: Vec<(String, String)> = ["XCURSOR_THEME", "XCURSOR_SIZE", "XCURSOR_PATH"]
@@ -71,9 +71,9 @@ pub fn start(event_loop: &mut EventLoop<'static, Dawn>, state: &mut Dawn) {
     ) {
         Ok(v) => v,
         Err(err) => {
-            // Не фатально: без XWayland dawn просто остаётся чисто
+            // Не фатально: без XWayland parallax просто остаётся чисто
             // wayland-компоситором.
-            tracing::warn!("dawn/xwayland: не удалось запустить Xwayland: {}", err);
+            tracing::warn!("plx/xwayland: could not start Xwayland: {}", err);
             return;
         }
     };
@@ -89,7 +89,7 @@ pub fn start(event_loop: &mut EventLoop<'static, Dawn>, state: &mut Dawn) {
             {
                 Ok(wm) => wm,
                 Err(err) => {
-                    tracing::error!("dawn/xwayland: не удалось поднять XWM: {}", err);
+                    tracing::error!("plx/xwayland: could not start the XWM: {}", err);
                     return;
                 }
             };
@@ -99,29 +99,29 @@ pub fn start(event_loop: &mut EventLoop<'static, Dawn>, state: &mut Dawn) {
             // терминала по Super+Enter и т.п.), иначе X11-клиенты пойдут в
             // чужой сервер или никуда.
             unsafe { std::env::set_var("DISPLAY", format!(":{display_number}")) };
-            tracing::info!("dawn/xwayland: XWM готов, DISPLAY=:{}", display_number);
+            tracing::info!("plx/xwayland: XWM ready, DISPLAY=:{}", display_number);
             // Повторяем экспорт уже с DISPLAY: порталу он нужен, чтобы X11-часть
             // (например файловый диалог из Xwayland-клиента) шла в НАШ сервер.
             crate::export_session_env();
         }
         XWaylandEvent::Error => {
-            tracing::warn!("dawn/xwayland: Xwayland не смог стартовать");
+            tracing::warn!("plx/xwayland: Xwayland failed to start");
         }
     });
     if let Err(err) = ret {
-        tracing::error!("dawn/xwayland: insert_source: {}", err);
+        tracing::error!("plx/xwayland: insert_source: {}", err);
     }
 }
 
-impl XWaylandShellHandler for Dawn {
+impl XWaylandShellHandler for Parallax {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
     }
 }
-delegate_xwayland_shell!(Dawn);
+delegate_xwayland_shell!(Parallax);
 
-impl Dawn {
-    /// Окно dawn, за которым стоит эта X11-поверхность. Ищем в tagged_windows,
+impl Parallax {
+    /// Окно parallax, за которым стоит эта X11-поверхность. Ищем в tagged_windows,
     /// а не в space: окно чужого тега из space убрано (см. refresh_tags), но
     /// продолжает существовать.
     pub fn window_for_x11(&self, surface: &X11Surface) -> Option<Window> {
@@ -142,7 +142,7 @@ impl Dawn {
         };
         if let Some(xwm) = self.xwm.as_mut() {
             if let Err(err) = xwm.raise_window(&surface) {
-                tracing::warn!("dawn/xwayland: raise_window: {}", err);
+                tracing::warn!("plx/xwayland: raise_window: {}", err);
             }
         }
     }
@@ -150,7 +150,7 @@ impl Dawn {
     /// Куда уехала X-позиция окна относительно его позиции на холсте.
     ///
     /// Ненулевая у окон, которые холст унёс за пределы корневого окна X: их
-    /// позицию мы зажимаем (см. [`Dawn::sync_x11_geometry`]). Нужна, чтобы
+    /// позицию мы зажимаем (см. [`Parallax::sync_x11_geometry`]). Нужна, чтобы
     /// перевести обратно в холст координаты, которые X11-клиент выбрал сам —
     /// позиции меню и тултипов (override-redirect).
     fn x11_offset(&self, window: &Window) -> Option<Point<i32, Logical>> {
@@ -194,7 +194,7 @@ impl Dawn {
     ///
     /// Wayland-клиент про свою позицию ничего не знает — её целиком держит
     /// компоситор. X11-клиент, наоборот, живёт в корневых координатах, и всё,
-    /// что двигает окна в dawn (arrange, анимации позиций, драг мышью,
+    /// что двигает окна в parallax (arrange, анимации позиций, драг мышью,
     /// инерция, обзор столов), обязано эту позицию ему сообщать. Вместо того
     /// чтобы дописывать configure к каждому из десятков вызовов
     /// `space.map_element`, один раз за итерацию главного цикла сверяем
@@ -276,7 +276,7 @@ impl Dawn {
                 // dawn-fullscreen-frame-invariant), а сам клампинг ниже в это
                 // время всё ещё пересчитывает rel_x/rel_y от УЖЕ уехавшего
                 // loc — и если разъезд превышает допустимый диапазон, X-клиент
-                // получает позицию, не совпадающую с тем, что рисует dawn:
+                // получает позицию, не совпадающую с тем, что рисует parallax:
                 // клики мимо после того как курсор ушёл дальше границы разъезда
                 // (жалоба Ярика 27.08.2026: «в Dota 2 после определённых
                 // координат курсор не работает» — игра всегда fullscreen).
@@ -293,14 +293,14 @@ impl Dawn {
 
         for (surface, rect) in updates {
             if let Err(err) = surface.configure(rect) {
-                tracing::warn!("dawn/xwayland: configure(pos) failed: {}", err);
+                tracing::warn!("plx/xwayland: configure(pos) failed: {}", err);
             }
         }
     }
 
 }
 
-impl XwmHandler for Dawn {
+impl XwmHandler for Parallax {
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
         self.xwm.as_mut().unwrap()
     }
@@ -310,7 +310,7 @@ impl XwmHandler for Dawn {
 
     fn map_window_request(&mut self, _xwm: XwmId, surface: X11Surface) {
         if let Err(err) = surface.set_mapped(true) {
-            tracing::warn!("dawn/xwayland: set_mapped: {}", err);
+            tracing::warn!("plx/xwayland: set_mapped: {}", err);
             return;
         }
         // Диалоги, сплеши и окна с зафиксированным размером тайлить нельзя —
@@ -372,14 +372,14 @@ impl XwmHandler for Dawn {
         // полный экран сами (Source-движок делает это, теряя и возвращая
         // фокус), и без отметки в логе череда «запрос — отказ — запрос»
         // выглядит как самопроизвольные прыжки камеры.
-        tracing::info!("dawn/xwayland: клиент просит полный экран");
+        tracing::info!("plx/xwayland: client asks for fullscreen");
         if let Some(window) = self.window_for_x11(&surface) {
             self.set_fullscreen(&window);
         }
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, surface: X11Surface) {
-        tracing::info!("dawn/xwayland: клиент просит выйти из полного экрана");
+        tracing::info!("plx/xwayland: client asks to leave fullscreen");
         if let Some(window) = self.window_for_x11(&surface) {
             self.unset_fullscreen_window(&window);
         }
@@ -396,7 +396,7 @@ impl XwmHandler for Dawn {
         _reorder: Option<Reorder>,
     ) {
         // Размер отдаём клиенту (в тайлинге его тут же перебьёт arrange),
-        // позицию — нет: где лежат окна, решает раскладка dawn.
+        // позицию — нет: где лежат окна, решает раскладка parallax.
         let mut geo = surface.geometry();
         if let Some(w) = w {
             geo.size.w = w as i32;
@@ -405,7 +405,7 @@ impl XwmHandler for Dawn {
             geo.size.h = h as i32;
         }
         if let Err(err) = surface.configure(geo) {
-            tracing::warn!("dawn/xwayland: configure_request: {}", err);
+            tracing::warn!("plx/xwayland: configure_request: {}", err);
         }
     }
 
@@ -502,7 +502,7 @@ impl XwmHandler for Dawn {
     ) {
         if selection == SelectionTarget::Clipboard {
             if let Err(err) = request_data_device_client_selection(&self.seat, mime_type, fd) {
-                tracing::warn!("dawn/xwayland: чтение буфера Wayland для X11: {}", err);
+                tracing::warn!("plx/xwayland: reading the Wayland buffer for X11: {}", err);
             }
         }
     }
@@ -516,7 +516,7 @@ impl XwmHandler for Dawn {
     }
 
     fn disconnected(&mut self, _xwm: XwmId) {
-        tracing::warn!("dawn/xwayland: XWM отвалился");
+        tracing::warn!("plx/xwayland: the XWM went away");
         self.xwm = None;
     }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build_portable.sh — сборка dawn на обычном Linux (НЕ NixOS), без nix-shell.
+# build_portable.sh — сборка parallax на обычном Linux (НЕ NixOS), без nix-shell.
 # Полагается на системные -dev библиотеки через pkg-config + rustup/cargo.
 #
 # Зависимости (примеры имён пакетов):
@@ -31,5 +31,27 @@ if ! command -v mold >/dev/null 2>&1; then
     export RUSTFLAGS=""
 fi
 
-exec cargo build --release "$@"
-# Бинарь: ./target/release/dawn
+# ДВА ОТДЕЛЬНЫХ ВЫЗОВА, а не один общий, и каталоги сборки тоже разные — ровно
+# как в build.sh, и по тем же двум причинам:
+#
+#  1. Голый `cargo build --release` здесь не собирал НИЧЕГО исполняемого.
+#     Корневой пакет `parallax` — это только `[lib]`, а оба бинаря лежат в
+#     отдельных крейтах bins/. По умолчанию cargo строит один корневой пакет,
+#     так что в target/release не появлялось ни plx-minimal, ни plx-extra.
+#  2. Собирать их одной командой всё равно нельзя: cargo ОБЪЕДИНЯЕТ наборы фич
+#     членов workspace и строит библиотеку по сумме — «минимальный» бинарь
+#     получил бы и vr, и mine, и share. Разные каталоги нужны потому, что
+#     отпечаток сборки включает набор фич: в общем каталоге вызовы вытесняли бы
+#     друг друга и пересобирали всё заново (fat LTO — это минуты).
+cargo build --release --target-dir target/minimal -p plx-minimal "$@"
+cargo build --release --target-dir target/extra   -p plx-extra   "$@"
+
+# Складываем оба рядом, туда, где их обещает README.
+mkdir -p target/release
+cp -f target/minimal/release/plx-minimal target/release/plx-minimal
+cp -f target/extra/release/plx-extra     target/release/plx-extra
+
+echo ""
+echo "Бинари:"
+echo "  ./target/release/plx-minimal  (без шлема, Minecraft и мультиюзера)"
+echo "  ./target/release/plx-extra    (всё)"

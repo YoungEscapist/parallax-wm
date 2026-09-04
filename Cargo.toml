@@ -1,11 +1,43 @@
+[workspace]
+members = ["bins/plx-minimal", "bins/plx-extra"]
+# Резольвер 2: без него cargo ругается, а объединение фич между членами всё
+# равно остаётся — от него спасают только раздельные вызовы (см. build.sh).
+resolver = "2"
+
 [package]
-name = "dawn"
+name = "parallax"
 version = "0.1.0"
 edition = "2021"
+description = "A Wayland compositor where windows live on one infinite canvas and the screen is a camera looking at it"
+# Имя `parallax` на crates.io занято заброшенным yanked-крейтом 0.0.1, так что
+# при публикации оно станет `parallax-wm`; здесь имя внутреннее (по нему зовут
+# библиотеку из bins/) и менять его незачем.
+license = "GPL-3.0-or-later"
+repository = "https://github.com/mifaroslav-dotcom/parallax"
+readme = "README.md"
+keywords = ["wayland", "compositor", "tiling", "smithay"]
+categories = ["gui"]
 
-[[bin]]
-name = "dawn"
-path = "src/main.rs"
+[lib]
+name = "parallax"
+path = "src/lib.rs"
+
+# Два бинаря — это два ТОНКИХ крейта в bins/, отличающиеся только набором фич
+# (см. bins/plx-minimal и bins/plx-extra). В одном крейте так нельзя: фичи в
+# cargo задаются на КРЕЙТ, а не на цель, и оба [[bin]] получили бы один набор.
+[features]
+default = []
+# Шлем. Тянет openxr; сам рантайм OpenXR нужен только во время выполнения.
+vr = ["dep:openxr"]
+# Окна композитора внутри Minecraft. Построен на VR-машинерии: mine/ зовёт
+# vr::окна_для_сцены, vr::нарисовать_в_полотно и vr::окно_по_ключу — то есть
+# без `vr` не собирается в принципе, отсюда зависимость, а не просто соседство.
+mine = ["vr"]
+# Мультиюзер: показ рабочего стола гостям (plx-share). Тянет sha2 — по проводу
+# идёт не код, а sha256(соль ‖ код), см. share/proto.rs.
+share = ["dep:sha2"]
+# Всё необязательное разом — набор бинаря plx-extra.
+extra = ["vr", "mine", "share"]
 
 [dependencies]
 smithay = { git = "https://github.com/Smithay/smithay.git", rev = "5312d5caedd0c2ce563a63719d38ae2183149210", default-features = false, features = [
@@ -48,7 +80,7 @@ libspa = "0.8"
 fontdue = "0.9"
 # Только ради доказательства кода в мультиюзере (sha256, см. share/proto.rs):
 # сам код по проводу не идёт, по сети летит sha256(соль ‖ код).
-sha2 = "0.10"
+sha2 = { version = "0.10", optional = true }
 png = "0.18.1"
 # Значки тем в SVG (см. icons.rs). Без default-features: из полного набора нам
 # не нужны ни шрифты (`text`, `system-fonts` — это fontdb + rustybuzz), ни
@@ -58,9 +90,9 @@ png = "0.18.1"
 resvg = { version = "0.48", default-features = false }
 # VR/AR (см. src/vr/). Высокоуровневая обёртка над OpenXR: она сама грузит
 # libopenxr_loader.so на старте (`Entry::load`), поэтому шлем и рантайм —
-# необязательная зависимость времени ВЫПОЛНЕНИЯ: без них dawn просто не входит
+# необязательная зависимость времени ВЫПОЛНЕНИЯ: без них parallax просто не входит
 # в VR-режим, а собирается и работает как раньше.
-openxr = "0.21"
+openxr = { version = "0.21", optional = true }
 
 [profile.release]
 # fat LTO + один codegen-unit: оптимизатор видит всю программу разом, что

@@ -42,7 +42,7 @@ use smithay::{
     },
 };
 
-use crate::state::Dawn;
+use crate::state::Parallax;
 
 /// Форматы shm, которые мы умеем отдавать. Argb8888 у GLES читается
 /// нативно (GL_BGRA_EXT), Xrgb8888 — тот же байтовый порядок без альфы.
@@ -56,9 +56,9 @@ pub struct PendingFrame {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-impl ImageCaptureSourceHandler for Dawn {}
+impl ImageCaptureSourceHandler for Parallax {}
 
-impl OutputCaptureSourceHandler for Dawn {
+impl OutputCaptureSourceHandler for Parallax {
     fn output_capture_source_state(&mut self) -> &mut OutputCaptureSourceState {
         &mut self.output_capture_source_state
     }
@@ -70,7 +70,7 @@ impl OutputCaptureSourceHandler for Dawn {
     }
 }
 
-impl ImageCopyCaptureHandler for Dawn {
+impl ImageCopyCaptureHandler for Parallax {
     fn image_copy_capture_state(&mut self) -> &mut ImageCopyCaptureState {
         &mut self.image_copy_capture_state
     }
@@ -80,8 +80,8 @@ impl ImageCopyCaptureHandler for Dawn {
         let mode = output.current_mode()?;
         Some(BufferConstraints {
             // Снимаем в физическом разрешении режима, а НЕ в логическом:
-            // логический размер output'а в dawn плавает вместе с зумом холста
-            // (zoom проброшен как fractional scale, см. Dawn::apply_camera), и
+            // логический размер output'а в parallax плавает вместе с зумом холста
+            // (zoom проброшен как fractional scale, см. Parallax::apply_camera), и
             // размер буфера у зрителя дёргался бы на каждый зум.
             size: mode.size.to_logical(1).to_buffer(1, Transform::Normal),
             shm: SHM_FORMATS.to_vec(),
@@ -103,7 +103,7 @@ impl ImageCopyCaptureHandler for Dawn {
     }
 
     fn new_session(&mut self, session: Session) {
-        tracing::info!("dawn/screencopy: новая сессия захвата");
+        tracing::info!("plx/screencopy: new capture session");
         // Держим сессию живой: Session при Drop шлёт клиенту `stopped`, а
         // клиент (портал) на это закрывает демонстрацию.
         self.capture_sessions.push(session);
@@ -122,13 +122,13 @@ impl ImageCopyCaptureHandler for Dawn {
     fn session_destroyed(&mut self, session: SessionRef) {
         self.capture_sessions.retain(|s| s.as_ref() != session);
         self.pending_frames.retain(|p| p.session != session);
-        tracing::info!("dawn/screencopy: сессия захвата закрыта");
+        tracing::info!("plx/screencopy: capture session closed");
     }
 }
 
-smithay::delegate_image_capture_source!(Dawn);
-smithay::delegate_output_capture_source!(Dawn);
-smithay::delegate_image_copy_capture!(Dawn);
+smithay::delegate_image_capture_source!(Parallax);
+smithay::delegate_output_capture_source!(Parallax);
+smithay::delegate_image_copy_capture!(Parallax);
 
 // ── Съём кадра ───────────────────────────────────────────────────────────────
 
@@ -153,7 +153,7 @@ fn shm_format_to_fourcc(format: wl_shm::Format) -> Option<Fourcc> {
 /// smithay; `cursor_elements` — сколько первых из них рисуют курсор (сессия
 /// может попросить кадр без курсора, тогда мы их отбрасываем).
 pub fn serve_pending<E>(
-    state: &mut Dawn,
+    state: &mut Parallax,
     output: &Output,
     renderer: &mut GlesRenderer,
     elements: &[E],
@@ -246,14 +246,14 @@ where
     let mut target: GlesRenderbuffer = match renderer.create_buffer(Fourcc::Abgr8888, size) {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!("dawn/screencopy: create_buffer: {:?}", e);
+            tracing::warn!("plx/screencopy: create_buffer: {:?}", e);
             return None;
         }
     };
     let mut fb = match renderer.bind(&mut target) {
         Ok(fb) => fb,
         Err(e) => {
-            tracing::warn!("dawn/screencopy: bind: {:?}", e);
+            tracing::warn!("plx/screencopy: bind: {:?}", e);
             return None;
         }
     };
@@ -275,7 +275,7 @@ where
         output.current_transform(),
     );
     if let Err(e) = dt.render_output(renderer, &mut fb, 0, elements, [0.1f32, 0.1, 0.1, 1.0]) {
-        tracing::warn!("dawn/screencopy: render_output: {:?}", e);
+        tracing::warn!("plx/screencopy: render_output: {:?}", e);
         return None;
     }
 
@@ -287,11 +287,11 @@ where
         match renderer.copy_framebuffer(&fb, Rectangle::from_size(size), Fourcc::Argb8888) {
             Ok(m) => (m, false),
             Err(e) => {
-                tracing::debug!("dawn/screencopy: BGRA-чтение недоступно ({:?}), беру RGBA", e);
+                tracing::debug!("plx/screencopy: BGRA readback unavailable ({:?}), falling back to RGBA", e);
                 match renderer.copy_framebuffer(&fb, Rectangle::from_size(size), Fourcc::Abgr8888) {
                     Ok(m) => (m, true),
                     Err(e) => {
-                        tracing::warn!("dawn/screencopy: copy_framebuffer: {:?}", e);
+                        tracing::warn!("plx/screencopy: copy_framebuffer: {:?}", e);
                         return None;
                     }
                 }
@@ -302,7 +302,7 @@ where
     let mut pixels = match renderer.map_texture(&mapping) {
         Ok(data) => data.to_vec(),
         Err(e) => {
-            tracing::warn!("dawn/screencopy: map_texture: {:?}", e);
+            tracing::warn!("plx/screencopy: map_texture: {:?}", e);
             return None;
         }
     };
@@ -354,13 +354,13 @@ fn write_to_buffer(
     match res {
         Ok(inner) => inner,
         Err(e) => {
-            tracing::warn!("dawn/screencopy: буфер клиента не shm: {:?}", e);
+            tracing::warn!("plx/screencopy: the client buffer is not shm: {:?}", e);
             Err(CaptureFailureReason::BufferConstraints)
         }
     }
 }
 
-impl Dawn {
+impl Parallax {
     /// Есть ли сейчас активные сессии захвата (идёт демонстрация экрана).
     pub fn screencast_active(&self) -> bool {
         self.capture_sessions.iter().any(|s| s.alive())

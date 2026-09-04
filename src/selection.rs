@@ -4,7 +4,7 @@ use smithay::{
     utils::{Logical, Point, Rectangle, Size},
 };
 
-use crate::state::Dawn;
+use crate::state::Parallax;
 use crate::tiling::Layout;
 
 fn same_window(a: &Window, b: &Window) -> bool {
@@ -12,7 +12,7 @@ fn same_window(a: &Window, b: &Window) -> bool {
 }
 
 
-impl Dawn {
+impl Parallax {
     pub fn is_selected(&self, window: &Window) -> bool {
         self.selected_windows.iter().any(|w| same_window(w, window))
     }
@@ -36,7 +36,7 @@ impl Dawn {
             .filter(|(_, g)| g.intersection(rect).is_some())
             .map(|(w, _)| w)
             .collect();
-        tracing::info!("dawn: selected {} windows", self.selected_windows.len());
+        tracing::info!("plx: selected {} windows", self.selected_windows.len());
         self.request_redraw();
     }
 
@@ -64,8 +64,8 @@ impl Dawn {
     /// двигаться вместе — это ровно половина смысла: за тем его и собирают.
     ///
     /// Поэтому созвездие снова едет целиком, а неожиданность лечится не
-    /// отключением, а ПОКАЗОМ: пока идёт драг, dawn рисует, куда встанут
-    /// остальные (см. `Dawn::призраки_группы` и `udev::build_ghost_elements`).
+    /// отключением, а ПОКАЗОМ: пока идёт драг, parallax рисует, куда встанут
+    /// остальные (см. `Parallax::призраки_группы` и `udev::build_ghost_elements`).
     /// Видимое намерение — не сюрприз.
     pub fn group_drag_members_excluding(&self, window: &Window) -> Vec<Window> {
         let mut члены: Vec<Window> = Vec::new();
@@ -104,7 +104,7 @@ impl Dawn {
             return;
         }
         if self.selected_windows.len() < 2 {
-            tracing::info!("dawn: need 2+ selected windows to form a constellation");
+            tracing::info!("plx: need 2+ selected windows to form a constellation");
             return;
         }
         // Убираем выбранные окна из групп, в которых они уже состояли —
@@ -118,14 +118,14 @@ impl Dawn {
         self.constellations.push(self.selected_windows.clone());
         let group = self.selected_windows.clone();
         self.clear_constellation_torn(&group);
-        tracing::info!("dawn: constellation formed ({} windows)", group.len());
+        tracing::info!("plx: constellation formed ({} windows)", group.len());
     }
 
     /// Рамка, в которой собирается гроздь: то место, которое выделенные окна
     /// занимают ПРЯМО СЕЙЧАС, — их общий bbox.
     ///
     /// У halley рамка кластера — это границы поля, то есть монитор целиком:
-    /// там кластер и есть отдельное рабочее место. В dawn холст бесконечный и
+    /// там кластер и есть отдельное рабочее место. В parallax холст бесконечный и
     /// гроздей на нём может лежать сколько угодно рядом, поэтому «полем» здесь
     /// служит площадь самого выделения: гроздь перестраивается ровно там, где
     /// её обвели, и не отбирает экран у соседей.
@@ -261,7 +261,7 @@ impl Dawn {
         // Гроздь снова сложена нами — метка «растащено» снимается, и следующий
         // Win+D по ней будет означать «распустить».
         self.clear_constellation_torn(&члены);
-        tracing::info!("dawn: созвездие собрано ({} окон) в {:?}", члены.len(), bounds);
+        tracing::info!("plx: constellation formed ({} windows) in {:?}", члены.len(), bounds);
         // Выделение больше не нужно — созвездие зафиксировано.
         self.selected_windows.clear();
         self.request_plane_reset();
@@ -429,7 +429,7 @@ impl Dawn {
 
         self.constellations.retain(|g| g.len() > 1);
         self.clear_selection();
-        tracing::info!("dawn: созвездие распущено ({count} окон)");
+        tracing::info!("plx: constellation dissolved ({count} windows)");
         self.request_plane_reset();
         self.request_redraw();
     }
@@ -478,7 +478,7 @@ impl Dawn {
         };
 
         let Some(idx) = по_выделению.or_else(по_фокусу).or_else(единственное_здесь) else {
-            tracing::info!("dawn: роспуск: созвездия не нашлось (ни в выделении, ни под фокусом)");
+            tracing::info!("plx: dissolve: no constellation found (neither in the selection nor under focus)");
             return;
         };
 
@@ -495,7 +495,7 @@ impl Dawn {
             }
         }
         self.constellations.retain(|g| g.len() > 1);
-        tracing::info!("dawn: созвездие распущено на месте ({} окон)", group.len());
+        tracing::info!("plx: constellation dissolved in place ({} windows)", group.len());
         // Роспуск ничего не двигает, но рисует: подсветка принадлежности к
         // грозди пропадает. Без этого запроса кадр не перерисовался бы вовсе,
         // и роспуск снова выглядел бы как «не сработал».
@@ -510,7 +510,7 @@ impl Dawn {
             for w in self.selected_windows.clone() {
                 crate::xwin::close(&w);
             }
-            tracing::info!("dawn: killed {} selected windows", n);
+            tracing::info!("plx: killed {} selected windows", n);
             self.clear_selection();
         } else {
             self.kill_focused();
@@ -544,7 +544,7 @@ impl Dawn {
         }
         // В Float поднимать некуда — там плавает всё.
         if self.tile_config.layout == Layout::Float {
-            tracing::info!("dawn: float_selected — уже во Float, нечего поднимать");
+            tracing::info!("plx: float_selected — already floating, nothing to lift");
             return;
         }
         let current = self.viewport.current_tags();
@@ -567,7 +567,7 @@ impl Dawn {
             self.arrange();
             self.request_plane_reset();
             self.request_redraw();
-            tracing::info!("dawn: float_selected — {} окон вернулись в раскладку", targets.len());
+            tracing::info!("plx: float_selected — {} windows returned to the layout", targets.len());
             return;
         }
 
@@ -626,7 +626,7 @@ impl Dawn {
         self.clear_selection();
         self.request_plane_reset();
         self.request_redraw();
-        tracing::info!("dawn: float_selected — поднято {} окон в границах стола {:?}",
+        tracing::info!("plx: float_selected — lifted {} windows within the workspace bounds {:?}",
             подняты, стол);
     }
 

@@ -17,9 +17,9 @@
 //! стрелка ползёт к краю монитора.
 //!
 //! Что тут есть:
-//!  * [`Dawn::pointer_constraint_now`] — спросить, заперт ли курсор ПРЯМО
+//!  * [`Parallax::pointer_constraint_now`] — спросить, заперт ли курсор ПРЯМО
 //!    сейчас (зовётся из input.rs на каждое движение);
-//!  * [`Dawn::activate_pointer_constraint`] — включить захват, когда курсор
+//!  * [`Parallax::activate_pointer_constraint`] — включить захват, когда курсор
 //!    сам въехал в область запроса;
 //!  * реализация [`PointerConstraintsHandler`].
 //!
@@ -40,7 +40,7 @@ use smithay::{
     },
 };
 
-use crate::state::Dawn;
+use crate::state::Parallax;
 
 /// Что протокол просит сделать с курсором прямо сейчас.
 #[derive(Default)]
@@ -64,7 +64,7 @@ impl PointerCapture {
     /// Точка холста всё ещё внутри удержания? Проверяются обе границы:
     /// поверхность (курсор не должен «перескочить» на соседнее окно) и
     /// заданная клиентом область внутри неё.
-    pub fn holds(&self, state: &Dawn, pos: Point<f64, Logical>) -> bool {
+    pub fn holds(&self, state: &Parallax, pos: Point<f64, Logical>) -> bool {
         let Some(surface) = self.surface.as_ref() else { return true };
         match state.surface_under(pos) {
             Some((s, _)) if &s == surface => {}
@@ -75,7 +75,7 @@ impl PointerCapture {
     }
 }
 
-impl Dawn {
+impl Parallax {
     /// Захват курсора для поверхности под указателем.
     ///
     /// Считается по поверхности ПОД КУРСОРОМ, а не по фокусу клавиатуры:
@@ -127,7 +127,7 @@ impl Dawn {
             Some(c) if !c.is_active() => {
                 if c.region().is_none_or(|r| r.contains(местная)) {
                     c.activate();
-                    tracing::debug!("dawn/capture: захват курсора включён");
+                    tracing::debug!("plx/capture: cursor capture enabled");
                 }
             }
             _ => {}
@@ -146,7 +146,7 @@ impl Dawn {
     }
 }
 
-impl PointerConstraintsHandler for Dawn {
+impl PointerConstraintsHandler for Parallax {
     /// Клиент создал ограничение. Если указатель уже на этой поверхности —
     /// включаем сразу: иначе игра, запросившая захват в ответ на клик по
     /// своему же окну, ждала бы, пока курсор «въедет» туда, где он и так есть.
@@ -159,7 +159,7 @@ impl PointerConstraintsHandler for Dawn {
                 c.activate();
             }
         });
-        tracing::info!("dawn/capture: клиент запросил захват курсора");
+        tracing::info!("plx/capture: client requested cursor capture");
     }
 
     /// Клиент подсказал, где показать курсор, когда захват снимется (обычно —
@@ -188,5 +188,5 @@ impl PointerConstraintsHandler for Dawn {
     }
 }
 
-delegate_pointer_constraints!(Dawn);
-delegate_relative_pointer!(Dawn);
+delegate_pointer_constraints!(Parallax);
+delegate_relative_pointer!(Parallax);

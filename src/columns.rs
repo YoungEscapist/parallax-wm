@@ -4,8 +4,8 @@
 //! здесь колонка — это ВЕРТИКАЛЬНАЯ стопка окон переменной ширины, а холст
 //! скроллится по горизонтали к активной колонке (как в niri).
 //!
-//! Структура (`ColumnLayout`) живёт в `Dawn::columns` и синхронизируется с
-//! `tagged_windows` через [`Dawn::columns_reconcile`]: мёртвые/скрытые/плавающие
+//! Структура (`ColumnLayout`) живёт в `Parallax::columns` и синхронизируется с
+//! `tagged_windows` через [`Parallax::columns_reconcile`]: мёртвые/скрытые/плавающие
 //! окна выпадают, новые видимые не-плавающие окна текущего тега добавляются
 //! отдельными колонками. Вертикальные стопки и ширины колонок переживают
 //! добавление/закрытие окон, но НЕ переживают переключение тегов (при возврате
@@ -19,7 +19,7 @@ use smithay::{
 };
 
 use crate::anim::CameraAnim;
-use crate::state::Dawn;
+use crate::state::Parallax;
 use crate::tiling::{GAP_INNER, GAP_OUTER, Layout};
 
 fn same_window(a: &Window, b: &Window) -> bool {
@@ -27,7 +27,7 @@ fn same_window(a: &Window, b: &Window) -> bool {
 }
 
 /// Зазор между колонками и вокруг них. У niri это `layout { gaps }`, по
-/// умолчанию 16 — совпадает с dawn'овским GAP_INNER, так что берём его.
+/// умолчанию 16 — совпадает с parallax'овским GAP_INNER, так что берём его.
 pub const COL_GAP: f64 = GAP_INNER as f64;
 
 /// Ширина колонки — ровно модель niri: либо доля рабочей области, либо
@@ -212,7 +212,7 @@ impl ColumnLayout {
     }
 }
 
-impl Dawn {
+impl Parallax {
     fn primary_output_geo(&self) -> Option<Rectangle<i32, Logical>> {
         let o = self.активный_выход()?;
         self.space.output_geometry(&o)
@@ -424,7 +424,7 @@ impl Dawn {
 
 /// План раскладки полосы `layout` на этаже `floor_y`: слева направо, каждая
 /// колонка своей ширины, окна внутри делят высоту по весам строк. Вынесено из
-/// [`Dawn::apply_columns_layout`] отдельной функцией, чтобы ту же геометрию
+/// [`Parallax::apply_columns_layout`] отдельной функцией, чтобы ту же геометрию
 /// можно было посчитать и для полосы НЕ текущего стола (см. columns_layout_tag).
 ///
 /// `geo` — прямоугольник СВОЕГО монитора (угол = его дом, см.
@@ -442,7 +442,7 @@ fn plan_columns(
         let avail_h = (geo.size.h - GAP_OUTER * 2).max(1);
         let working_w = geo.size.w as f64;
         // Первая колонка стоит на COL_GAP от начала полосы — в niri это поле
-        // даёт view_offset, но dawn возит камеру по холсту, поэтому проще
+        // даёт view_offset, но parallax возит камеру по холсту, поэтому проще
         // заложить его прямо в координаты.
         let mut x = geo.loc.x + COL_GAP as i32;
         for col in &layout.columns {
@@ -524,7 +524,7 @@ fn column_x_in(layout: &ColumnLayout, idx: usize, working_w: f64, начало: 
 
 /// Куда встанет окно, брошенное на X = `pos_x` (координата ХОЛСТА) в полосе
 /// `layout`: номер колонки и «в стопку ли». Вынесено из
-/// [`Dawn::columns_insert_target`], чтобы то же решение можно было принять и
+/// [`Parallax::columns_insert_target`], чтобы то же решение можно было принять и
 /// для полосы не текущего стола.
 fn insert_target_in(
     layout: &ColumnLayout,
@@ -553,7 +553,7 @@ fn insert_target_in(
     (layout.columns.len(), false)
 }
 
-impl Dawn {
+impl Parallax {
     /// Во вкладочных колонках на экране остаётся только активное окно.
     ///
     /// Скрываем снятием со `space` — тогда окно не рисуется, не получает frame
@@ -596,7 +596,7 @@ impl Dawn {
 
     // ── Раскладка колонок у КАЖДОГО стола своя ───────────────────────────────
     //
-    // `Dawn::columns` — это полоса ТЕКУЩЕГО стола; полосы остальных лежат в
+    // `Parallax::columns` — это полоса ТЕКУЩЕГО стола; полосы остальных лежат в
     // `columns_by_tag`. В niri каждый воркспейс держит свои колонки, и уход на
     // соседний с возвратом ничего не меняет. Раньше структура была одна на весь
     // композитор: при возврате reconcile разбивал окна заново по одной колонке,
@@ -606,7 +606,7 @@ impl Dawn {
     ///
     /// В niri floating-слой лежит поверх полосы и не уезжает вместе с
     /// колонками: прокрутил ленту — плавающее окно осталось на своём месте
-    /// экрана. В dawn же всё живёт в canvas-координатах, поэтому при движении
+    /// экрана. В parallax же всё живёт в canvas-координатах, поэтому при движении
     /// камеры плавающие окна текущего стола сдвигаются на ту же дельту.
     ///
     /// Зовётся из apply_camera и работает только в Columns — в остальных
@@ -1017,7 +1017,7 @@ impl Dawn {
             self.columns_give_focus(&w);
             self.request_redraw();
         } else {
-            tracing::debug!("dawn/columns: плавающих окон на этом столе нет");
+            tracing::debug!("plx/columns: no floating windows on this workspace");
         }
     }
 
@@ -1112,7 +1112,7 @@ impl Dawn {
 
     /// Бросили окно в полосу СОСЕДНЕГО этажа (niri-обзор): окно меняет стол и
     /// встаёт в полосу того стола туда, куда показывал курсор по X. Тот же
-    /// contract, что у [`Dawn::columns_drop_window`], только приёмник — не
+    /// contract, что у [`Parallax::columns_drop_window`], только приёмник — не
     /// обязательно текущий стол.
     pub fn columns_drop_window_on_ws(&mut self, window: &Window, tag: u32, pos_x: f64) {
         if self.tile_config.layout != Layout::Columns {
@@ -1172,11 +1172,11 @@ impl Dawn {
         self.columns_layout_tag(tag);
         self.request_plane_reset();
         self.request_redraw();
-        tracing::info!("dawn/columns: окно брошено на стол {:#b} (колонка {})", tag, idx);
+        tracing::info!("plx/columns: window sent to workspace {:#b} (column {})", tag, idx);
     }
 
     /// Отдать окно полосе стола `tag` — программный аналог броска мышью
-    /// ([`Dawn::columns_drop_window_on_ws`]), только место в полосе выбирает не
+    /// ([`Parallax::columns_drop_window_on_ws`]), только место в полосе выбирает не
     /// курсор, а правило niri: НОВАЯ КОЛОНКА сразу справа от активной.
     ///
     /// В отличие от drop-версии работает из ЛЮБОЙ раскладки: сюда приходит
@@ -1236,7 +1236,7 @@ impl Dawn {
         }
         self.request_plane_reset();
         self.request_redraw();
-        tracing::info!("dawn/columns: окно принято столом {:#b} (колонка {})", tag, idx);
+        tracing::info!("plx/columns: window accepted by workspace {:#b} (column {})", tag, idx);
         true
     }
 
@@ -1283,7 +1283,7 @@ impl Dawn {
     /// пустой стол в СЕРЕДИНЕ не живёт, лента всегда плотная, а пустой ровно
     /// один и всегда последний.
     ///
-    /// В dawn стол — это бит тега, поэтому «схлопнуть» значит перенумеровать
+    /// В parallax стол — это бит тега, поэтому «схлопнуть» значит перенумеровать
     /// теги окон так, чтобы занятыми оказались 1..k без пропусков. Текущий
     /// просматриваемый стол едет вместе со своим содержимым.
     ///
@@ -1360,7 +1360,7 @@ impl Dawn {
         // схлопывание двигало только теги, а геометрия соседних этажей
         // оставалась на прежних Y (см. columns_relayout_strip).
         self.columns_relayout_strip();
-        tracing::info!("dawn/columns: лента столов схлопнута, занято {}", occupied.len());
+        tracing::info!("plx/columns: the workspace ribbon is collapsed, {} in use", occupied.len());
     }
 
     // ── Жесты тачпада (niri: view scroll / workspace switch) ─────────────────
@@ -1444,7 +1444,7 @@ impl Dawn {
             self.columns_give_focus(&w);
         }
         self.request_redraw();
-        tracing::info!("dawn/columns: колонка {} → {}", a, if tabbed { "вкладки" } else { "стопка" });
+        tracing::info!("plx/columns: column {} → {}", a, if tabbed { "tabs" } else { "stack" });
     }
 
     /// Геометрия полоски вкладок для колонки: (x, y, ширина, высота одной
@@ -2202,7 +2202,7 @@ impl Dawn {
         }
         self.columns_scroll_to_active();
         self.request_redraw();
-        tracing::info!("dawn: moved column ({} win) → workspace {}", wins.len(), new);
+        tracing::info!("plx: moved column ({} win) → workspace {}", wins.len(), new);
     }
 
     /// Вызывается из new_toplevel в Columns-режиме: только что добавленное окно

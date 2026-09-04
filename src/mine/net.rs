@@ -1,4 +1,4 @@
-//! Сокет dmine: слушатель, один мод, очередь на отправку.
+//! Сокет plx-mine: слушатель, один мод, очередь на отправку.
 //!
 //! **Один клиент, а не пять.** Minecraft с модом на этой машине один; второй
 //! показывал бы те же самые окна теми же панелями и только делил бы полосу.
@@ -14,7 +14,7 @@
 //!
 //! **Сокет живёт в `$XDG_RUNTIME_DIR`,** а не в `/tmp`: это каталог сеанса,
 //! права там уже правильные (0700 на пользователя), и он чистится сам при
-//! выходе. Осиротевший файл (dawn упал, не убрав) снимаем перед bind —
+//! выходе. Осиротевший файл (parallax упал, не убрав) снимаем перед bind —
 //! проверив, что в него никто не слушает, чтобы не отобрать сокет у живого
 //! композитора соседнего сеанса.
 
@@ -29,9 +29,9 @@ use smithay::reexports::calloop::{
 
 use super::proto;
 use crate::share::net::Очередь;
-use crate::Dawn;
+use crate::Parallax;
 
-/// Где лежит сокет. `$XDG_RUNTIME_DIR/dawn-mine.sock`, а без переменной —
+/// Где лежит сокет. `$XDG_RUNTIME_DIR/plx-mine.sock`, а без переменной —
 /// `/run/user/<uid>`, который в Void и есть настоящий рантайм-каталог.
 pub fn путь_сокета() -> PathBuf {
     let каталог = std::env::var_os("XDG_RUNTIME_DIR")
@@ -59,7 +59,7 @@ pub struct Мод {
 
 /// Завести слушателя. Токен возвращается наружу: при выходе из режима его
 /// снимает `mine::выключить`.
-pub fn слушать(state: &mut Dawn) -> std::io::Result<RegistrationToken> {
+pub fn слушать(state: &mut Parallax) -> std::io::Result<RegistrationToken> {
     let путь = путь_сокета();
     // Осиротевший файл: если в него никто не слушает, connect даст
     // ECONNREFUSED — значит хозяин мёртв и файл можно снять. Живой сокет
@@ -70,7 +70,7 @@ pub fn слушать(state: &mut Dawn) -> std::io::Result<RegistrationToken> {
             Ok(_) => {
                 return Err(std::io::Error::new(
                     ErrorKind::AddrInUse,
-                    format!("{} уже слушает другой dawn", путь.display()),
+                    format!("{} is already being listened on by another parallax", путь.display()),
                 ));
             }
             Err(_) => {
@@ -80,18 +80,18 @@ pub fn слушать(state: &mut Dawn) -> std::io::Result<RegistrationToken> {
     }
     let слушатель = UnixListener::bind(&путь)?;
     слушатель.set_nonblocking(true)?;
-    tracing::info!("dawn/mine: слушаю {}", путь.display());
+    tracing::info!("plx/mine: listening on {}", путь.display());
     state
         .петля
         .insert_source(
             Generic::new(слушатель, Interest::READ, Mode::Level),
-            |_, слушатель, state: &mut Dawn| {
+            |_, слушатель, state: &mut Parallax| {
                 loop {
                     match слушатель.accept() {
                         Ok((поток, _)) => принять(state, поток),
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => {
-                            tracing::warn!("dawn/mine: accept: {e}");
+                            tracing::warn!("plx/mine: accept: {e}");
                             break;
                         }
                     }
@@ -121,21 +121,21 @@ fn pid_соседа(поток: &UnixStream) -> Option<u32> {
         )
     };
     if код != 0 {
-        tracing::warn!("dawn/mine: SO_PEERCRED: {}", std::io::Error::last_os_error());
+        tracing::warn!("plx/mine: SO_PEERCRED: {}", std::io::Error::last_os_error());
         return None;
     }
     u32::try_from(ucred.pid).ok()
 }
 
 /// Новое соединение: заводим мод, шлём «здравствуй», ставим источник чтения.
-fn принять(state: &mut Dawn, поток: UnixStream) {
+fn принять(state: &mut Parallax, поток: UnixStream) {
     let Some(шахта) = state.mine.as_mut() else { return };
     if шахта.мод.is_some() {
-        tracing::info!("dawn/mine: мод уже подключён — второму отказ");
+        tracing::info!("plx/mine: a mod is already connected — second one refused");
         return;
     }
     if let Err(e) = поток.set_nonblocking(true) {
-        tracing::warn!("dawn/mine: неблокирующий режим: {e}");
+        tracing::warn!("plx/mine: non-blocking mode: {e}");
         return;
     }
     // Чей это процесс. Нужно не ради статистики: по этому pid находится ОКНО
@@ -143,11 +143,11 @@ fn принять(state: &mut Dawn, поток: UnixStream) {
     // панелью в самом себе (человек видит собственный экран «монитором»), а
     // ввод панелей утыкается в него же, потому что оно поверх всех.
     let pid = pid_соседа(&поток);
-    tracing::info!("dawn/mine: соединение от pid {pid:?}");
+    tracing::info!("plx/mine: connection from pid {pid:?}");
     let (читалка, писалка) = match (поток.try_clone(), поток) {
         (Ok(ч), п) => (ч, п),
         (Err(e), _) => {
-            tracing::warn!("dawn/mine: try_clone: {e}");
+            tracing::warn!("plx/mine: try_clone: {e}");
             return;
         }
     };
@@ -167,7 +167,7 @@ fn принять(state: &mut Dawn, поток: UnixStream) {
         let исходящие = исходящие.clone();
         let mut сокет = писалка;
         std::thread::Builder::new()
-            .name("dawn-mine-запись".into())
+            .name("plx-mine-write".into())
             .spawn(move || {
                 while let Some(сообщение) = исходящие.взять() {
                     let mut ушло = 0;
@@ -183,14 +183,14 @@ fn принять(state: &mut Dawn, поток: UnixStream) {
                             }
                             Err(e) if e.kind() == ErrorKind::Interrupted => {}
                             Err(e) => {
-                                tracing::warn!("dawn/mine: запись: {e}");
+                                tracing::warn!("plx/mine: write: {e}");
                                 return;
                             }
                         }
                     }
                 }
             })
-            .map_err(|e| tracing::warn!("dawn/mine: поток записи не завёлся: {e}"))
+            .map_err(|e| tracing::warn!("plx/mine: writer thread failed to start: {e}"))
             .ok();
     }
 
@@ -198,7 +198,7 @@ fn принять(state: &mut Dawn, поток: UnixStream) {
     let mut буфер = vec![0u8; 64 * 1024];
     let токен = state.петля.insert_source(
         Generic::new(читалка, Interest::READ, Mode::Level),
-        move |_, сокет, state: &mut Dawn| {
+        move |_, сокет, state: &mut Parallax| {
             // Читаем через общую ссылку (`&UnixStream: Read`), а не через
             // `NoIoDrop::get_mut`: тот unsafe, и запрещает он не чтение, а
             // роняние сокета из колбэка. Общая ссылка того же не позволяет.
@@ -206,7 +206,7 @@ fn принять(state: &mut Dawn, поток: UnixStream) {
             loop {
                 match чтение.read(&mut буфер) {
                     Ok(0) => {
-                        tracing::info!("dawn/mine: мод отключился");
+                        tracing::info!("plx/mine: mod disconnected");
                         пометить_мёртвым(state);
                         return Ok(PostAction::Remove);
                     }
@@ -214,7 +214,7 @@ fn принять(state: &mut Dawn, поток: UnixStream) {
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        tracing::warn!("dawn/mine: чтение: {e}");
+                        tracing::warn!("plx/mine: read: {e}");
                         пометить_мёртвым(state);
                         return Ok(PostAction::Remove);
                     }
@@ -224,7 +224,7 @@ fn принять(state: &mut Dawn, поток: UnixStream) {
                 match вход.следующее() {
                     Ok(Some(тело)) => {
                         let Some(сообщение) = proto::ОтМода::из_байт(&тело) else {
-                            tracing::warn!("dawn/mine: не разобрал сообщение — рвём");
+                            tracing::warn!("plx/mine: could not parse the message — dropping");
                             пометить_мёртвым(state);
                             return Ok(PostAction::Remove);
                         };
@@ -235,7 +235,7 @@ fn принять(state: &mut Dawn, поток: UnixStream) {
                     }
                     Ok(None) => break,
                     Err(()) => {
-                        tracing::warn!("dawn/mine: длина сообщения вне предела — рвём");
+                        tracing::warn!("plx/mine: message length out of range — dropping");
                         пометить_мёртвым(state);
                         return Ok(PostAction::Remove);
                     }
@@ -251,7 +251,7 @@ fn принять(state: &mut Dawn, поток: UnixStream) {
             }
         }
         Err(e) => {
-            tracing::warn!("dawn/mine: источник мода не завёлся: {e}");
+            tracing::warn!("plx/mine: mod event source failed to start: {e}");
             пометить_мёртвым(state);
         }
     }
@@ -259,14 +259,14 @@ fn принять(state: &mut Dawn, поток: UnixStream) {
 
 /// Пометить мод на удаление. Сам он убирается в тике: рвать связи посреди
 /// разбора сообщения нельзя — на стеке уже лежит ссылка на это же соединение.
-pub fn пометить_мёртвым(state: &mut Dawn) {
+pub fn пометить_мёртвым(state: &mut Parallax) {
     if let Some(м) = state.mine.as_mut().and_then(|ш| ш.мод.as_mut()) {
         м.жив = false;
     }
 }
 
 /// Выкинуть мод, если он помечен мёртвым.
-pub fn убрать_мёртвого(state: &mut Dawn) {
+pub fn убрать_мёртвого(state: &mut Parallax) {
     let помечен = state
         .mine
         .as_ref()
@@ -277,7 +277,7 @@ pub fn убрать_мёртвого(state: &mut Dawn) {
     }
     отключить(state);
     // Панели останутся висеть в игре мёртвыми текстурами, пока мод не
-    // переподключится, — но dawn об этом уже ничего не знает и рисовать в
+    // переподключится, — но parallax об этом уже ничего не знает и рисовать в
     // пустоту не должен.
     if let Some(ш) = state.mine.as_mut() {
         ш.посланные.clear();
@@ -285,7 +285,7 @@ pub fn убрать_мёртвого(state: &mut Dawn) {
 }
 
 /// Оборвать соединение с модом (ушёл сам, или режим выключают).
-pub fn отключить(state: &mut Dawn) {
+pub fn отключить(state: &mut Parallax) {
     let Some(шахта) = state.mine.as_mut() else { return };
     let Some(мод) = шахта.мод.take() else { return };
     // Пишущий поток висит на условной переменной очереди — без закрытия он
@@ -302,7 +302,7 @@ pub fn отключить(state: &mut Dawn) {
 /// важнее полной. Панели, курсор и прощание ставятся всегда: по ним мод
 /// понимает, что вообще происходит, и уронить их значит показать окно не там,
 /// где оно есть.
-pub fn послать(state: &mut Dawn, сообщение: &proto::ОтДавна, можно_ронять: bool) {
+pub fn послать(state: &mut Parallax, сообщение: &proto::ОтДавна, можно_ронять: bool) {
     let Some(мод) = state.mine.as_mut().and_then(|ш| ш.мод.as_mut()) else { return };
     мод.исходящие.положить(сообщение.в_байты(), можно_ронять);
 }

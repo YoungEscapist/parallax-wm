@@ -6,7 +6,8 @@ use mlua::{Lua, Table};
 use smithay::backend::session::Session as _;
 use smithay::input::keyboard::{xkb, XkbConfig};
 
-use crate::state::Dawn;
+use crate::state::Parallax;
+use crate::{т, тф};
 use crate::tiling::Layout;
 
 // ── Modifiers ────────────────────────────────────────────────────────────────
@@ -29,7 +30,7 @@ impl ModMask {
                 "shift" => m.shift = true,
                 "super" | "logo" | "mod4" | "win" => m.logo = true,
                 "" => {}
-                other => tracing::warn!("dawn/config: unknown modifier '{}'", other),
+                other => tracing::warn!("plx/config: unknown modifier '{}'", other),
             }
         }
         m
@@ -42,7 +43,7 @@ impl ModMask {
 pub enum Action {
     Spawn(String),
     Quit,
-    /// Super+R: перезапуск компоновщика на месте — сессия сохраняется, dawn
+    /// Super+R: перезапуск компоновщика на месте — сессия сохраняется, parallax
     /// выходит с кодом [`crate::state::RESTART_EXIT_CODE`], а launch_native.sh
     /// пересобирает (если исходники новее бинаря) и поднимает его заново.
     /// Нужен, чтобы забирать свежую сборку без перелогина в ly.
@@ -62,7 +63,7 @@ pub enum Action {
     /// `center-window`. Считает `canvas::camera_to_center_window`.
     CenterWindow,
     /// Win+V: выделенные (или сфокусированное) окна — во floating и обратно,
-    /// не покидая свой рабочий стол. См. Dawn::float_selected.
+    /// не покидая свой рабочий стол. См. Parallax::float_selected.
     FloatSelected,
     FocusDirection(i32, i32),
     FocusStack(i32),
@@ -252,7 +253,7 @@ pub struct MonitorConfig {
     pub scale: f64,
     pub transform: String,
     /// `monitor{ tag = N }` — с какого рабочего стола монитор начинает
-    /// (1..=9, 0 — «выбери сам»). Столы в dawn принадлежат монитору, как
+    /// (1..=9, 0 — «выбери сам»). Столы в parallax принадлежат монитору, как
     /// воркспейсы в hyprland: без этой ручки монитор N открывает стол N.
     pub tag: u32,
     /// `monitor{ primary = true }` — этот монитор становится активным при
@@ -282,7 +283,7 @@ pub struct VrConfig {
     pub radius: f32,
     /// Входить в дополненную реальность сразу, как только шлем подключился.
     pub ar: bool,
-    /// Надевать шлем при старте dawn (то же, что ключ `--vr`).
+    /// Надевать шлем при старте parallax (то же, что ключ `--vr`).
     pub auto: bool,
     /// Кнопки пульта «Пуск» в шлеме: (подпись, команда). Пусто — набор по
     /// умолчанию (см. `vr::ui::приложения_по_умолчанию`).
@@ -293,7 +294,7 @@ pub struct VrConfig {
     ///              { name = "Браузер",  cmd = "waterfox" } } }
     /// ```
     pub apps: Vec<(String, String)>,
-    /// Жест или кнопка контроллера → действие dawn. Ключи — имена из
+    /// Жест или кнопка контроллера → действие parallax. Ключи — имена из
     /// [`crate::vr::input::Жест::имя`] (`fist`, `swipe_left`, `menu_button`, …),
     /// значения — любые действия `bind{}`:
     /// ```lua
@@ -324,7 +325,7 @@ impl Default for VrConfig {
     }
 }
 
-/// `mine{}` — dawn внутри Minecraft (см. mine/).
+/// `mine{}` — parallax внутри Minecraft (см. mine/).
 ///
 /// Отдельно от `vr{}`, хотя расстановка панелей у них общая: зона в игре —
 /// это не охраняемая граница комнаты, а сколько блоков вокруг игрока не жалко
@@ -377,6 +378,10 @@ pub struct Config {
     /// больше — медленнее и спокойнее, меньше — резче. Одна ручка на все
     /// движения сразу; сами длительности живут в `anim::дуг`.
     pub anim_speed: f64,
+    /// `set{ lang = "ru" | "en" }` — язык интерфейса; по умолчанию английский.
+    /// Накрывает то, что человек читает: панель, меню, подсказки, уведомления
+    /// и ответы терминальных команд. Логи всегда английские — см. `lang.rs`.
+    pub lang: crate::lang::Язык,
     /// `set{ pan_drift = ... }` — насколько долго холст едет по инерции после
     /// броска пальцами/мышью: 0 — инерции нет вовсе, 1 — самая «плавучая».
     /// `canvas::speed_dependent_drift` с самого начала называл это «ручкой
@@ -404,27 +409,27 @@ pub struct Config {
     ///
     /// `true` — не оставлять и этого: гость может ровно всё, что хозяин.
     pub share_guest_all: bool,
-    /// `set{ keyboard_grab_apps = {"dshare"} }` — приложения, которым, пока они
+    /// `set{ keyboard_grab_apps = {"plx-share"} }` — приложения, которым, пока они
     /// в фокусе, отдаются ВСЕ клавиши: ни один бинд композитора не срабатывает.
     ///
-    /// **Зачем.** Гость мультиюзера сидит за своим dawn и работает в чужом
-    /// рабочем столе через окно `dshare`. Super у него съедал бы СВОЙ
+    /// **Зачем.** Гость мультиюзера сидит за своим parallax и работает в чужом
+    /// рабочем столе через окно `plx-share`. Super у него съедал бы СВОЙ
     /// композитор, и до хоста не доходило бы ничего: ни Super+D, ни Super+1,
     /// ни Super+Q. То же самое нужно виртуалкам и любому удалённому столу.
     ///
     /// **Почему по классу окна, а не протоколом.** В Wayland для этого есть
     /// `zwp_keyboard_shortcuts_inhibit_v1`, и smithay его умеет — но просить
-    /// инхибитор должен КЛИЕНТ, а `dshare` написан на winit, который этого
+    /// инхибитор должен КЛИЕНТ, а `plx-share` написан на winit, который этого
     /// протокола не выставляет вовсе. Класс окна даёт тот же результат, не
     /// требуя от клиента ничего.
     ///
     /// **Выход всегда есть:** Super+Shift+Escape снимает захват и возвращает
-    /// бинды, даже если приложение зависло. Без этой лазейки повисший dshare
+    /// бинды, даже если приложение зависло. Без этой лазейки повисший plx-share
     /// запирал бы человека в его собственном сеансе намертво.
     pub keyboard_grab_apps: Vec<String>,
     /// Жесты тачпада таблицей — `gesture{}` в `config.lua`. См. `gestures.rs`.
     ///
-    /// Пустая таблица = поведение dawn до 30.08.2026: жесты обрабатывают
+    /// Пустая таблица = поведение parallax до 30.08.2026: жесты обрабатывают
     /// прежние ветки `input.rs`, слово в слово.
     pub gestures: Vec<crate::gestures::БиндЖеста>,
     /// Пороги распознавания жестов: `set{ swipe_threshold = …,
@@ -444,10 +449,18 @@ pub struct Config {
     ///
     /// Ручка заведена не «на всякий случай»: снимок окна делается через
     /// offscreen-проход рендера (`bind` → `render` → `finish`), а это тот же
-    /// приём, что у размытия, и живьём он в dawn ни разу не отсмотрен. Если
+    /// приём, что у размытия, и живьём он в parallax ни разу не отсмотрен. Если
     /// закрытие окна начнёт портить кадр — выключается здесь и подхватывается
     /// по Super+Shift+C, без пересборки.
     pub close_anim: bool,
+    /// `set{ intro = ... }` — появление рабочего места при запуске
+    /// (см. `anim::Вход`). Включено.
+    pub intro: bool,
+    /// `set{ notify_sound = ... }` — чем звенеть на уведомление: путь к файлу,
+    /// пусто — вшитый тон, `"off"` — молчать (см. notify.rs).
+    pub notify_sound: String,
+    /// `set{ notify_volume = ... }` — громкость этого тона, 0.0…1.0.
+    pub notify_volume: f32,
 }
 
 impl Config {
@@ -464,7 +477,7 @@ impl Config {
             .map(|b| b.action.clone())
     }
 
-    /// Loads `~/.config/dawn/config.lua`, writing out the embedded default
+    /// Loads `~/.config/parallax/config.lua`, writing out the embedded default
     /// config on first run. Falls back to the embedded default (in-memory)
     /// on any read or evaluation error, so a broken user config never
     /// prevents startup.
@@ -493,16 +506,20 @@ impl Default for Config {
             cursor_size: 0,
             cursor_client_max: -1,
             anim_speed: 1.0,
+            lang: crate::lang::Язык::default(),
             pan_drift: 0.5,
             fling_distance: 1.0,
             infinite_wallpaper: true,
             share_guest_all: false,
-            keyboard_grab_apps: vec!["dshare".to_string()],
+            keyboard_grab_apps: vec!["plx-share".to_string()],
             gestures: Vec::new(),
             gesture_thresholds: crate::gestures::Пороги::default(),
             автодовод: crate::touchpad::Автодовод::default(),
             blur: false,
             close_anim: true,
+            intro: true,
+            notify_sound: String::new(),
+            notify_volume: 0.35,
         }
     }
 }
@@ -510,15 +527,15 @@ impl Default for Config {
 const DEFAULT_CONFIG_LUA: &str = include_str!("../default_config.lua");
 
 fn config_path() -> Option<PathBuf> {
-    // dawn обычно запускается через `sudo openvt` (см. launch.zsh), поэтому
-    // HOME=/root и конфиг читался бы из /root/.config/dawn/ — НЕ там, где его
+    // parallax обычно запускается через `sudo openvt` (см. launch.zsh), поэтому
+    // HOME=/root и конфиг читался бы из /root/.config/parallax/ — НЕ там, где его
     // правит пользователь. Если задан SUDO_USER — берём конфиг реального
-    // пользователя (/home/<user>/.config/dawn/config.lua).
+    // пользователя (/home/<user>/.config/parallax/config.lua).
     let home = match std::env::var("SUDO_USER") {
         Ok(user) if !user.is_empty() && user != "root" => format!("/home/{user}"),
         _ => std::env::var("HOME").ok()?,
     };
-    Some(PathBuf::from(home).join(".config/dawn/config.lua"))
+    Some(PathBuf::from(home).join(".config/parallax/config.lua"))
 }
 
 fn keysym_from_name(name: &str) -> Option<u32> {
@@ -540,29 +557,29 @@ pub fn action_from_str(имя: &str, аргументы: &str) -> Option<Action>
     let tbl: Table = lua
         .load(format!("return {{{}}}", аргументы))
         .eval()
-        .map_err(|e| tracing::warn!("dawn/ctl: аргументы '{}' не разобрались: {}", аргументы, e))
+        .map_err(|e| tracing::warn!("plx/ctl: could not parse the arguments '{}': {}", аргументы, e))
         .ok()?;
     action_from_lua(имя, &tbl)
 }
 
 /// Действие жеста: сперва непрерывные и `center-nearest` (их нет среди
-/// клавиатурных — клавиша не умеет «ехать»), потом обычное действие dawn.
+/// клавиатурных — клавиша не умеет «ехать»), потом обычное действие parallax.
 ///
 /// Имена непрерывных пишутся через дефис, как в driftwm, и через
 /// подчёркивание, как всё остальное в `config.lua`: конфиг переносится оттуда
 /// копированием, и заставлять человека переписывать половину строк было бы глупо.
 ///
 /// **Ловушка имени `zoom`.** В driftwm `zoom` — это зум КАМЕРЫ щипком, а в
-/// dawn действие с тем же именем — «поднять окно в мастер-слот» (dwm). В жестах
+/// parallax действие с тем же именем — «поднять окно в мастер-слот» (dwm). В жестах
 /// побеждает driftwm-смысл, иначе перенос конфига молча менял бы поведение; для
 /// оконного зума есть отдельное имя `zoom-master`.
 /// Жесты тачпада, как их отдаёт driftwm из коробки (`config/defaults.rs` там).
 ///
-/// Перевод один в один, насколько действия вообще совпадают; чего в dawn нет —
+/// Перевод один в один, насколько действия вообще совпадают; чего в parallax нет —
 /// перечислено в `default_config.lua` рядом с этим же списком.
 const ЖЕСТЫ_ПО_УМОЛЧАНИЮ: &str = r#"
 -- Над окном.
--- Ресайз висит на SUPER, а не на alt, как в driftwm: alt в dawn уже занят
+-- Ресайз висит на SUPER, а не на alt, как в driftwm: alt в parallax уже занят
 -- паном холста, и жест приходилось начинать с пустого места (01.09.2026,
 -- жалоба «ресайз на alt работает слабо»).
 gesture{ mods = "super", fingers = 3, kind = "swipe", where = "window", action = "resize-window" }
@@ -570,7 +587,7 @@ gesture{ mods = "super+shift", fingers = 3, kind = "swipe", where = "window", ac
 gesture{ mods = "alt", fingers = 3, kind = "pinch-in", where = "window", action = "toggle_fullscreen" }
 gesture{ mods = "alt", fingers = 3, kind = "pinch-out", where = "window", action = "toggle_fullscreen" }
 
--- По холсту. Голый двухпальцевый щипок в dawn не делал НИЧЕГО (встроенный зум
+-- По холсту. Голый двухпальцевый щипок в parallax не делал НИЧЕГО (встроенный зум
 -- просит Alt) — это чистое добавление.
 gesture{ fingers = 2, kind = "pinch", where = "canvas", action = "zoom" }
 
@@ -589,16 +606,16 @@ gesture{ mods = "super", fingers = 3, kind = "hold", action = "center_window" }
 "#;
 
 fn действие_жеста(имя: &str, tbl: &Table) -> Option<crate::gestures::ДействиеЖеста> {
-    use crate::gestures::{ДействиеЖеста as Д, Непрерывное as Н};
+    use crate::gestures::{ДействиеЖеста as Д, Непрерывное as Непр};
     let ключ = имя.trim().to_ascii_lowercase().replace('_', "-");
     Some(match ключ.as_str() {
-        "pan-viewport" => Д::Непрерывно(Н::ПанВида),
-        "zoom" => Д::Непрерывно(Н::Зум),
+        "pan-viewport" => Д::Непрерывно(Непр::ПанВида),
+        "zoom" => Д::Непрерывно(Непр::Зум),
         "zoom-master" => Д::Порогом(action_from_lua("zoom", tbl)?),
-        "move-window" => Д::Непрерывно(Н::ВестиОкно),
-        "move-snapped-windows" => Д::Непрерывно(Н::ВестиСоСнапом),
-        "resize-window" => Д::Непрерывно(Н::РазмерОкна),
-        "resize-window-snapped" => Д::Непрерывно(Н::РазмерСоСнапом),
+        "move-window" => Д::Непрерывно(Непр::ВестиОкно),
+        "move-snapped-windows" => Д::Непрерывно(Непр::ВестиСоСнапом),
+        "resize-window" => Д::Непрерывно(Непр::РазмерОкна),
+        "resize-window-snapped" => Д::Непрерывно(Непр::РазмерСоСнапом),
         "center-nearest" => Д::ЦентрБлижайший,
         _ => Д::Порогом(action_from_lua(имя, tbl)?),
     })
@@ -614,12 +631,12 @@ fn непрерывное_подходит(
     действие: crate::gestures::Непрерывное,
     триггер: crate::gestures::Триггер,
 ) -> bool {
-    use crate::gestures::{Непрерывное as Н, Триггер as Т};
+    use crate::gestures::{Непрерывное as Непр, Триггер as Триг};
     match действие {
-        Н::Зум => matches!(триггер, Т::Щипок { .. }),
-        Н::ПанВида => matches!(триггер, Т::Свайп { .. }),
-        Н::ВестиОкно | Н::ВестиСоСнапом | Н::РазмерОкна | Н::РазмерСоСнапом => {
-            matches!(триггер, Т::Свайп { .. } | Т::ДвойнойТапСвайп { .. })
+        Непр::Зум => matches!(триггер, Триг::Щипок { .. }),
+        Непр::ПанВида => matches!(триггер, Триг::Свайп { .. }),
+        Непр::ВестиОкно | Непр::ВестиСоСнапом | Непр::РазмерОкна | Непр::РазмерСоСнапом => {
+            matches!(триггер, Триг::Свайп { .. } | Триг::ДвойнойТапСвайп { .. })
         }
     }
 }
@@ -646,7 +663,7 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
                 "monocle" => Layout::Monocle,
                 "columns" => Layout::Columns,
                 other => {
-                    tracing::warn!("dawn/config: unknown layout '{}'", other);
+                    tracing::warn!("plx/config: unknown layout '{}'", other);
                     return None;
                 }
             })
@@ -733,13 +750,13 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
         "move_column_to_workspace" => MoveColumnToWorkspace(get_i32("dir", 1)),
         "toggle_niri_mode" => ToggleNiriMode,
         other => {
-            tracing::warn!("dawn/config: unknown action '{}'", other);
+            tracing::warn!("plx/config: unknown action '{}'", other);
             return None;
         }
     })
 }
 
-/// Loads `~/.config/dawn/config.lua`, writing out the embedded default config
+/// Loads `~/.config/parallax/config.lua`, writing out the embedded default config
 /// on first run. Falls back to the embedded default (in-memory) on any read
 /// or evaluation error, so a broken user config never prevents startup.
 pub fn load() -> Config {
@@ -751,35 +768,40 @@ pub fn load() -> Config {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 match std::fs::write(p, DEFAULT_CONFIG_LUA) {
-                    Ok(()) => tracing::info!("dawn/config: wrote default config to {:?}", p),
-                    Err(e) => tracing::warn!("dawn/config: failed to write default config to {:?}: {}", p, e),
+                    Ok(()) => tracing::info!("plx/config: wrote default config to {:?}", p),
+                    Err(e) => tracing::warn!("plx/config: failed to write default config to {:?}: {}", p, e),
                 }
             }
             std::fs::read_to_string(p).unwrap_or_else(|e| {
-                tracing::warn!("dawn/config: failed to read {:?}: {} — using embedded default", p, e);
+                tracing::warn!("plx/config: failed to read {:?}: {} — using embedded default", p, e);
                 DEFAULT_CONFIG_LUA.to_string()
             })
         }
         None => {
-            tracing::warn!("dawn/config: $HOME not set — using embedded default config");
+            tracing::warn!("plx/config: $HOME not set — using embedded default config");
             DEFAULT_CONFIG_LUA.to_string()
         }
     };
 
     let cfg = match load_from_str(&source) {
         Ok(cfg) => {
-            tracing::info!("dawn/config: loaded {} keybinding(s)", cfg.bindings.len());
+            tracing::info!("plx/config: loaded {} keybinding(s)", cfg.bindings.len());
             cfg
         }
         Err(e) => {
-            tracing::error!("dawn/config: error evaluating config.lua: {} — falling back to built-in default", e);
+            tracing::error!("plx/config: error evaluating config.lua: {} — falling back to built-in default", e);
             load_from_str(DEFAULT_CONFIG_LUA).unwrap_or_default()
         }
     };
     // Темп анимаций живёт в самом anim.rs (атомик — см. anim::set_tempo), а не
-    // в поле, которое каждый конструктор анимации спрашивал бы у Dawn. Ставим
+    // в поле, которое каждый конструктор анимации спрашивал бы у Parallax. Ставим
     // его ЗДЕСЬ, в единственной точке загрузки: Super+Shift+C зовёт тот же
     // load(), так что перечитывание конфига подхватывает новый темп само.
+    // Язык — по той же схеме и в той же единственной точке, что и темп: он
+    // живёт атомиком в `lang`, потому что текст просят из мест, куда состояние
+    // не дотягивается. Раз ставим здесь — Super+Shift+C переключает язык на
+    // лету, без перезапуска.
+    crate::lang::установить(cfg.lang);
     crate::anim::set_tempo(cfg.anim_speed);
     // Дальность броска окна живёт там же и по той же причине (атомик в anim.rs).
     crate::anim::set_fling(cfg.fling_distance);
@@ -791,8 +813,10 @@ pub fn load() -> Config {
 pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let lua = Lua::new();
     let bindings: Rc<RefCell<Vec<KeyBinding>>> = Rc::new(RefCell::new(Vec::new()));
-    /// Жесты, которые человек погасил (`action = "none"`): их не должно
-    /// остаться ни от умолчаний, ни от его же прежних строк.
+    // Жесты, которые человек погасил (`action = "none"`): их не должно
+    // остаться ни от умолчаний, ни от его же прежних строк.
+    // (Именно `//`: doc-комментарий на `let` компилятор выбрасывает — он
+    // ни к чему не может быть привязан, отсюда `unused doc comment`.)
     #[allow(clippy::type_complexity)]
     let отключённые: Rc<RefCell<Vec<(ModMask, crate::gestures::Триггер, crate::gestures::Где)>>> =
         Rc::new(RefCell::new(Vec::new()));
@@ -813,14 +837,18 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let cursor_size: Rc<RefCell<i32>> = Rc::new(RefCell::new(0));
     let cursor_client_max: Rc<RefCell<i32>> = Rc::new(RefCell::new(-1));
     let anim_speed: Rc<RefCell<f64>> = Rc::new(RefCell::new(1.0));
+    let lang: Rc<RefCell<crate::lang::Язык>> = Rc::new(RefCell::new(crate::lang::Язык::default()));
     let pan_drift: Rc<RefCell<f64>> = Rc::new(RefCell::new(0.5));
     let fling_distance: Rc<RefCell<f64>> = Rc::new(RefCell::new(1.0));
     let infinite_wallpaper: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let share_guest_all: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let keyboard_grab_apps: Rc<RefCell<Vec<String>>> =
-        Rc::new(RefCell::new(vec!["dshare".to_string()]));
+        Rc::new(RefCell::new(vec!["plx-share".to_string()]));
     let blur: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let close_anim: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let intro: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let notify_sound: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    let notify_volume: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.35));
 
     {
         let bindings = bindings.clone();
@@ -836,7 +864,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             let keysym = match keysym_from_name(&key_str) {
                 Some(k) => k,
                 None => {
-                    tracing::warn!("dawn/config: unknown key name '{}', skipping bind", key_str);
+                    tracing::warn!("plx/config: unknown key name '{}', skipping bind", key_str);
                     return Ok(());
                 }
             };
@@ -873,11 +901,11 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             })?;
 
             let Some(триггер) = crate::gestures::Триггер::разобрать(&kind_str, fingers) else {
-                tracing::warn!("dawn/config: неизвестный вид жеста '{kind_str}', пропускаю");
+                tracing::warn!("plx/config: unknown gesture kind '{kind_str}', skipping");
                 return Ok(());
             };
             let Some(где) = crate::gestures::Где::разобрать(&where_str) else {
-                tracing::warn!("dawn/config: неизвестный контекст жеста '{where_str}', пропускаю");
+                tracing::warn!("plx/config: unknown gesture context '{where_str}', skipping");
                 return Ok(());
             };
             // `action = "none"` — не действие, а ОТКАЗ: строка гасит жест,
@@ -889,7 +917,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                 return Ok(());
             }
             let Some(действие) = действие_жеста(&action_str, &tbl) else {
-                tracing::warn!("dawn/config: неизвестное действие жеста '{action_str}', пропускаю");
+                tracing::warn!("plx/config: unknown gesture action '{action_str}', skipping");
                 return Ok(());
             };
             // Непрерывные действия привязаны к своему типу жеста намертво.
@@ -899,7 +927,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             if let crate::gestures::ДействиеЖеста::Непрерывно(н) = &действие {
                 if !непрерывное_подходит(*н, триггер) {
                     tracing::warn!(
-                        "dawn/config: '{action_str}' непрерывно и на '{kind_str}' не вешается — пропускаю",
+                        "plx/config: '{action_str}' is continuous and cannot be bound to '{kind_str}' — skipping",
                     );
                     return Ok(());
                 }
@@ -943,6 +971,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let cursor_size = cursor_size.clone();
         let cursor_client_max = cursor_client_max.clone();
         let anim_speed = anim_speed.clone();
+        let lang = lang.clone();
         let pan_drift = pan_drift.clone();
         let fling_distance = fling_distance.clone();
         let infinite_wallpaper = infinite_wallpaper.clone();
@@ -952,6 +981,9 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let автодовод = автодовод.clone();
         let blur = blur.clone();
         let close_anim = close_anim.clone();
+        let intro = intro.clone();
+        let notify_sound = notify_sound.clone();
+        let notify_volume = notify_volume.clone();
         // ВАЖНО: булевы ключи спрашиваются как `Option<bool>`, а не как `bool`.
         //
         // mlua переводит в bool ЛЮБОЕ значение по правилу истинности Lua, и
@@ -964,7 +996,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         // `bluetooth_autoconnect`, как бы их ни выставляли выше. Вылезло это
         // как «обои пропали на втором мониторе»: без бесконечных обоев картинка
         // рисуется обычной layer-поверхностью, а она есть только у того выхода,
-        // которому её отдал dwall (26.08.2026).
+        // которому её отдал plx-wall (26.08.2026).
         //
         // `Option<bool>` разводит «ключа нет» (None) и «ключ есть» (Some).
         let set_fn = lua.create_function(move |_, tbl: Table| {
@@ -980,8 +1012,28 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             if let Ok(v) = tbl.get::<f64>("anim_speed") {
                 *anim_speed.borrow_mut() = v;
             }
+            // Опечатку в языке НЕ проглатываем молча: человек написал
+            // `lang = "рус"`, интерфейс остался английским, и понять почему
+            // без этой строчки было бы нечем.
+            if let Ok(Some(v)) = tbl.get::<Option<String>>("lang") {
+                match crate::lang::Язык::разобрать(&v) {
+                    Some(я) => *lang.borrow_mut() = я,
+                    None => tracing::warn!(
+                        "plx/config: lang = {:?} not recognised — expected \"ru\" or \"en\"", v
+                    ),
+                }
+            }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("close_anim") {
                 *close_anim.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("intro") {
+                *intro.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<String>>("notify_sound") {
+                *notify_sound.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f64>>("notify_volume") {
+                *notify_volume.borrow_mut() = (v as f32).clamp(0.0, 1.0);
             }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("blur") {
                 *blur.borrow_mut() = v;
@@ -1037,7 +1089,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                 if let Some(k) = keysym_from_name(&v) {
                     *bird_eye_key.borrow_mut() = k;
                 } else {
-                    tracing::warn!("dawn/config: unknown bird_eye_key '{}'", v);
+                    tracing::warn!("plx/config: unknown bird_eye_key '{}'", v);
                 }
             }
             Ok(())
@@ -1104,7 +1156,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                     "стена" | "wall" => в.layout = Стена,
                     "купол" | "dome" => в.layout = Купол,
                     "свободно" | "free" => в.layout = Свободно,
-                    иное => tracing::warn!("dawn/config: vr{{}} не знает раскладку '{}'", иное),
+                    иное => tracing::warn!("plx/config: vr{{}} does not know the layout '{}'", иное),
                 }
             }
             if let Ok(v) = tbl.get::<f32>("scale") {
@@ -1130,7 +1182,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                 for пара in список.sequence_values::<Table>().flatten() {
                     let cmd = пара.get::<String>("cmd").unwrap_or_default();
                     if cmd.trim().is_empty() {
-                        tracing::warn!("dawn/config: vr{{ apps }} — пункт без cmd, пропущен");
+                        tracing::warn!("plx/config: vr{{ apps }} — entry without cmd, skipped");
                         continue;
                     }
                     let name = пара.get::<String>("name").unwrap_or_else(|_| cmd.clone());
@@ -1152,7 +1204,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                     let имя_действия =
                         |д: &str| д.trim().to_ascii_lowercase().replace('-', "_");
                     let разобрано = match знач {
-                        mlua::Value::String(с) => с
+                        mlua::Value::String(строка) => строка
                             .to_str()
                             .ok()
                             .and_then(|д| action_from_str(&имя_действия(&д), "")),
@@ -1160,7 +1212,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                             Ok(д) => action_from_lua(&имя_действия(&д), &t),
                             Err(_) => {
                                 tracing::warn!(
-                                    "dawn/config: vr{{ gestures }} — у «{}» нет action",
+                                    "plx/config: vr{{ gestures }} — '{}' has no action",
                                     имя_жеста
                                 );
                                 None
@@ -1170,7 +1222,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                     };
                     let ключ = имя_жеста.trim().to_ascii_lowercase().replace('-', "_");
                     if !crate::vr::input::Жест::все().iter().any(|ж| ж.имя() == ключ) {
-                        tracing::warn!("dawn/config: vr{{ gestures }} не знает жест '{}'", ключ);
+                        tracing::warn!("plx/config: vr{{ gestures }} does not know the gesture '{}'", ключ);
                         continue;
                     }
                     match разобрано {
@@ -1178,7 +1230,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                             в.gestures.insert(ключ, д);
                         }
                         None => tracing::warn!(
-                            "dawn/config: vr{{ gestures }} — действие жеста '{}' не разобралось",
+                            "plx/config: vr{{ gestures }} — could not parse the gesture action '{}'",
                             ключ
                         ),
                     }
@@ -1197,7 +1249,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             let name = match tbl.get::<String>("name") {
                 Ok(n) => n,
                 Err(_) => {
-                    tracing::warn!("dawn/config: monitor{{}} без name — пропущен");
+                    tracing::warn!("plx/config: monitor{{}} without name — skipped");
                     return Ok(());
                 }
             };
@@ -1237,7 +1289,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     // До 01.09.2026 этот список лежал в `default_config.lua` закомментированным
     // — то есть жестов из driftwm по умолчанию не было ни одного, и Ярик
     // попросил их наконец включить. Что при этом перебивается прежним
-    // поведением dawn, сказано в комментариях внутри.
+    // поведением parallax, сказано в комментариях внутри.
     lua.load(ЖЕСТЫ_ПО_УМОЛЧАНИЮ).exec()?;
     {
         let mut таблица = gestures.borrow_mut();
@@ -1253,7 +1305,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         });
         let гашения = отключённые.borrow();
         таблица.retain(|б| !гашения.contains(&(б.mods, б.триггер, б.где)));
-        tracing::info!("dawn/config: жестов тачпада {}", таблица.len());
+        tracing::info!("plx/config: touchpad gestures: {}", таблица.len());
     }
 
     let result = Config {
@@ -1271,6 +1323,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         cursor_size: *cursor_size.borrow(),
         cursor_client_max: *cursor_client_max.borrow(),
         anim_speed: *anim_speed.borrow(),
+        lang: *lang.borrow(),
         pan_drift: *pan_drift.borrow(),
         fling_distance: *fling_distance.borrow(),
         infinite_wallpaper: *infinite_wallpaper.borrow(),
@@ -1278,13 +1331,16 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         keyboard_grab_apps: keyboard_grab_apps.borrow().clone(),
         blur: *blur.borrow(),
         close_anim: *close_anim.borrow(),
+        intro: *intro.borrow(),
+        notify_sound: notify_sound.borrow().clone(),
+        notify_volume: *notify_volume.borrow(),
     };
     Ok(result)
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────
 
-impl Dawn {
+impl Parallax {
     /// Runs the effect of one resolved [`Action`]. Called from the keyboard
     /// handler in input.rs once it finds a matching binding in
     /// `self.lua_config.bindings` for the pressed (mods, keysym) pair.
@@ -1293,7 +1349,7 @@ impl Dawn {
         match action {
             Spawn(cmd) => self.spawn(&cmd),
             Quit => {
-                tracing::info!("dawn: quit");
+                tracing::info!("plx: quit");
                 crate::session::save(&self.tagged_windows);
                 // Флаг, а не только loop_signal: главный цикл в main.rs
                 // крутится вручную и сигнал не смотрит (см. state::ExitAction).
@@ -1301,7 +1357,7 @@ impl Dawn {
                 self.loop_signal.stop();
             }
             Restart => {
-                tracing::info!("dawn: restart");
+                tracing::info!("plx: restart");
                 crate::session::save(&self.tagged_windows);
                 self.exit = Some(crate::state::ExitAction::Restart);
                 self.loop_signal.stop();
@@ -1443,27 +1499,27 @@ impl Dawn {
             // маске «этаж» перестаёт существовать. В niri-режиме эти действия
             // просто не работают — столы там изолированы друг от друга.
             ToggleView(_) | ToggleTag(_) if self.tile_config.layout == Layout::Columns => {
-                tracing::debug!("dawn/columns: смешивать столы в ленте нельзя (Win+Ctrl+цифра)");
+                tracing::debug!("plx/columns: cannot mix workspaces in the ribbon (Win+Ctrl+digit)");
             }
             ToggleView(mask) => self.toggle_view(mask),
             ToggleTag(mask) => self.toggle_tag(mask),
             ToggleMinimap => {
                 self.is_minimap_visible = !self.is_minimap_visible;
-                tracing::info!("dawn: is_minimap_visible={}", self.is_minimap_visible);
+                tracing::info!("plx: is_minimap_visible={}", self.is_minimap_visible);
             }
             Screenshot => self.snip_start(),
             TogglePortal => self.toggle_portal(),
             ToggleBookmarksMode => {
                 self.bookmarks_mode = !self.bookmarks_mode;
-                tracing::info!("dawn: bookmarks_mode={}", self.bookmarks_mode);
+                tracing::info!("plx: bookmarks_mode={}", self.bookmarks_mode);
             }
             ToggleSnapping => {
                 self.is_snapping_enabled = !self.is_snapping_enabled;
-                tracing::info!("dawn: is_snapping_enabled={}", self.is_snapping_enabled);
+                tracing::info!("plx: is_snapping_enabled={}", self.is_snapping_enabled);
             }
             ToggleMagnetism => {
                 self.is_magnetism_enabled = !self.is_magnetism_enabled;
-                tracing::info!("dawn: is_magnetism_enabled={}", self.is_magnetism_enabled);
+                tracing::info!("plx: is_magnetism_enabled={}", self.is_magnetism_enabled);
             }
             ShareStart(порт) => self.раздача_по_команде(порт),
             ShareStop => self.раздача_закончить(),
@@ -1471,11 +1527,11 @@ impl Dawn {
             // управления: выключить всем — там же, отдельной клавишей.
             // Прежнее поведение оставляло только «всё или ничего»: убрать
             // одного назойливого гостя было нельзя, не выгнав заодно всех
-            // остальных. См. `share::Dawn::раздача_переключить`.
+            // остальных. См. `share::Parallax::раздача_переключить`.
             ShareToggle(порт) => self.раздача_переключить(порт),
             ToggleFoldStack => self.toggle_fold_stack(),
             VtSwitch(vt) => {
-                tracing::info!("dawn: VT switch → {}", vt);
+                tracing::info!("plx: VT switch → {}", vt);
                 if let Some(ref mut session) = self.session {
                     let _ = session.change_vt(vt);
                 }
@@ -1497,7 +1553,7 @@ impl Dawn {
             | ColumnConsumeOrExpel(_) | ColumnToggleTabbed | ColumnFocusOtherLayer
                 if self.tile_config.layout != Layout::Columns =>
             {
-                tracing::debug!("dawn/columns: действие только для режима Columns (Super+N)");
+                tracing::debug!("plx/columns: this action is for Columns mode only (Super+N)");
             }
             ColumnWidthCycle => self.columns_cycle_width(),
             WindowHeightCycle => self.columns_cycle_height(),
@@ -1513,7 +1569,7 @@ impl Dawn {
             ColumnFocusOtherLayer => self.columns_focus_other_layer(),
             ColumnCenterMode(mode) => {
                 self.columns.center_focused = mode;
-                tracing::info!("dawn/columns: center-focused-column = {:?}", mode);
+                tracing::info!("plx/columns: center-focused-column = {:?}", mode);
                 self.columns_scroll_to_active();
             }
             // ── Шлем ──────────────────────────────────────────────────────
@@ -1532,37 +1588,33 @@ impl Dawn {
             VrMode => crate::vr::режим(self),
             MineMode => crate::mine::режим(self),
             MineLayout => {
-                let р = crate::mine::сменить_раскладку(self);
-                self.уведомить(&format!("Minecraft: раскладка «{}»", р.имя()));
+                let раскл = crate::mine::сменить_раскладку(self);
+                self.уведомить(&тф!("Minecraft: раскладка «{}»", "Minecraft: layout '{}'", раскл.имя()));
             }
             MineGrab => crate::mine::хват_тумблер(self),
             VrAr => {
                 if self.vr.is_none() {
-                    self.уведомить("VR: сначала включи шлем (Super+Alt+V)");
+                    self.уведомить(т!("VR: сначала включи шлем (Super+Alt+V)", "VR: turn the headset on first (Super+Alt+V)"));
                 } else {
-                    use crate::vr::Ар;
+                    use crate::vr::АР;
                     let исход = crate::vr::переключить_ар(self);
                     // При отказе показываем ИМЕННО то, что объявил рантайм.
                     // «Не показывает комнату» без этого списка неотличимо от
                     // нашей же ошибки, а разница решающая: нет ALPHA_BLEND —
-                    // чинить надо passthrough в клиенте WiVRn, а не dawn.
-                    let подробно = self
-                        .vr
-                        .as_ref()
-                        .map(|вр| вр.шлем.смешивание_строкой())
-                        .unwrap_or_default();
+                    // чинить надо passthrough в клиенте WiVRn, а не parallax.
+                    let подробно = crate::vr::смешивание_строкой(self);
                     self.уведомить(&match исход {
-                        Ар::Включена => "VR: дополненная реальность".to_string(),
-                        Ар::Выключена => "VR: обычный режим".to_string(),
-                        Ар::НеУмеет => {
-                            format!("VR: шлем не показывает комнату ({подробно})")
+                        АР::Включена => т!("VR: дополненная реальность", "VR: passthrough").to_string(),
+                        АР::Выключена => т!("VR: обычный режим", "VR: normal mode").to_string(),
+                        АР::НеУмеет => {
+                            тф!("VR: шлем не показывает комнату ({подробно})", "VR: the headset has no passthrough ({подробно})")
                         }
                     });
                 }
             }
             VrLayout => {
-                let р = crate::vr::сменить_раскладку(self);
-                self.уведомить(&format!("VR: раскладка «{}»", р.имя()));
+                let раскл = crate::vr::сменить_раскладку(self);
+                self.уведомить(&тф!("VR: раскладка «{}»", "VR: layout '{}'", раскл.имя()));
             }
             VrRecenter => crate::vr::пересобрать(self),
             VrLauncher | VrKeyboard => {
@@ -1571,10 +1623,10 @@ impl Dawn {
                     _ => crate::vr::ui::Вид::Клавиатура,
                 };
                 match crate::vr::пульт(self, вид) {
-                    Ok(открыт) => self.уведомить(&format!(
-                        "VR: пульт «{}» {}",
+                    Ok(открыт) => self.уведомить(&тф!(
+                        "VR: пульт «{}» {}", "VR: control panel '{}' {}",
                         вид.имя(),
-                        if открыт { "открыт" } else { "спрятан" }
+                        if открыт { т!("открыт", "opened") } else { т!("спрятан", "hidden") }
                     )),
                     Err(e) => self.уведомить(&format!("VR: {e}")),
                 }
@@ -1602,9 +1654,22 @@ impl Dawn {
         }
     }
 
+    /// Короткое сообщение человеку всплывающим уведомлением.
+    ///
+    /// Жило в `vr/mod.rs` (там и появилось — сообщать, что шлем не поднялся),
+    /// но зовут его отовсюду: отсюда же, из управляющего сокета, из режима
+    /// Minecraft. В сборке `plx-minimal` модуля `vr` нет вовсе, поэтому метод
+    /// переехал сюда — к `spawn`, через который он и работает.
+    pub(crate) fn уведомить(&self, текст: &str) {
+        tracing::info!("plx: {текст}");
+        // Кавычки в тексте экранируем: он попадает в `sh -c`.
+        let без_кавычек = текст.replace('\'', "’");
+        self.spawn(&format!("notify-send -a parallax 'parallax' '{}'", без_кавычек));
+    }
+
     pub(crate) fn spawn(&self, cmd: &str) {
         let socket = self.socket_name.to_string_lossy().to_string();
-        tracing::info!("dawn: spawn '{}'", cmd);
+        tracing::info!("plx: spawn '{}'", cmd);
         match std::process::Command::new("sh")
             .arg("-c")
             .arg(cmd)
@@ -1633,7 +1698,7 @@ impl Dawn {
                     let _ = child.wait();
                 });
             }
-            Err(e) => tracing::warn!("dawn: spawn '{}' failed: {}", cmd, e),
+            Err(e) => tracing::warn!("plx: spawn '{}' failed: {}", cmd, e),
         }
     }
 
@@ -1655,23 +1720,32 @@ impl Dawn {
         self.request_redraw();
     }
 
-    /// Re-reads `~/.config/dawn/config.lua` (Super+Shift+C) and swaps in the
+    /// Re-reads `~/.config/parallax/config.lua` (Super+Shift+C) and swaps in the
     /// new bindings + xkb settings live, without restarting the compositor.
     fn reload_config(&mut self) {
         let new_cfg = load();
         if let Some(kb) = self.seat.get_keyboard() {
             if let Err(e) = kb.set_xkb_config(self, new_cfg.xkb_config()) {
-                tracing::warn!("dawn/config: failed to apply reloaded xkb config: {:?}", e);
+                tracing::warn!("plx/config: failed to apply reloaded xkb config: {:?}", e);
             }
         }
-        tracing::info!("dawn: config reloaded ({} binds)", new_cfg.bindings.len());
+        tracing::info!("plx: config reloaded ({} binds)", new_cfg.bindings.len());
         // Инерция холста живёт в MomentumState, а не спрашивается у конфига на
         // каждый кадр — значит при перечитывании её надо переставить руками.
         self.momentum.drift = new_cfg.pan_drift;
         self.lua_config = new_cfg;
         // Список раскладок мог смениться прямо сейчас — надпись в панели берёт
-        // коды именно из конфига (см. Dawn::refresh_kb_layout).
+        // коды именно из конфига (см. Parallax::refresh_kb_layout).
         self.refresh_kb_layout();
+        // Часы и дату — руками, и это не перестраховка. `anim::tick` сверяет
+        // дату со свежей ТОЛЬКО когда сменилась строка ЧАСОВ (раз в минуту), а
+        // `set{ lang }` меняет дату в любой момент. Без этих двух строк
+        // переключение языка по Super+Shift+C оставляло панель с «Thu 03.09»
+        // при уже русском интерфейсе — до ближайшей смены минуты. Поймано
+        // снимком на харнессе 03.09.2026.
+        self.bar_clock = crate::bar::clock_text();
+        self.bar_date = crate::bar::date_text();
+        self.request_redraw();
     }
 }
 
@@ -1707,6 +1781,29 @@ mod tests {
         assert_eq!(действие(&cfg, logo, xkb::keysyms::KEY_r), "Some(Restart)");
         // Пресеты ширины колонок уехали с Super+R, но не потерялись.
         assert_eq!(действие(&cfg, logo_alt, xkb::keysyms::KEY_r), "Some(ColumnWidthCycle)");
+    }
+
+    /// `set{ lang = … }` разбирается, а без него интерфейс английский.
+    ///
+    /// Проверяется именно через `load_from_str`, а не через `Язык::разобрать`:
+    /// разбор буквы уже накрыт тестом в `lang.rs`, а здесь важно, что ключ
+    /// вообще доходит из Lua до поля — на булевых ключах это ровно то место,
+    /// где однажды всё и осыпалось (см. `set{}` и `Option<bool>` выше).
+    #[test]
+    fn язык_разбирается() {
+        use crate::lang::Язык;
+        assert_eq!(load_from_str(DEFAULT_CONFIG_LUA).unwrap().lang, Язык::En);
+        assert_eq!(load_from_str("").unwrap().lang, Язык::En);
+        assert_eq!(load_from_str(r#"set{ lang = "ru" }"#).unwrap().lang, Язык::Ru);
+        assert_eq!(load_from_str(r#"set{ lang = "en" }"#).unwrap().lang, Язык::En);
+        // Опечатка не роняет конфиг и не молчит наполовину: язык остаётся
+        // прежним, а в лог уходит предупреждение.
+        assert_eq!(load_from_str(r#"set{ lang = "рус" }"#).unwrap().lang, Язык::En);
+        // Соседние ключи в том же set{} от этого не теряются — та самая
+        // грабля, из-за которой каждый set{} однажды гасил чужие настройки.
+        let cfg = load_from_str(r#"set{ lang = "ru", anim_speed = 1.5 }"#).unwrap();
+        assert_eq!(cfg.lang, Язык::Ru);
+        assert_eq!(cfg.anim_speed, 1.5);
     }
 
     /// Ручки темпа и инерции разбираются, зажимаются и доезжают до значений

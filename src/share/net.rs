@@ -35,7 +35,8 @@ use smithay::reexports::calloop::{
 };
 
 use super::{proto, Гость};
-use crate::Dawn;
+use crate::Parallax;
+use crate::{т, тф};
 
 /// Сколько СООБЩЕНИЙ разрешено держать неотправленными. Кадр 1080p в h264 —
 /// десятки килобайт, 32 кадра это уже секунда отставания; дальше копить
@@ -121,23 +122,23 @@ impl Default for Очередь {
 
 /// Завести слушателя. Возвращает токен источника — по нему раздача снимет его
 /// при остановке.
-pub fn слушать(state: &mut Dawn, порт: u16) -> std::io::Result<RegistrationToken> {
+pub fn слушать(state: &mut Parallax, порт: u16) -> std::io::Result<RegistrationToken> {
     let слушатель = TcpListener::bind(("0.0.0.0", порт))?;
     слушатель.set_nonblocking(true)?;
     let токен = state
         .петля
         .insert_source(
             Generic::new(слушатель, Interest::READ, Mode::Level),
-            |_, слушатель, state: &mut Dawn| {
+            |_, слушатель, state: &mut Parallax| {
                 loop {
                     match слушатель.accept() {
                         Ok((поток, адрес)) => {
-                            tracing::info!("dawn/share: стучится {адрес}");
+                            tracing::info!("plx/share: incoming from {адрес}");
                             принять(state, поток, адрес.ip());
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => {
-                            tracing::warn!("dawn/share: accept: {e}");
+                            tracing::warn!("plx/share: accept: {e}");
                             break;
                         }
                     }
@@ -150,7 +151,7 @@ pub fn слушать(state: &mut Dawn, порт: u16) -> std::io::Result<Regist
 }
 
 /// Новое соединение: заводим гостя, шлём вызов (соль), ставим источник чтения.
-fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net::IpAddr) {
+fn принять(state: &mut Parallax, поток: TcpStream, адрес: std::net::IpAddr) {
     let Some(раздача) = state.раздача.as_mut() else {
         // Раздачу выключили между accept и этим местом — вежливо закрываем.
         return;
@@ -160,29 +161,29 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
     // подбора), ни повода думать, что дело в занятых местах.
     if раздача.бан.contains(&адрес) {
         let mut поток = поток;
-        let отказ = proto::ОтХоста::Отказ { причина: "доступ закрыт".into() };
+        let отказ = proto::ОтХоста::Отказ { причина: т!("доступ закрыт", "access denied").into() };
         let _ = поток.write_all(&отказ.в_байты());
-        tracing::info!("dawn/share: {адрес} в бане — отказ");
+        tracing::info!("plx/share: {адрес} is banned — refused");
         return;
     }
     if раздача.гости.len() >= proto::МАКС_ГОСТЕЙ {
         let mut поток = поток;
-        let отказ = proto::ОтХоста::Отказ { причина: "мест нет".into() };
+        let отказ = proto::ОтХоста::Отказ { причина: т!("мест нет", "no free slots").into() };
         let _ = поток.write_all(&отказ.в_байты());
-        tracing::warn!("dawn/share: отказ — уже {} гостей", раздача.гости.len());
+        tracing::warn!("plx/share: refused — already {} guests", раздача.гости.len());
         return;
     }
     if let Err(e) = поток.set_nodelay(true) {
-        tracing::warn!("dawn/share: nodelay: {e}");
+        tracing::warn!("plx/share: nodelay: {e}");
     }
     if let Err(e) = поток.set_nonblocking(true) {
-        tracing::warn!("dawn/share: неблокирующий режим: {e}");
+        tracing::warn!("plx/share: non-blocking mode: {e}");
         return;
     }
     let читалка = match поток.try_clone() {
         Ok(п) => п,
         Err(e) => {
-            tracing::warn!("dawn/share: try_clone: {e}");
+            tracing::warn!("plx/share: try_clone: {e}");
             return;
         }
     };
@@ -190,7 +191,7 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
     let писалка = match поток.try_clone() {
         Ok(п) => п,
         Err(e) => {
-            tracing::warn!("dawn/share: try_clone (запись): {e}");
+            tracing::warn!("plx/share: try_clone (write): {e}");
             return;
         }
     };
@@ -201,7 +202,7 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
     let исходящие = Arc::new(Очередь::new());
     let гость = Гость {
         id,
-        имя: format!("гость {id}"),
+        имя: тф!("гость {id}", "guest {id}"),
         цвет: super::цвет(id),
         адрес,
         сокет: поток,
@@ -233,7 +234,7 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
         // нет, флаг общий и после клона — поэтому пишем с учётом WouldBlock.
         let _ = сокет.set_nodelay(true);
         std::thread::Builder::new()
-            .name(format!("dshare-{id}"))
+            .name(format!("plx-share-{id}"))
             .spawn(move || {
                 while let Some(сообщение) = исходящие.взять() {
                     let mut ушло = 0;
@@ -249,14 +250,14 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
                             }
                             Err(e) if e.kind() == ErrorKind::Interrupted => {}
                             Err(e) => {
-                                tracing::warn!("dawn/share: гость {id}: запись: {e}");
+                                tracing::warn!("plx/share: guest {id}: write: {e}");
                                 return;
                             }
                         }
                     }
                 }
             })
-            .map_err(|e| tracing::warn!("dawn/share: поток записи не завёлся: {e}"))
+            .map_err(|e| tracing::warn!("plx/share: writer thread failed to start: {e}"))
             .ok();
     }
 
@@ -267,7 +268,7 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
     let mut буфер = vec![0u8; 64 * 1024];
     let токен = state.петля.insert_source(
         Generic::new(читалка, Interest::READ, Mode::Level),
-        move |_, сокет, state: &mut Dawn| {
+        move |_, сокет, state: &mut Parallax| {
             // Читаем через `&TcpStream` (у него свой `impl Read`), а не через
             // `NoIoDrop::get_mut`: тот unsafe, и не из-за чтения — calloop так
             // запрещает УРОНИТЬ сокет из колбэка (иначе fd закроется у него под
@@ -276,7 +277,7 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
             loop {
                 match чтение.read(&mut буфер) {
                     Ok(0) => {
-                        tracing::info!("dawn/share: гость {id} отключился");
+                        tracing::info!("plx/share: guest {id} disconnected");
                         пометить_мёртвым(state, id);
                         return Ok(PostAction::Remove);
                     }
@@ -284,7 +285,7 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        tracing::warn!("dawn/share: гость {id}: чтение: {e}");
+                        tracing::warn!("plx/share: guest {id}: read: {e}");
                         пометить_мёртвым(state, id);
                         return Ok(PostAction::Remove);
                     }
@@ -294,7 +295,7 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
                 match вход.следующее() {
                     Ok(Some(тело)) => {
                         let Some(сообщение) = proto::ОтГостя::из_байт(&тело) else {
-                            tracing::warn!("dawn/share: гость {id}: не разобрал сообщение — рвём");
+                            tracing::warn!("plx/share: guest {id}: could not parse the message — dropping");
                             пометить_мёртвым(state, id);
                             return Ok(PostAction::Remove);
                         };
@@ -305,7 +306,7 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
                     }
                     Ok(None) => break,
                     Err(()) => {
-                        tracing::warn!("dawn/share: гость {id}: длина кадра вне предела — рвём");
+                        tracing::warn!("plx/share: guest {id}: frame length out of range — dropping");
                         пометить_мёртвым(state, id);
                         return Ok(PostAction::Remove);
                     }
@@ -321,7 +322,7 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
             }
         }
         Err(e) => {
-            tracing::warn!("dawn/share: источник гостя {id} не завёлся: {e}");
+            tracing::warn!("plx/share: guest {id} event source failed to start: {e}");
             пометить_мёртвым(state, id);
         }
     }
@@ -330,14 +331,14 @@ fn принять(state: &mut Dawn, поток: TcpStream, адрес: std::net:
 /// Пометить гостя на удаление. Сам список правится в `убрать_мёртвых` из
 /// тика — рвать связи посреди разбора сообщения нельзя, на стеке уже лежит
 /// ссылка на этого же гостя.
-pub fn пометить_мёртвым(state: &mut Dawn, id: u8) {
+pub fn пометить_мёртвым(state: &mut Parallax, id: u8) {
     if let Some(г) = state.раздача.as_mut().and_then(|р| р.гость(id)) {
         г.жив = false;
     }
 }
 
 /// Выкинуть помеченных: снять источник, закрыть сокет, обновить список.
-pub fn убрать_мёртвых(state: &mut Dawn) {
+pub fn убрать_мёртвых(state: &mut Parallax) {
     let Some(раздача) = state.раздача.as_mut() else { return };
     if раздача.гости.iter().all(|г| г.жив) {
         return;
@@ -357,7 +358,7 @@ pub fn убрать_мёртвых(state: &mut Dawn) {
         if let Some(место) = г.место.take() {
             super::seat::убрать(state, место);
         }
-        tracing::info!("dawn/share: гость {} («{}») ушёл", г.id, г.имя);
+        tracing::info!("plx/share: guest {} ('{}') left", г.id, г.имя);
     }
     state.раздача_разослать_участников();
     state.request_redraw();
@@ -367,7 +368,7 @@ pub fn убрать_мёртвых(state: &mut Dawn) {
 ///
 /// `можно_ронять` — про видеокадры: если гость не успевает, свежий кадр
 /// важнее полного потока. Служебные сообщения ставятся всегда.
-pub fn поставить_в_очередь(state: &mut Dawn, id: u8, данные: &[u8], можно_ронять: bool) {
+pub fn поставить_в_очередь(state: &mut Parallax, id: u8, данные: &[u8], можно_ронять: bool) {
     let Some(гость) = state.раздача.as_mut().and_then(|р| р.гость(id)) else { return };
     гость.исходящие.положить(данные.to_vec(), можно_ронять);
 }

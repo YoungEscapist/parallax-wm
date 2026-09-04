@@ -5,19 +5,19 @@
 //! было единственным способом: занять монитор живого сеанса — то есть выгнать
 //! человека из-за машины. Winit-бэкенд не годится: он рисует стоковым
 //! `render_output` из smithay и ни скруглений, ни блюра не знает вовсе, поэтому
-//! «проверил во вложенном dawn» про эти правки означало «не проверил ничего».
+//! «проверил во вложенном parallax» про эти правки означало «не проверил ничего».
 //!
 //! **Как.** GLES поднимается на РЕНДЕР-узле (`/dev/dri/renderD128`) — ему не
 //! нужен ни DRM master, ни VT, ни libseat: узел доступен всем на чтение-запись
 //! (см. `udev::open_render_gbm`, там же объяснение). Выход придумывается сам
-//! (`DAWN_HEADLESS_MODE`, по умолчанию 2560×1080@60), кадр собирается тем же
+//! (`PLX_HEADLESS_MODE`, по умолчанию 2560×1080@60), кадр собирается тем же
 //! `собрать_элементы` и рисуется в offscreen через `screencopy::capture` — тот
 //! самый путь, которым снимает экран демонстрация. Ввод — только через
 //! управляющий сокет (`ctl.rs`): физической клавиатуры этот экземпляр не видит,
 //! то есть чужой сеанс он тронуть не может ни при каких обстоятельствах.
 //!
-//! Запуск: `dawn --headless` (лучше со своим `XDG_RUNTIME_DIR`, чтобы сокет
-//! не путался с живым). Снимок: `dawn-ctl shot /путь/кадр.png`.
+//! Запуск: `parallax --headless` (лучше со своим `XDG_RUNTIME_DIR`, чтобы сокет
+//! не путался с живым). Снимок: `plxctl shot /путь/кадр.png`.
 
 use std::{os::unix::fs::OpenOptionsExt, time::Duration};
 
@@ -36,7 +36,7 @@ use smithay::{
     utils::{DeviceFd, Transform},
 };
 
-use crate::Dawn;
+use crate::Parallax;
 
 /// Всё, что живёт между кадрами у ОДНОГО выхода: сам выход и его шейдеры.
 ///
@@ -64,7 +64,7 @@ fn разобрать_режим(строка: &str) -> Option<(i32, i32, i32)> 
     }
 }
 
-/// Разбирает `DAWN_HEADLESS_MODE`: один режим `2560x1080@60` либо НЕСКОЛЬКО
+/// Разбирает `PLX_HEADLESS_MODE`: один режим `2560x1080@60` либо НЕСКОЛЬКО
 /// через запятую — `2560x1080@60,1920x1280@60`. Каждый даёт свой выход, то
 /// есть свой монитор со своей камерой и своим столом.
 ///
@@ -73,7 +73,7 @@ fn разобрать_режим(строка: &str) -> Option<(i32, i32, i32)> 
 /// умолчание: заваливать запуск харнесса из-за опечатки в переменной незачем.
 fn режимы_из_окружения() -> Vec<(i32, i32, i32)> {
     let по_умолчанию = vec![(2560, 1080, 60)];
-    let Ok(строка) = std::env::var("DAWN_HEADLESS_MODE") else {
+    let Ok(строка) = std::env::var("PLX_HEADLESS_MODE") else {
         return по_умолчанию;
     };
     let список: Vec<_> = строка.split(',')
@@ -82,9 +82,9 @@ fn режимы_из_окружения() -> Vec<(i32, i32, i32)> {
     if список.is_empty() { по_умолчанию } else { список }
 }
 
-/// Разбирает `DAWN_HEADLESS_NAMES` — имена коннекторов, под которыми искать
+/// Разбирает `PLX_HEADLESS_NAMES` — имена коннекторов, под которыми искать
 /// `monitor{}` в config.lua, в том же порядке, что и режимы из
-/// `DAWN_HEADLESS_MODE`. Без переменной (или при несовпадении числа) выход `n`
+/// `PLX_HEADLESS_MODE`. Без переменной (или при несовпадении числа) выход `n`
 /// зовётся «headless-N+1», как и раньше, и ни один monitor{} под ним не
 /// найдётся — раскладка и primary для него останутся по умолчанию.
 ///
@@ -94,7 +94,7 @@ fn режимы_из_окружения() -> Vec<(i32, i32, i32)> {
 /// primary/раскладка не подключились бы вовсе.
 fn имена_из_окружения(n: usize) -> Vec<String> {
     let по_умолчанию: Vec<String> = (0..n).map(|i| format!("headless-{}", i + 1)).collect();
-    let Ok(строка) = std::env::var("DAWN_HEADLESS_NAMES") else {
+    let Ok(строка) = std::env::var("PLX_HEADLESS_NAMES") else {
         return по_умолчанию;
     };
     let список: Vec<String> = строка.split(',').map(|с| с.trim().to_string()).collect();
@@ -102,12 +102,12 @@ fn имена_из_окружения(n: usize) -> Vec<String> {
 }
 
 pub fn init_headless(
-    event_loop: &mut EventLoop<'static, Dawn>,
-    state: &mut Dawn,
+    event_loop: &mut EventLoop<'static, Parallax>,
+    state: &mut Parallax,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Узел открываем НАПРЯМУЮ, а не через сессию: рендер-узел не имеет
     // отношения ни к seat'у, ни к DRM master (см. udev::open_render_gbm).
-    let путь = std::env::var("DAWN_RENDER_NODE")
+    let путь = std::env::var("PLX_RENDER_NODE")
         .unwrap_or_else(|_| "/dev/dri/renderD128".to_string());
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -118,7 +118,7 @@ pub fn init_headless(
     let egl = unsafe { EGLDisplay::new(gbm)? };
     let ctx = EGLContext::new(&egl)?;
     let mut gles = unsafe { GlesRenderer::new(ctx)? };
-    tracing::info!("dawn/headless: GLES на {}", путь);
+    tracing::info!("plx/headless: GLES on {}", путь);
 
     let режимы = режимы_из_окружения();
     let коннекторы = имена_из_окружения(режимы.len());
@@ -127,7 +127,7 @@ pub fn init_headless(
         let mode = Mode { size: (w, h).into(), refresh: гц * 1000 };
         let имя = format!("headless-{}", n + 1);
         // Имя коннектора для поиска monitor{} — «headless-N» без
-        // DAWN_HEADLESS_NAMES, иначе то, что попросили (см. имена_из_окружения).
+        // PLX_HEADLESS_NAMES, иначе то, что попросили (см. имена_из_окружения).
         let коннектор_имя = коннекторы[n].clone();
         let mon_cfg = state.lua_config.monitors.iter()
             .find(|m| m.name == коннектор_имя)
@@ -137,12 +137,12 @@ pub fn init_headless(
             PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
-                make: "dawn".into(),
+                make: "parallax".into(),
                 model: "headless".into(),
                 serial_number: "Unknown".into(),
             },
         );
-        let _global = output.create_global::<Dawn>(&state.display_handle);
+        let _global = output.create_global::<Parallax>(&state.display_handle);
         // Дом на холсте и место в раскладке — ровно как в udev.rs: позиция
         // выхода в space это КАМЕРА, а «где монитор стоит» живёт отдельно.
         let дом = state.свободный_дом();
@@ -170,7 +170,7 @@ pub fn init_headless(
             PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
-                make: "dawn".into(),
+                make: "parallax".into(),
                 model: "headless".into(),
                 serial_number: "Unknown".into(),
             },
@@ -224,8 +224,13 @@ pub fn init_headless(
             ));
             state.pointer_warped();
         }
+        if n == 0 {
+            // Как и в udev::add_surface — вход начинается на первом экране и
+            // ПОСЛЕ заявки основного монитора (она подменяет активный вид).
+            state.начать_вход();
+        }
         tracing::info!(
-            "dawn/headless: выход {} ({}) {}x{}@{}Hz стол {:#b} дом ({},{}) раскладка ({},{})",
+            "plx/headless: output {} ({}) {}x{}@{}Hz workspace {:#b} home ({},{}) layout ({},{})",
             имя, коннектор_имя, w, h, гц, тег, дом.x, дом.y, раскладка.x, раскладка.y,
         );
 
@@ -246,7 +251,7 @@ pub fn init_headless(
     // если его попросили. Сцену КАЖДЫЙ такт не собираем: показывать её некуда,
     // а GPU на машине общий с живым сеансом.
     let timer = Timer::from_duration(Duration::from_millis(16));
-    event_loop.handle().insert_source(timer, move |_, _, state: &mut Dawn| {
+    event_loop.handle().insert_source(timer, move |_, _, state: &mut Parallax| {
         такт(&mut экраны, &mut gles, state);
         TimeoutAction::ToDuration(Duration::from_millis(16))
     })?;
@@ -254,13 +259,13 @@ pub fn init_headless(
     Ok(())
 }
 
-fn такт(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mut Dawn) {
+fn такт(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mut Parallax) {
     // Шлем: рендерер здесь — единственный на весь headless, и другого места,
     // откуда его видно, нет. Пока VR не просили, это одна проверка Option
     // (см. vr::тик_с).
     crate::vr::тик_с(state, gles);
     // Minecraft: тот же рендерер и та же причина — другого места, откуда его
-    // видно, в headless нет. Благодаря этому вся dawn-сторона dmine
+    // видно, в headless нет. Благодаря этому вся parallax-сторона plx-mine
     // проверяется харнессом без самой игры.
     crate::mine::тик_с(state, gles);
 
@@ -305,15 +310,15 @@ fn такт(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mu
 
 /// Собирает кадр ТЕМ ЖЕ кодом, что и монитор, и кладёт его в PNG.
 ///
-/// Выходов может быть несколько (`DAWN_HEADLESS_MODE` со списком режимов):
+/// Выходов может быть несколько (`PLX_HEADLESS_MODE` со списком режимов):
 /// первый пишется в запрошенный путь, остальные — рядом с суффиксом `-2`,
 /// `-3`. Так один `shot` даёт снимок ВСЕХ мониторов разом, и сравнивать их
 /// между собой можно, не гоняя харнесс дважды.
-fn снимок(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mut Dawn, путь: &std::path::Path) {
+fn снимок(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mut Parallax, путь: &std::path::Path) {
     state.sync_pointer_to_camera();
     for (n, экран) in экраны.iter_mut().enumerate() {
         let Some(mode) = экран.output.current_mode() else {
-            tracing::warn!("dawn/headless: снимок без режима выхода");
+            tracing::warn!("plx/headless: screenshot with no output mode");
             continue;
         };
         // Точка зрения СВОЕГО монитора: своя камера, свой зум, свой стол —
@@ -340,15 +345,15 @@ fn снимок(экраны: &mut [Экран], gles: &mut GlesRenderer, state:
         state.покинуть_монитор(вернуть);
 
         let Some(пиксели) = пиксели else {
-            tracing::warn!("dawn/headless: кадр {} не снялся", n + 1);
+            tracing::warn!("plx/headless: frame {} was not captured", n + 1);
             continue;
         };
         let файл = if n == 0 { путь.to_path_buf() } else { с_суффиксом(путь, n + 1) };
         match записать_png(&файл, &пиксели, mode.size.w as u32, mode.size.h as u32) {
             Ok(()) => tracing::info!(
-                "dawn/headless: снимок {:?} ({} элементов)", файл, экран.last_elements
+                "plx/headless: screenshot {:?} ({} elements)", файл, экран.last_elements
             ),
-            Err(e) => tracing::warn!("dawn/headless: PNG {:?}: {}", файл, e),
+            Err(e) => tracing::warn!("plx/headless: PNG {:?}: {}", файл, e),
         }
     }
 }
@@ -356,7 +361,7 @@ fn снимок(экраны: &mut [Экран], gles: &mut GlesRenderer, state:
 /// `/tmp/кадр.png` + 2 → `/tmp/кадр-2.png`.
 fn с_суффиксом(путь: &std::path::Path, n: usize) -> std::path::PathBuf {
     let основа = путь.file_stem().map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "кадр".into());
+        .unwrap_or_else(|| "frame".into());
     let расш = путь.extension().map(|s| format!(".{}", s.to_string_lossy()))
         .unwrap_or_default();
     путь.with_file_name(format!("{}-{}{}", основа, n, расш))

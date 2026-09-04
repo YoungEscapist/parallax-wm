@@ -612,32 +612,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
-name = "dawn"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.13.1",
- "calloop 0.14.4",
- "drm-ffi",
- "fontdue",
- "libc",
- "libspa",
- "mlua",
- "openxr",
- "pipewire",
- "png",
- "resvg",
- "serde",
- "serde_json",
- "sha2",
- "smithay",
- "smithay-drm-extras",
- "tracing",
- "tracing-subscriber",
- "xcursor",
- "zbus",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1894,6 +1868,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "parallax"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.1",
+ "calloop 0.14.4",
+ "drm-ffi",
+ "fontdue",
+ "libc",
+ "libspa",
+ "mlua",
+ "openxr",
+ "pipewire",
+ "png",
+ "resvg",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smithay",
+ "smithay-drm-extras",
+ "tracing",
+ "tracing-subscriber",
+ "xcursor",
+ "zbus",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2034,6 +2034,20 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "plx-extra"
+version = "0.1.0"
+dependencies = [
+ "parallax",
+]
+
+[[package]]
+name = "plx-minimal"
+version = "0.1.0"
+dependencies = [
+ "parallax",
+]
 
 [[package]]
 name = "png"

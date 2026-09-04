@@ -10,13 +10,13 @@ use smithay::{
     utils::{Logical, Point, Rectangle},
 };
 
-use crate::Dawn;
+use crate::Parallax;
 
 /// Rubber-band мультивыделение: ЛКМ, зажатая на пустом холсте (без окна под
 /// курсором), протягивает прямоугольник — на отпускании выделяются все окна,
-/// пересекающиеся с ним (см. Dawn::select_windows_in_rect).
+/// пересекающиеся с ним (см. Parallax::select_windows_in_rect).
 pub struct SelectGrab {
-    pub start_data: PointerGrabStartData<Dawn>,
+    pub start_data: PointerGrabStartData<Parallax>,
     pub start_pos: Point<f64, Logical>,
 }
 
@@ -30,11 +30,11 @@ pub fn rect_from_points(a: Point<f64, Logical>, b: Point<f64, Logical>) -> Recta
     Rectangle::new((x0, y0).into(), ((x1 - x0).max(0), (y1 - y0).max(0)).into())
 }
 
-impl PointerGrab<Dawn> for SelectGrab {
+impl PointerGrab<Parallax> for SelectGrab {
     fn motion(
         &mut self,
-        data: &mut Dawn,
-        handle: &mut PointerInnerHandle<'_, Dawn>,
+        data: &mut Parallax,
+        handle: &mut PointerInnerHandle<'_, Parallax>,
         _focus: Option<(WlSurface, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
@@ -45,8 +45,8 @@ impl PointerGrab<Dawn> for SelectGrab {
 
     fn relative_motion(
         &mut self,
-        data: &mut Dawn,
-        handle: &mut PointerInnerHandle<'_, Dawn>,
+        data: &mut Parallax,
+        handle: &mut PointerInnerHandle<'_, Parallax>,
         focus: Option<(WlSurface, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
@@ -55,8 +55,8 @@ impl PointerGrab<Dawn> for SelectGrab {
 
     fn button(
         &mut self,
-        data: &mut Dawn,
-        handle: &mut PointerInnerHandle<'_, Dawn>,
+        data: &mut Parallax,
+        handle: &mut PointerInnerHandle<'_, Parallax>,
         event: &ButtonEvent,
     ) {
         handle.button(data, event);
@@ -69,38 +69,38 @@ impl PointerGrab<Dawn> for SelectGrab {
         }
     }
 
-    fn axis(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, details: AxisFrame) {
+    fn axis(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, details: AxisFrame) {
         handle.axis(data, details)
     }
-    fn frame(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>) {
+    fn frame(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>) {
         handle.frame(data);
     }
-    fn gesture_swipe_begin(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GestureSwipeBeginEvent) {
+    fn gesture_swipe_begin(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GestureSwipeBeginEvent) {
         handle.gesture_swipe_begin(data, event)
     }
-    fn gesture_swipe_update(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GestureSwipeUpdateEvent) {
+    fn gesture_swipe_update(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GestureSwipeUpdateEvent) {
         handle.gesture_swipe_update(data, event)
     }
-    fn gesture_swipe_end(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GestureSwipeEndEvent) {
+    fn gesture_swipe_end(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GestureSwipeEndEvent) {
         handle.gesture_swipe_end(data, event)
     }
-    fn gesture_pinch_begin(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GesturePinchBeginEvent) {
+    fn gesture_pinch_begin(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GesturePinchBeginEvent) {
         handle.gesture_pinch_begin(data, event)
     }
-    fn gesture_pinch_update(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GesturePinchUpdateEvent) {
+    fn gesture_pinch_update(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GesturePinchUpdateEvent) {
         handle.gesture_pinch_update(data, event)
     }
-    fn gesture_pinch_end(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GesturePinchEndEvent) {
+    fn gesture_pinch_end(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GesturePinchEndEvent) {
         handle.gesture_pinch_end(data, event)
     }
-    fn gesture_hold_begin(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GestureHoldBeginEvent) {
+    fn gesture_hold_begin(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GestureHoldBeginEvent) {
         handle.gesture_hold_begin(data, event)
     }
-    fn gesture_hold_end(&mut self, data: &mut Dawn, handle: &mut PointerInnerHandle<'_, Dawn>, event: &GestureHoldEndEvent) {
+    fn gesture_hold_end(&mut self, data: &mut Parallax, handle: &mut PointerInnerHandle<'_, Parallax>, event: &GestureHoldEndEvent) {
         handle.gesture_hold_end(data, event)
     }
-    fn start_data(&self) -> &PointerGrabStartData<Dawn> {
+    fn start_data(&self) -> &PointerGrabStartData<Parallax> {
         &self.start_data
     }
-    fn unset(&mut self, _data: &mut Dawn) {}
+    fn unset(&mut self, _data: &mut Parallax) {}
 }

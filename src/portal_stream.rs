@@ -5,7 +5,7 @@
 //! наша.
 //!
 //! Устройство. PipeWire живёт своим циклом, в отдельном потоке: смешивать его с
-//! calloop нельзя, а рендер dawn однопоточный и останавливаться ради сети не
+//! calloop нельзя, а рендер parallax однопоточный и останавливаться ради сети не
 //! должен. Кадры уезжают туда `pipewire::channel` — он будит цикл PipeWire
 //! изнутри, так что копирование в буфер происходит в его же потоке.
 //!
@@ -66,10 +66,10 @@ impl Cast {
         let (id_tx, id_rx) = mpsc::channel::<u32>();
 
         std::thread::Builder::new()
-            .name("dawn-pipewire".into())
+            .name("plx-pipewire".into())
             .spawn(move || {
                 if let Err(err) = serve(width, height, fps, frames_rx, id_tx) {
-                    tracing::warn!("dawn/pipewire: поток остановлен: {}", err);
+                    tracing::warn!("plx/pipewire: stream stopped: {}", err);
                 }
             })
             .ok()?;
@@ -79,7 +79,7 @@ impl Cast {
         match id_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(node_id) => {
                 tracing::info!(
-                    "dawn/pipewire: нода {} готова, кадр {}×{} @{} fps",
+                    "plx/pipewire: node {} ready, frame {}×{} @{} fps",
                     node_id, width, height, fps,
                 );
                 Some(Cast {
@@ -94,7 +94,7 @@ impl Cast {
                 })
             }
             Err(_) => {
-                tracing::warn!("dawn/pipewire: нода не поднялась за 5 с");
+                tracing::warn!("plx/pipewire: the node did not come up within 5 s");
                 None
             }
         }
@@ -128,7 +128,7 @@ impl Cast {
                 .count();
             let всего = pixels.len() / 4 / 997 + 1;
             tracing::info!(
-                "dawn/cast: снятый кадр {} байт, непустых пикселей {}/{} ({}%)",
+                "plx/cast: captured frame {} bytes, non-empty pixels {}/{} ({}%)",
                 pixels.len(),
                 непустых,
                 всего,
@@ -155,12 +155,12 @@ fn serve(
 
     let stream = std::rc::Rc::new(Stream::new(
         &core,
-        "dawn-screencast",
+        "plx-screencast",
         properties! {
             *pipewire::keys::MEDIA_TYPE => "Video",
             *pipewire::keys::MEDIA_CATEGORY => "Capture",
             *pipewire::keys::MEDIA_ROLE => "Screen",
-            *pipewire::keys::NODE_NAME => "dawn-screencast",
+            *pipewire::keys::NODE_NAME => "plx-screencast",
         },
     )?);
 
@@ -171,7 +171,7 @@ fn serve(
     let _listener = stream
         .add_local_listener_with_user_data(())
         .state_changed(move |stream, _, old, new| {
-            tracing::debug!("dawn/pipewire: состояние {:?} → {:?}", old, new);
+            tracing::debug!("plx/pipewire: state {:?} → {:?}", old, new);
             // Номер ноды осмыслен, только когда PipeWire её приняла.
             if matches!(new, StreamState::Paused | StreamState::Streaming) {
                 let _ = id_tx_state.send(stream.node_id());
@@ -237,7 +237,7 @@ fn serve(
             let bytes = bytes.0.into_inner();
             let Some(param) = Pod::from_bytes(&bytes) else { return };
             if let Err(err) = stream.update_params(&mut [param]) {
-                tracing::warn!("dawn/pipewire: update_params: {}", err);
+                tracing::warn!("plx/pipewire: update_params: {}", err);
             }
         })
         .register()?;
@@ -266,7 +266,7 @@ fn serve(
     )?
     .0
     .into_inner();
-    let param = Pod::from_bytes(&bytes).ok_or("не собрался POD формата")?;
+    let param = Pod::from_bytes(&bytes).ok_or("could not build the format POD")?;
 
     stream.connect(
         Direction::Output,
@@ -286,7 +286,7 @@ fn serve(
     let первый = std::cell::Cell::new(true);
     let _receiver = frames.attach(mainloop.loop_(), move |pixels: Vec<u8>| {
         let Some(mut buffer) = stream_frames.dequeue_buffer() else {
-            tracing::trace!("dawn/pipewire: нет свободного буфера — кадр пропущен");
+            tracing::trace!("plx/pipewire: no free buffer — frame dropped");
             return;
         };
         let datas = buffer.datas_mut();
@@ -300,12 +300,12 @@ fn serve(
             let тип = data.type_().as_raw();
             let есть_память = data.data().is_some();
             tracing::info!(
-                "dawn/pipewire: буферы типа {} ({}), отображены={}, ждём {} байт, буфер {} байт",
+                "plx/pipewire: buffers of type {} ({}), mapped={}, expecting {} bytes, buffer {} bytes",
                 тип,
                 match тип {
-                    x if x == SPA_DATA_MemPtr => "MemPtr — чужому процессу НЕ отдать",
+                    x if x == SPA_DATA_MemPtr => "MemPtr — cannot be handed to another process",
                     x if x == SPA_DATA_MemFd => "MemFd",
-                    _ => "другой",
+                    _ => "other",
                 },
                 есть_память,
                 frame_size,

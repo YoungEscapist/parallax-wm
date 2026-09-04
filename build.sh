@@ -11,7 +11,7 @@ set -e
 # получался процесс с системным интерпретатором, но чужой (Nix) libc.
 # glibc жёстко требует, чтобы ld.so и libc.so.6 были из одной сборки —
 # итог: моментальный general protection fault в libc.so.6 при каждом
-# запуске (см. dmesg: "dawn[...] general protection fault ... in libc.so.6"),
+# запуске (см. dmesg: "parallax[...] general protection fault ... in libc.so.6"),
 # без единой строчки в логе — падало до init tracing_subscriber.
 #
 # Фикс: не использовать nix-shell для сборки вообще. В системе (Void, xbps)
@@ -20,10 +20,24 @@ set -e
 # pkg-config находит их сам без PKG_CONFIG_PATH. mold ставится штатно:
 # `sudo xbps-install mold`.
 
-TARGET_DIR=/mnt/dawn-build/target
+TARGET_DIR=/mnt/plx-build/target
 
 cd "$(dirname "$0")"
-cargo build --release --target-dir "$TARGET_DIR" "$@"
+
+# Собираются ОБА бинаря: plx-minimal (без шлема, Minecraft и мультиюзера) и
+# plx-extra (со всем). Это не два разных исходника, а один и тот же крейт с
+# разным набором фич — см. `[features]` в Cargo.toml и заглушки в src/*_stub/.
+#
+# ДВА ОТДЕЛЬНЫХ ВЫЗОВА, а не один `--workspace`, и каталоги сборки тоже разные.
+# Причина не в аккуратности, а в том, что иначе разделения НЕ ПРОИСХОДИТ вовсе:
+# собирая несколько членов workspace разом, cargo ОБЪЕДИНЯЕТ их наборы фич и
+# строит общую библиотеку по сумме — то есть с `vr`, `mine` и `share`. Поймано
+# замером: после `--workspace` оба бинаря весили 17.8 МиБ байт в байт, и в
+# «минимальном» лежали 137 строк openxr. Раздельные каталоги нужны потому, что
+# отпечаток сборки включает набор фич: в общем каталоге каждый вызов вытеснял
+# бы предыдущий и пересобирал библиотеку целиком (fat LTO — это минуты).
+cargo build --release --target-dir "$TARGET_DIR/minimal" -p plx-minimal "$@"
+cargo build --release --target-dir "$TARGET_DIR/extra"   -p plx-extra   "$@"
 
 # Сборку зовут ДВА разных пользователя: человек (или Super+R внутри сессии) —
 # от yarik, я при проверках — от root. Каталог сборки при этом ОДИН, и после
@@ -41,25 +55,27 @@ cargo build --release --target-dir "$TARGET_DIR" "$@"
 # «command not found», а `set -e` до неё не добирается (присваивание внутри
 # if — не последняя команда конвейера). Итог: chown молча не выполнялся вовсе,
 # и root оставлял за собой ровно тот каталог сборки, ради которого этот блок и
-# написан. Поймано 23.08.2026: после сборки от root в /mnt/dawn-build/target
+# написан. Поймано 23.08.2026: после сборки от root в /mnt/plx-build/target
 # лежало 3160 root'овых файлов.
 if [[ $EUID -eq 0 ]]; then
     owner="$(stat -c %U:%G "$(dirname "$0")")"
     chown -R "$owner" "$TARGET_DIR" 2>/dev/null || true
 fi
 
-# dawn-share — терминальная команда раздачи. Кладём рядом с dwall, в
+# plx-host — терминальная команда раздачи. Кладём рядом с plx-wall, в
 # ~/.local/bin ВЛАДЕЛЬЦА репозитория: при сборке от root $HOME — это /root, и
 # команда тихо уехала бы туда, где её никто не ищет.
 owner_user="$(stat -c %U "$(dirname "$0")")"
 owner_home="$(getent passwd "$owner_user" | cut -d: -f6)"
 bindir="${owner_home:-$HOME}/.local/bin"
 mkdir -p "$bindir"
-cp dawn-share "$bindir/.dawn-share.new"
-mv -f "$bindir/.dawn-share.new" "$bindir/dawn-share"
-chmod +x "$bindir/dawn-share"
-[[ $EUID -eq 0 ]] && chown "$owner_user" "$bindir/dawn-share" 2>/dev/null
+cp plx-host "$bindir/.plx-host.new"
+mv -f "$bindir/.plx-host.new" "$bindir/plx-host"
+chmod +x "$bindir/plx-host"
+[[ $EUID -eq 0 ]] && chown "$owner_user" "$bindir/plx-host" 2>/dev/null
 
 echo ""
-echo "Binary: $TARGET_DIR/release/dawn"
-echo "Команда: $bindir/dawn-share"
+echo "Бинари:"
+echo "  $TARGET_DIR/minimal/release/plx-minimal"
+echo "  $TARGET_DIR/extra/release/plx-extra"
+echo "Команда: $bindir/plx-host"

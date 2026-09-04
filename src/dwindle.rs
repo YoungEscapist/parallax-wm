@@ -5,7 +5,7 @@
 //! `addTarget` / `removeTarget` / `recalcSizePosRecursive` / `resizeTarget`
 //! (smart_resizing) / `moveTargetInDirection` / `moveToRoot`.
 //!
-//! Чем это отличается от старой раскладки dawn (master + рекурсивный
+//! Чем это отличается от старой раскладки parallax (master + рекурсивный
 //! `dwindle_rects` по порядку списка окон):
 //!
 //!  · новое окно ДЕЛИТ ПОПОЛАМ слот сфокусированного окна, а не встаёт в конец

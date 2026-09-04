@@ -24,10 +24,10 @@ use std::cell::RefCell;
 
 use crate::{
     grabs::resize_grab::handle_commit,
-    state::{ClientState, Dawn},
+    state::{ClientState, Parallax},
 };
 
-impl CompositorHandler for Dawn {
+impl CompositorHandler for Parallax {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
     }
@@ -57,7 +57,7 @@ impl CompositorHandler for Dawn {
             window.on_commit();
             // trace!: срабатывает на каждый commit каждого клиента — у
             // анимированного окна это десятки строк в секунду в горячем пути.
-            tracing::trace!("dawn: commit for mapped window");
+            tracing::trace!("plx: commit for mapped window");
         }
 
         // Эластичное расталкивание соседей при ресайзе — ТОЛЬКО в режиме
@@ -100,7 +100,7 @@ impl CompositorHandler for Dawn {
     }
 }
 
-impl Dawn {
+impl Parallax {
     /// Отдать клавиатуру слою, который её просит (лаунчер, панель с вводом).
     ///
     /// Делаем это на КОММИТЕ, а не при создании поверхности: в момент
@@ -125,7 +125,7 @@ impl Dawn {
             return; // уже отдали
         }
         // Карту слоёв ищем ПО САМОЙ ПОВЕРХНОСТИ, а не у активного монитора:
-        // слой мог приехать на второй монитор (dwall создаёт обои на каждый
+        // слой мог приехать на второй монитор (plx-wall создаёт обои на каждый
         // wl_output), и спрашивать его у первого значит не найти вовсе.
         let Some(output) = self.слои_с_поверхностью(surface) else { return };
         let слой = {
@@ -136,9 +136,9 @@ impl Dawn {
         // ТОЛЬКО Exclusive. По протоколу wlr-layer-shell `on_demand` значит
         // «фокус даётся по клику, как обычному окну», а `exclusive` — «весь
         // ввод мой, пока я живу». Раньше мы отдавали клавиатуру и по OnDemand,
-        // прямо на коммите: dwall заводит поверхность меню обоев при старте и
+        // прямо на коммите: plx-wall заводит поверхность меню обоев при старте и
         // держит её всегда (закрытое меню — прозрачный кадр), и весь ввод
-        // уходил в невидимое меню. См. парную правку в dwall.
+        // уходил в невидимое меню. См. парную правку в plx-wall.
         let хочет = matches!(
             слой.cached_state().keyboard_interactivity,
             KeyboardInteractivity::Exclusive,
@@ -146,7 +146,7 @@ impl Dawn {
         if !хочет { return; }
         // ...и слой ДЕЙСТВИТЕЛЬНО показан, то есть прислал буфер.
         //
-        // dwall заводит поверхность меню обоев сразу при старте — пустую, без
+        // plx-wall заводит поверхность меню обоев сразу при старте — пустую, без
         // буфера, с OnDemand: иначе Esc в открытом меню было бы нечем поймать.
         // Мы же отдавали ей клавиатуру на первом же коммите, и весь ввод
         // уходил в невидимое меню: на десктопе это не видно (первый же клик по
@@ -156,7 +156,7 @@ impl Dawn {
         // строкой в логе).
         //
         // Буфер здесь — ровно та граница, которая отделяет «меню открыто» от
-        // «меню создано на будущее»: fuzzel, лаунчер и открытое меню dwall
+        // «меню создано на будущее»: fuzzel, лаунчер и открытое меню plx-wall
         // присылают его в том же коммите, где просят клавиатуру.
         let показан = smithay::backend::renderer::utils::with_renderer_surface_state(
             surface, |s| s.surface_size(),
@@ -167,7 +167,7 @@ impl Dawn {
             let цель = crate::focus::KeyboardFocusTarget::Wayland(surface.clone());
             kb.set_focus(self, Some(цель), serial);
             self.layer_keyboard = Some(surface.clone());
-            tracing::info!("dawn: клавиатура отдана layer-поверхности");
+            tracing::info!("plx: keyboard handed to a layer surface");
         }
     }
 
@@ -176,9 +176,9 @@ impl Dawn {
     /// Его ОБЯЗАН отправить композитор в ответ на первый commit клиента —
     /// `LayerMap::arrange` этого сознательно не делает (см. комментарий в
     /// smithay: до первого commit клиент ещё не сообщил свой желаемый размер,
-    /// и configure нарушил бы протокол). В dawn этого шага не было вообще:
+    /// и configure нарушил бы протокол). В parallax этого шага не было вообще:
     /// layer-клиент вставал в LayerMap, но configure не получал никогда, а без
-    /// него ему запрещено прикреплять буфер. Поэтому обои dwall не появлялись
+    /// него ему запрещено прикреплять буфер. Поэтому обои plx-wall не появлялись
     /// (его bg_configured навсегда оставался false), и меню выбора обоев тоже:
     /// в WAYLAND_DEBUG видно set_size(740,480) без единого события в ответ.
     fn ensure_layer_configured(&mut self, surface: &WlSurface) {
@@ -198,7 +198,7 @@ impl Dawn {
         // Здесь стоял map.arrange() на каждый commit (как в anvil), и он
         // устраивал пинг-понг: arrange пересчитывал размер поверхности, слал
         // configure, клиент отвечал ack + commit, commit снова звал arrange —
-        // и так по кругу. В протокольном логе dwall серийник configure за
+        // и так по кругу. В протокольном логе plx-wall серийник configure за
         // несколько секунд доходил до 9340, а размер меню приезжал 2482×1047
         // вместо 740×480. Клиент при этом жёг ядро вхолостую и переставал
         // отвечать на сигналы — меню открывалось один раз и больше никогда.
@@ -208,7 +208,7 @@ impl Dawn {
         }
 
         // Карту слоёв ищем ПО САМОЙ ПОВЕРХНОСТИ, а не у активного монитора:
-        // слой мог приехать на второй монитор (dwall создаёт обои на каждый
+        // слой мог приехать на второй монитор (plx-wall создаёт обои на каждый
         // wl_output), и спрашивать его у первого значит не найти вовсе.
         let Some(output) = self.слои_с_поверхностью(surface) else { return };
         let layer = {
@@ -225,7 +225,7 @@ impl Dawn {
     /// Повторный configure для слоя, который САМ попросил другой размер.
     ///
     /// Layer-клиент, которому нужно вырасти, шлёт `set_size(w,h)` + commit и
-    /// ЖДЁТ configure: до него прикреплять новый буфер ему нельзя. Раз dawn
+    /// ЖДЁТ configure: до него прикреплять новый буфер ему нельзя. Раз parallax
     /// после первого configure не делал больше ничего, такой клиент застревал
     /// навсегда на первом кадре.
     ///
@@ -237,11 +237,11 @@ impl Dawn {
     ///
     /// Пинг-понга, из-за которого arrange отсюда когда-то убрали, тут нет:
     /// пересчёт запускает только смена ЗАПРОШЕННОГО клиентом размера, а не
-    /// каждый commit. Клиент с постоянным set_size (меню dwall) проходит
+    /// каждый commit. Клиент с постоянным set_size (меню plx-wall) проходит
     /// через эту ветку ровно один раз.
     fn relayout_if_client_resized(&mut self, surface: &WlSurface) {
         // Карту слоёв ищем ПО САМОЙ ПОВЕРХНОСТИ, а не у активного монитора:
-        // слой мог приехать на второй монитор (dwall создаёт обои на каждый
+        // слой мог приехать на второй монитор (plx-wall создаёт обои на каждый
         // wl_output), и спрашивать его у первого значит не найти вовсе.
         let Some(output) = self.слои_с_поверхностью(surface) else { return };
 
@@ -258,7 +258,7 @@ impl Dawn {
         // здесь — карта слоёв по этому коммиту уже поднята, отдельного обхода
         // не нужно. По свежести отметки главный цикл держит частый тик и
         // будит обои кадровым callback'ом на неподвижном экране (см.
-        // Dawn::будить_фоновые_слои).
+        // Parallax::будить_фоновые_слои).
         if matches!(
             layer.layer(),
             smithay::wayland::shell::wlr_layer::Layer::Background
@@ -304,17 +304,17 @@ impl Dawn {
 #[derive(Default)]
 struct ПрошлыйЗапросРазмера(Option<Size<i32, Logical>>);
 
-impl BufferHandler for Dawn {
+impl BufferHandler for Parallax {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
 
-impl ShmHandler for Dawn {
+impl ShmHandler for Parallax {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
     }
 }
 
-impl DmabufHandler for Dawn {
+impl DmabufHandler for Parallax {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
     }
@@ -327,19 +327,19 @@ impl DmabufHandler for Dawn {
     ) {
         for device in self.udev_devices.values_mut() {
             if device.gles.import_dmabuf(&dmabuf, None).is_ok() {
-                let _ = notifier.successful::<Dawn>();
+                let _ = notifier.successful::<Parallax>();
                 return;
             }
         }
-        tracing::warn!("dawn/dmabuf: import failed");
+        tracing::warn!("plx/dmabuf: import failed");
         notifier.failed();
     }
 }
 
-delegate_compositor!(Dawn);
-delegate_shm!(Dawn);
-delegate_dmabuf!(Dawn);
+delegate_compositor!(Parallax);
+delegate_shm!(Parallax);
+delegate_dmabuf!(Parallax);
 // wp_viewporter: обработчика писать не надо, smithay сам складывает src/dst в
 // состояние поверхности, а рендер читает их в SurfaceView::from_states.
-// См. Dawn::viewporter_state.
-smithay::delegate_viewporter!(Dawn);
+// См. Parallax::viewporter_state.
+smithay::delegate_viewporter!(Parallax);

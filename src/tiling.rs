@@ -6,7 +6,7 @@ use smithay::{
 };
 
 use crate::anim::{CameraAnim, PosAnim};
-use crate::state::Dawn;
+use crate::state::Parallax;
 
 /// Псевдослучайный угол из seed (LCG)
 fn lcg_f64(seed: u64) -> f64 {
@@ -68,7 +68,7 @@ impl Default for TileConfig {
     }
 }
 
-impl Dawn {
+impl Parallax {
     pub fn arrange(&mut self) {
         // В обзоре столов ленту раскладывает overview.rs — обычный arrange
         // не должен её перетасовывать.
@@ -104,7 +104,7 @@ impl Dawn {
     /// Тайлинг обязан считать по экрану: в него он и попадает.
     /// Прямоугольник холста, в котором собираются столы АКТИВНОГО монитора.
     ///
-    /// В dawn все рабочие столы лежат в ОДНОМ прямоугольнике (см. `слайд_столов`
+    /// В parallax все рабочие столы лежат в ОДНОМ прямоугольнике (см. `слайд_столов`
     /// в state.rs): между столами нет пространственного отношения, их разводят
     /// теги. Двум мониторам одного прямоугольника мало — каждый получает свой,
     /// начинающийся с его «дома» (`monitors::ШАГ_ДОМА`). Отсюда и берётся то,
@@ -337,7 +337,7 @@ impl Dawn {
             loc.y = loc.y.clamp(area.loc.y, (area.loc.y + area.size.h - h).max(area.loc.y));
         }
         tracing::debug!(
-            "dawn/tile: слот {:?} не по клиенту (max {:?}) → {:?} в {:?}",
+            "plx/tile: slot {:?} does not fit the client (max {:?}) → {:?} at {:?}",
             slot.size, max, Size::<i32, Logical>::from((w, h)), loc,
         );
         Rectangle::new(loc, (w, h).into())
@@ -662,8 +662,8 @@ impl Dawn {
                         .find(|tw| tw.window == window)
                     {
                         tracing::debug!(
-                            "dawn/float: снимок места {:?} size {:?}{}",
-                            loc, size, if летит { " (по цели анимации)" } else { "" },
+                            "plx/float: place snapshot {:?} size {:?}{}",
+                            loc, size, if летит { " (from the animation target)" } else { "" },
                         );
                         tw.float_position = loc;
                         // Размер трогаем только у осевшего окна. Пока идёт
@@ -734,7 +734,7 @@ impl Dawn {
             }
             self.arrange();
         }
-        tracing::info!("dawn: layout → {}", layout.symbol());
+        tracing::info!("plx: layout → {}", layout.symbol());
     }
 
     /// Hyprland-style "slide-in": устарел — arrange + animate_window_to (180ms)
@@ -801,7 +801,7 @@ impl Dawn {
                     // где его оставили. Кольцевой разлёт ниже — только для тех,
                     // кто во Float ещё не был ни разу.
                     if tw.float_position_set {
-                        tracing::debug!("dawn/float: возврат на место {:?} size {:?}",
+                        tracing::debug!("plx/float: back to place {:?} size {:?}",
                             tw.float_position, tw.float_size);
                         return (tw.window.clone(), tw.float_size, tw.float_position);
                     }
@@ -861,7 +861,7 @@ impl Dawn {
                         let y = (cy + angle.sin() * r - win_size.h as f64 / 2.0) as i32;
                         зажать(smithay::utils::Point::from((x, y)))
                     };
-                    tracing::debug!("dawn/float: РАЗЛЁТ кольцом в {:?} size {:?}", pos, win_size);
+                    tracing::debug!("plx/float: SCATTER in a ring at {:?} size {:?}", pos, win_size);
                     (tw.window.clone(), Some(win_size), pos)
                 })
                 .collect();
@@ -1082,7 +1082,7 @@ impl Dawn {
                     tw.folded = false;
                 }
             }
-            tracing::info!("dawn: stack unfolded");
+            tracing::info!("plx: stack unfolded");
         } else {
             const FOLD_OFFSET: i32 = 30;
             let focused = self.focused_surface();
@@ -1117,7 +1117,7 @@ impl Dawn {
             for &idx in &visible_idxs {
                 self.tagged_windows[idx].folded = true;
             }
-            tracing::info!("dawn: stack folded ({} windows)", visible_idxs.len());
+            tracing::info!("plx: stack folded ({} windows)", visible_idxs.len());
         }
         self.request_plane_reset();
         self.request_redraw();
@@ -1407,7 +1407,7 @@ impl Dawn {
             Some(w) => w, None => return,
         };
         let cur = crate::xwin::current_size(&w);
-        // Пол — 1 px, а не «удобные» 50: своего нижнего порога у dawn больше
+        // Пол — 1 px, а не «удобные» 50: своего нижнего порога у parallax больше
         // нет нигде (см. tiling::fit_to_constraints и dwindle::RATIO_MIN).
         let new_w = (cur.w + dw).max(1);
         let new_h = (cur.h + dh).max(1);

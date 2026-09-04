@@ -5,7 +5,7 @@
 #
 # Использование:
 #   ./build_env.sh check   — cargo check --release
-#   ./build_env.sh build   — cargo build --release --target-dir /mnt/dawn-build/target
+#   ./build_env.sh build   — cargo build --release --target-dir /mnt/plx-build/target
 #
 # ПРЕДУПРЕЖДЕНИЕ (2026-08-03): `build` через nix-shell даёт бинарь, который
 # падает с general protection fault в libc.so.6 при каждом запуске —
@@ -20,7 +20,7 @@ case "$cmd" in
         nix-shell shell.nix --run "cargo check --release"
         ;;
     build)
-        nix-shell shell.nix --run "cargo build --release --target-dir /mnt/dawn-build/target"
+        nix-shell shell.nix --run "cargo build --release --target-dir /mnt/plx-build/target"
         ;;
     *)
         echo "usage: $0 [check|build]" >&2

@@ -1,7 +1,7 @@
 //! Спокойное закрытие окна: снимок содержимого плюс затухание.
 //!
 //! **Зачем снимок, а не сама поверхность.** Анимировать закрытие «как есть»
-//! нечем: к тому моменту, когда dawn узнаёт о закрытии
+//! нечем: к тому моменту, когда parallax узнаёт о закрытии
 //! (`XdgShellHandler::toplevel_destroyed`, `XwmHandler::destroyed_window`),
 //! клиента уже нет — рисовать нечего, и окно пропадает одним кадром. Поэтому
 //! ровно в этот момент, пока текстура последнего кадра ещё жива в
@@ -121,7 +121,7 @@ pub fn снять(
         Fourcc::Abgr8888,
         Size::<i32, BufferCoords>::from((размер.w, размер.h)),
     )
-    .map_err(|e| tracing::warn!("dawn/close: буфер снимка {:?}: {:?}", размер, e))
+    .map_err(|e| tracing::warn!("plx/close: snapshot buffer {:?}: {:?}", размер, e))
     .ok()?;
 
     let полный = Rectangle::<i32, Physical>::new((0, 0).into(), размер);
@@ -133,7 +133,7 @@ pub fn снять(
         // углами ровно в момент, когда на окно смотрят.
         frame.clear(Color32F::TRANSPARENT, &[полный]).ok()?;
         draw_render_elements::<GlesRenderer, _, _>(&mut frame, 1.0, &элементы, &[полный])
-            .map_err(|e| tracing::warn!("dawn/close: снимок не нарисовался: {:?}", e))
+            .map_err(|e| tracing::warn!("plx/close: the snapshot was not drawn: {:?}", e))
             .ok()?;
         // SyncPoint ждать не нужно и вредно: ждать пришлось бы прямо в
         // обработчике закрытия окна, то есть в главном цикле. Текстуру
