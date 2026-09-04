@@ -440,6 +440,15 @@ pub struct Config {
     /// `set{ touchpad_edge_motion = true, touchpad_edge_zone = 0.08,
     ///       touchpad_edge_speed = 900.0 }`. См. touchpad.rs.
     pub автодовод: crate::touchpad::Автодовод,
+    /// `set{ glow = ... }` — светящаяся кайма по краю окна В ЦВЕТ ОБОЕВ
+    /// (см. rounded.rs, `Свечение`; цвет берётся из палитры plx-wall —
+    /// src/обои.rs). Сила 0.0…1.0, 0 — выключено.
+    ///
+    /// Гаснет сама на светлых обоях и у окон не в фокусе — так кайма
+    /// показывает, где ввод, а не просто красит края.
+    pub glow: f32,
+    /// `set{ glow_width = ... }` — ширина этой каймы в логических пикселях.
+    pub glow_width: f32,
     /// `set{ blur = ... }` — размывать фон под островами панели (см. blur.rs).
     /// ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО: код проходом рендера живьём не отсмотрен, а
     /// ошибка там стоит чёрного экрана.
@@ -515,6 +524,10 @@ impl Default for Config {
             gestures: Vec::new(),
             gesture_thresholds: crate::gestures::Пороги::default(),
             автодовод: crate::touchpad::Автодовод::default(),
+            // Выключено по умолчанию: эффект вкусовой, а включается одной
+            // строкой в config.lua.
+            glow: 0.0,
+            glow_width: 12.0,
             blur: false,
             close_anim: true,
             intro: true,
@@ -845,6 +858,8 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let keyboard_grab_apps: Rc<RefCell<Vec<String>>> =
         Rc::new(RefCell::new(vec!["plx-share".to_string()]));
     let blur: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let glow: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
+    let glow_width: Rc<RefCell<f32>> = Rc::new(RefCell::new(12.0));
     let close_anim: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let intro: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let notify_sound: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
@@ -980,6 +995,8 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let gesture_thresholds = gesture_thresholds.clone();
         let автодовод = автодовод.clone();
         let blur = blur.clone();
+        let glow = glow.clone();
+        let glow_width = glow_width.clone();
         let close_anim = close_anim.clone();
         let intro = intro.clone();
         let notify_sound = notify_sound.clone();
@@ -1034,6 +1051,15 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             }
             if let Ok(Some(v)) = tbl.get::<Option<f64>>("notify_volume") {
                 *notify_volume.borrow_mut() = (v as f32).clamp(0.0, 1.0);
+            }
+            // Только Option<…>: голый get срабатывает на ОТСУТСТВУЮЩЕМ ключе
+            // (см. разбор выше про blur) и каждый set{} гасил бы чужие
+            // настройки.
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("glow") {
+                *glow.borrow_mut() = v.clamp(0.0, 1.0);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("glow_width") {
+                *glow_width.borrow_mut() = v.max(0.0);
             }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("blur") {
                 *blur.borrow_mut() = v;
@@ -1329,6 +1355,8 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         infinite_wallpaper: *infinite_wallpaper.borrow(),
         share_guest_all: *share_guest_all.borrow(),
         keyboard_grab_apps: keyboard_grab_apps.borrow().clone(),
+        glow: *glow.borrow(),
+        glow_width: *glow_width.borrow(),
         blur: *blur.borrow(),
         close_anim: *close_anim.borrow(),
         intro: *intro.borrow(),

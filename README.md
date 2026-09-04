@@ -61,6 +61,12 @@ in-tree docs; this file and the config reference are in English too.
 - Hovering a window chip shows a live preview of where that window is.
 - Rounded corners, drop shadows, optional background blur behind the bar,
   shelf, menus and preview cards.
+- Windows can be rim-lit in the wallpaper's own colour: a shader traces the
+  window edge with the accent colour Parallax reads from the palette plx-wall
+  computes for the current wallpaper, so the desktop re-tints itself whenever
+  the wallpaper changes. It fades out on bright wallpapers, where a coloured
+  rim reads as grime, and the focused window glows twice as bright as the rest
+  (`set{ glow = 0.6 }`).
 - A quiet entrance: at startup the canvas eases out of the dark to its own zoom
   while the bar arrives from above (`set{ intro = false }` to skip it).
 - A short, unobtrusive tone on every notification. Parallax hears notifications
@@ -186,6 +192,7 @@ xkb{ layout = "us,ru" }                       -- keyboard layouts, Ctrl+Space to
 bind{ mods = "super", key = "Return",         -- your terminal
       action = "spawn", cmd = "ghostty" }
 set{ blur = true }                            -- frosted glass behind the bar
+set{ glow = 0.6 }                            -- windows rim-lit in the wallpaper's colour
 set{ anim_speed = 1.0 }                       -- tempo of every animation
 set{ infinite_wallpaper = true }              -- wallpaper rides the canvas
 set{ notify_volume = 0.35 }                   -- loudness of the notification tone

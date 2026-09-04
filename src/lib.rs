@@ -51,6 +51,9 @@ mod mine;
 mod mode;
 mod monitors;
 mod notify;
+/// Палитра обоев: цвета, которыми красятся эффекты рабочего стола.
+#[path = "обои.rs"]
+mod обои;
 mod overview;
 mod portal;
 mod portal_stream;
