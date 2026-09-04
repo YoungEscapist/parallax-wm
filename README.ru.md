@@ -1,4 +1,15 @@
+<p align="center">
+  <img src="assets/cover.jpg" alt="Parallax" width="420">
+</p>
+
 # Parallax
+
+<p align="center">
+  <a href="https://github.com/mifaroslav-dotcom/parallax/actions/workflows/ci.yml"><img src="https://github.com/mifaroslav-dotcom/parallax/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="Лицензия: GPL-3.0-or-later"></a>
+  <img src="https://img.shields.io/badge/wayland-smithay-informational" alt="Wayland, на smithay">
+  <img src="https://img.shields.io/badge/status-pre--release-orange" alt="Состояние: до релиза">
+</p>
 
 *[In English](README.md)*
 
@@ -49,8 +60,13 @@ TTY/DRM и winit (для разработки).
 - Наведение на чип показывает живой предпросмотр: где это окно находится.
 - Скруглённые углы, тени, размытие фона под панелью, полкой, меню и карточками
   предпросмотра.
+- Спокойный вход: при запуске холст выплывает из темноты к своему зуму, панель
+  приезжает сверху (`set{ intro = false }` — без него).
+- Короткий ненавязчивый тон на уведомление. Уведомления parallax слышит сам, на
+  сессионной шине, поэтому демон подойдёт любой — mako, dunst, свой
+  (`set{ notify_sound = …, notify_volume = … }`, см. `assets/sounds/`).
 - Обои могут жить на холсте и ехать за камерой, а не быть приклеенными к
-  экрану. Живые (видео) обои даёт спутник [dwall](https://github.com/mifaroslav-dotcom/dwall).
+  экрану. Живые (видео) обои даёт спутник [plx-wall](https://github.com/mifaroslav-dotcom/plx-wall).
 
 **Остальное**
 - Xwayland — с починенными хит-тестом и зажимом указателя, без которых игры
@@ -60,7 +76,7 @@ TTY/DRM и winit (для разработки).
 - Несколько мониторов: свои столы на каждом, `monitor{ primary }`, перенос окна
   на соседний экран перетаскиванием через край.
 - Показ рабочего стола гостю — со своим местом ввода (`Super+Shift+S`, клиент:
-  [dshare](https://github.com/mifaroslav-dotcom/dshare)).
+  [plx-share](https://github.com/mifaroslav-dotcom/plx-share)).
 - VR: окна на панелях внутри шлема через OpenXR/WiVRn (`Super+Alt+V`) —
   экспериментально, проверено на симуляторе Monado.
 - Настройка — Lua, перечитывается на лету по `Super+Shift+C`.
@@ -72,10 +88,13 @@ TTY/DRM и winit (для разработки).
 GLES, libdisplay-info. Lua отдельно ставить не надо — `mlua` собирает её из
 исходников. Для запуска нужен ещё `xwayland`.
 
-Точные имена пакетов по дистрибутивам — в шапке `build_portable.sh`.
+Точные имена пакетов по дистрибутивам — в шапке `build_portable.sh`; для Void,
+Arch, Debian/Ubuntu и Fedora их поставит скрипт:
 
 ```sh
-./build_portable.sh            # release, бинарь в target/release/parallax
+./dist/install-deps.sh --print   # показать команду, ничего не делая
+sudo ./dist/install-deps.sh      # поставить
+./build_portable.sh              # release, бинари в target/release/{plx-minimal,plx-extra}
 ```
 
 Первая сборка тянет smithay с гита (ревизия закреплена в `Cargo.toml`) и много
@@ -84,6 +103,34 @@ GLES, libdisplay-info. Lua отдельно ставить не надо — `ml
 Для NixOS есть `shell.nix` и `build.sh`. Важно: бинарь, слинкованный с
 Nix-glibc, падает на не-Nix системе (и наоборот) — подробности в шапке
 `build.sh`.
+
+### Две сборки
+
+Parallax — это два бинаря из одного крейта с разными наборами фич. Второго
+дерева исходников нет: то, что фича выключает, подменяется заглушкой той же
+формы (`src/*_stub/`), поэтому вызывающий код в обеих сборках одинаков.
+
+| | `plx-minimal` | `plx-extra` |
+|---|---|---|
+| композитор, тайлинг, лента, обзор, обои | да | да |
+| панель, трей, блютуз, вайфай, звук, портал, снимок, X11, жесты | да | да |
+| шлем (`vr`) | — | да |
+| окна внутри Minecraft (`mine`) | — | да |
+| мультиюзер, показ стола гостям (`share`) | — | да |
+
+`plx-minimal` легче примерно на 0.9 МиБ и не линкует OpenXR. Команды
+выключённых частей отвечают внятно: `vr status` говорит, что фича не собрана,
+а не падает непонятным образом.
+
+Собрать одну отдельно — обычным вызовом cargo:
+
+```sh
+cargo build --release -p plx-minimal
+```
+
+Собирать обе одной командой `--workspace` **нельзя**: cargo объединяет фичи
+между членами workspace, и оба бинаря получатся полными. `build.sh` поэтому
+зовёт cargo дважды, с раздельными каталогами сборки.
 
 ## Запуск
 
@@ -97,6 +144,24 @@ Nix-glibc, падает на не-Nix системе (и наоборот) — �
 ```
 
 Выход — `Super+Shift+Q`, перезапуск на месте — `Super+R`. Логи — в `logs/`.
+
+### Из менеджера входа
+
+Чтобы **Parallax** появился в списке сессий ly, greetd, SDDM или GDM:
+
+```sh
+sudo ./dist/install-session.sh          # --uninstall убирает оба файла
+```
+
+Ставится ровно два файла — `/usr/local/bin/parallax-session` и
+`/usr/share/wayland-sessions/parallax.desktop`, — и больше ничего. Бинарь
+остаётся в дереве исходников, куда его положила сборка: обёртка идёт к нему
+через `launch_native.sh`, поэтому `Super+R` и пересборка ведут в то же место,
+а не к забытой копии в `/usr/local/bin`.
+
+Путь к дереву подставляется в обёртку при установке (`Exec=` у менеджера входа
+не проходит через шелл, и `$HOME` в нём не раскрылся бы); переопределяется
+переменной `PLX_CHECKOUT`, а каталоги установки — `BIN_DIR` и `SESSIONS_DIR`.
 
 ## Настройка
 
@@ -112,14 +177,27 @@ cp default_config.lua ~/.config/parallax/config.lua
 С чего начать:
 
 ```lua
+set{ lang = "ru" }                            -- язык интерфейса: "en" или "ru"
 xkb{ layout = "us,ru" }                       -- раскладки, переключение Ctrl+Space
 bind{ mods = "super", key = "Return",         -- свой терминал
       action = "spawn", cmd = "ghostty" }
 set{ blur = true }                            -- матовое стекло под панелью
 set{ anim_speed = 1.0 }                       -- общий темп анимаций
 set{ infinite_wallpaper = true }              -- обои едут за камерой
+set{ notify_volume = 0.35 }                   -- громкость тона уведомлений
 monitor{ name = "DP-2", primary = true }
 ```
+
+### Язык
+
+По умолчанию интерфейс английский; `set{ lang = "ru" }` переключает на русский
+на лету, по `Super+Shift+C`. Ручка накрывает всё, что читаешь глазами: панель,
+меню вайфая/блютуза/звука, подсказки снимка и обзора, уведомления — и ответы
+терминальных команд (`plx-host`, управляющий сокет).
+
+Логи всегда английские, ручка их не трогает: лог попадает в чужой баг-репорт,
+и разбирать его должен уметь не только автор. Комментарии в коде и доки в
+дереве остаются русскими.
 
 ### Часть клавиш по умолчанию
 
@@ -146,5 +224,12 @@ monitor{ name = "DP-2", primary = true }
 
 GPL-3.0-or-later, текст — в [LICENSE](LICENSE).
 
-Вшитый шрифт Nunito распространяется по SIL Open Font License, её текст —
-[assets/Nunito-OFL.txt](assets/Nunito-OFL.txt).
+Чужое — на чём Parallax стоит, у кого что перенято и что уезжает внутри
+бинаря — перечислено в [THIRD-PARTY.md](THIRD-PARTY.md) вместе с требуемыми
+уведомлениями. Все зависимости разрешительные (MIT / Apache-2.0 / BSD / ISC /
+Zlib); отдельного упоминания стоят [smithay](https://github.com/Smithay/smithay)
+(MIT), раскладка dwindle, портированная из
+[Hyprland](https://github.com/hyprwm/Hyprland) (BSD-3-Clause), модель жестов из
+[driftwm](https://github.com/malbiruk/driftwm) (GPL-3.0), вшитый шрифт Nunito
+(SIL OFL, текст — [assets/Nunito-OFL.txt](assets/Nunito-OFL.txt)) и звуки
+уведомлений из [akx/Notifications](https://github.com/akx/Notifications) (CC0).

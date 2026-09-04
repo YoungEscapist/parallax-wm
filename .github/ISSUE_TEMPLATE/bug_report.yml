@@ -1,0 +1,81 @@
+name: Bug report
+description: Something misbehaves — a window in the wrong place, a crash, a key that does nothing.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Write in English or Russian, whichever is easier — both are read.
+        Пиши по-русски или по-английски, как удобнее.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+      placeholder: |
+        Opened Steam in tiling mode; the window overlapped its neighbour
+        instead of taking its slot.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. `./launch_native.sh` from a clean TTY
+        2. open two terminals, then …
+    validations:
+      required: true
+
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      description: >
+        Which binary, and which commit: `plx-minimal --version` or
+        `plx-extra --version` prints both.
+      placeholder: plx-extra 0.1.0 (a85d7f7)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - TTY/DRM (./launch_native.sh)
+        - nested winit (--winit)
+        - headless harness (./harness.sh)
+    validations:
+      required: true
+
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      description: Distribution, kernel, GPU and driver, number of monitors.
+      placeholder: |
+        Void Linux, 6.12.4, RTX 3060 / nvidia 565, two monitors (2560x1080 + 1920x1080)
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: >
+        The relevant part of the newest file in `logs/`. Lines are prefixed with
+        `plx/<subsystem>` — grab a hundred lines around the moment it went wrong,
+        not the whole file. Logs are always English, so paste them as they are.
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: >
+        `~/.config/parallax/config.lua`, if you changed it. A surprising number of
+        problems are one `set{}` line.
+      render: lua

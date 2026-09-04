@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Configuration reference
+    url: https://github.com/mifaroslav-dotcom/parallax/blob/master/default_config.lua
+    about: Every knob is documented next to the line that sets it — check here before filing.
+  - name: plx-wall (wallpapers)
+    url: https://github.com/mifaroslav-dotcom/plx-wall
+    about: Live and static wallpapers are a separate tool — report wallpaper bugs there.

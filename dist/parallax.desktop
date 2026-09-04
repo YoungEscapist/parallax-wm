@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Parallax
+Comment=Wayland compositor with an infinite canvas
+Exec=/usr/local/bin/parallax-session
+TryExec=/usr/local/bin/parallax-session
+Type=Application
+DesktopNames=Parallax
+Keywords=wayland;compositor;tiling;

@@ -1,0 +1,36 @@
+#!/bin/sh
+# parallax-session — точка входа для менеджера входа (ly, greetd, SDDM;
+# см. соседний parallax.desktop).
+#
+# Сам компоновщик поднимает `launch_native.sh` из каталога с исходниками: там
+# сессионная шина D-Bus, PipeWire, обои и сторожевой таймер старта. Здесь
+# только то, что обязано быть готово ДО него, и поиск этого каталога.
+#
+# Путь к дереву подставляет install-session.sh при установке — держать его
+# зашитым в .desktop нельзя: Exec= у менеджера входа не проходит через шелл,
+# и ни `$HOME`, ни `~` в нём не раскроются.
+: "${PLX_CHECKOUT:=@CHECKOUT@}"
+
+# XDG_RUNTIME_DIR. На системах без elogind/systemd-logind каталог /run/user/UID
+# не создаёт никто, а без него у сессии не будет ни шины, ни PipeWire, ни
+# сокета Wayland — компоновщик умрёт на первой же строке. Менеджеры входа,
+# у которых есть pam_elogind.so или pam_systemd.so, выставят переменную сами,
+# и эта ветка просто не сработает.
+if [ -z "$XDG_RUNTIME_DIR" ] || [ ! -d "$XDG_RUNTIME_DIR" ]; then
+    XDG_RUNTIME_DIR=/tmp/runtime-$(id -u)
+    export XDG_RUNTIME_DIR
+    mkdir -p "$XDG_RUNTIME_DIR"
+    chmod 700 "$XDG_RUNTIME_DIR"
+fi
+
+LAUNCH="$PLX_CHECKOUT/launch_native.sh"
+if [ ! -x "$LAUNCH" ]; then
+    # Сообщение уходит в лог менеджера входа: экрана в этот момент ещё нет,
+    # и человек увидит только «сессия завершилась сразу» — без этой строки
+    # искать причину ему негде.
+    echo "parallax-session: $LAUNCH не найден или не исполняемый" >&2
+    echo "parallax-session: задайте PLX_CHECKOUT или переустановите" >&2
+    exit 1
+fi
+
+exec "$LAUNCH"

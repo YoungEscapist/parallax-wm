@@ -1,0 +1,101 @@
+# Сборка и тесты на чистой машине. Смысл проверки не в том, что код собирается
+# у автора, — а в том, что он собирается У ПОСТОРОННЕГО: по списку пакетов из
+# README, без /nix/store, без mold и без правок под это железо.
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # ПЕРЕБИВАЕТ .cargo/config.toml. В репозитории там `-fuse-ld=mold` и
+  # `target-cpu=native` — то и другое верно для машины автора и неверно для
+  # рантайма GitHub. Переменная окружения у cargo старше файла настроек, так
+  # что достаточно задать её непустой; `-D warnings` намеренно НЕ ставим —
+  # в дереве ещё живут предупреждения confusable_idents (см. CONTRIBUTING).
+  RUSTFLAGS: -C debuginfo=0
+
+jobs:
+  build:
+    name: ${{ matrix.bin }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        bin: [plx-minimal, plx-extra]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libinput-dev \
+            libudev-dev \
+            libseat-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libegl-dev \
+            libgles-dev \
+            libdisplay-info-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Ключ включает имя бинаря: наборы фич у них разные, и общий каталог
+      # сборки они вытесняли бы друг у друга (та же причина, по которой
+      # build.sh держит два --target-dir).
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.bin }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.bin }}-
+
+      - name: Сборка
+        run: cargo build --release -p ${{ matrix.bin }}
+
+  test:
+    name: тесты
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libinput-dev \
+            libudev-dev \
+            libseat-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libegl-dev \
+            libgles-dev \
+            libdisplay-info-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+
+      # Тесты живут в библиотеке и не требуют ни экрана, ни DRM: это геометрия
+      # холста, дерево тайлинга, разбор конфигурации и протоколы.
+      - name: Тесты
+        run: cargo test --features extra

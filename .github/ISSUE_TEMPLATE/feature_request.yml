@@ -1,0 +1,35 @@
+name: Idea
+description: A knob, a binding, a behaviour that should exist.
+labels: [idea]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Write in English or Russian, whichever is easier — both are read.
+        Пиши по-русски или по-английски, как удобнее.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: >
+        Describe the situation, not the implementation. Parallax has a strong
+        idea of its own about windows on a plane, and the shape of a feature
+        usually follows from that idea rather than from how other compositors
+        do it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: How you imagine it
+      description: The knob, key or command you would expect to find.
+
+  - type: textarea
+    id: elsewhere
+    attributes:
+      label: Prior art
+      description: >
+        If another compositor already does this, say which one and what you like
+        or dislike about the way it does it.
