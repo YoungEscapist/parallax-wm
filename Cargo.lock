@@ -2043,7 +2043,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "plx-minimal"
+name = "plx-standard"
 version = "0.1.0"
 dependencies = [
  "parallax",

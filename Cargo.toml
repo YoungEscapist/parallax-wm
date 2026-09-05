@@ -1,5 +1,5 @@
 [workspace]
-members = ["bins/plx-minimal", "bins/plx-extra"]
+members = ["bins/plx-standard", "bins/plx-extra"]
 # Резольвер 2: без него cargo ругается, а объединение фич между членами всё
 # равно остаётся — от него спасают только раздельные вызовы (см. build.sh).
 resolver = "2"
@@ -13,7 +13,7 @@ description = "A Wayland compositor where windows live on one infinite canvas an
 # при публикации оно станет `parallax-wm`; здесь имя внутреннее (по нему зовут
 # библиотеку из bins/) и менять его незачем.
 license = "GPL-3.0-or-later"
-repository = "https://github.com/mifaroslav-dotcom/parallax"
+repository = "https://github.com/YoungEscapist/parallax-wm"
 readme = "README.md"
 keywords = ["wayland", "compositor", "tiling", "smithay"]
 categories = ["gui"]
@@ -23,7 +23,7 @@ name = "parallax"
 path = "src/lib.rs"
 
 # Два бинаря — это два ТОНКИХ крейта в bins/, отличающиеся только набором фич
-# (см. bins/plx-minimal и bins/plx-extra). В одном крейте так нельзя: фичи в
+# (см. bins/plx-standard и bins/plx-extra). В одном крейте так нельзя: фичи в
 # cargo задаются на КРЕЙТ, а не на цель, и оба [[bin]] получили бы один набор.
 [features]
 default = []
@@ -36,8 +36,14 @@ mine = ["vr"]
 # Мультиюзер: показ рабочего стола гостям (plx-share). Тянет sha2 — по проводу
 # идёт не код, а sha256(соль ‖ код), см. share/proto.rs.
 share = ["dep:sha2"]
+# Украшения, считающиеся на видеокарте: свечение окон, свет на холсте в цвет
+# обоев, куб рабочих столов. Новых зависимостей не тянут — это свои шейдеры
+# (куб.rs, свет.rs, rounded.rs) и чтение палитры plx-wall.
+# Разделение здесь не про размер бинаря, а про кадр: plx-standard обязан
+# оставаться сборкой, где каждый пиксель рисуется самым коротким путём.
+shaders = []
 # Всё необязательное разом — набор бинаря plx-extra.
-extra = ["vr", "mine", "share"]
+extra = ["vr", "mine", "share", "shaders"]
 
 [dependencies]
 smithay = { git = "https://github.com/Smithay/smithay.git", rev = "5312d5caedd0c2ce563a63719d38ae2183149210", default-features = false, features = [

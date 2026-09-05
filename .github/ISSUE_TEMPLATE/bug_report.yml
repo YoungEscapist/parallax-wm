@@ -34,7 +34,7 @@ body:
     attributes:
       label: Build
       description: >
-        Which binary, and which commit: `plx-minimal --version` or
+        Which binary, and which commit: `plx-standard --version` or
         `plx-extra --version` prints both.
       placeholder: plx-extra 0.1.0 (a85d7f7)
     validations:

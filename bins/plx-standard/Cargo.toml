@@ -1,0 +1,19 @@
+[package]
+name = "plx-standard"
+version = "0.1.0"
+edition = "2021"
+description = "Parallax as an everyday compositor: no VR, no Minecraft, no guest sharing, no GPU decorations"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/YoungEscapist/parallax-wm"
+
+[[bin]]
+name = "plx-standard"
+path = "src/main.rs"
+
+# default-features = false — здесь это и есть весь смысл сборки: композитор,
+# тайлинг, лента, обзор, обои, панель, трей, блютуз, вайфай, звук, портал,
+# снимок, X11 и жесты, но БЕЗ шлема, Minecraft, мультиюзера и украшений,
+# считающихся на видеокарте (свет, свечение, куб). Вместе с ними из дерева
+# уходят openxr и sha2 (см. `[features]` в корневом Cargo.toml).
+[dependencies]
+parallax = { path = "../..", default-features = false }

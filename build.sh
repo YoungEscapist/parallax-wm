@@ -24,7 +24,7 @@ TARGET_DIR=/mnt/plx-build/target
 
 cd "$(dirname "$0")"
 
-# Собираются ОБА бинаря: plx-minimal (без шлема, Minecraft и мультиюзера) и
+# Собираются ОБА бинаря: plx-standard (без шлема, Minecraft и мультиюзера) и
 # plx-extra (со всем). Это не два разных исходника, а один и тот же крейт с
 # разным набором фич — см. `[features]` в Cargo.toml и заглушки в src/*_stub/.
 #
@@ -33,10 +33,10 @@ cd "$(dirname "$0")"
 # собирая несколько членов workspace разом, cargo ОБЪЕДИНЯЕТ их наборы фич и
 # строит общую библиотеку по сумме — то есть с `vr`, `mine` и `share`. Поймано
 # замером: после `--workspace` оба бинаря весили 17.8 МиБ байт в байт, и в
-# «минимальном» лежали 137 строк openxr. Раздельные каталоги нужны потому, что
+# «стандартном» лежали 137 строк openxr. Раздельные каталоги нужны потому, что
 # отпечаток сборки включает набор фич: в общем каталоге каждый вызов вытеснял
 # бы предыдущий и пересобирал библиотеку целиком (fat LTO — это минуты).
-cargo build --release --target-dir "$TARGET_DIR/minimal" -p plx-minimal "$@"
+cargo build --release --target-dir "$TARGET_DIR/standard" -p plx-standard "$@"
 cargo build --release --target-dir "$TARGET_DIR/extra"   -p plx-extra   "$@"
 
 # Сборку зовут ДВА разных пользователя: человек (или Super+R внутри сессии) —
@@ -76,6 +76,6 @@ chmod +x "$bindir/plx-host"
 
 echo ""
 echo "Бинари:"
-echo "  $TARGET_DIR/minimal/release/plx-minimal"
+echo "  $TARGET_DIR/standard/release/plx-standard"
 echo "  $TARGET_DIR/extra/release/plx-extra"
 echo "Команда: $bindir/plx-host"

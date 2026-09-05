@@ -149,12 +149,13 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
         "mouse" => мышь(хвост, state),
         "key" => клавиша(хвост, state),
         "pointer" => указатель(state),
+        "cube" => куб(state),
         "share" => раздача(хвост, state),
         "portal" => портал(хвост, state),
         "vr" => шлем(хвост, state),
         "mine" => шахта(хвост, state),
         "help" => т!(
-            "shot <путь> | action <имя> [k=v ...] | windows | pointer | \
+            "shot <путь> | action <имя> [k=v ...] | windows | pointer | cube | \
              mouse to X Y | mouse move DX DY | mouse down|up|click [левая|правая|средняя] | \
              mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
              key [logo+shift+]<имя> | key down|up <имя> | \
@@ -163,7 +164,7 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
              vr [mode|on|off|ar|layout|recenter|menu|keys|pults|press <пульт> <n>|\
              status|panels|input|gestures|shot <путь>] | \
              mine [on|off|mode|layout|status|panels|ray x y z dx dy dz|pin ключ x y|game номер]",
-            "shot <path> | action <name> [k=v ...] | windows | pointer | \
+            "shot <path> | action <name> [k=v ...] | windows | pointer | cube | \
              mouse to X Y | mouse move DX DY | mouse down|up|click [left|right|middle] | \
              mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
              key [logo+shift+]<name> | key down|up <name> | \
@@ -740,6 +741,59 @@ fn код_клавиши(имя: &str) -> Option<u32> {
 /// Где сейчас указатель и что под ним. Первое, что нужно после `mouse to`:
 /// без этого «клик ушёл не туда» отличить от «клик дошёл, но обработчик
 /// промолчал» нечем.
+/// Состояние куба: рисуется ли он, какие столы на гранях, куда повёрнут, как
+/// отмасштабирован и какая грань под курсором.
+///
+/// Без этой строки проверка куба сводилась к гаданию по снимку: плоский обзор с
+/// перспективой миниатюр на кадре был бы похож на куб, стоящий лицом,
+/// и «колесо не сработало» неотличимо от «куб вообще не включён» (ленточная
+/// раскладка граней не получает — см. `куб_активен`).
+fn куб(state: &mut Parallax) -> String {
+    let грань = state
+        .куб_стол_в_точке(state.pointer_screen_physical())
+        .map(|m| format!("{}", m.trailing_zeros() + 1))
+        .unwrap_or_else(|| "-".into());
+    let передний = state
+        .куб_передний_стол()
+        .map(|m| format!("{}", m.trailing_zeros() + 1))
+        .unwrap_or_else(|| "-".into());
+    let столы: Vec<String> = state
+        .куб_столы
+        .iter()
+        .map(|m| format!("{}", m.trailing_zeros() + 1))
+        .collect();
+    // Что на КАЖДОЙ грани прямо сейчас. Кольцо столов длиннее круга граней, и
+    // по одному переднему столу не видно, ту ли пару соседей несёт куб —
+    // а именно там и ломается бесконечное вращение.
+    let грани: Vec<String> = (0..state.куб_граней())
+        .map(|i| {
+            state
+                .куб_стол_грани(i)
+                .map(|m| format!("{}", m.trailing_zeros() + 1))
+                .unwrap_or_else(|| "-".into())
+        })
+        .collect();
+    тф!(
+        "куб={} стол={} столы=[{}] грани=[{}] угол={:.3} цель={:.3} масштаб={:.2} заполнение={:.2} \
+         передний={} под_курсором={} драг={}",
+        "cube={} desktop={} desktops=[{}] faces=[{}] angle={:.3} target={:.3} scale={:.2} fill={:.2} \
+         front={} under_cursor={} drag={}",
+        state.куб_активен(),
+        // Текущий стол рядом с передней гранью: в покое они обязаны совпадать,
+        // и без этой пары «куб показывает не тот стол» ловится только глазами.
+        state.viewport.current_tags().trailing_zeros() + 1,
+        столы.join(","),
+        грани.join(","),
+        state.куб_угол,
+        state.куб_цель,
+        state.куб_масштаб,
+        state.куб_заполнение(),
+        передний,
+        грань,
+        state.куб_драг.is_some(),
+    )
+}
+
 fn указатель(state: &mut Parallax) -> String {
     let экран = state.pointer_screen_physical();
     let холст = state.pointer_location;

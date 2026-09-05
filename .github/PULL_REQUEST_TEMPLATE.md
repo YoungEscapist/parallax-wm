@@ -26,7 +26,7 @@ Write in English or Russian, whichever is easier.
 - [ ] Комментарии и имена — по-русски, как в остальном дереве (см. CONTRIBUTING).
 - [ ] Никаких новых односимвольных кириллических имён (`с`, `р`, `о`…) —
       компилятор ругается `confusable_idents`, и не зря.
-- [ ] Сборка обоих бинарей: `./build.sh` (или `cargo build -p plx-minimal`
+- [ ] Сборка обоих бинарей: `./build.sh` (или `cargo build -p plx-standard`
       и `-p plx-extra` по отдельности — но не `--workspace`).
 - [ ] `cargo fmt` по всему дереву **не** гонять: оно не отформатировано
       rustfmt'ом, и получится 28 тысяч строк шума вместо правки.

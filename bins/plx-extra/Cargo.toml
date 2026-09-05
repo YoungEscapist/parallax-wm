@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Parallax with everything optional: VR headset, windows inside Minecraft, guest sharing"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/mifaroslav-dotcom/parallax"
+repository = "https://github.com/YoungEscapist/parallax-wm"
 
 [[bin]]
 name = "plx-extra"

@@ -31,14 +31,14 @@ Rust через rustup, `pkg-config`, компилятор C и dev-пакеты
 
 ```sh
 ./build.sh                       # оба бинаря, в /mnt/plx-build/target
-cargo build --release -p plx-minimal
+cargo build --release -p plx-standard
 cargo build --release -p plx-extra
 ```
 
 Никогда не `cargo build --workspace`. Cargo объединяет фичи между членами
 workspace, и один такой вызов даёт два бинаря, в каждом из которых лежит всё.
 Это замер, а не опасение: после одного `--workspace` оба бинаря весили 17.8 МиБ
-байт в байт, и в «минимальном» лежал openxr. `build.sh` зовёт cargo дважды, с
+байт в байт, и в «стандартном» лежал openxr. `build.sh` зовёт cargo дважды, с
 раздельными `--target-dir`, ровно поэтому.
 
 `.cargo/config.toml` в репозитории линкует через `mold` и компилирует с

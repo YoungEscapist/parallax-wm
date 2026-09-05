@@ -37,21 +37,21 @@ fi
 #  1. Голый `cargo build --release` здесь не собирал НИЧЕГО исполняемого.
 #     Корневой пакет `parallax` — это только `[lib]`, а оба бинаря лежат в
 #     отдельных крейтах bins/. По умолчанию cargo строит один корневой пакет,
-#     так что в target/release не появлялось ни plx-minimal, ни plx-extra.
+#     так что в target/release не появлялось ни plx-standard, ни plx-extra.
 #  2. Собирать их одной командой всё равно нельзя: cargo ОБЪЕДИНЯЕТ наборы фич
 #     членов workspace и строит библиотеку по сумме — «минимальный» бинарь
 #     получил бы и vr, и mine, и share. Разные каталоги нужны потому, что
 #     отпечаток сборки включает набор фич: в общем каталоге вызовы вытесняли бы
 #     друг друга и пересобирали всё заново (fat LTO — это минуты).
-cargo build --release --target-dir target/minimal -p plx-minimal "$@"
+cargo build --release --target-dir target/standard -p plx-standard "$@"
 cargo build --release --target-dir target/extra   -p plx-extra   "$@"
 
 # Складываем оба рядом, туда, где их обещает README.
 mkdir -p target/release
-cp -f target/minimal/release/plx-minimal target/release/plx-minimal
+cp -f target/standard/release/plx-standard target/release/plx-standard
 cp -f target/extra/release/plx-extra     target/release/plx-extra
 
 echo ""
 echo "Бинари:"
-echo "  ./target/release/plx-minimal  (без шлема, Minecraft и мультиюзера)"
+echo "  ./target/release/plx-standard  (без шлема, Minecraft и мультиюзера)"
 echo "  ./target/release/plx-extra    (всё)"

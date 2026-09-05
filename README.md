@@ -5,7 +5,7 @@
 # Parallax
 
 <p align="center">
-  <a href="https://github.com/mifaroslav-dotcom/parallax/actions/workflows/ci.yml"><img src="https://github.com/mifaroslav-dotcom/parallax/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/YoungEscapist/parallax-wm/actions/workflows/ci.yml"><img src="https://github.com/YoungEscapist/parallax-wm/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="License: GPL-3.0-or-later"></a>
   <img src="https://img.shields.io/badge/wayland-smithay-informational" alt="Wayland, on smithay">
   <img src="https://img.shields.io/badge/status-pre--release-orange" alt="Status: pre-release">
@@ -39,10 +39,7 @@ in-tree docs; this file and the config reference are in English too.
 - Zoom-nav (`Super+Space`): pull back for a bird's-eye view and pan with the
   arrow keys.
 - Minimap (`Super+~`) with live window thumbnails, its own pan/zoom, and
-  click-to-fly. The thumbnails can stand in perspective — each one turned
-  towards the centre, far edge receding and dimmed, so the overview reads as a
-  curved wall of windows rather than a flat map (`set{ overview_3d = 1.0 }`).
-  It is a real projective warp done in the fragment shader, not a scale trick.
+  click-to-fly.
 - Camera bookmarks: drop one anywhere (`Alt+B`), jump to it (`Super+Alt+1..9`),
   or switch to bookmark mode instead of workspaces entirely (`Super+B`).
 - Overview shows the workspaces exactly as they are — floating windows stay
@@ -104,7 +101,7 @@ on Void, Arch, Debian/Ubuntu and Fedora a script will install them for you:
 ```sh
 ./dist/install-deps.sh --print   # show the command it would run
 sudo ./dist/install-deps.sh      # run it
-./build_portable.sh              # release build: target/release/{plx-minimal,plx-extra}
+./build_portable.sh              # release build: target/release/{plx-standard,plx-extra}
 ```
 
 The first build pulls smithay from git (the revision is pinned in `Cargo.toml`)
@@ -121,7 +118,7 @@ sets. There is no second source tree: what a feature turns off is replaced by a
 stub with the same shape (`src/*_stub/`), so the calling code is identical in
 both.
 
-| | `plx-minimal` | `plx-extra` |
+| | `plx-standard` | `plx-extra` |
 |---|---|---|
 | compositor, tiling, ribbon, overview, wallpaper | yes | yes |
 | bar, tray, bluetooth, wifi, audio, portal, screenshot, X11, gestures | yes | yes |
@@ -129,14 +126,14 @@ both.
 | windows inside Minecraft (`mine`) | — | yes |
 | multi-user desktop sharing (`share`) | — | yes |
 
-`plx-minimal` is about 0.9 MiB smaller and does not link OpenXR. With the
+`plx-standard` is about 0.9 MiB smaller and does not link OpenXR. With the
 optional parts off, their commands answer plainly — `vr status` says the
 feature is not in this build rather than failing in some obscure way.
 
 Build one on its own with a normal cargo invocation:
 
 ```sh
-cargo build --release -p plx-minimal
+cargo build --release -p plx-standard
 ```
 
 Do **not** build both with a single `--workspace` command: cargo unifies

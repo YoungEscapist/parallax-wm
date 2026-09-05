@@ -197,6 +197,9 @@ pub struct DecorCache {
     parallax_w: i32,
     parallax_proto: Vec<u8>,
     parallax_row: Vec<MemoryRenderBuffer>,
+    /// Плитки ореола (см. `гало`) и то, с какими значениями их последний раз
+    /// рисовали.
+    halo: Vec<(MemoryRenderBuffer, Vec<f32>)>,
 }
 
 impl DecorCache {
@@ -209,7 +212,42 @@ impl DecorCache {
             parallax_w: 0,
             parallax_proto: Vec::new(),
             parallax_row: Vec::new(),
+            halo: Vec::new(),
         }
+    }
+
+    /// Плитка ореола вокруг окна: ОДИН белый непрозрачный пиксель, растянутый
+    /// рендером на весь ореол.
+    ///
+    /// Пикселей у ореола нет: и тень, и свечение считает шейдер (см.
+    /// `rounded.rs`, uniform `halo`). Текстура здесь только потому, что
+    /// программа текстурная, — её цвет шейдер не читает вовсе.
+    ///
+    /// `ключ` — значения, ушедшие в uniform'ы. Damage tracker о содержимом
+    /// элемента ничего не знает и замечает перемену ТОЛЬКО по счётчику
+    /// коммитов (та же грабля, что у `pooled_solid` в udev.rs): без этого
+    /// окно, потерявшее фокус, осталось бы с прежним ореолом до ближайшего
+    /// чужого повреждения. Геометрия при смене фокуса не меняется, повредить
+    /// некому — поэтому отмечаем буфер повреждённым сами.
+    pub fn гало(&mut self, slot: usize, ключ: &[f32]) -> &MemoryRenderBuffer {
+        while self.halo.len() <= slot {
+            // Непрозрачный белый: шейдер множит собственный цвет на `alpha`
+            // элемента, а не на текстуру, но нулевая альфа текстуры срезала бы
+            // всё ещё до этого в вариантах шейдера без NO_ALPHA.
+            self.halo.push((buffer_from(&[255, 255, 255, 255], 1, 1), Vec::new()));
+        }
+        let (буфер, прежний) = &mut self.halo[slot];
+        if прежний.as_slice() != ключ {
+            прежний.clear();
+            прежний.extend_from_slice(ключ);
+            let mut ctx = буфер.render();
+            let _ = ctx.draw(|_| {
+                Ok::<_, std::convert::Infallible>(vec![smithay::utils::Rectangle::from_size(
+                    smithay::utils::Size::<i32, smithay::utils::Buffer>::from((1, 1)),
+                )])
+            });
+        }
+        &self.halo[slot].0
     }
 
     /// Пересобрать плитки, если сменился радиус (Tile ↔ Float).

@@ -44,7 +44,7 @@ fi
 # Предупреждение, а не отказ: сессию удобно поставить заранее, а собрать потом.
 if [ ! -x /mnt/plx-build/target/extra/release/plx-extra ] \
    && [ ! -x "$checkout/target/release/plx-extra" ] \
-   && [ ! -x "$checkout/target/release/plx-minimal" ]; then
+   && [ ! -x "$checkout/target/release/plx-standard" ]; then
     echo "ВНИМАНИЕ: собранного бинаря не видно — сначала ./build_portable.sh" >&2
 fi
 

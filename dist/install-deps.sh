@@ -78,4 +78,4 @@ fi
 echo
 echo "Готово. Дальше:"
 echo "  rustup — если Rust ещё не стоит (https://rustup.rs)"
-echo "  ./build_portable.sh — собрать plx-minimal и plx-extra"
+echo "  ./build_portable.sh — собрать plx-standard и plx-extra"

@@ -243,7 +243,7 @@ pub fn init_headless(
     }
     if state.blur_shape.is_none() {
         state.blur_shape = crate::rounded::Шейдер::new(&mut gles);
-        state.наклон_шейдер = crate::наклон::Шейдер::new(&mut gles);
+        state.куб_шейдер = crate::куб::Шейдер::new(&mut gles);
     }
     state.apply_camera_all();
 

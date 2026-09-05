@@ -1,7 +1,7 @@
 blank_issues_enabled: true
 contact_links:
   - name: Configuration reference
-    url: https://github.com/mifaroslav-dotcom/parallax/blob/master/default_config.lua
+    url: https://github.com/YoungEscapist/parallax-wm/blob/master/default_config.lua
     about: Every knob is documented next to the line that sets it — check here before filing.
   - name: plx-wall (wallpapers)
     url: https://github.com/mifaroslav-dotcom/plx-wall

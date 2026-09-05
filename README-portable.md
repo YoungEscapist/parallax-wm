@@ -19,7 +19,7 @@ Lua отдельно ставить не надо — `mlua` собирает Lu
 ./build_portable.sh --verbose  # доп. аргументы уходят в cargo
 ```
 
-Бинари: `target/release/plx-extra` (всё) и `target/release/plx-minimal`
+Бинари: `target/release/plx-extra` (всё) и `target/release/plx-standard`
 (без шлема, Minecraft и мультиюзера). Если в системе нет линкера `mold`, скрипт сам
 откатится на системный `ld` (правило mold лежит в `.cargo/config.toml`).
 

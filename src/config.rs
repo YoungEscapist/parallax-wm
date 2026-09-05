@@ -436,6 +436,13 @@ pub struct Config {
     /// pinch_in_threshold = …, pinch_out_threshold = … }`. Имена и значения
     /// по умолчанию — как в driftwm, чтобы настройки переносились один в один.
     pub gesture_thresholds: crate::gestures::Пороги,
+    /// Мышиные аккорды — команды парой кнопок, модель hevel (см. аккорды.rs).
+    /// ПУСТАЯ таблица = мышь работает ровно как без этого файла.
+    pub mouse_chords: Vec<crate::аккорды::БиндАккорда>,
+    /// Сколько ждать вторую кнопку аккорда, мс. Имя и значение — из hevel
+    /// (`chord_click_timeout_ms`). За этот срок задерживается ПЕРВОЕ нажатие,
+    /// и только той кнопки, с которой аккорд начинается.
+    pub mouse_chord_timeout: u32,
     /// Автодовод курсора по краям НАКЛАДКИ тачпада:
     /// `set{ touchpad_edge_motion = true, touchpad_edge_zone = 0.08,
     ///       touchpad_edge_speed = 900.0 }`. См. touchpad.rs.
@@ -449,10 +456,61 @@ pub struct Config {
     pub glow: f32,
     /// `set{ glow_width = ... }` — ширина этой каймы в логических пикселях.
     pub glow_width: f32,
-    /// `set{ overview_3d = ... }` — перспектива миниатюр в карточке обзора
-    /// окон: карточки разворачиваются к центру, дальний край уходит вглубь
-    /// (см. наклон.rs). Сила 0.0…1.0, 0 — плоский обзор, как раньше.
-    pub overview_3d: f32,
+    /// `set{ cube = ... }` — КУБ РАБОЧИХ СТОЛОВ, тот самый из Compiz
+    /// (см. куб.rs). Столы встают на грани призмы, обзор перестаёт быть
+    /// плоской сеткой. Сила 0.0…1.0, 0 — выключено.
+    ///
+    /// Значение — не только тумблер: им множится затенение дальних граней
+    /// (`cube_shade`), так что 0.3 даёт плоский на вид куб с еле заметной
+    /// глубиной, а 1.0 — полный контраст между ближней и дальней гранью.
+    /// Размер и «крутизну» перспективы задают `cube_fill` и `cube_focal`.
+    pub cube: f32,
+    /// `set{ cube_faces = ... }` — сколько У КУБА ГРАНЕЙ, 3…12.
+    ///
+    /// Не сколько столов: столов может быть сколько угодно, они идут по кольцу
+    /// и переназначаются на задней грани (см. куб.rs). Раньше грань заводилась
+    /// на каждый стол, и на десяти столах призма вырождалась в почти плоскую
+    /// стену, а кольцо из четырёх столов кончалось.
+    pub cube_faces: u32,
+    /// `set{ cube_focal = ... }` — фокусное расстояние в ширинах экрана.
+    /// Меньше — резче перспектива и «шире» угол зрения.
+    pub cube_focal: f32,
+    /// `set{ cube_fill = ... }` — какую долю ширины экрана занимает передняя
+    /// грань. Это и есть главная ручка размера куба.
+    pub cube_fill: f32,
+    /// `set{ cube_shade = ... }` — насколько темнеет дальний край грани.
+    /// Без затемнения куб читается плоской мозаикой.
+    pub cube_shade: f32,
+    /// `set{ cube_switch = ... }` — крутить куб при переходе на соседний стол
+    /// (Super+PgUp/PgDn), а не только в обзоре. Ровно поведение Compiz.
+    pub cube_switch: bool,
+    /// `set{ sun = ... }` — СВЕТ НА ХОЛСТЕ в цвет обоев (см. свет.rs).
+    /// Сила 0.0…1.0, 0 — выключено.
+    ///
+    /// Не рисованное солнце: диска на экране нет. Есть источник, стоящий в
+    /// точке холста, и от него светятся сцена (мягкая заливка поверх обоев) и
+    /// ОКНА — сторона, обращённая к свету, ярче, обратная уходит в тень, а
+    /// кайма горит сильнее там, где на неё падает. Отсюда и ориентир «откуда
+    /// светит», и объём у окон, которого не даёт ровная кайма.
+    pub sun: f32,
+    /// `set{ sun_size = ... }` — как далеко достаёт свет, в ширинах экрана.
+    /// Это радиус спада, а не радиус видимого пятна: за ним свет сходит в ноль.
+    pub sun_size: f32,
+    /// `set{ sun_x = ..., sun_y = ... }` — где стоит источник, в долях экрана
+    /// от левого верхнего угла ДОМА монитора (0.5, 0.5 — ровно в середине
+    /// первого экрана стола). Значения вне 0…1 допустимы: источник может
+    /// висеть и за краем первого экрана, холст бесконечен.
+    pub sun_x: f32,
+    pub sun_y: f32,
+    /// `set{ sun_far = ... }` — насколько источник ДАЛЕКО: 0 — приклеен к
+    /// экрану (не реагирует ни на камеру, ни на зум), 1 — лежит на холсте
+    /// наравне с окнами и уезжает вместе с ним.
+    ///
+    /// По умолчанию четверть: холст бесконечен, и источник, честно стоящий в
+    /// его точке, уходит из кадра навсегда после первого же дальнего перелёта
+    /// — свет пропадает вместе с ним. Настоящее солнце далеко: смещается при
+    /// ходьбе, но позади не остаётся.
+    pub sun_far: f32,
     /// `set{ blur = ... }` — размывать фон под островами панели (см. blur.rs).
     /// ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО: код проходом рендера живьём не отсмотрен, а
     /// ошибка там стоит чёрного экрана.
@@ -527,12 +585,27 @@ impl Default for Config {
             keyboard_grab_apps: vec!["plx-share".to_string()],
             gestures: Vec::new(),
             gesture_thresholds: crate::gestures::Пороги::default(),
+            mouse_chords: Vec::new(),
+            mouse_chord_timeout: 250,
             автодовод: crate::touchpad::Автодовод::default(),
             // Выключено по умолчанию: эффект вкусовой, а включается одной
             // строкой в config.lua.
             glow: 0.0,
             glow_width: 12.0,
-            overview_3d: 0.0,
+            cube: 0.0,
+            cube_faces: 4,
+            cube_focal: 2.2,
+            cube_fill: 0.62,
+            cube_shade: 0.35,
+            cube_switch: true,
+            sun: 0.0,
+            // Крупное и высоко справа: пятно радиусом почти в экран читается
+            // светом, а не кругом, а угол — то место, где оно реже всего
+            // оказывается ровно за окном.
+            sun_size: 1.6,
+            sun_x: 0.78,
+            sun_y: 0.18,
+            sun_far: 0.25,
             blur: false,
             close_anim: true,
             intro: true,
@@ -840,6 +913,9 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         Rc::new(RefCell::new(Vec::new()));
     let gestures: Rc<RefCell<Vec<crate::gestures::БиндЖеста>>> =
         Rc::new(RefCell::new(Vec::new()));
+    let mouse_chords: Rc<RefCell<Vec<crate::аккорды::БиндАккорда>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let mouse_chord_timeout: Rc<RefCell<u32>> = Rc::new(RefCell::new(250));
     let gesture_thresholds: Rc<RefCell<crate::gestures::Пороги>> =
         Rc::new(RefCell::new(crate::gestures::Пороги::default()));
     let автодовод: Rc<RefCell<crate::touchpad::Автодовод>> =
@@ -865,7 +941,17 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let blur: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let glow: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
     let glow_width: Rc<RefCell<f32>> = Rc::new(RefCell::new(12.0));
-    let overview_3d: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
+    let cube: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
+    let cube_faces: Rc<RefCell<u32>> = Rc::new(RefCell::new(4));
+    let cube_focal: Rc<RefCell<f32>> = Rc::new(RefCell::new(2.2));
+    let cube_fill: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.62));
+    let cube_shade: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.35));
+    let cube_switch: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let sun: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
+    let sun_size: Rc<RefCell<f32>> = Rc::new(RefCell::new(1.6));
+    let sun_x: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.78));
+    let sun_y: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.18));
+    let sun_far: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.25));
     let close_anim: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let intro: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let notify_sound: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
@@ -964,6 +1050,74 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         lua.globals().set("gesture", gesture_fn)?;
     }
     {
+        // ── mouse{} — мышиные аккорды (hevel) ────────────────────────────────
+        //
+        //   mouse{ chord = "1-3", action = "spawn_rect", cmd = "ghostty" }
+        //   mouse{ chord = "3-1", action = "close_under" }
+        //   mouse{ chord = "3-2", action = "pan" }
+        //   mouse{ chord = "2-1", action = "move_window" }
+        //   mouse{ chord = "2-3", action = "resize_window" }
+        //   mouse{ chord = "1-2", action = "toggle_fullscreen" }
+        //
+        // Кнопки нумерует hevel: 1 — левая, 2 — колесо, 3 — правая. Действие,
+        // которого нет в списке аккордов, ищется в ОБЩЕЙ таблице действий: на
+        // аккорд вешается что угодно из того, что вешается на клавишу (у hevel
+        // это `custom_chord` с тремя вариантами; здесь ограничения нет).
+        let mouse_chords_c = mouse_chords.clone();
+        let mouse_fn = lua.create_function(move |_, tbl: mlua::Table| {
+            let chord: String = tbl.get::<String>("chord").unwrap_or_default();
+            let (a, b) = match chord.split_once(['-', '+', ',']) {
+                Some(п) => п,
+                None => {
+                    tracing::warn!("plx/config: mouse{{}}: chord '{chord}' is not a pair, skipping");
+                    return Ok(());
+                }
+            };
+            let (Some(первая), Some(вторая)) =
+                (crate::аккорды::Кнопка::разобрать(a), crate::аккорды::Кнопка::разобрать(b))
+            else {
+                tracing::warn!("plx/config: mouse{{}}: unknown button in '{chord}', skipping");
+                return Ok(());
+            };
+            if первая == вторая {
+                // Одна и та же кнопка дважды — не аккорд: второе нажатие без
+                // отпускания физически не придёт, и бинд не сработал бы никогда.
+                tracing::warn!("plx/config: mouse{{}}: '{chord}' is the same button twice, skipping");
+                return Ok(());
+            }
+            let action_str: String = tbl.get::<String>("action").unwrap_or_default();
+            use crate::аккорды::ДействиеАккорда as Д;
+            let действие = match action_str.trim().to_ascii_lowercase().as_str() {
+                "spawn_rect" | "рамка" => {
+                    let cmd: String = tbl.get::<String>("cmd").unwrap_or_default();
+                    if cmd.is_empty() {
+                        tracing::warn!("plx/config: mouse{{}}: 'spawn_rect' needs cmd, skipping");
+                        return Ok(());
+                    }
+                    Д::Прямоугольник(cmd)
+                }
+                "close_under" | "kill_under" | "закрыть_под" => Д::ЗакрытьПод,
+                "pan" | "пан" => Д::Пан,
+                "move_window" | "вести_окно" => Д::ВестиОкно,
+                "resize_window" | "размер_окна" => Д::РазмерОкна,
+                _ => match action_from_lua(&action_str, &tbl) {
+                    Some(a) => Д::Обычное(Box::new(a)),
+                    None => {
+                        tracing::warn!("plx/config: mouse{{}}: unknown action '{action_str}', skipping");
+                        return Ok(());
+                    }
+                },
+            };
+            mouse_chords_c.borrow_mut().push(crate::аккорды::БиндАккорда {
+                первая,
+                вторая,
+                действие,
+            });
+            Ok(())
+        })?;
+        lua.globals().set("mouse", mouse_fn)?;
+    }
+    {
         let xkb_settings = xkb_settings.clone();
         let xkb_fn = lua.create_function(move |_, tbl: Table| {
             let mut s = xkb_settings.borrow_mut();
@@ -999,11 +1153,22 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let share_guest_all = share_guest_all.clone();
         let keyboard_grab_apps = keyboard_grab_apps.clone();
         let gesture_thresholds = gesture_thresholds.clone();
+        let mouse_chord_timeout = mouse_chord_timeout.clone();
         let автодовод = автодовод.clone();
         let blur = blur.clone();
         let glow = glow.clone();
         let glow_width = glow_width.clone();
-        let overview_3d = overview_3d.clone();
+        let cube = cube.clone();
+        let cube_faces = cube_faces.clone();
+        let cube_focal = cube_focal.clone();
+        let cube_fill = cube_fill.clone();
+        let cube_shade = cube_shade.clone();
+        let cube_switch = cube_switch.clone();
+        let sun = sun.clone();
+        let sun_size = sun_size.clone();
+        let sun_x = sun_x.clone();
+        let sun_y = sun_y.clone();
+        let sun_far = sun_far.clone();
         let close_anim = close_anim.clone();
         let intro = intro.clone();
         let notify_sound = notify_sound.clone();
@@ -1068,8 +1233,41 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             if let Ok(Some(v)) = tbl.get::<Option<f32>>("glow_width") {
                 *glow_width.borrow_mut() = v.max(0.0);
             }
-            if let Ok(Some(v)) = tbl.get::<Option<f32>>("overview_3d") {
-                *overview_3d.borrow_mut() = v.clamp(0.0, 1.0);
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("cube") {
+                *cube.borrow_mut() = v.clamp(0.0, 1.0);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<u32>>("cube_faces") {
+                *cube_faces.borrow_mut() = v.clamp(3, 12);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("cube_focal") {
+                *cube_focal.borrow_mut() = v.clamp(0.5, 20.0);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("cube_fill") {
+                *cube_fill.borrow_mut() = v.clamp(0.1, 1.0);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("cube_shade") {
+                *cube_shade.borrow_mut() = v.clamp(0.0, 1.0);
+            }
+            // Булев ключ — только Option<bool> (см. разбор про blur выше).
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("cube_switch") {
+                *cube_switch.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun") {
+                *sun.borrow_mut() = v.clamp(0.0, 1.0);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun_size") {
+                // Нижняя граница не косметическая: из радиуса считается сторона
+                // картинки на экране, а нулевая сторона — вырожденный dst.
+                *sun_size.borrow_mut() = v.clamp(0.05, 8.0);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun_x") {
+                *sun_x.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun_y") {
+                *sun_y.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun_far") {
+                *sun_far.borrow_mut() = v.clamp(0.0, 1.0);
             }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("blur") {
                 *blur.borrow_mut() = v;
@@ -1082,6 +1280,12 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             }
             if let Ok(Some(v)) = tbl.get::<Option<Vec<String>>>("keyboard_grab_apps") {
                 *keyboard_grab_apps.borrow_mut() = v;
+            }
+            // Сколько ждать вторую кнопку аккорда (hevel: chord_click_timeout_ms).
+            // Потолок в секунду — не вкус: столько задерживается ОБЫЧНЫЙ клик
+            // той же кнопкой, и при большем значении мышь выглядит сломанной.
+            if let Ok(Some(v)) = tbl.get::<Option<u32>>("mouse_chord_timeout") {
+                *mouse_chord_timeout.borrow_mut() = v.clamp(30, 1000);
             }
             // Пороги жестов — те же имена, что в driftwm, чтобы настройки
             // переносились между композиторами без перевода.
@@ -1348,6 +1552,8 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         bindings: bindings.borrow().clone(),
         gestures: gestures.borrow().clone(),
         gesture_thresholds: *gesture_thresholds.borrow(),
+        mouse_chords: mouse_chords.borrow().clone(),
+        mouse_chord_timeout: *mouse_chord_timeout.borrow(),
         автодовод: *автодовод.borrow(),
         xkb: xkb_settings.borrow().clone(),
         bird_eye_key: *bird_eye_key.borrow(),
@@ -1366,7 +1572,17 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         share_guest_all: *share_guest_all.borrow(),
         keyboard_grab_apps: keyboard_grab_apps.borrow().clone(),
         glow: *glow.borrow(),
-        overview_3d: *overview_3d.borrow(),
+        cube: *cube.borrow(),
+        cube_faces: *cube_faces.borrow(),
+        cube_focal: *cube_focal.borrow(),
+        cube_fill: *cube_fill.borrow(),
+        cube_shade: *cube_shade.borrow(),
+        cube_switch: *cube_switch.borrow(),
+        sun: *sun.borrow(),
+        sun_size: *sun_size.borrow(),
+        sun_x: *sun_x.borrow(),
+        sun_y: *sun_y.borrow(),
+        sun_far: *sun_far.borrow(),
         glow_width: *glow_width.borrow(),
         blur: *blur.borrow(),
         close_anim: *close_anim.borrow(),
@@ -1697,7 +1913,7 @@ impl Parallax {
     ///
     /// Жило в `vr/mod.rs` (там и появилось — сообщать, что шлем не поднялся),
     /// но зовут его отовсюду: отсюда же, из управляющего сокета, из режима
-    /// Minecraft. В сборке `plx-minimal` модуля `vr` нет вовсе, поэтому метод
+    /// Minecraft. В сборке `plx-standard` модуля `vr` нет вовсе, поэтому метод
     /// переехал сюда — к `spawn`, через который он и работает.
     pub(crate) fn уведомить(&self, текст: &str) {
         tracing::info!("plx: {текст}");

@@ -3,7 +3,7 @@
 //! Вся программа живёт здесь, в библиотеке; бинари в `bins/` — это по пять
 //! строк вокруг [`run`]. Отличаются они только НАБОРОМ ФИЧ:
 //!
-//! * `plx-minimal` — композитор, тайлинг, лента, обзор, обои, панель, трей,
+//! * `plx-standard` — композитор, тайлинг, лента, обзор, обои, панель, трей,
 //!   блютуз, вайфай, звук, портал, снимок, X11, жесты;
 //! * `plx-extra` — то же плюс шлем (`vr`), окна в Minecraft (`mine`) и
 //!   мультиюзер (`share`).
@@ -37,6 +37,9 @@ mod dwindle;
 mod focus;
 mod fullscreen;
 mod gestures;
+/// Мышиные аккорды: команда парой кнопок (модель hevel).
+#[path = "аккорды.rs"]
+mod аккорды;
 mod grabs;
 mod handlers;
 mod headless;
@@ -51,12 +54,27 @@ mod mine;
 mod mode;
 mod monitors;
 mod notify;
-/// Перспектива миниатюр в обзоре окон.
-#[path = "наклон.rs"]
-mod наклон;
 /// Палитра обоев: цвета, которыми красятся эффекты рабочего стола.
+#[cfg(feature = "shaders")]
 #[path = "обои.rs"]
 mod обои;
+#[cfg(not(feature = "shaders"))]
+#[path = "шейдеры_stub/обои.rs"]
+mod обои;
+/// Куб рабочих столов (Compiz Desktop Cube).
+#[cfg(feature = "shaders")]
+#[path = "куб.rs"]
+mod куб;
+#[cfg(not(feature = "shaders"))]
+#[path = "шейдеры_stub/куб.rs"]
+mod куб;
+/// Свет на холсте в цвет обоев: заливка сцены и свет на окнах.
+#[cfg(feature = "shaders")]
+#[path = "свет.rs"]
+mod свет;
+#[cfg(not(feature = "shaders"))]
+#[path = "шейдеры_stub/свет.rs"]
+mod свет;
 mod overview;
 mod portal;
 mod portal_stream;
@@ -190,7 +208,7 @@ fn поднять_лимит_дескрипторов() {
 }
 
 /// Набор фич, с которым собран ЭТОТ бинарь. Не украшение: разница между
-/// `plx-minimal` и `plx-extra` задаётся только фичами, и по одному имени файла
+/// `plx-standard` и `plx-extra` задаётся только фичами, и по одному имени файла
 /// её не видно — бинарь можно переименовать, скопировать, собрать самому.
 /// В отчёте об ошибке это первое, что нужно знать.
 fn собранные_фичи() -> Vec<&'static str> {
@@ -254,7 +272,7 @@ fn справка_или_версия() -> bool {
         println!("      --winit      run nested inside an existing session, for development");
         println!("      --headless   no output and no input; frames are taken through");
         println!("                   the control socket (see harness.sh)");
-        // Ключ есть только там, где есть сам шлем: в plx-minimal `--vr` ответил
+        // Ключ есть только там, где есть сам шлем: в plx-standard `--vr` ответил
         // бы «этой сборки не касается», и в справке ему делать нечего.
         if cfg!(feature = "vr") {
             println!("      --vr         put on the headset at startup (needs an OpenXR runtime)");
@@ -270,14 +288,14 @@ fn справка_или_версия() -> bool {
         println!("  RUST_LOG         log filter (e.g. RUST_LOG=parallax=debug,info)");
         println!("  PLX_CONFIG       path to config.lua, overriding the default");
         println!();
-        println!("https://github.com/mifaroslav-dotcom/parallax");
+        println!("https://github.com/YoungEscapist/parallax-wm");
         return true;
     }
 
     false
 }
 
-/// Точка входа композитора. Оба бинаря (`plx-minimal` и `plx-extra`) — это
+/// Точка входа композитора. Оба бинаря (`plx-standard` и `plx-extra`) — это
 /// пять строк вокруг неё; вся разница между сборками задана НАБОРОМ ФИЧ,
 /// с которым каждый из них тянет эту библиотеку (см. bins/ и `[features]`).
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {

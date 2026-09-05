@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        bin: [plx-minimal, plx-extra]
+        bin: [plx-standard, plx-extra]
     steps:
       - uses: actions/checkout@v4
 

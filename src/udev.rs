@@ -23,7 +23,7 @@ use smithay::{
                 solid::SolidColorRenderElement,
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
                 texture::TextureRenderElement,
-                utils::{CropRenderElement, RescaleRenderElement},
+                utils::{CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement},
             },
             gles::{GlesRenderer, GlesTexture},
             utils::CommitCounter,
@@ -105,10 +105,20 @@ smithay::backend::renderer::element::render_elements! {
     // Размытый фон под островом панели: та же текстура, но обрезанная
     // скруглением плашки тем же шейдером, что и углы окон (см. blur.rs).
     Blur = crate::rounded::Rounded<CropRenderElement<TextureRenderElement<GlesTexture>>>,
-    // Миниатюра обзора, развёрнутая в перспективе (см. наклон.rs). Тот же
-    // элемент, что и Minimap, только нарисованный своим шейдером: обзор от
-    // этого становится вогнутой стеной окон, а не плоской картой.
-    Наклон = crate::наклон::Наклон<CropRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>>,
+    // Ореол вокруг окна (тень + свечение наружу): плитка в один пиксель,
+    // растянутая на окно с запасом, весь цвет которой считает тот же шейдер,
+    // что рисует само окно (см. build_halo_elements).
+    Гало = crate::rounded::Rounded<MemoryRenderBufferRenderElement<GlesRenderer>>,
+    // Заливка света на холсте (см. свет.rs): картинка из памяти, обрезанная
+    // кадром. Обрезка не косметика — заливка заведомо крупнее экрана и своей
+    // геометрией повреждала бы соседний выход.
+    Свет = CropRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>,
+    // Грань куба рабочих столов (см. куб.rs): живое окно стола, растянутое в
+    // коробку своей проекции и развёрнутое шейдером в плоскость грани.
+    Грань = crate::куб::Грань<CropRenderElement<RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>>>,
+    // Подложка грани — она же сама грань: однотонная плитка, растянутая на
+    // всю грань и развёрнутая тем же шейдером.
+    ГраньФон = crate::куб::Грань<CropRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>>,
 }
 
 type GbmDrmCompositor = DrmCompositor<
@@ -1063,7 +1073,7 @@ fn add_surface(
     // потом только клонируется (внутри — Arc на программу).
     if state.blur_shape.is_none() {
         state.blur_shape = crate::rounded::Шейдер::new(&mut device.gles);
-        state.наклон_шейдер = crate::наклон::Шейдер::new(&mut device.gles);
+        state.куб_шейдер = crate::куб::Шейдер::new(&mut device.gles);
     }
     tracing::info!("plx/udev: output '{}' {}x{}@{}Hz",
         output_name, wl_mode.size.w, wl_mode.size.h, wl_mode.refresh/1000);
@@ -1404,6 +1414,64 @@ fn build_portal_pick_elements(
 /// Затемнение кладётся не одним прямоугольником с дыркой (сплошной элемент
 /// дырок не умеет), а четырьмя полосами вокруг выделения: так внутри рамки
 /// остаётся неискажённая картинка — по ней и целятся.
+/// Рамка мышиного аккорда «обвести и запустить в ней» (hevel 1 → 3).
+///
+/// Одна кайма без затемнения — в отличие от снимка области. Разница не
+/// косметическая: снимок целятся по неискажённой картинке и потому гасят всё
+/// вокруг, а здесь человек показывает МЕСТО для будущего окна и обязан видеть,
+/// что под этим местом уже лежит.
+///
+/// Координаты рамки хранятся в ХОЛСТЕ (курсор ходит по холсту, а холст едет и
+/// зумится), поэтому здесь они переводятся в экранные тем же преобразованием,
+/// что и всё остальное: `(точка − камера) × зум`.
+fn build_chord_frame_elements(
+    state: &mut Parallax,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    let mut elements = Vec::new();
+    let Some(a) = state.аккорд_рамка else { return elements };
+    let b = state.pointer_location;
+    let Some(mode) = output.current_mode() else { return elements };
+    let (ширина, высота) = (mode.size.w, mode.size.h);
+
+    let вид = state.viewport.clone();
+    let zoom = вид.zoom.max(0.01);
+    let в_экран = |p: Point<f64, Logical>| ((p.x - вид.cam_x) * zoom, (p.y - вид.cam_y) * zoom);
+    let (x0, y0) = в_экран(a);
+    let (x1, y1) = в_экран(b);
+    let x = x0.min(x1).round() as i32;
+    let y = y0.min(y1).round() as i32;
+    let w = (x1 - x0).abs().round() as i32;
+    let h = (y1 - y0).abs().round() as i32;
+    if w <= 0 || h <= 0 {
+        return elements;
+    }
+    let x = x.clamp(0, ширина);
+    let y = y.clamp(0, высота);
+    let w = w.min(ширина - x);
+    let h = h.min(высота - y);
+    if w <= 0 || h <= 0 {
+        return elements;
+    }
+
+    // Цвета ОБЫЧНЫЕ (straight): `pooled_solid` домножает на альфу сам.
+    const ЦВЕТ: [f32; 4] = [0.35, 0.75, 1.0, 0.9];
+    const ЗАЛИВКА: [f32; 4] = [0.35, 0.75, 1.0, 0.12];
+    const ТОЛЩИНА: i32 = 2;
+
+    let pool = &mut state.аккорд_ids;
+    let mut idx = 0usize;
+    // Кайма ВНУТРЬ, как у снимка: снаружи она сдвигала бы видимую границу.
+    elements.push(pooled_solid(pool, &mut idx, (x, y), (w, ТОЛЩИНА), ЦВЕТ));
+    elements.push(pooled_solid(pool, &mut idx, (x, y + h - ТОЛЩИНА), (w, ТОЛЩИНА), ЦВЕТ));
+    elements.push(pooled_solid(pool, &mut idx, (x, y), (ТОЛЩИНА, h), ЦВЕТ));
+    elements.push(pooled_solid(pool, &mut idx, (x + w - ТОЛЩИНА, y), (ТОЛЩИНА, h), ЦВЕТ));
+    // Заливка идёт ПОСЛЕДНЕЙ: список кадра от переднего плана к заднему, и
+    // положи её раньше — она легла бы поверх собственной каймы.
+    elements.push(pooled_solid(pool, &mut idx, (x, y), (w, h), ЗАЛИВКА));
+    elements
+}
+
 fn build_snip_elements(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
@@ -1631,10 +1699,8 @@ fn build_minimap_elements(
 
     // Живые миниатюры собираем ДО заимствования пула solid-слотов: дальше
     // `state` занят изменяемой ссылкой на `minimap_ids`.
-    let миниатюры = build_minimap_thumbnails(
-        renderer, &окна, &proj, остриё, карта, видимость,
-        state.наклон_шейдер.clone(), state.lua_config.overview_3d,
-    );
+    let миниатюры =
+        build_minimap_thumbnails(renderer, &окна, &proj, остриё, карта, видимость);
     // Подписи под миниатюрами и заголовок карточки — им нужен `state` целиком
     // (кэш текста), поэтому тоже ДО пула.
     let (подписи, плашки_подписей) =
@@ -2046,12 +2112,8 @@ fn build_minimap_thumbnails(
     остриё: Point<i32, Physical>,
     карта: Rectangle<i32, Physical>,
     видимость: f32,
-    наклон: Option<crate::наклон::Шейдер>,
-    сила_3d: f32,
 ) -> Vec<OutputRenderElements> {
     let панель = карта;
-    // Разворачивать миниатюры имеет смысл, только если есть чем и на сколько.
-    let наклон = наклон.filter(|_| сила_3d > 0.0);
 
     let mut out = Vec::new();
     for окно in окна {
@@ -2071,41 +2133,13 @@ fn build_minimap_thumbnails(
             smithay::utils::Scale::from(1.0),
             видимость,
         );
-        // Прямоугольник ЭТОЙ миниатюры на экране: он же — рамка, в которую
-        // вписывается развёрнутая карточка. Считается тем же преобразованием,
-        // что и сама миниатюра (проекция карты плюс её масштаб).
-        let рамка = {
-            let x = остриё.x as f64 + (окно.loc.x - proj.bbox.loc.x) as f64 * proj.scale;
-            let y = остриё.y as f64 + (окно.loc.y - proj.bbox.loc.y) as f64 * proj.scale;
-            let w = окно.size.w as f64 * proj.scale;
-            let h = окно.size.h as f64 * proj.scale;
-            [x as f32, y as f32, w as f32, h as f32]
-        };
-        // Доля от центра карты: −1 у левого края, +1 у правого. По ней и
-        // считается угол — карточки поворачиваются к центру, и обзор
-        // становится вогнутой стеной окон.
-        let доля = if карта.size.w > 0 {
-            let центр_карты = карта.loc.x as f32 + карта.size.w as f32 * 0.5;
-            let центр_окна = рамка[0] + рамка[2] * 0.5;
-            ((центр_окна - центр_карты) / (карта.size.w as f32 * 0.5)).clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        let разворот = crate::наклон::Разворот::по_месту(доля, сила_3d);
-        let наклон_окна = наклон.clone();
-
         out.extend(els.into_iter().filter_map(|el| {
             let ужатое = RescaleRenderElement::from_element(el, остриё, proj.scale);
             // Обрезка обязательна: панель показывает весь холст с запасом 20%,
             // но окно у края bbox своей рамкой из неё торчит — без Crop оно
             // рисовалось бы поверх экрана рядом с панелью.
             let обрезанное = CropRenderElement::from_element(ужатое, 1.0, панель)?;
-            Some(match наклон_окна.as_ref() {
-                Some(ш) => OutputRenderElements::Наклон(crate::наклон::Наклон::new(
-                    обрезанное, ш, рамка, разворот,
-                )),
-                None => OutputRenderElements::Minimap(обрезанное),
-            })
+            Some(OutputRenderElements::Minimap(обрезанное))
         }));
     }
     out
@@ -2410,7 +2444,16 @@ fn видимый_размер(window: &Window, факт: Size<i32, Logical>) ->
 fn build_shadow_elements(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
+    скругление: Option<&crate::rounded::Шейдер>,
+    свет: Option<crate::свет::Источник>,
 ) -> Vec<OutputRenderElements> {
+    // Есть шейдер — ореол считает он: одна плитка на окно вместо одиннадцати, и
+    // главное — та же форма и тот же свет, что у самого окна (см. rounded.rs,
+    // uniform `halo`). Плиточный путь ниже остаётся запасным: без шейдера окна
+    // и так с прямыми углами, но тень им нужна ровно так же.
+    if let Some(ш) = скругление {
+        return build_halo_elements(state, renderer, ш, свет);
+    }
     let mut els = Vec::new();
     if state.tagged_windows.is_empty() {
         return els;
@@ -2527,6 +2570,104 @@ fn build_shadow_elements(
         }
 
         slot += 1;
+    }
+    els
+}
+
+/// Ореол вокруг каждого окна ОДНИМ элементом на окно — тем же шейдером, что
+/// рисует само окно.
+///
+/// **Зачем это заменило плитки.** Плиточная тень (`build_shadow_elements` ниже)
+/// была вещью в себе: нейтрально-чёрная, одинаковая со всех сторон, ничего не
+/// знающая ни про обои, ни про источник света на холсте, — при том что у окна
+/// ВНУТРИ по краю уже шла кайма в цвет обоев, которая и про то, и про другое
+/// знала. Снаружи это читалось как две разные вещи на одной границе.
+///
+/// Теперь граница одна. Прямоугольник и радиус — те же, что уходят в
+/// собственный элемент окна; цвет, направление света и его сила — тот же
+/// [`crate::rounded::Свечение`]; ручка `glow` гасит и кайму, и ореол разом.
+/// Шейдер считает по нему обе стороны: внутрь — кайму, наружу — тень со
+/// свечением. Тень при этом падает ОТ света, а не всегда вниз.
+fn build_halo_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    шейдер: &crate::rounded::Шейдер,
+    свет: Option<crate::свет::Источник>,
+) -> Vec<OutputRenderElements> {
+    let mut els = Vec::new();
+    if state.tagged_windows.is_empty() {
+        return els;
+    }
+    let zoom = state.viewport.zoom;
+    let screen = state.screen_size();
+    let радиус_лог = corner_radius_logical(state);
+    // Всё в физических пикселях: логические величины декора умножаем на зум
+    // ровно так же, как это делает плиточный путь.
+    let spread = crate::decor::SPREAD as f64 * zoom;
+    let drop = crate::decor::DROP as f64 * zoom;
+    let палитра = state.палитра_обоев;
+    let (glow, glow_width, sun) =
+        (state.lua_config.glow, state.lua_config.glow_width, state.lua_config.sun);
+
+    let windows: Vec<Window> = state.tagged_windows.iter().map(|tw| tw.window.clone()).collect();
+    let mut slot = 0usize;
+    for window in windows {
+        // Тень у полноэкранного окна рисовать негде и не нужно (то же правило,
+        // что у плиток).
+        if state.is_fullscreen(&window) {
+            continue;
+        }
+        let Some((x0, y0, w, h)) = window_screen_rect(state, &window) else { continue };
+        if w < 8.0 || h < 8.0 {
+            continue;
+        }
+        // Свет может утащить тень в любую сторону, поэтому запас берём с обеих:
+        // ширина тени плюс её сдвиг.
+        let поле = spread + drop;
+        if !on_screen(screen, (x0, y0, w, h), поле) {
+            continue;
+        }
+        let в_фокусе = state
+            .focused_surface()
+            .map(|s| crate::xwin::is_surface(&window, &s))
+            .unwrap_or(false);
+        let свечение = crate::rounded::Свечение::для_окна(палитра, glow, glow_width, zoom, в_фокусе)
+            .со_светом(палитра, sun, свет, (x0 + w * 0.5, y0 + h * 0.5));
+        let радиус = (радиус_лог as f64 * zoom).min(w / 2.0).min(h / 2.0).max(0.0) as f32;
+        let rect = [x0 as f32, y0 as f32, w as f32, h as f32];
+        let форма = crate::rounded::Ореол {
+            ширина: spread as f32,
+            сдвиг: drop as f32,
+            тень: 1.0,
+        };
+
+        // Плитка кроет окно с запасом на тень со всех сторон. Внутри окна она
+        // тоже нужна: у прозрачных окон (все терминалы Ярика) сквозь них видна
+        // середина тени — ровно так же было и у плиточной раскладки.
+        let ключ = [
+            rect[0], rect[1], rect[2], rect[3], радиус,
+            свечение.цвет[0], свечение.цвет[1], свечение.цвет[2],
+            свечение.ширина, свечение.сила,
+            свечение.направление[0], свечение.направление[1], свечение.свет,
+            форма.ширина, форма.сдвиг,
+        ];
+        let буфер = state.decor.гало(slot, &ключ).clone();
+        slot += 1;
+        let размер = Size::<i32, Logical>::from((
+            (w + 2.0 * поле).round() as i32,
+            (h + 2.0 * поле).round() as i32,
+        ));
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            Point::<f64, Physical>::from((x0 - поле, y0 - поле)),
+            &буфер,
+            None, None, Some(размер), Kind::Unspecified,
+        ) {
+            Ok(el) => els.push(OutputRenderElements::Гало(crate::rounded::Rounded::ореол(
+                el, шейдер, rect, радиус, форма, свечение,
+            ))),
+            Err(e) => tracing::warn!("plx/udev: halo: {:?}", e),
+        }
     }
     els
 }
@@ -3798,6 +3939,335 @@ fn wallpaper_texture(
     None
 }
 
+/// Куб рабочих столов (см. куб.rs): столы на гранях призмы вместо плоской
+/// сетки обзора.
+///
+/// `None` — куба сейчас нет (выключен настройкой, не скомпилировался шейдер,
+/// нечего показывать), и кадр собирается как обычно. Пустой список — куб есть,
+/// но все грани оказались за краем экрана; это тоже «куб активен», и обычные
+/// окна поверх него рисовать нельзя, поэтому пустой вектор и `None` здесь
+/// значат РАЗНОЕ.
+///
+/// Содержимое грани — живые окна стола, а не снимок: то же дерево поверхностей,
+/// что и на холсте, только положенное в плоскость грани. Ради этого шейдер и
+/// написан обратным отображением — снимок потребовал бы офскрин-прохода на
+/// каждую грань каждый кадр.
+fn build_cube_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Option<Vec<OutputRenderElements>> {
+    let шейдер = state.куб_шейдер.clone()?;
+    let сила = state.lua_config.cube;
+    if сила <= 0.0 || !state.куб_активен() {
+        return None;
+    }
+    let mode = output.current_mode()?;
+    let экран = mode.size;
+    if state.куб_столы.len() < 2 {
+        // Один стол — призмы не бывает, и показывать по кругу нечего.
+        return None;
+    }
+    let граней = state.куб_граней();
+
+    let mut куб = crate::куб::Куб::новый(
+        граней,
+        экран.w as f32,
+        state.lua_config.cube_focal,
+        // Не голый cube_fill: колесо в обзоре отодвигает и приближает куб,
+        // умножая долю экрана под передней гранью (см. куб_зум).
+        state.куб_заполнение(),
+        (экран.w as f32 * 0.5, экран.h as f32 * 0.5),
+        state.lua_config.cube_shade * сила,
+    );
+    куб.поворот = state.куб_угол as f32;
+
+    // Грани обходим ОТ БЛИЖНЕЙ К ДАЛЬНЕЙ: список кадра идёт от переднего плана
+    // к заднему, и передняя грань обязана перекрывать соседние по ребру.
+    let mut порядок: Vec<u32> = (0..граней).filter(|&i| куб.видна(i)).collect();
+    порядок.sort_by(|&a, &b| {
+        let к = |i: u32| куб.угол(i).cos();
+        к(b).partial_cmp(&к(a)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let кадр = Rectangle::<i32, Physical>::new((0, 0).into(), экран);
+    let mut out: Vec<OutputRenderElements> = Vec::new();
+    for грань in порядок {
+        // Какой стол лежит на ЭТОЙ грани — вопрос к кольцу столов, а не к
+        // номеру грани: столов может быть больше, чем граней, и слоты берут их
+        // по кругу (см. куб.rs, «Куб бесконечен»).
+        let Some(стол) = state.куб_стол_грани(грань) else { continue };
+        let угол = куб.угол(грань);
+        // Прямоугольник стола на холсте: в обзоре — его ячейка сетки, вне
+        // обзора (проворот при переключении) все столы лежат в одном месте —
+        // на домашнем экране монитора.
+        let Some(рамка) = state.куб_рамка_стола(стол) else { continue };
+        if рамка.size.w <= 0 || рамка.size.h <= 0 {
+            continue;
+        }
+        // Холст → плоскость грани: доля внутри рамки, растянутая на экран, с
+        // началом координат в ЦЕНТРЕ грани (так требует шейдер).
+        let кx = экран.w as f32 / рамка.size.w as f32;
+        let кy = экран.h as f32 / рамка.size.h as f32;
+        let в_грань = |p: Point<i32, Logical>| -> (f32, f32) {
+            (
+                (p.x - рамка.loc.x) as f32 * кx - экран.w as f32 * 0.5,
+                (p.y - рамка.loc.y) as f32 * кy - экран.h as f32 * 0.5,
+            )
+        };
+
+        // Подложка грани — под окнами, поэтому кладётся в список ПОСЛЕ них.
+        let mut грани_элементы: Vec<OutputRenderElements> = Vec::new();
+
+        // Окна стола: снизу вверх по стеку, а в список кадра — наоборот.
+        let окна: Vec<(Window, Rectangle<i32, Logical>)> = state
+            .space
+            .elements()
+            .rev()
+            .filter(|w| {
+                state
+                    .tagged_windows
+                    .iter()
+                    .any(|tw| &tw.window == *w && tw.tags & стол != 0)
+            })
+            .filter_map(|w| state.space.element_geometry(w).map(|g| (w.clone(), g)))
+            .collect();
+
+        for (окно, geo) in окна {
+            // Начало дерева поверхностей — та же поправка на клиентские поля,
+            // что и в обычной отрисовке: g.loc − window.geometry().loc.
+            let корень = geo.loc - окно.geometry().loc;
+            let элементы: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = окно.render_elements(
+                renderer,
+                Point::<i32, Physical>::from((корень.x, корень.y)),
+                smithay::utils::Scale::from(1.0),
+                1.0,
+            );
+            for el in элементы {
+                // Где эта ПОВЕРХНОСТЬ (не окно целиком — у окна их бывает
+                // много) лежит в холсте, а значит и в плоскости грани.
+                // Трейт `Element` зовётся по полному пути: в этом файле он не
+                // в области видимости, а тащить его сюда ради одного вызова
+                // значит поменять разрешение имён у всего остального.
+                let г = smithay::backend::renderer::element::Element::geometry(
+                    &el,
+                    smithay::utils::Scale::from(1.0),
+                );
+                if г.size.w <= 0 || г.size.h <= 0 {
+                    continue;
+                }
+                let (u0, v0) = в_грань(Point::from((г.loc.x, г.loc.y)));
+                let (u1, v1) = в_грань(Point::from((
+                    г.loc.x + г.size.w,
+                    г.loc.y + г.size.h,
+                )));
+                let Some(коробка) = куб.коробка(угол, (u0, v0, u1, v1)) else { continue };
+                if коробка.intersection(кадр).is_none() {
+                    continue;
+                }
+                // Элемент растягиваем в коробку: сначала масштаб по каждой оси
+                // отдельно (проекция сжимает грань неравномерно), потом сдвиг.
+                // Сам разворот делает шейдер — коробка нужна лишь затем, чтобы
+                // фрагменты вообще существовали там, где встанет трапеция.
+                let sx = коробка.size.w as f64 / г.size.w as f64;
+                let sy = коробка.size.h as f64 / г.size.h as f64;
+                let ужатое = RescaleRenderElement::from_element(
+                    el,
+                    Point::<i32, Physical>::from((0, 0)),
+                    smithay::utils::Scale::from((sx, sy)),
+                );
+                let сдвиг = Point::<i32, Physical>::from((
+                    коробка.loc.x - (г.loc.x as f64 * sx).round() as i32,
+                    коробка.loc.y - (г.loc.y as f64 * sy).round() as i32,
+                ));
+                let на_месте = RelocateRenderElement::from_element(ужатое, сдвиг, Relocate::Relative);
+                let Some(обрезанное) = CropRenderElement::from_element(на_месте, 1.0, кадр) else {
+                    continue;
+                };
+                грани_элементы.push(OutputRenderElements::Грань(crate::куб::Грань::new(
+                    обрезанное,
+                    &шейдер,
+                    &куб,
+                    угол,
+                    (u0, v0, u1, v1),
+                )));
+            }
+        }
+
+        // Подложка: та же плитка, растянутая на всю грань. Она же и есть сама
+        // грань — без неё куб был бы набором висящих в пустоте окон.
+        let вся = (
+            -(экран.w as f32) * 0.5,
+            -(экран.h as f32) * 0.5,
+            экран.w as f32 * 0.5,
+            экран.h as f32 * 0.5,
+        );
+        if let Some(коробка) = куб.коробка(угол, вся) {
+            if коробка.intersection(кадр).is_some() {
+                let свой = стол == state.viewport.current_tags();
+                if let Some(эл) = cube_face_backdrop(state, renderer, коробка, свой) {
+                    грани_элементы.push(OutputRenderElements::ГраньФон(crate::куб::Грань::new(
+                        эл, &шейдер, &куб, угол, вся,
+                    )));
+                }
+            }
+        }
+
+        out.extend(грани_элементы);
+    }
+    Some(out)
+}
+
+/// Плитка-подложка грани, растянутая на её коробку.
+///
+/// Однотонная и текстурная (а не `SolidColorRenderElement`): через шейдер куба
+/// проходят только текстуры — `override_default_tex_program` на сплошной цвет
+/// не действует, и грань из солида осталась бы плоским прямоугольником поверх
+/// куба.
+fn cube_face_backdrop(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    коробка: Rectangle<i32, Physical>,
+    свой: bool,
+) -> Option<CropRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>> {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
+
+    if state.куб_фон.is_none() {
+        // 2×2 вместо 1×1: билинейная фильтрация на краю однопиксельной
+        // текстуры тянет цвет из-за её границы и даёт полупрозрачную кромку.
+        let px: Vec<u8> = std::iter::repeat([20u8, 20, 24, 255]).take(4).flatten().collect();
+        state.куб_фон = Some(MemoryRenderBuffer::from_slice(
+            &px,
+            Fourcc::Abgr8888,
+            (2, 2),
+            1,
+            Transform::Normal,
+            None,
+        ));
+    }
+    let буфер = state.куб_фон.as_ref()?;
+    let el = MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        Point::<f64, Physical>::from((коробка.loc.x as f64, коробка.loc.y as f64)),
+        буфер,
+        // Свой стол чуть светлее прочих: иначе на кубе не видно, откуда вышел.
+        Some(if свой { 1.0 } else { 0.75 }),
+        None,
+        Some(Size::<i32, Logical>::from((коробка.size.w, коробка.size.h))),
+        Kind::Unspecified,
+    )
+    .ok()?;
+    let экран = state.screen_size();
+    let кадр = Rectangle::<i32, Physical>::new(
+        (0, 0).into(),
+        Size::<i32, Physical>::from((экран.w, экран.h)),
+    );
+    CropRenderElement::from_element(el, 1.0, кадр)
+}
+
+/// Источник света на экране — общий для заливки сцены и для окон.
+///
+/// Считается ОДИН раз на кадр и уходит обоим потребителям: заливке
+/// (`build_light_element`) и каждому окну (см. `Свечение::со_светом`). Считать
+/// его в двух местах значило бы получить две разные точки после первого же
+/// расхождения в формуле — и свет на окнах поехал бы мимо света на холсте.
+///
+/// Место отсчитывается от ДОМА своего монитора, а не от нуля холста: дом
+/// второго монитора отстоит на `monitors::ШАГ_ДОМА`, и от нуля источник висел
+/// бы у него за краем света (та же поправка, что в `build_wallpaper_backdrop`).
+fn источник_света(state: &Parallax, output: &Output) -> Option<crate::свет::Источник> {
+    if state.lua_config.sun <= 0.0 {
+        return None;
+    }
+    let mode = output.current_mode()?;
+    let экран = mode.size;
+    let дом = state.монитор_дом();
+    Some(crate::свет::источник(
+        (
+            экран.w as f64 * state.lua_config.sun_x as f64,
+            экран.h as f64 * state.lua_config.sun_y as f64,
+        ),
+        экран.w as f64 * state.lua_config.sun_size as f64,
+        (
+            state.viewport.cam_x - дом.x as f64,
+            state.viewport.cam_y - дом.y as f64,
+        ),
+        state.viewport.zoom,
+        state.lua_config.sun_far as f64,
+        // Размах — ширина экрана: дальше этого источник не уходит ни при каком
+        // перелёте по холсту.
+        экран.w as f64,
+    ))
+}
+
+/// Заливка сцены: как освещён сам холст. Лежит ЗА окнами и ПОВЕРХ обоев
+/// (см. свет.rs).
+///
+/// Диска здесь нет — это мягкий градиент без ядра и без края; то, что видно
+/// как «откуда светит», складывается из него и из освещённых сторон окон.
+///
+/// Обрезка по кадру обязательна: заливка заведомо больше экрана, а элемент,
+/// торчащий за его пределы, повреждал бы соседний выход.
+fn build_light_element(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    и: crate::свет::Источник,
+) -> Option<OutputRenderElements> {
+    let сила = state.lua_config.sun;
+    if сила <= 0.0 {
+        return None;
+    }
+    let mode = output.current_mode()?;
+    let экран = mode.size;
+    let сторона = и.охват * 2.0;
+    if сторона < 1.0 {
+        return None;
+    }
+    let (x, y) = (и.точка.0 - и.охват, и.точка.1 - и.охват);
+    let кадр = Rectangle::<i32, Physical>::new((0, 0).into(), экран);
+    // Заливка целиком за краем экрана — не строим элемент вовсе: Crop ниже всё
+    // равно вернул бы None, но буфер уже был бы посчитан.
+    let место_на_экране = Rectangle::<f64, Physical>::new(
+        (x, y).into(),
+        (сторона, сторона).into(),
+    );
+    if место_на_экране.intersection(кадр.to_f64()).is_none() {
+        return None;
+    }
+    let палитра = state.палитра_обоев;
+    let буфер = state.свет.буфер(палитра, сила)?;
+    let el = match MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        Point::<f64, Physical>::from((x, y)),
+        буфер,
+        None,
+        // `src` — КАКОЙ КУСОК КАРТИНКИ берём, и передавать его обязательно.
+        // Грабля smithay (element/memory.rs:501): при `src = None` он берётся
+        // не из размера буфера, а из `size`, то есть из размера НА ЭКРАНЕ.
+        // Сторона заливки — тысячи пикселей, картинка — 256 текселей, и
+        // выборка уходила целиком за край текстуры: элемент строился, лежал
+        // в кадре, а на экране не было ничего.
+        Some(Rectangle::from_size(Size::<f64, Logical>::from((
+            crate::свет::СТОРОНА as f64,
+            crate::свет::СТОРОНА as f64,
+        )))),
+        Some(Size::<i32, Logical>::from((
+            сторона.round().max(1.0) as i32,
+            сторона.round().max(1.0) as i32,
+        ))),
+        Kind::Unspecified,
+    ) {
+        Ok(el) => el,
+        Err(e) => {
+            tracing::warn!("plx/udev: light: {:?}", e);
+            return None;
+        }
+    };
+    CropRenderElement::from_element(el, 1.0, кадр).map(OutputRenderElements::Свет)
+}
+
 fn build_wallpaper_backdrop(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
@@ -4304,6 +4774,10 @@ pub fn собрать_элементы(
     let mut elements: Vec<OutputRenderElements> =
         Vec::with_capacity(ёмкость.max(64));
 
+    // Источник света на холсте — один на кадр (см. `источник_света`): его
+    // берут и окна ниже, и заливка сцены в самом конце списка.
+    let свет = источник_света(state, output);
+
     // ── Cursor (front layer) ─────────────────────────────────────────────────
     // Только для диагностики ниже: сами ветки курсора считают свою точку
     // каждая по своему хотспоту (см. match по cursor_status).
@@ -4663,6 +5137,11 @@ pub fn собрать_элементы(
     // затемнением был бы не виден.
     elements.extend(build_snip_elements(state, renderer, output));
 
+    // ── Рамка мышиного аккорда ───────────────────────────────────────────────
+    // Рядом с выделением под снимок и по тому же доводу: пока её тянут, она и
+    // есть то, на что человек смотрит.
+    elements.extend(build_chord_frame_elements(state, output));
+
     // ── Top-слой (wlr-layer-shell): поверх окон, под UI -----------------------
     elements.extend(build_layer_elements(state, renderer, output, &[WlrLayer::Top]));
 
@@ -4688,7 +5167,18 @@ pub fn собрать_элементы(
     //
     // Отсечение — по ВИДИМОЙ части холста (экран ⁄ зум): при отдалении в кадр
     // попадает больше холста, чем сам экран.
-    {
+    //
+    // КУБ. Когда столы стоят на гранях призмы (см. build_cube_elements), окна
+    // на холсте не рисуются ВООБЩЕ: те же поверхности уже положены на грани, и
+    // вторая их копия плашмя поверх куба — ровно то, чего быть не должно.
+    // Отсюда `None` против пустого вектора: пустой значит «куб есть, но все
+    // грани мимо кадра», и холст всё равно остаётся скрытым.
+    let куб = build_cube_elements(state, renderer, output);
+    let куб_рисуется = куб.is_some();
+    if let Some(грани) = куб {
+        elements.extend(грани);
+    }
+    if !куб_рисуется {
         let zoom = state.viewport.zoom.max(0.01);
         let cam = Point::<f64, Logical>::from((state.viewport.cam_x, state.viewport.cam_y));
         let vis = state.visible_canvas_size();
@@ -4840,6 +5330,20 @@ pub fn собрать_элементы(
                 state.lua_config.glow_width,
                 zoom,
                 в_фокусе,
+            )
+            // ...и свет от источника на холсте: сторона окна, обращённая к
+            // нему, светлее, обратная уходит в тень. Центр окна считаем тем же
+            // преобразованием, что и рамка скругления выше (phys + geo.loc,
+            // всё умноженное на зум), — иначе свет падал бы не на то место,
+            // где окно нарисовано.
+            .со_светом(
+                state.палитра_обоев,
+                state.lua_config.sun,
+                свет,
+                (
+                    (phys.x as f64 + geo.loc.x as f64 + geo.size.w as f64 * 0.5) * zoom,
+                    (phys.y as f64 + geo.loc.y as f64 + geo.size.h as f64 * 0.5) * zoom,
+                ),
             );
 
             // Список элементов окна. Без обрезки — как раньше, один вызов.
@@ -4974,16 +5478,30 @@ pub fn собрать_элементы(
     // В обзоре тоже рисуем: раньше их там отключали из-за цены (225 элементов
     // на окно), но после перехода на плитки это 11 элементов, и в обзоре тень
     // как раз нужна — она отделяет окна от фона стола.
-    elements.extend(build_shadow_elements(state, renderer));
+    // При кубе теней и рамок столов нет: и то и другое — прямоугольники,
+    // приклеенные к холсту, а холст в этот момент не показывается. Плоская
+    // рамка поверх повёрнутой грани выдала бы обман сразу.
+    if !куб_рисуется {
+        elements.extend(build_shadow_elements(state, renderer, скругление, свет));
 
-    // Focus Aura (голубое свечение) УБРАНА — её принимали за "голубую тень".
-    // Глубину теперь даёт нейтральная мягкая build_shadow_elements выше.
+        // Focus Aura (голубое свечение) УБРАНА — её принимали за "голубую тень".
+        // Глубину теперь даёт нейтральная мягкая build_shadow_elements выше.
 
-    // ── Фон рабочих столов в обзоре (только при тапе Super), позади окон ────
-    elements.extend(build_overview_bg_elements(state));
+        // ── Фон рабочих столов в обзоре (только при тапе Super), позади окон ────
+        elements.extend(build_overview_bg_elements(state));
+    }
 
     // Граница групп: bottom-слой, тени и фоны обзора — декор.
     let счёт_декор = elements.len() - счёт_интерфейс - счёт_окна;
+
+    // ── Свет на холсте ─────────────────────────────────────────────────────
+    //
+    // Здесь, а не ниже с обоями: список идёт ОТ ПЕРЕДНЕГО ПЛАНА К ЗАДНЕМУ, и
+    // заливке место сразу за окнами и декором, но перед обоями — она светит
+    // ПОВЕРХ картинки и ПОД окнами, как свет в комнате.
+    if let Some(и) = свет {
+        elements.extend(build_light_element(state, renderer, output, и));
+    }
 
     // ── Background-слой (wlr-layer-shell) и за ним параллакс ───────────────────
     //

@@ -32,14 +32,14 @@ in the header of `build_portable.sh`. Lua is compiled from source by `mlua`.
 
 ```sh
 ./build.sh                       # both binaries, into /mnt/plx-build/target
-cargo build --release -p plx-minimal
+cargo build --release -p plx-standard
 cargo build --release -p plx-extra
 ```
 
 Never `cargo build --workspace`. Cargo unifies features across workspace
 members, so a single invocation gives you two binaries that both contain
 everything — measured, not feared: after one `--workspace` run both binaries
-were 17.8 MiB byte for byte, and the "minimal" one had OpenXR inside it.
+were 17.8 MiB byte for byte, and the "standard" one had OpenXR inside it.
 `build.sh` calls cargo twice, with separate `--target-dir`s, for this reason.
 
 `.cargo/config.toml` in this repository links with `mold` and compiles with

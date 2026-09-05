@@ -475,6 +475,34 @@ impl Parallax {
     /// `floating` — окно не участвует в тайлинге (X11-диалоги с фиксированным
     /// размером; у Wayland-окон всегда false).
     pub fn insert_new_window(&mut self, window: Window, size: Size<i32, Logical>, floating: bool) {
+        // Мышиный аккорд «обвести рамку и запустить в ней» (hevel 1 → 3, см.
+        // аккорды.rs) кладёт сюда прямоугольник, и первое же появившееся окно
+        // его забирает. Место именно здесь: это общий путь и для Wayland, и для
+        // X11, а рамку рисовали до того, как клиент вообще запустился, — знать
+        // заранее, каким протоколом он придёт, неоткуда.
+        //
+        // Срок годности нужен: команда может не запуститься вовсе (опечатка в
+        // `cmd`), и рамка иначе досталась бы случайному окну, открывшемуся
+        // через полчаса.
+        let рамка = match self.аккорд_запуск_в_рамке {
+            Some((_, _, когда)) if когда.elapsed() > std::time::Duration::from_secs(10) => {
+                self.аккорд_запуск_в_рамке = None;
+                None
+            }
+            Some((угол, размер, _)) => {
+                self.аккорд_запуск_в_рамке = None;
+                Some((угол, размер))
+            }
+            None => None,
+        };
+        let floating = floating || рамка.is_some();
+        let size = match рамка {
+            Some((_, (w, h))) => {
+                Size::<i32, Logical>::from((w.round().max(1.0) as i32, h.round().max(1.0) as i32))
+            }
+            None => size,
+        };
+
         let output_size: Size<i32, Logical> = self
             .space
             .outputs()
@@ -490,11 +518,16 @@ impl Parallax {
         let zoom = self.viewport.zoom;
         let camera_center_x = self.viewport.cam_x + output_size.w as f64 / (2.0 * zoom);
         let camera_center_y = self.viewport.cam_y + output_size.h as f64 / (2.0 * zoom);
-        let spawn: Point<i32, Logical> = (
-            camera_center_x as i32 - size.w / 2,
-            camera_center_y as i32 - size.h / 2,
-        )
-            .into();
+        // Обведённая рамка задаёт угол ТОЧНО: человек показал, где окно, и
+        // центрировать его по камере после этого — значит не выполнить просьбу.
+        let spawn: Point<i32, Logical> = match рамка {
+            Some((угол, _)) => (угол.x.round() as i32, угол.y.round() as i32).into(),
+            None => (
+                camera_center_x as i32 - size.w / 2,
+                camera_center_y as i32 - size.h / 2,
+            )
+                .into(),
+        };
 
         // Порядок в tagged_windows задаёт только обход Super+Tab (focus_stack):
         // геометрию в Tile определяет BSP-дерево (dwindle.rs), а не позиция в
@@ -536,6 +569,13 @@ impl Parallax {
         );
 
         self.space.map_element(window.clone(), spawn, false);
+        if рамка.is_some() {
+            // Размер шлём явно: `new_toplevel` успел отправить configure с
+            // предсказанным размером (predict_new_window_size), и без второго
+            // клиент нарисовался бы в него, а не в обведённую рамку.
+            set_size(&window, Some(size), Tiled::Unset);
+            configure(&window);
+        }
         // Columns (niri): новое окно — отдельная колонка сразу справа от
         // активной, камера едет к нему (см. columns.rs). Делаем ДО arrange(),
         // чтобы reconcile не дописал его в конец.

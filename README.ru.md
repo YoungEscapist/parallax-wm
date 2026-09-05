@@ -5,7 +5,7 @@
 # Parallax
 
 <p align="center">
-  <a href="https://github.com/mifaroslav-dotcom/parallax/actions/workflows/ci.yml"><img src="https://github.com/mifaroslav-dotcom/parallax/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/YoungEscapist/parallax-wm/actions/workflows/ci.yml"><img src="https://github.com/YoungEscapist/parallax-wm/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="Лицензия: GPL-3.0-or-later"></a>
   <img src="https://img.shields.io/badge/wayland-smithay-informational" alt="Wayland, на smithay">
   <img src="https://img.shields.io/badge/status-pre--release-orange" alt="Состояние: до релиза">
@@ -37,10 +37,7 @@ TTY/DRM и winit (для разработки).
   панорамированием, зумом и инерцией.
 - Лупа (`Super+Space`): отъехать и осмотреться, стрелки панорамируют холст.
 - Миникарта (`Super+~`) с живыми миниатюрами окон, своим паном и зумом,
-  перелёт по клику. Миниатюры умеют стоять в перспективе: каждая развёрнута к
-  центру, дальний край уходит вглубь и темнеет — обзор читается вогнутой
-  стеной окон, а не плоской картой (`set{ overview_3d = 1.0 }`). Это честное
-  проективное преобразование во фрагментном шейдере, а не подмена масштабом.
+  перелёт по клику.
 - Закладки камеры: поставить в любой точке (`Alt+B`), прыгнуть
   (`Super+Alt+1..9`), либо вообще перейти на закладки вместо столов
   (`Super+B`).
@@ -102,7 +99,7 @@ Arch, Debian/Ubuntu и Fedora их поставит скрипт:
 ```sh
 ./dist/install-deps.sh --print   # показать команду, ничего не делая
 sudo ./dist/install-deps.sh      # поставить
-./build_portable.sh              # release, бинари в target/release/{plx-minimal,plx-extra}
+./build_portable.sh              # release, бинари в target/release/{plx-standard,plx-extra}
 ```
 
 Первая сборка тянет smithay с гита (ревизия закреплена в `Cargo.toml`) и много
@@ -118,7 +115,7 @@ Parallax — это два бинаря из одного крейта с раз
 дерева исходников нет: то, что фича выключает, подменяется заглушкой той же
 формы (`src/*_stub/`), поэтому вызывающий код в обеих сборках одинаков.
 
-| | `plx-minimal` | `plx-extra` |
+| | `plx-standard` | `plx-extra` |
 |---|---|---|
 | композитор, тайлинг, лента, обзор, обои | да | да |
 | панель, трей, блютуз, вайфай, звук, портал, снимок, X11, жесты | да | да |
@@ -126,14 +123,14 @@ Parallax — это два бинаря из одного крейта с раз
 | окна внутри Minecraft (`mine`) | — | да |
 | мультиюзер, показ стола гостям (`share`) | — | да |
 
-`plx-minimal` легче примерно на 0.9 МиБ и не линкует OpenXR. Команды
+`plx-standard` легче примерно на 0.9 МиБ и не линкует OpenXR. Команды
 выключённых частей отвечают внятно: `vr status` говорит, что фича не собрана,
 а не падает непонятным образом.
 
 Собрать одну отдельно — обычным вызовом cargo:
 
 ```sh
-cargo build --release -p plx-minimal
+cargo build --release -p plx-standard
 ```
 
 Собирать обе одной командой `--workspace` **нельзя**: cargo объединяет фичи
