@@ -147,6 +147,7 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
         }
         "windows" => окна(state),
         "mouse" => мышь(хвост, state),
+        "touch" => сенсор(хвост, state),
         "key" => клавиша(хвост, state),
         "pointer" => указатель(state),
         "cube" => куб(state),
@@ -158,6 +159,8 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
             "shot <путь> | action <имя> [k=v ...] | windows | pointer | cube | \
              mouse to X Y | mouse move DX DY | mouse down|up|click [левая|правая|средняя] | \
              mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
+             touch down|move <слот> X Y | touch up <слот> | touch tap X Y | \
+             touch cancel | touch status | \
              key [logo+shift+]<имя> | key down|up <имя> | \
              share [start [порт] | stop | status] | \
              portal [pick [типы] | cancel] | \
@@ -167,6 +170,8 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
             "shot <path> | action <name> [k=v ...] | windows | pointer | cube | \
              mouse to X Y | mouse move DX DY | mouse down|up|click [left|right|middle] | \
              mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
+             touch down|move <slot> X Y | touch up <slot> | touch tap X Y | \
+             touch cancel | touch status | \
              key [logo+shift+]<name> | key down|up <name> | \
              share [start [port] | stop | status] | \
              portal [pick [types] | cancel] | \
@@ -419,6 +424,64 @@ fn мышь(хвост: &str, state: &mut Parallax) -> String {
             "ok".into()
         }
         _ => т!("ошибка: mouse to|move|down|up|click|drag|scroll", "error: mouse to|move|down|up|click|drag|scroll").into(),
+    }
+}
+
+/// Сенсорный экран из сокета: `touch down 0 X Y`, `touch move 0 X Y`,
+/// `touch up 0`, `touch tap X Y`, `touch cancel`, `touch status`.
+///
+/// Координаты — ЭКРАННЫЕ пиксели, а не холст (в отличие от `mouse to`): палец
+/// лежит на стекле, и харнесс обязан задавать его там же, где его задаёт
+/// драйвер. Другого способа проверить сенсор нет вовсе — синтетический бэкенд
+/// харнесса объявляет типы касаний `UnusedEvent` (см. synth.rs), то есть
+/// событие тачскрина в нём невыразимо в принципе.
+fn сенсор(хвост: &str, state: &mut Parallax) -> String {
+    let слова: Vec<&str> = хвост.split_whitespace().collect();
+    let число = |i: usize| слова.get(i).and_then(|s| s.parse::<f64>().ok());
+    let слот = |i: usize| слова.get(i).and_then(|s| s.parse::<i32>().ok());
+    let время = || std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u32)
+        .unwrap_or(0);
+
+    match слова.first().copied() {
+        Some("down") | Some("вниз") => {
+            let (Some(с), Some(x), Some(y)) = (слот(1), число(2), число(3)) else {
+                return т!("ошибка: touch down <слот> X Y", "error: touch down <slot> X Y").into();
+            };
+            state.сенсор_вниз(с, (x, y).into(), время());
+            state.сенсор_состояние()
+        }
+        Some("move") | Some("движение") => {
+            let (Some(с), Some(x), Some(y)) = (слот(1), число(2), число(3)) else {
+                return т!("ошибка: touch move <слот> X Y", "error: touch move <slot> X Y").into();
+            };
+            state.сенсор_движение(с, (x, y).into(), время());
+            state.сенсор_состояние()
+        }
+        Some("up") | Some("вверх") => {
+            let Some(с) = слот(1) else {
+                return т!("ошибка: touch up <слот>", "error: touch up <slot>").into();
+            };
+            state.сенсор_вверх(с, время());
+            state.сенсор_состояние()
+        }
+        Some("tap") | Some("тык") => {
+            let (Some(x), Some(y)) = (число(1), число(2)) else {
+                return т!("ошибка: touch tap X Y", "error: touch tap X Y").into();
+            };
+            state.сенсор_вниз(0, (x, y).into(), время());
+            state.сенсор_вверх(0, время());
+            state.сенсор_состояние()
+        }
+        Some("cancel") | Some("отмена") => {
+            state.сенсор_отмена();
+            state.сенсор_состояние()
+        }
+        Some("status") | Some("") | None => state.сенсор_состояние(),
+        Some(иное) => тф!(
+            "ошибка: не знаю 'touch {}'", "error: unknown 'touch {}'", иное
+        ),
     }
 }
 

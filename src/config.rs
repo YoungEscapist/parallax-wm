@@ -449,6 +449,33 @@ pub struct Config {
     /// ход руки, и общая цифра означала бы, что подгонка под одно устройство
     /// каждый раз портит второе.
     pub mouse_chord_resize_gain: f64,
+    /// СЕНСОРНЫЙ ЭКРАН: `set{ touch = true }` (см. сенсор.rs). Выключенный
+    /// сенсор не объявляется местом вовсе — клиент, увидевший `wl_touch`, ждёт
+    /// касаний вместо эмуляции мыши, и молчащая возможность оставила бы его
+    /// без ввода.
+    pub touch: bool,
+    /// `set{ touch_pan = true }` — палец по ПУСТОМУ холсту ведёт камеру.
+    /// Выключено — по пустому месту палец работает мышью (рамка выделения).
+    pub touch_pan: bool,
+    /// `set{ touch_zoom = true }` — щипок двумя пальцами зумит холст.
+    pub touch_zoom: bool,
+    /// `set{ touch_gestures = true }` — три пальца и больше идут в ту же
+    /// таблицу `gesture{}`, что и жесты тачпада. Пустая таблица = ничего не
+    /// происходит, как и у тачпада.
+    pub touch_gestures: bool,
+    /// `set{ touch_long_press = 500 }` — сколько палец должен пролежать
+    /// неподвижно, чтобы стать ПРАВОЙ кнопкой (контекстное меню). 0 —
+    /// выключено.
+    pub touch_long_press: u32,
+    /// `set{ touch_tap_slop = 12 }` — сколько пикселей экрана касание может
+    /// проехать и всё ещё считаться тычком, а не протяжкой. Тем же порогом
+    /// меряется неподвижность для долгого нажатия.
+    pub touch_tap_slop: f64,
+    /// `set{ touch_emulate_pointer = false }` — отдавать пальцы НЕ клиентам, а
+    /// эмуляции мыши. Для приложений, которые `wl_touch` не поддерживают
+    /// (старые игры под Xwayland, java-клиенты): без этого они на палец не
+    /// отзываются вовсе.
+    pub touch_emulate_pointer: bool,
     /// Автодовод курсора по краям НАКЛАДКИ тачпада:
     /// `set{ touchpad_edge_motion = true, touchpad_edge_zone = 0.08,
     ///       touchpad_edge_speed = 900.0 }`. См. touchpad.rs.
@@ -594,6 +621,13 @@ impl Default for Config {
             mouse_chords: Vec::new(),
             mouse_chord_timeout: 250,
             mouse_chord_resize_gain: 4.0,
+            touch: true,
+            touch_pan: true,
+            touch_zoom: true,
+            touch_gestures: true,
+            touch_long_press: 500,
+            touch_tap_slop: 12.0,
+            touch_emulate_pointer: false,
             автодовод: crate::touchpad::Автодовод::default(),
             // Выключено по умолчанию: эффект вкусовой, а включается одной
             // строкой в config.lua.
@@ -924,6 +958,13 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         Rc::new(RefCell::new(Vec::new()));
     let mouse_chord_timeout: Rc<RefCell<u32>> = Rc::new(RefCell::new(250));
     let mouse_chord_resize_gain: Rc<RefCell<f64>> = Rc::new(RefCell::new(4.0));
+    let touch: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let touch_pan: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let touch_zoom: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let touch_gestures: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let touch_long_press: Rc<RefCell<u32>> = Rc::new(RefCell::new(500));
+    let touch_tap_slop: Rc<RefCell<f64>> = Rc::new(RefCell::new(12.0));
+    let touch_emulate_pointer: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let gesture_thresholds: Rc<RefCell<crate::gestures::Пороги>> =
         Rc::new(RefCell::new(crate::gestures::Пороги::default()));
     let автодовод: Rc<RefCell<crate::touchpad::Автодовод>> =
@@ -1180,6 +1221,13 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let gesture_thresholds = gesture_thresholds.clone();
         let mouse_chord_timeout = mouse_chord_timeout.clone();
         let mouse_chord_resize_gain = mouse_chord_resize_gain.clone();
+        let touch = touch.clone();
+        let touch_pan = touch_pan.clone();
+        let touch_zoom = touch_zoom.clone();
+        let touch_gestures = touch_gestures.clone();
+        let touch_long_press = touch_long_press.clone();
+        let touch_tap_slop = touch_tap_slop.clone();
+        let touch_emulate_pointer = touch_emulate_pointer.clone();
         let автодовод = автодовод.clone();
         let blur = blur.clone();
         let glow = glow.clone();
@@ -1319,6 +1367,39 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             if let Ok(Some(v)) = tbl.get::<Option<f64>>("mouse_chord_resize_gain") {
                 if v.is_finite() && v > 0.0 {
                     *mouse_chord_resize_gain.borrow_mut() = v.clamp(0.1, 50.0);
+                }
+            }
+            // Сенсорный экран. Булевы ключи — только через Option<bool>: см.
+            // грабли с `blur` выше, из-за них каждый set{} гасил чужие
+            // настройки.
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touch") {
+                *touch.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touch_pan") {
+                *touch_pan.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touch_zoom") {
+                *touch_zoom.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touch_gestures") {
+                *touch_gestures.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touch_emulate_pointer") {
+                *touch_emulate_pointer.borrow_mut() = v;
+            }
+            // Долгое нажатие. Потолок в три секунды — не вкус: столько человек
+            // держит палец, не понимая, случилось ли что-нибудь, а нижняя
+            // граница в 120 мс не даёт превратить в правую кнопку обычный тап.
+            // Ноль проходит мимо clamp нарочно: это «выключено».
+            if let Ok(Some(v)) = tbl.get::<Option<u32>>("touch_long_press") {
+                *touch_long_press.borrow_mut() = if v == 0 { 0 } else { v.clamp(120, 3000) };
+            }
+            // Порог тычка. Ноль запрещён: палец на стекле не стоит ровно
+            // никогда, и с нулевым порогом тапом не считалось бы ни одно
+            // касание — а долгое нажатие не срабатывало бы вовсе.
+            if let Ok(Some(v)) = tbl.get::<Option<f64>>("touch_tap_slop") {
+                if v.is_finite() && v > 0.0 {
+                    *touch_tap_slop.borrow_mut() = v.clamp(1.0, 200.0);
                 }
             }
             // Пороги жестов — те же имена, что в driftwm, чтобы настройки
@@ -1623,6 +1704,23 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         }
     }
 
+    // Строка про сенсор — по той же причине, по которой она есть у аккордов:
+    // «сенсор выключён» и «сенсор не разобрался» иначе неотличимы, а на
+    // ноутбуке без мыши разница между ними — это разница между «работает» и
+    // «не работает».
+    if *touch.borrow() {
+        tracing::info!(
+            "plx/config: touchscreen: on (pan={}, pinch zoom={}, gestures={}, long press={} ms{})",
+            *touch_pan.borrow(),
+            *touch_zoom.borrow(),
+            *touch_gestures.borrow(),
+            *touch_long_press.borrow(),
+            if *touch_emulate_pointer.borrow() { ", pointer emulation" } else { "" },
+        );
+    } else {
+        tracing::info!("plx/config: touchscreen: off (wl_touch is not advertised)");
+    }
+
     let result = Config {
         bindings: bindings.borrow().clone(),
         gestures: gestures.borrow().clone(),
@@ -1630,6 +1728,13 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         mouse_chords: mouse_chords.borrow().clone(),
         mouse_chord_timeout: *mouse_chord_timeout.borrow(),
         mouse_chord_resize_gain: *mouse_chord_resize_gain.borrow(),
+        touch: *touch.borrow(),
+        touch_pan: *touch_pan.borrow(),
+        touch_zoom: *touch_zoom.borrow(),
+        touch_gestures: *touch_gestures.borrow(),
+        touch_long_press: *touch_long_press.borrow(),
+        touch_tap_slop: *touch_tap_slop.borrow(),
+        touch_emulate_pointer: *touch_emulate_pointer.borrow(),
         автодовод: *автодовод.borrow(),
         xkb: xkb_settings.borrow().clone(),
         bird_eye_key: *bird_eye_key.borrow(),

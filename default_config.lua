@@ -885,3 +885,46 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 -- touchpad keeps its own gain). The drag is divided by the zoom first, so it
 -- feels the same however far the camera is pulled back.
 -- set{ mouse_chord_resize_gain = 4.0 }
+
+-- ── ТАЧСКРИН ────────────────────────────────────────────────────────────────
+--
+-- A laptop touchscreen. On by default: without it the finger does nothing at
+-- all — parallax used to not even advertise wl_touch.
+--
+-- Where the finger lands decides who owns it:
+--
+--   * ON A WINDOW — the touch goes to the CLIENT, as real wl_touch with slots
+--     and multitouch: the browser gets its own kinetic scrolling, the reader
+--     its page pinch. A tap also focuses the window, exactly like a click.
+--   * ON THE COMPOSITOR (bar, shelf, window map, preview card, overview, cube,
+--     screencast picker) — the finger works as the pointer: the cursor is
+--     moved under it and the ordinary click path takes over.
+--   * ON EMPTY CANVAS — the finger drives the CAMERA. One finger pans (with
+--     the same inertia a touchpad swipe has), two pinch-zoom, three or more go
+--     into the gesture{} table above, shared with the touchpad. A tap with no
+--     drag just drops the focus, like a click on empty space.
+--
+-- The cursor follows the finger in every one of those cases: half of parallax
+-- reads "where the human is" from the pointer position.
+--
+-- Pinching over a WINDOW zooms the client, not the canvas — the window's
+-- content is its own business. To zoom the canvas from anywhere, pinch with
+-- three fingers (see the gesture{} table). In the Tile and Columns layouts
+-- fingers do not move the camera at all: there the view belongs to the layout,
+-- and that is the same rule the touchpad follows.
+--
+-- set{ touch = true }
+-- set{ touch_pan = true }       -- one finger on empty canvas pans the camera
+-- set{ touch_zoom = true }      -- two fingers pinch-zoom the canvas
+-- set{ touch_gestures = true }  -- three fingers and up → the gesture{} table
+--
+-- A finger held still for this long becomes the RIGHT button (context menus —
+-- a finger has no second button). 0 turns it off.
+-- set{ touch_long_press = 500 }
+-- How far a touch may travel and still count as a tap, screen pixels. The same
+-- threshold decides "held still" for the long press above.
+-- set{ touch_tap_slop = 12 }
+-- Hand touches to POINTER EMULATION instead of the clients. For applications
+-- that do not support wl_touch at all (old games under Xwayland, java
+-- clients): without this they do not react to a finger in any way.
+-- set{ touch_emulate_pointer = false }

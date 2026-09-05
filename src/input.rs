@@ -4,6 +4,7 @@ use smithay::{
         GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent,
         GestureSwipeUpdateEvent, InputBackend, InputEvent,
         KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+        TouchEvent,
     },
     input::{
         keyboard::{FilterResult, keysyms},
@@ -279,40 +280,33 @@ impl Parallax {
         true
     }
 
+    /// Отдать задержанное аккордами нажатие — ЧЕРЕЗ ВСЮ ЦЕПОЧКУ `PointerButton`.
+    ///
+    /// Раньше здесь лежала СВОЯ УРЕЗАННАЯ КОПИЯ этой цепочки: фокус окна и
+    /// начало рамки выделения, и всё. Копия отставала от оригинала ровно на
+    /// то, чего в ней не было, а не было в ней панели, полки состояния, карты
+    /// окон, карточки предпросмотра, обзора, куба и меню — то есть при
+    /// НАСТРОЕННОМ АККОРДЕ С ЛЕВОЙ КНОПКИ переставали нажиматься все органы
+    /// компоновщика разом. Замер на харнессе 05.09.2026: с `1-3` в конфиге
+    /// клик по ячейке стола на панели не делал ничего, `view_tag` в логе не
+    /// появлялся ни разу.
+    ///
+    /// Теперь событие возвращается в ту же цепочку синтетическим нажатием, а
+    /// от повторной задержки его хранит флаг `аккорд_мимо`: без него отданное
+    /// нажатие снова попало бы в `аккорд_кнопка`.
     pub(crate) fn аккорд_отдать_клиенту(&mut self, код: u32, нажата: bool, время: u32) {
-        // ФОКУС ПЕРЕД КНОПКОЙ. Задержанное нажатие приходит сюда в обход всей
-        // цепочки `PointerButton`, а в ней клик по окну не только пересылается
-        // клиенту, но и переводит на окно фокус (см. «Клик → focus» ниже по
-        // файлу). Без этой пары строк клик кнопкой, с которой начинается
-        // аккорд, доходил бы до приложения, но не поднимал и не фокусировал
-        // окно, — а выглядело бы это как «по этому окну надо кликать дважды».
-        //
-        // Только фокус: остальное в той цепочке — ветки под зажатые Super/Alt,
-        // а модификатор с аккордом не сочетается (аккорд сам себе модификатор).
-        if нажата {
-            if let Some((window, _)) = self.space.element_under(self.pointer_location) {
-                let window = window.clone();
-                crate::xwin::focus(self, &window);
-            } else if код == BTN_LEFT
-                && !self.overview_active
-                && !self.курсор_над_слоем(self.pointer_location)
-            {
-                // Под курсором пусто — значит это начало рамки выделения, а не
-                // клик по приложению. Отдавать такое нажатие клиенту некому
-                // (клиента там нет), и без этой ветки задержанная аккордами
-                // ЛКМ теряла выделение целиком.
-                let pos = self.pointer_location;
-                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                if self.начать_выделение(pos, serial) {
-                    return;
-                }
-            }
-        }
-        let Some(pointer) = self.seat.get_pointer() else { return };
-        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        let state = if нажата { ButtonState::Pressed } else { ButtonState::Released };
-        pointer.button(self, &ButtonEvent { button: код, state, serial, time: время });
-        pointer.frame(self);
+        // Время исходного нажатия здесь теряется: синтетическое событие берёт
+        // текущее. Для клиента это безвредно (метки монотонны, и позже они
+        // быть обязаны), а разъехаться с настоящим ходом событий не даёт то,
+        // что нажатие уходит сразу, а не откладывается ещё раз.
+        let _ = время;
+        self.аккорд_мимо = true;
+        self.process_input_event(smithay::backend::input::InputEvent::PointerButton::<
+            crate::synth::Синтетика,
+        > {
+            event: crate::synth::Кнопка::new(код, нажата),
+        });
+        self.аккорд_мимо = false;
     }
 
     /// Забирает ли окно в фокусе себе всю клавиатуру
@@ -2085,6 +2079,29 @@ impl Parallax {
             InputEvent::GestureHoldEnd { event, .. } => {
                 self.жест_конец(event.cancelled());
             }
+
+            // ── Сенсорный экран ──────────────────────────────────────────────
+            // Всё содержимое — в `сенсор.rs`; здесь только перевод координат.
+            // Позиция касания приходит В ДОЛЯХ ЭКРАНА, как у планшета, и
+            // разворачивается ровно тем же `position_transformed` по размеру
+            // ЭКРАНА, что и `PointerMotionAbsolute` выше: размер выхода брать
+            // нельзя, он сам уже поделён на зум, и поправка вышла бы двойной.
+            InputEvent::TouchDown { event, .. } => {
+                let экран = event.position_transformed(self.screen_size());
+                let слот: i32 = event.slot().into();
+                self.сенсор_вниз(слот, экран, event.time_msec());
+            }
+            InputEvent::TouchMotion { event, .. } => {
+                let экран = event.position_transformed(self.screen_size());
+                let слот: i32 = event.slot().into();
+                self.сенсор_движение(слот, экран, event.time_msec());
+            }
+            InputEvent::TouchUp { event, .. } => {
+                let слот: i32 = event.slot().into();
+                self.сенсор_вверх(слот, event.time_msec());
+            }
+            InputEvent::TouchCancel { .. } => self.сенсор_отмена(),
+            InputEvent::TouchFrame { .. } => self.сенсор_кадр(),
 
             _ => {}
         }

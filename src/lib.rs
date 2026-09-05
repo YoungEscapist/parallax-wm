@@ -102,6 +102,9 @@ mod vr;
 mod audio;
 mod tiling;
 mod touchpad;
+/// Сенсорный экран ноутбука: касание клиенту, органам компоновщика и камере.
+#[path = "сенсор.rs"]
+mod сенсор;
 mod tray;
 mod wifi;
 mod winit;

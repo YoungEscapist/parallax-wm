@@ -658,6 +658,19 @@ impl crate::state::Parallax {
         }
     }
 
+    /// Лежит ли точка НА ПАНЕЛИ — без единого побочного действия.
+    ///
+    /// Нужно сенсорному экрану: палец, попавший в панель, обязан пойти
+    /// указателем (там его разберёт `bar_click`), а не увести камеру, как
+    /// палец по пустому холсту. Спросить это `bar_click`-ом нельзя — он
+    /// переключает столы и жмёт значки трея.
+    pub fn bar_inside(&self, pos: smithay::utils::Point<f64, smithay::utils::Physical>) -> bool {
+        if self.fullscreen_here() {
+            return false;
+        }
+        layout(&self.bar_data()).inside(pos.x, pos.y)
+    }
+
     /// Клик по панели. `true` — клик съеден: под панелью окно, и промах по краю
     /// таблетки не должен уходить ему.
     pub fn bar_click(&mut self, pos: smithay::utils::Point<f64, smithay::utils::Physical>, right: bool, middle: bool) -> bool {

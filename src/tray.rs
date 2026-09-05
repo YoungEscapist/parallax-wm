@@ -388,6 +388,20 @@ impl crate::state::Parallax {
         }
     }
 
+    /// Лежит ли точка на полке — тихий хит-тест для сенсорного экрана
+    /// (см. `bar_inside` рядом: пальцу нужно знать хозяина точки ДО того, как
+    /// он что-нибудь нажмёт, а `tray_click` мимо полки её закрывает).
+    pub fn tray_inside(&self, pos: smithay::utils::Point<f64, smithay::utils::Physical>) -> bool {
+        let Some(tray) = self.tray.as_ref() else { return false };
+        layout(
+            tray.open, tray.snap.battery.is_some(), self.screen_size().w, self.bar_hide,
+            self.shelf_anim,
+        )
+        .cells
+        .iter()
+        .any(|c| c.rect.hit(pos.x, pos.y))
+    }
+
     /// Клик мышью в экранных пикселях. `right` — правая кнопка.
     /// `true` — клик съеден полкой.
     pub fn tray_click(

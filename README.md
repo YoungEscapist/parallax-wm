@@ -136,6 +136,11 @@ dragging — the wheel pulls it closer, a click on a face flies to that workspac
   (`mouse{}` in `default_config.lua`). The second half can be the wheel instead
   of a button — `"1-scroll"` zooms the canvas while the left button is down, and
   that pair holds nothing back.
+- **A laptop touchscreen is a first-class input.** On a window the touch goes
+  to the client as real `wl_touch`; on the bar, the window map or the overview
+  the finger works as the pointer; on empty canvas it drives the camera — one
+  finger pans, two pinch-zoom, three or more run the same `gesture{}` table the
+  touchpad uses. A finger held still is the right button.
 - Configuration is Lua, reloaded live with `Super+Shift+C`.
 
 ## Building
