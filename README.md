@@ -36,22 +36,29 @@ in-tree docs; this file and the config reference are in English too.
 > code before you trust a working session to it, and run it from a TTY you can
 > escape from.
 
+<p align="center">
+  <img src="assets/shots/canvas.webp" alt="The camera pulling back from a tiled desktop until the windows are a cluster on an endless plane" width="100%">
+</p>
+<p align="center">
+  <sub><b>The canvas.</b> The same three windows and one camera pulling away from them. The
+  workspace is a place on a plane without edges, not a screen to divide; the wallpaper rides
+  the canvas, and the light stands on it.</sub>
+</p>
+
 <table>
 <tr>
 <td width="50%"><img src="assets/shots/desktop.jpg" alt="Tiling: three terminals, the bar on top"><br>
 <sub><b>Tiling.</b> The dwindle split, the bar with the workspace strip, the tray and the
 clock — and the focused window rim-lit in the wallpaper's own colour.</sub></td>
-<td width="50%"><img src="assets/shots/canvas.jpg" alt="The same windows floating on the canvas, camera pulled back"><br>
-<sub><b>The canvas.</b> The same windows, floating, with the camera pulled back: a plane
-without edges, a light standing on it, and the wallpaper riding along.</sub></td>
-</tr>
-<tr>
 <td width="50%"><img src="assets/shots/overview.jpg" alt="Overview: three workspaces in a grid"><br>
 <sub><b>Overview.</b> The workspaces exactly as they are, in a grid around the current
 one; a click on one flies you there.</sub></td>
-<td width="50%"><img src="assets/shots/cube.jpg" alt="The desktop cube: workspaces on the faces of a prism"><br>
+</tr>
+<tr>
+<td colspan="2"><img src="assets/shots/cube.webp" alt="The desktop cube turning: workspaces on the faces of a prism"><br>
 <sub><b>The desktop cube.</b> The same workspaces on the faces of a prism you spin by
-dragging (<code>plx-extra</code>).</sub></td>
+dragging — the wheel pulls it closer, a click on a face flies to that workspace
+(<code>plx-extra</code>, off by default).</sub></td>
 </tr>
 </table>
 
