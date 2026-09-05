@@ -2,13 +2,22 @@
 # parallax-session — точка входа для менеджера входа (ly, greetd, SDDM;
 # см. соседний parallax.desktop).
 #
-# Сам компоновщик поднимает `launch_native.sh` из каталога с исходниками: там
-# сессионная шина D-Bus, PipeWire, обои и сторожевой таймер старта. Здесь
-# только то, что обязано быть готово ДО него, и поиск этого каталога.
+# Два способа запуска, и обёртка сама выбирает между ними:
 #
-# Путь к дереву подставляет install-session.sh при установке — держать его
-# зашитым в .desktop нельзя: Exec= у менеджера входа не проходит через шелл,
-# и ни `$HOME`, ни `~` в нём не раскроются.
+#   1. ИЗ ДЕРЕВА ИСХОДНИКОВ. Путь к нему подставляет install-session.sh при
+#      установке (@CHECKOUT@); дальше работу ведёт launch_native.sh — там
+#      сессионная шина, PipeWire, обои и пересборка при свежих исходниках.
+#      Держать этот путь зашитым в .desktop нельзя: Exec= у менеджера входа
+#      не проходит через шелл, и ни `$HOME`, ни `~` в нём не раскроются.
+#
+#   2. ИЗ ПАКЕТА ДИСТРИБУТИВА. Тогда никакого дерева нет: есть только
+#      /usr/bin/plx-standard (или plx-extra) и этот файл, поставленные из
+#      пакета. launch_native.sh в пакет не идёт — он скрипт разработчика:
+#      зовёт cargo, пишет логи в каталог исходников и знает про машину
+#      автора. Всё, что нужно сессии на самом деле, делается ниже.
+#
+# Порядок проверок — сначала дерево, потом PATH: у того, кто поставил Parallax
+# из исходников, установленного пакета обычно и нет, а обновляет он дерево.
 : "${PLX_CHECKOUT:=@CHECKOUT@}"
 
 # XDG_RUNTIME_DIR. На системах без elogind/systemd-logind каталог /run/user/UID
@@ -23,14 +32,68 @@ if [ -z "$XDG_RUNTIME_DIR" ] || [ ! -d "$XDG_RUNTIME_DIR" ]; then
     chmod 700 "$XDG_RUNTIME_DIR"
 fi
 
+# ── 1. Дерево исходников ──────────────────────────────────────────────────
 LAUNCH="$PLX_CHECKOUT/launch_native.sh"
-if [ ! -x "$LAUNCH" ]; then
+if [ -x "$LAUNCH" ]; then
+    exec "$LAUNCH"
+fi
+
+# ── 2. Установленный бинарь ───────────────────────────────────────────────
+# Полная сборка вперёд минимальной: если человек поставил plx-extra, он хотел
+# именно её. PLX_BINARY перебивает поиск — им пользуются пакеты, кладущие
+# бинарь мимо PATH (например, Nix: путь подставляется при сборке).
+if [ -z "$PLX_BINARY" ]; then
+    for cand in plx-extra plx-standard; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            PLX_BINARY=$(command -v "$cand")
+            break
+        fi
+    done
+fi
+
+if [ -z "$PLX_BINARY" ] || [ ! -x "$PLX_BINARY" ]; then
     # Сообщение уходит в лог менеджера входа: экрана в этот момент ещё нет,
     # и человек увидит только «сессия завершилась сразу» — без этой строки
     # искать причину ему негде.
-    echo "parallax-session: $LAUNCH не найден или не исполняемый" >&2
-    echo "parallax-session: задайте PLX_CHECKOUT или переустановите" >&2
+    echo "parallax-session: не нашёл ни дерева исходников, ни установленного бинаря" >&2
+    echo "parallax-session: пробовал $LAUNCH, затем plx-extra и plx-standard в PATH" >&2
+    echo "parallax-session: задайте PLX_CHECKOUT или PLX_BINARY" >&2
     exit 1
 fi
 
-exec "$LAUNCH"
+# Имя рабочего стола — СТРОЧНЫМИ и ровно то же, что в DesktopNames= соседнего
+# .desktop: по нему xdg-desktop-portal ищет `parallax-portals.conf` и сверяет
+# `UseIn=`, сравнение точное. Менеджеры входа, читающие DesktopNames, выставят
+# переменную сами — тогда своё значение не навязываем.
+: "${XDG_CURRENT_DESKTOP:=parallax}"
+export XDG_CURRENT_DESKTOP
+export XDG_SESSION_TYPE=wayland
+
+# Сессионная шина. Без неё нет ни портала (демонстрация экрана), ни звука
+# уведомлений, ни трея. Если менеджер входа шину уже поднял (pam_systemd,
+# pam_elogind, dbus-user-session) — берём её, иначе поднимаем свою и
+# перезапускаем себя внутри.
+if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && [ -z "$PLX_NO_DBUS" ]; then
+    if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+        export DBUS_SESSION_BUS_ADDRESS
+    elif command -v dbus-run-session >/dev/null 2>&1; then
+        PLX_BINARY="$PLX_BINARY"
+        export PLX_BINARY
+        exec dbus-run-session -- "$0" "$@"
+    else
+        echo "parallax-session: dbus-run-session не найден — портал," >&2
+        echo "parallax-session: уведомления и трей работать не будут" >&2
+    fi
+fi
+
+# Активационное окружение шины: службы, поднятые ПО ТРЕБОВАНИЮ (портал —
+# первая из них), наследуют окружение не от нас, а от dbus-daemon. Без этой
+# строки портал видит пустой XDG_CURRENT_DESKTOP и не находит свой .conf.
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment \
+        XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_RUNTIME_DIR WAYLAND_DISPLAY \
+        >/dev/null 2>&1 || true
+fi
+
+exec "$PLX_BINARY" "$@"
