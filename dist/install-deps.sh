@@ -30,6 +30,7 @@ if command -v xbps-install >/dev/null 2>&1; then
         libinput libinput-devel eudev-libudev-devel
         libseat libseat-devel libdrm libdrm-devel
         MesaLib-devel libglvnd-devel libdisplay-info libdisplay-info-devel
+        pipewire-devel pixman-devel
         # Пакета `xwayland` в Void нет вовсе — вложенный X зовётся так:
         xorg-server-xwayland)
 elif command -v pacman >/dev/null 2>&1; then
@@ -39,21 +40,24 @@ elif command -v pacman >/dev/null 2>&1; then
     manager="Arch (pacman)"
     cmd=(pacman -S --needed --noconfirm
         base-devel pkgconf wayland libxkbcommon libinput
-        systemd-libs seatd libdrm mesa libdisplay-info xorg-xwayland)
+        systemd-libs seatd libdrm mesa libdisplay-info pipewire pixman
+        xorg-xwayland)
 elif command -v apt >/dev/null 2>&1; then
     manager="Debian/Ubuntu (apt)"
     cmd=(apt install -y
         build-essential pkg-config
         libwayland-dev libxkbcommon-dev libinput-dev libudev-dev
         libseat-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev
-        libdisplay-info-dev xwayland)
+        libdisplay-info-dev libpipewire-0.3-dev libspa-0.2-dev libpixman-1-dev
+        xwayland)
 elif command -v dnf >/dev/null 2>&1; then
     manager="Fedora (dnf)"
     cmd=(dnf install -y
         gcc pkgconf-pkg-config
         wayland-devel libxkbcommon-devel libinput-devel systemd-devel
         libseat-devel libdrm-devel mesa-libgbm-devel mesa-libEGL-devel
-        mesa-libGLES-devel libdisplay-info-devel xorg-x11-server-Xwayland)
+        mesa-libGLES-devel libdisplay-info-devel pipewire-devel pixman-devel
+        xorg-x11-server-Xwayland)
 else
     echo "Не узнаю пакетный менеджер. Списки для других дистрибутивов —" >&2
     echo "в шапке build_portable.sh; на NixOS есть shell.nix." >&2

@@ -34,6 +34,11 @@ jobs:
 
       - name: Системные зависимости
         run: |
+          # libpipewire-0.3 и libspa просят крейты `pipewire` и `libspa` (через
+          # них идёт портал демонстрации экрана), pixman — рендерер smithay:
+          # он линкуется через -lpixman-1. Ни один из трёх не приезжает
+          # зависимостью остальных, и без них сборка падает ещё в build.rs
+          # у libspa-sys — на этом CI не проходил ни разу (05.09.2026).
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
@@ -46,7 +51,10 @@ jobs:
             libgbm-dev \
             libegl-dev \
             libgles-dev \
-            libdisplay-info-dev
+            libdisplay-info-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libpixman-1-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -73,6 +81,11 @@ jobs:
 
       - name: Системные зависимости
         run: |
+          # libpipewire-0.3 и libspa просят крейты `pipewire` и `libspa` (через
+          # них идёт портал демонстрации экрана), pixman — рендерер smithay:
+          # он линкуется через -lpixman-1. Ни один из трёх не приезжает
+          # зависимостью остальных, и без них сборка падает ещё в build.rs
+          # у libspa-sys — на этом CI не проходил ни разу (05.09.2026).
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
@@ -85,7 +98,10 @@ jobs:
             libgbm-dev \
             libegl-dev \
             libgles-dev \
-            libdisplay-info-dev
+            libdisplay-info-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libpixman-1-dev
 
       - uses: dtolnay/rust-toolchain@stable
 

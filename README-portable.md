@@ -9,7 +9,8 @@ Parallax — Wayland-компоситор на Rust (smithay, TTY/DRM backend).
 `build_portable.sh` (Debian/Ubuntu, Fedora, Arch).
 
 Кратко нужны dev-версии: wayland, libxkbcommon, libinput, udev/systemd, seat
-(libseat), libdrm, gbm, EGL, GLES, libdisplay-info. Для запуска — ещё `xwayland`.
+(libseat), libdrm, gbm, EGL, GLES, libdisplay-info, PipeWire (с libspa) и
+pixman. Для запуска — ещё `xwayland`.
 Lua отдельно ставить не надо — `mlua` собирает Lua 5.4 из исходников.
 
 ## 2. Сборка

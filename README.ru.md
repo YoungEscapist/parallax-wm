@@ -125,7 +125,8 @@ TTY/DRM и winit (для разработки).
 
 Нужны Rust (лучше через rustup), pkg-config, C-компилятор и dev-версии
 библиотек: wayland, libxkbcommon, libinput, udev, libseat, libdrm, gbm, EGL,
-GLES, libdisplay-info. Lua отдельно ставить не надо — `mlua` собирает её из
+GLES, libdisplay-info, PipeWire (вместе с libspa — через него идёт портал
+демонстрации экрана) и pixman (smithay линкует рендерер через `-lpixman-1`). Lua отдельно ставить не надо — `mlua` собирает её из
 исходников. Для запуска нужен ещё `xwayland`.
 
 Точные имена пакетов по дистрибутивам — в шапке `build_portable.sh`; для Void,

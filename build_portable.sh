@@ -7,16 +7,18 @@
 #     sudo apt install build-essential pkg-config cargo rustc \
 #       libwayland-dev libxkbcommon-dev libinput-dev libudev-dev \
 #       libseat-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
-#       libdisplay-info-dev
+#       libdisplay-info-dev libpipewire-0.3-dev libspa-0.2-dev libpixman-1-dev
 #     # для запуска нужен ещё xwayland
 #   Fedora:
 #     sudo dnf install gcc pkgconf-pkg-config cargo rust \
 #       wayland-devel libxkbcommon-devel libinput-devel systemd-devel \
 #       libseat-devel libdrm-devel mesa-libgbm-devel mesa-libEGL-devel \
-#       mesa-libGLES-devel libdisplay-info-devel xorg-x11-server-Xwayland
+#       mesa-libGLES-devel libdisplay-info-devel pipewire-devel pixman-devel \
+#       xorg-x11-server-Xwayland
 #   Arch:
 #     sudo pacman -S base-devel pkgconf rust wayland libxkbcommon libinput \
-#       systemd-libs seatd libdrm mesa libdisplay-info xorg-xwayland
+#       systemd-libs seatd libdrm mesa libdisplay-info pipewire pixman \
+#       xorg-xwayland
 #
 # Рекомендуется свежий стабильный Rust (rustup). mlua собирает Lua 5.4 из
 # исходников (feature "vendored") — отдельный Lua ставить не нужно.

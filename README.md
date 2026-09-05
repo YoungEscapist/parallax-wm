@@ -127,8 +127,9 @@ dragging (<code>plx-extra</code>).</sub></td>
 ## Building
 
 Rust (via rustup), pkg-config, a C compiler, and the development packages for
-wayland, libxkbcommon, libinput, udev, libseat, libdrm, gbm, EGL, GLES and
-libdisplay-info. Lua is built from source by `mlua`, so you do not need it
+wayland, libxkbcommon, libinput, udev, libseat, libdrm, gbm, EGL, GLES,
+libdisplay-info, PipeWire (with libspa — the screencast portal goes through it)
+and pixman (smithay's renderer links `-lpixman-1`). Lua is built from source by `mlua`, so you do not need it
 installed. `xwayland` is needed at runtime.
 
 Exact package names per distribution are in the header of `build_portable.sh`;
