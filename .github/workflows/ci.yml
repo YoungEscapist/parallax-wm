@@ -118,3 +118,61 @@ jobs:
       # холста, дерево тайлинга, разбор конфигурации и протоколы.
       - name: Тесты
         run: cargo test --features extra
+
+  # ── Сборка «как у постороннего»: git clone, cd, компилятор ────────────────
+  #
+  # Отличается от job `build` намеренно и по всем трём пунктам:
+  #
+  #   * дерево берётся `git clone`, а не actions/checkout — то есть ровно тем
+  #     способом, каким его берёт человек, прочитавший README. Никаких файлов,
+  #     подложенных рантаймом мимо репозитория, тут быть не может;
+  #   * зависимости ставит `dist/install-deps.sh`, а не свой список пакетов
+  #     внутри workflow. Ради этого job и существует: список в скрипте — то,
+  #     чему верит читатель README, и разъехаться с ним он не должен незаметно;
+  #   * КЭША НЕТ. Первая сборка тянет smithay из git и сотни крейтов, и вопрос
+  #     как раз в том, доедет ли она с нуля.
+  #
+  # Собирает `build_portable.sh` — оба бинаря, теми же двумя вызовами cargo.
+  # Имя job'а латиницей нарочно: GitHub принимает в идентификаторе только
+  # [A-Za-z0-9_-], кириллица здесь — синтаксическая ошибка всего файла.
+  # Человеку видно `name:`, оно ниже.
+  clone:
+    name: сборка из чистого клона
+    runs-on: ubuntu-24.04
+    steps:
+      - name: git clone
+        run: |
+          git clone --no-single-branch \
+            https://github.com/${{ github.repository }}.git parallax
+          cd parallax
+          # Именно тот коммит, из-за которого запустились: у pull_request
+          # github.sha — это слитый предпросмотр, его в клоне нет, поэтому
+          # для PR берём голову ветки.
+          git checkout --detach "${{ github.event.pull_request.head.sha || github.sha }}"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Зависимости по README
+        run: |
+          cd parallax
+          # Единственная строка, которой нет в README: списки пакетов на
+          # рантайме приезжают устаревшими, и без обновления apt берёт версии,
+          # которых на зеркале уже нет. На своей машине человек обновляется сам.
+          sudo apt-get update
+          ./dist/install-deps.sh --print
+          sudo ./dist/install-deps.sh
+
+      - name: ./build_portable.sh
+        run: |
+          cd parallax
+          ./build_portable.sh
+
+      # Собралось — но собралось ли то, что запускают. Бинарь должен хотя бы
+      # подняться и ответить: динамическая линковка (EGL, GLES, pixman,
+      # libspa) проверяется только запуском, `cargo build` о ней не судит.
+      - name: Бинарь запускается
+        run: |
+          cd parallax
+          ls -lh target/release/plx-standard target/release/plx-extra
+          ./target/release/plx-standard --version
+          ./target/release/plx-extra --version
