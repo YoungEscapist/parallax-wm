@@ -443,6 +443,12 @@ pub struct Config {
     /// (`chord_click_timeout_ms`). За этот срок задерживается ПЕРВОЕ нажатие,
     /// и только той кнопки, с которой аккорд начинается.
     pub mouse_chord_timeout: u32,
+    /// Во сколько раз протяжка аккордом меняет размер окна сильнее, чем прошла
+    /// рука: `set{ mouse_chord_resize_gain = 4.0 }`. Единица = пиксель экрана
+    /// на пиксель окна. Отдельно от тачпадного усиления нарочно — у мыши свой
+    /// ход руки, и общая цифра означала бы, что подгонка под одно устройство
+    /// каждый раз портит второе.
+    pub mouse_chord_resize_gain: f64,
     /// Автодовод курсора по краям НАКЛАДКИ тачпада:
     /// `set{ touchpad_edge_motion = true, touchpad_edge_zone = 0.08,
     ///       touchpad_edge_speed = 900.0 }`. См. touchpad.rs.
@@ -587,6 +593,7 @@ impl Default for Config {
             gesture_thresholds: crate::gestures::Пороги::default(),
             mouse_chords: Vec::new(),
             mouse_chord_timeout: 250,
+            mouse_chord_resize_gain: 4.0,
             автодовод: crate::touchpad::Автодовод::default(),
             // Выключено по умолчанию: эффект вкусовой, а включается одной
             // строкой в config.lua.
@@ -916,6 +923,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let mouse_chords: Rc<RefCell<Vec<crate::аккорды::БиндАккорда>>> =
         Rc::new(RefCell::new(Vec::new()));
     let mouse_chord_timeout: Rc<RefCell<u32>> = Rc::new(RefCell::new(250));
+    let mouse_chord_resize_gain: Rc<RefCell<f64>> = Rc::new(RefCell::new(4.0));
     let gesture_thresholds: Rc<RefCell<crate::gestures::Пороги>> =
         Rc::new(RefCell::new(crate::gestures::Пороги::default()));
     let автодовод: Rc<RefCell<crate::touchpad::Автодовод>> =
@@ -1057,7 +1065,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         //   mouse{ chord = "3-2", action = "pan" }
         //   mouse{ chord = "2-1", action = "move_window" }
         //   mouse{ chord = "2-3", action = "resize_window" }
-        //   mouse{ chord = "1-2", action = "toggle_fullscreen" }
+        //   mouse{ chord = "1-2", action = "zoom" }           -- вверх-вниз = масштаб
         //
         // Кнопки нумерует hevel: 1 — левая, 2 — колесо, 3 — правая. Действие,
         // которого нет в списке аккордов, ищется в ОБЩЕЙ таблице действий: на
@@ -1074,12 +1082,12 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                 }
             };
             let (Some(первая), Some(вторая)) =
-                (crate::аккорды::Кнопка::разобрать(a), crate::аккорды::Кнопка::разобрать(b))
+                (crate::аккорды::Кнопка::разобрать(a), crate::аккорды::Вторая::разобрать(b))
             else {
                 tracing::warn!("plx/config: mouse{{}}: unknown button in '{chord}', skipping");
                 return Ok(());
             };
-            if первая == вторая {
+            if вторая == crate::аккорды::Вторая::Кнопка(первая) {
                 // Одна и та же кнопка дважды — не аккорд: второе нажатие без
                 // отпускания физически не придёт, и бинд не сработал бы никогда.
                 tracing::warn!("plx/config: mouse{{}}: '{chord}' is the same button twice, skipping");
@@ -1100,6 +1108,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                 "pan" | "пан" => Д::Пан,
                 "move_window" | "вести_окно" => Д::ВестиОкно,
                 "resize_window" | "размер_окна" => Д::РазмерОкна,
+                "zoom" | "зум" => Д::Зум,
                 _ => match action_from_lua(&action_str, &tbl) {
                     Some(a) => Д::Обычное(Box::new(a)),
                     None => {
@@ -1108,6 +1117,22 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                     }
                 },
             };
+            // Прокрутка ведёт только мгновенные действия. Протяжку (пан,
+            // ведение, размер) вести нечем: у колеса нет хода руки, за которым
+            // она следует, и молча взятый в таблицу «1-scroll → pan» выглядел
+            // бы как поломка пана, а не как непригодная пара.
+            if вторая == crate::аккорды::Вторая::Прокрутка
+                && matches!(
+                    действие,
+                    Д::Пан | Д::ВестиОкно | Д::РазмерОкна | Д::Прямоугольник(_) | Д::ЗакрытьПод
+                )
+            {
+                tracing::warn!(
+                    "plx/config: mouse{{}}: '{chord}' — action '{action_str}' needs a drag, \
+                     the wheel has none; skipping"
+                );
+                return Ok(());
+            }
             mouse_chords_c.borrow_mut().push(crate::аккорды::БиндАккорда {
                 первая,
                 вторая,
@@ -1154,6 +1179,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let keyboard_grab_apps = keyboard_grab_apps.clone();
         let gesture_thresholds = gesture_thresholds.clone();
         let mouse_chord_timeout = mouse_chord_timeout.clone();
+        let mouse_chord_resize_gain = mouse_chord_resize_gain.clone();
         let автодовод = автодовод.clone();
         let blur = blur.clone();
         let glow = glow.clone();
@@ -1286,6 +1312,14 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             // той же кнопкой, и при большем значении мышь выглядит сломанной.
             if let Ok(Some(v)) = tbl.get::<Option<u32>>("mouse_chord_timeout") {
                 *mouse_chord_timeout.borrow_mut() = v.clamp(30, 1000);
+            }
+            // Усиление ресайза аккордом. Ноль и минус запрещены: это «размер не
+            // меняется» и «тяну вправо — окно ужимается», а обе настройки
+            // выглядели бы поломкой, а не выбором.
+            if let Ok(Some(v)) = tbl.get::<Option<f64>>("mouse_chord_resize_gain") {
+                if v.is_finite() && v > 0.0 {
+                    *mouse_chord_resize_gain.borrow_mut() = v.clamp(0.1, 50.0);
+                }
             }
             // Пороги жестов — те же имена, что в driftwm, чтобы настройки
             // переносились между композиторами без перевода.
@@ -1548,12 +1582,54 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         tracing::info!("plx/config: touchpad gestures: {}", таблица.len());
     }
 
+    {
+        // Жесты и бинды считают себя в логе, аккорды до сих пор не считались —
+        // и «аккорд не настроен» было неотличимо от «аккорд не разобрался».
+        // Вместе с числом печатаются ЗАДЕРЖАННЫЕ кнопки: это единственная
+        // цена аккордов (первая кнопка не уходит клиенту сразу, см.
+        // аккорды.rs), и человек должен видеть её, не читая исходников.
+        let таблица = mouse_chords.borrow();
+        if таблица.is_empty() {
+            tracing::info!("plx/config: mouse chords: none");
+        } else {
+            // Только аккорды из двух КНОПОК: пара с прокруткой ничего не
+            // задерживает (см. аккорды::Вторая), и приписывать ей цену
+            // задержки значило бы врать в той единственной строке, по которой
+            // человек эту цену и узнаёт.
+            let mut задержанные: Vec<&str> = таблица
+                .iter()
+                .filter(|б| matches!(б.вторая, crate::аккорды::Вторая::Кнопка(_)))
+                .map(|б| match б.первая {
+                    crate::аккорды::Кнопка::Левая => "left",
+                    crate::аккорды::Кнопка::Средняя => "middle",
+                    crate::аккорды::Кнопка::Правая => "right",
+                })
+                .collect();
+            задержанные.sort_unstable();
+            задержанные.dedup();
+            if задержанные.is_empty() {
+                tracing::info!(
+                    "plx/config: mouse chords: {} (nothing held back)",
+                    таблица.len()
+                );
+            } else {
+                tracing::info!(
+                    "plx/config: mouse chords: {} (held back for up to {} ms: {})",
+                    таблица.len(),
+                    *mouse_chord_timeout.borrow(),
+                    задержанные.join(", ")
+                );
+            }
+        }
+    }
+
     let result = Config {
         bindings: bindings.borrow().clone(),
         gestures: gestures.borrow().clone(),
         gesture_thresholds: *gesture_thresholds.borrow(),
         mouse_chords: mouse_chords.borrow().clone(),
         mouse_chord_timeout: *mouse_chord_timeout.borrow(),
+        mouse_chord_resize_gain: *mouse_chord_resize_gain.borrow(),
         автодовод: *автодовод.borrow(),
         xkb: xkb_settings.borrow().clone(),
         bird_eye_key: *bird_eye_key.borrow(),

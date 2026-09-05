@@ -859,6 +859,16 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 -- you want hevel's full set, uncomment everything; if you would rather leave
 -- the left button alone, keep only the "2-…" and "3-…" ones.
 --
+-- THE SECOND HALF CAN BE THE SCROLL WHEEL: "1-scroll" means "while the left
+-- button is down, the wheel zooms" — exactly Alt+wheel, with the hand on a
+-- button instead of Alt. Such a pair holds NOTHING back: the delay only exists
+-- so that a press which turns out to start a chord is not handed to the client
+-- first, and scrolling arrives on its own. So "1-scroll" costs the left button
+-- neither its instant click nor the rubber-band selection on empty canvas —
+-- unlike "1-2" (left, then a PRESS on the wheel). Only instant actions can ride
+-- the wheel: zoom and anything from the common table. Pan, move and resize need
+-- a drag the wheel does not have, and such pairs are skipped with a warning.
+--
 -- An empty table (nothing uncommented) = the mouse works exactly as it did
 -- before this section existed. That is the same promise gesture{} makes.
 --
@@ -867,5 +877,11 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 -- mouse{ chord = "3-2", action = "pan" }
 -- mouse{ chord = "2-1", action = "move_window" }
 -- mouse{ chord = "2-3", action = "resize_window" }
+-- mouse{ chord = "1-scroll", action = "zoom" }      -- left + wheel = canvas zoom (no Alt)
+-- mouse{ chord = "1-2", action = "zoom" }           -- left, then press wheel: drag up/down = zoom
 -- mouse{ chord = "1-2", action = "toggle_fullscreen" }
 -- set{ mouse_chord_timeout = 250 }
+-- How much stronger than the hand a chord resize is (mouse path only; the
+-- touchpad keeps its own gain). The drag is divided by the zoom first, so it
+-- feels the same however far the camera is pulled back.
+-- set{ mouse_chord_resize_gain = 4.0 }

@@ -133,7 +133,9 @@ dragging — the wheel pulls it closer, a click on a face flies to that workspac
   on a *pair* of buttons pressed in sequence — hold the right button, click the
   left, release over the window you meant to close. Off by default, because the
   first button of a chord has to be held back until the second one decides
-  (`mouse{}` in `default_config.lua`).
+  (`mouse{}` in `default_config.lua`). The second half can be the wheel instead
+  of a button — `"1-scroll"` zooms the canvas while the left button is down, and
+  that pair holds nothing back.
 - Configuration is Lua, reloaded live with `Super+Shift+C`.
 
 ## Building

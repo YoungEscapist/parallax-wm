@@ -256,6 +256,29 @@ impl Parallax {
     /// `frame`». Серийник берём СВЕЖИЙ: прежний уже потрачен на то событие,
     /// которое мы съели, а повторный серийник клиент вправе считать ошибкой
     /// протокола.
+    /// ЛКМ по ПУСТОМУ холсту → rubber-band мультивыделение (см.
+    /// `grabs/select_grab.rs`). `true` — grab начат.
+    ///
+    /// Отдельной функцией, потому что путей к ней два: обычное нажатие и
+    /// нажатие, ЗАДЕРЖАННОЕ аккордами и отданное позже (`аккорд_отдать_клиенту`
+    /// ниже). Пока код жил внутри цепочки `PointerButton`, второй путь его
+    /// просто не проходил: с настроенным аккордом на левой кнопке рамка
+    /// выделения не начиналась никогда — снаружи это ровно «выделения нет, оно
+    /// не рисуется».
+    pub(crate) fn начать_выделение(&mut self, pos: Point<f64, Logical>, serial: smithay::utils::Serial) -> bool {
+        if self.tile_config.layout != Layout::Float {
+            return false;
+        }
+        let Some(pointer) = self.seat.get_pointer() else { return false };
+        self.clear_selection();
+        let grab = crate::grabs::SelectGrab {
+            start_data: GrabStartData { focus: None, button: BTN_LEFT, location: pos },
+            start_pos: pos,
+        };
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+        true
+    }
+
     pub(crate) fn аккорд_отдать_клиенту(&mut self, код: u32, нажата: bool, время: u32) {
         // ФОКУС ПЕРЕД КНОПКОЙ. Задержанное нажатие приходит сюда в обход всей
         // цепочки `PointerButton`, а в ней клик по окну не только пересылается
@@ -270,6 +293,19 @@ impl Parallax {
             if let Some((window, _)) = self.space.element_under(self.pointer_location) {
                 let window = window.clone();
                 crate::xwin::focus(self, &window);
+            } else if код == BTN_LEFT
+                && !self.overview_active
+                && !self.курсор_над_слоем(self.pointer_location)
+            {
+                // Под курсором пусто — значит это начало рамки выделения, а не
+                // клик по приложению. Отдавать такое нажатие клиенту некому
+                // (клиента там нет), и без этой ветки задержанная аккордами
+                // ЛКМ теряла выделение целиком.
+                let pos = self.pointer_location;
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                if self.начать_выделение(pos, serial) {
+                    return;
+                }
             }
         }
         let Some(pointer) = self.seat.get_pointer() else { return };
@@ -524,6 +560,13 @@ impl Parallax {
             }
 
             InputEvent::PointerMotion { event, .. } => {
+               // Задержанная аккордами кнопка дозревает и ЗДЕСЬ, не только в
+               // `anim::tick`: тик идёт по кадрам, а кадр рисуется, когда есть
+               // что рисовать. На неподвижном экране (и на headless-харнессе,
+               // где кадр берут по команде) нажатие висело в отложенных сколь
+               // угодно долго — то есть человек жмёт ЛКМ, ведёт мышь, а рамка
+               // выделения не начинается вовсе, пока экран не оживёт сам.
+               self.аккорд_сторож();
                let delta = event.delta();
                tracing::trace!("PTR MOTION: delta=({:.2},{:.2})", delta.x, delta.y);
                let zoom = self.viewport.zoom;
@@ -1365,15 +1408,8 @@ impl Parallax {
                         // ЛКМ по пустому холсту в Float → rubber-band мультивыделение
                         // (протяжка выделяет пересекающиеся окна, клик без протяжки —
                         // просто снимает выделение, см. select_grab.rs).
-                        if button == BTN_LEFT && !alt_held
-                            && self.tile_config.layout == Layout::Float
-                        {
-                            self.clear_selection();
-                            let grab = crate::grabs::SelectGrab {
-                                start_data: GrabStartData { focus: None, button, location: pos },
-                                start_pos: pos,
-                            };
-                            pointer.set_grab(self, grab, serial, Focus::Clear);
+                        if button == BTN_LEFT && !alt_held {
+                            self.начать_выделение(pos, serial);
                         }
                     }
                 }
@@ -1733,6 +1769,17 @@ impl Parallax {
                     } else if h > 0.0 { 1 } else { -1 };
                     self.columns_focus(dir, 0);
                     self.request_redraw();
+                    return;
+                }
+
+                // ── Аккорд «кнопка + колесо» (hevel): ЛКМ вместо Alt ──────────
+                //
+                // Стоит вплотную перед Alt+колесом нарочно: это тот же зум, у
+                // него та же цена и тот же порядок относительно куба, карты и
+                // карточки — они забирают колесо раньше, потому что лежат
+                // поверх холста. Аккорда нет в конфиге — ветка отвечает `false`
+                // и колесо идёт дальше как прежде.
+                if self.аккорд_прокрутка(v, source == AxisSource::Finger) {
                     return;
                 }
 
