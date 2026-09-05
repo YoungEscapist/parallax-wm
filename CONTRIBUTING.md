@@ -89,9 +89,18 @@ They cost real hours. In rough order of how often they bite:
   made all of `migrate.sh` do nothing while exiting 0. Function names in
   Cyrillic are fine — bash accepts those. **Variable names: Latin only.**
 - **Single-character Cyrillic identifiers in Rust.** `с`/`c`, `р`/`p`, `о`/`o`,
-  `г`/`r` are indistinguishable on screen. rustc warns `confusable_idents` and
-  it is right to; there are still around a thousand of them in the tree, being
-  worked off gradually. Do not add more, and do not silence the lint.
+  `г`/`r` are indistinguishable on screen, and rustc's `confusable_idents` is
+  right to say so. The lint is nevertheless allowed crate-wide in `src/lib.rs`,
+  with the reason written above the attribute: it fires on one pair at a time,
+  so fixing one place only moves the warning to the next file, and in Russian
+  code homoglyphs are the norm rather than a typo. That is a decision about the
+  *lint*, not about naming: prefer a name that reads (`рад`, `глуб`, `статус`)
+  over a single letter, and do not add new one-letter Cyrillic locals.
+- **The config reference is two files.** `default_config.lua` (English, the one
+  embedded in the binary) and `default_config.ru.lua` (Russian) must differ only
+  in their comments — a knob added to one belongs in the other on the same line.
+  `config::tests::два_справочника_совпадают` compares everything that is not a
+  comment and fails if they drift.
 - **`cargo fmt` over the whole tree** produces a 28 000-line diff. The tree is
   not rustfmt-formatted. Format the lines you touched, by hand, in the
   surrounding style.

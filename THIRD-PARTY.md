@@ -93,6 +93,46 @@ in the renderer rather than in output scale came from.
 > Licensed under the GNU General Public License, version 3 or later — the same
 > license as Parallax.
 
+### hevel (ISC)
+
+The mouse-chord model in `src/аккорды.rs` — a command bound to a *pair* of mouse
+buttons pressed in sequence rather than to one button — is taken from
+[hevel](https://git.sr.ht/~dlm/hevel), a Plan 9-style floating Wayland
+compositor in which the mouse does everything. What is borrowed is the model and
+its vocabulary: the button numbering (1 left, 2 wheel, 3 right), the chords
+themselves (`1→3` draw a rectangle and open a window in it, `3→1` close the
+window released over, `3→2` pan, `2→1` move, `2→3` resize, `1→2` left to the
+user), the rule that the first press is held back until the second button
+decides, and the name and the 250 ms of `chord_click_timeout_ms`, which is
+`mouse_chord_timeout` here. No source was copied — hevel is C on neuswc,
+Parallax is Rust on smithay — and the chords are off by default (see the
+`mouse{}` section of `default_config.lua` for why).
+
+hevel is under the ISC license. Its `LICENSE` file carries the template's
+unfilled copyright line, and is quoted here as it stands:
+
+> `Copyright (c) YYYY YOUR-NAME-HERE <user@your.dom.ain>`
+>
+> Permission to use, copy, modify, and distribute this software for any
+> purpose with or without fee is hereby granted, provided that the above
+> copyright notice and this permission notice appear in all copies.
+>
+> THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+> WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+> MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+> ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+> WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+> ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+> OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+### Compiz (idea, no code)
+
+The desktop cube (`src/куб.rs`, `plx-extra` only) is Compiz's, and the settings
+are named after what it did: faces, shading of the far edge, turning the cube on
+a workspace switch. The geometry here is written from scratch against this
+renderer, and the ring of faces is unbounded — Compiz gave the idea and the
+expectations, not a line of code.
+
 ### niri, sway (ideas, no code)
 
 The scrollable-strip layout (`src/columns.rs`) and parts of the overview follow

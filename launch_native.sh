@@ -10,14 +10,29 @@
 # в libc.so.6 при каждом запуске (несовместимость системного ld.so с
 # Nix-glibc, подтянутой транзитивно через RUNPATH нижних библиотек) — см.
 # комментарий в build.sh. Если после пересборки снова начались segfault'ы
-# без единой строчки в логе — проверьте, что сборка НЕ шла через
-# build_env.sh build (nix-shell), а через build.sh.
+# без единой строчки в логе — проверьте, что сборка НЕ шла через nix-shell,
+# а через build.sh (машина автора) или build_portable.sh (любая другая).
 #
 # Использование: ./launch_native.sh [--debug] [--winit]
 set -euo pipefail
 
 PLX_DIR="$(cd -- "$(dirname -- "$(realpath -- "$0")")" && pwd)"
-BUILD_DIR="/mnt/plx-build/target"
+
+# Каталог сборки. На машине автора это /mnt/plx-build/target — туда пишет
+# build.sh. У всех остальных бинарь лежит в `target/` самого чекаута, потому
+# что README ведёт именно этим путём: `./build_portable.sh`, потом
+# `./launch_native.sh`. Пока каталог был захардкожен, вторая команда у
+# постороннего падала с «Бинарь не найден» на пути, которого у него нет вовсе.
+# Порядок: явный PLX_BUILD_DIR, потом авторский — если там ДЕЙСТВИТЕЛЬНО
+# лежит бинарь, — потом свой.
+BUILD_DIR="${PLX_BUILD_DIR:-}"
+if [[ -z "$BUILD_DIR" ]]; then
+    if [[ -x /mnt/plx-build/target/extra/release/plx-extra ]]; then
+        BUILD_DIR="/mnt/plx-build/target"
+    else
+        BUILD_DIR="$PLX_DIR/target"
+    fi
+fi
 # Сеанс идёт на ПОЛНОЙ сборке: шлем, окна в Minecraft и мультиюзер нужны
 # именно здесь. Минимальная лежит рядом — plx-standard, тот же композитор без них.
 #
@@ -29,14 +44,35 @@ BUILD_DIR="/mnt/plx-build/target"
 # продолжали видеть исходники новее ЗАПУСКАЕМОГО файла, и сессия поднималась на
 # старом бинаре с руганью «Сборка отчиталась об успехе, но бинарь не обновился».
 # Поймано 03.09.2026 при разборе расхода процессора.
+#
+# Полная сборка предпочтительнее, но сеанс поднимется и на стандартной: у
+# того, кто собрал только `-p plx-standard`, ровно тот же композитор без шлема,
+# Minecraft и мультиюзера, и отказываться его запускать не за что.
 BINARY="$BUILD_DIR/extra/release/plx-extra"
-[[ "${1:-}" == --debug ]] && BINARY="$BUILD_DIR/debug/parallax"
+# Имя переменной ЛАТИНИЦЕЙ: кириллическое bash за идентификатор не считает и
+# падает на `not a valid identifier` — та же грабля, что с chown в build.sh.
+for cand in \
+    "$BUILD_DIR/extra/release/plx-extra" \
+    "$BUILD_DIR/release/plx-extra" \
+    "$BUILD_DIR/standard/release/plx-standard" \
+    "$BUILD_DIR/release/plx-standard"; do
+    if [[ -x "$cand" ]]; then BINARY="$cand"; break; fi
+done
+# Отладочный бинарь лежит там же, где и релизный, только в `debug/`. Пока здесь
+# стояло `$BUILD_DIR/debug/parallax`, `--debug` не работал вовсе: бинаря с
+# именем `parallax` не существует с тех пор, как сборка разделилась на
+# plx-standard и plx-extra.
+[[ "${1:-}" == --debug ]] && BINARY="$BUILD_DIR/extra/debug/plx-extra"
 
 DWALL_BIN="$HOME/.local/bin/plx-wall"
 
 if [[ ! -x "$BINARY" ]]; then
     echo "Бинарь не найден: $BINARY" >&2
-    echo "Сборка: cd $PLX_DIR && ./build_env.sh build" >&2
+    if [[ "$BUILD_DIR" == "$PLX_DIR/target" ]]; then
+        echo "Сборка: cd $PLX_DIR && ./build_portable.sh" >&2
+    else
+        echo "Сборка: cd $PLX_DIR && ./build.sh" >&2
+    fi
     exit 1
 fi
 
@@ -282,8 +318,15 @@ rebuild_if_stale() {
     local ok=0
     local build_log="$LOG_DIR/rebuild_$(date +%Y%m%d_%H%M%S).log"
     set -o pipefail
-    if [[ "$BINARY" == */debug/parallax ]]; then
-        (cd "$PLX_DIR" && cargo build --target-dir "$BUILD_DIR") 2>&1 | tee "$build_log" || ok=1
+    if [[ "$BINARY" == */debug/plx-extra ]]; then
+        # `-p plx-extra` обязателен: корневой пакет — это только [lib], и
+        # голый `cargo build` не собрал бы ни одного исполняемого файла.
+        (cd "$PLX_DIR" && cargo build -p plx-extra --target-dir "$BUILD_DIR/extra") \
+            2>&1 | tee "$build_log" || ok=1
+    elif [[ "$BUILD_DIR" == "$PLX_DIR/target" ]]; then
+        # Собираем тем же скриптом, каким собран запускаемый бинарь: build.sh
+        # пишет в /mnt/plx-build и на чужой машине просто не сможет.
+        "$PLX_DIR/build_portable.sh" 2>&1 | tee "$build_log" || ok=1
     else
         "$PLX_DIR/build.sh" 2>&1 | tee "$build_log" || ok=1
     fi

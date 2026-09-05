@@ -1590,6 +1590,33 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         notify_sound: notify_sound.borrow().clone(),
         notify_volume: *notify_volume.borrow(),
     };
+
+    // Ручки шейдеров разбираются в ОБЕИХ сборках: разбор к фиче отношения не
+    // имеет, а `#[cfg]` вокруг десятка `tbl.get` дал бы «unknown key» там, где
+    // ключ на самом деле известен. Но в plx-standard шейдеров нет вовсе (см.
+    // шейдеры_stub/), и молча съеденное `glow = 0.6` читается как поломка.
+    // Отвечаем тем же, чем `vr status` в сборке без шлема: этого нет В ЭТОЙ
+    // сборке. Строка уходит в лог на каждое чтение конфигурации, в том числе
+    // по Super+Shift+C, — ровно тогда, когда человек и подкручивает ручку.
+    #[cfg(not(feature = "shaders"))]
+    {
+        let заданные: Vec<&str> = [
+            ("glow", result.glow > 0.0),
+            ("sun", result.sun > 0.0),
+            ("cube", result.cube > 0.0),
+        ]
+        .into_iter()
+        .filter(|(_, задана)| *задана)
+        .map(|(имя, _)| имя)
+        .collect();
+        if !заданные.is_empty() {
+            tracing::warn!(
+                "plx/config: {} set, but this build has no shaders — needs plx-extra",
+                заданные.join(", ")
+            );
+        }
+    }
+
     Ok(result)
 }
 
@@ -1916,7 +1943,11 @@ impl Parallax {
     /// Minecraft. В сборке `plx-standard` модуля `vr` нет вовсе, поэтому метод
     /// переехал сюда — к `spawn`, через который он и работает.
     pub(crate) fn уведомить(&self, текст: &str) {
-        tracing::info!("plx: {текст}");
+        // Текст уведомления переведён (`т!`), и в логе он окажется на языке
+        // человека — единственное место, где в английский лог попадает чужой
+        // язык. Поэтому он ПОДПИСАН: читающий чужой лог видит не строку лога
+        // на непонятном языке, а цитату того, что человеку показали.
+        tracing::info!("plx: notification shown: {текст}");
         // Кавычки в тексте экранируем: он попадает в `sh -c`.
         let без_кавычек = текст.replace('\'', "’");
         self.spawn(&format!("notify-send -a parallax 'parallax' '{}'", без_кавычек));
@@ -2059,6 +2090,41 @@ mod tests {
         let cfg = load_from_str(r#"set{ lang = "ru", anim_speed = 1.5 }"#).unwrap();
         assert_eq!(cfg.lang, Язык::Ru);
         assert_eq!(cfg.anim_speed, 1.5);
+    }
+
+    /// Русский справочник не разъезжается с английским.
+    ///
+    /// `default_config.lua` (английский) и `default_config.ru.lua` — ОДИН
+    /// конфиг на двух языках: расходиться им можно только комментариями.
+    /// Проверка сравнивает всё, что не комментарий и не пустая строка, —
+    /// значит, добавив ручку в один файл и забыв про другой, тест уронишь
+    /// сразу, а не узнаешь об этом от человека, который скопировал русский
+    /// файл и не получил половины настроек.
+    ///
+    /// Русский файл читается С ДИСКА, а не `include_str!`: в бинаре он не
+    /// нужен (вшит английский), а класть туда вторую копию на 69 КиБ ради
+    /// теста — плата не по делу.
+    #[test]
+    fn два_справочника_совпадают() {
+        let путь = concat!(env!("CARGO_MANIFEST_DIR"), "/default_config.ru.lua");
+        let русский = std::fs::read_to_string(путь).expect("default_config.ru.lua не читается");
+
+        let код = |текст: &str| -> Vec<String> {
+            текст
+                .lines()
+                .map(str::trim_end)
+                .filter(|с| !с.trim_start().is_empty() && !с.trim_start().starts_with("--"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            код(DEFAULT_CONFIG_LUA),
+            код(&русский),
+            "строки настроек в default_config.lua и default_config.ru.lua разошлись"
+        );
+
+        // И он именно разбирается, а не просто похож глазами.
+        load_from_str(&русский).expect("default_config.ru.lua не разобрался");
     }
 
     /// Ручки темпа и инерции разбираются, зажимаются и доезжают до значений

@@ -31,6 +31,25 @@ in-tree docs; this file and the config reference are in English too.
 > one set of eyes on it. Expect rough edges, and run it from a TTY you can
 > escape from.
 
+<table>
+<tr>
+<td width="50%"><img src="assets/shots/desktop.jpg" alt="Tiling: three terminals, the bar on top"><br>
+<sub><b>Tiling.</b> The dwindle split, the bar with the workspace strip, the tray and the
+clock — and the focused window rim-lit in the wallpaper's own colour.</sub></td>
+<td width="50%"><img src="assets/shots/canvas.jpg" alt="The same windows floating on the canvas, camera pulled back"><br>
+<sub><b>The canvas.</b> The same windows, floating, with the camera pulled back: a plane
+without edges, a light standing on it, and the wallpaper riding along.</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="assets/shots/overview.jpg" alt="Overview: three workspaces in a grid"><br>
+<sub><b>Overview.</b> The workspaces exactly as they are, in a grid around the current
+one; a click on one flies you there.</sub></td>
+<td width="50%"><img src="assets/shots/cube.jpg" alt="The desktop cube: workspaces on the faces of a prism"><br>
+<sub><b>The desktop cube.</b> The same workspaces on the faces of a prism you spin by
+dragging (<code>plx-extra</code>).</sub></td>
+</tr>
+</table>
+
 ## What it does
 
 **The canvas**
@@ -45,6 +64,12 @@ in-tree docs; this file and the config reference are in English too.
 - Overview shows the workspaces exactly as they are — floating windows stay
   floating, monocle stays monocle — because a workspace in the overview is just
   the same windows, shifted.
+- Or the desktop cube from Compiz, if you want it there instead: the workspaces
+  stand on the faces of a prism you spin by dragging, the wheel pulls it closer,
+  a click on a face flies to that workspace, and `Super+PgUp/PgDn` turns it too.
+  The prism has `cube_faces` faces while the ring behind it holds as many
+  workspaces as you like, so the tenth one still meets a cube and not a
+  twenty-sided wall (`set{ cube = 0.6 }`, `plx-extra` only).
 
 **Layouts**
 - `tile` — Hyprland-style dwindle (BSP): a new window splits the focused slot.
@@ -66,7 +91,13 @@ in-tree docs; this file and the config reference are in English too.
   computes for the current wallpaper, so the desktop re-tints itself whenever
   the wallpaper changes. It fades out on bright wallpapers, where a coloured
   rim reads as grime, and the focused window glows twice as bright as the rest
-  (`set{ glow = 0.6 }`).
+  (`set{ glow = 0.6 }`, `plx-extra` only).
+- A light that stands on the canvas rather than on the screen, lit from the same
+  wallpaper colour: it pools softly over the wallpaper, the side of a window
+  facing it is brighter and the far side falls into shade, and a window's shadow
+  falls away from the light instead of always downwards. On a plane without
+  edges it doubles as a landmark — you can tell where you are by where the light
+  is (`set{ sun = 0.6 }`, `plx-extra` only).
 - A quiet entrance: at startup the canvas eases out of the dark to its own zoom
   while the bar arrives from above (`set{ intro = false }` to skip it).
 - A short, unobtrusive tone on every notification. Parallax hears notifications
@@ -86,6 +117,11 @@ in-tree docs; this file and the config reference are in English too.
   own (`Super+Shift+S`, client: [plx-share](https://github.com/mifaroslav-dotcom/plx-share)).
 - VR: put your windows on panels inside a headset over OpenXR/WiVRn
   (`Super+Alt+V`) — experimental, verified against a Monado simulator.
+- Mouse chords, the model from [hevel](https://git.sr.ht/~dlm/hevel): a command
+  on a *pair* of buttons pressed in sequence — hold the right button, click the
+  left, release over the window you meant to close. Off by default, because the
+  first button of a chord has to be held back until the second one decides
+  (`mouse{}` in `default_config.lua`).
 - Configuration is Lua, reloaded live with `Super+Shift+C`.
 
 ## Building
@@ -125,10 +161,17 @@ both.
 | VR headset (`vr`) | — | yes |
 | windows inside Minecraft (`mine`) | — | yes |
 | multi-user desktop sharing (`share`) | — | yes |
+| window glow, canvas light, desktop cube (`shaders`) | — | yes |
 
 `plx-standard` is about 0.9 MiB smaller and does not link OpenXR. With the
 optional parts off, their commands answer plainly — `vr status` says the
-feature is not in this build rather than failing in some obscure way.
+feature is not in this build rather than failing in some obscure way, and a
+`glow`, `sun` or `cube` left in the config is read like any other setting and
+answered in the log with a line saying this build has no shaders.
+
+`shaders` is not there to save bytes — it adds no dependency and barely any
+size. It is there so that `plx-standard` stays the build where every pixel takes
+the shortest path to the screen.
 
 Build one on its own with a normal cargo invocation:
 
@@ -184,6 +227,11 @@ cp default_config.lua ~/.config/parallax/config.lua
 every knob is documented next to the line that sets it. It is Lua, evaluated at
 startup and again on `Super+Shift+C`.
 
+The same file in Russian is `default_config.ru.lua`: the same settings on the
+same lines, comments translated. Copy that one instead if you would rather read
+the manual in Russian — a test compares everything in the two files that is not
+a comment, so they cannot drift apart.
+
 A few starting points:
 
 ```lua
@@ -192,7 +240,9 @@ xkb{ layout = "us,ru" }                       -- keyboard layouts, Ctrl+Space to
 bind{ mods = "super", key = "Return",         -- your terminal
       action = "spawn", cmd = "ghostty" }
 set{ blur = true }                            -- frosted glass behind the bar
-set{ glow = 0.6 }                            -- windows rim-lit in the wallpaper's colour
+set{ glow = 0.6 }                             -- rim-lit windows (plx-extra)
+set{ sun = 0.6 }                              -- a light standing on the canvas (plx-extra)
+set{ cube = 0.6 }                             -- workspaces on a cube (plx-extra)
 set{ anim_speed = 1.0 }                       -- tempo of every animation
 set{ infinite_wallpaper = true }              -- wallpaper rides the canvas
 set{ notify_volume = 0.35 }                   -- loudness of the notification tone
@@ -209,7 +259,12 @@ overview hints, notifications — and the replies of the terminal commands
 
 Logs are always English and the knob does not touch them: a log ends up in
 someone else's bug report, and it has to be readable by more than its author.
-Code comments and in-tree docs stay Russian — see the note at the top.
+So is what `plx-host` says on its own behalf — its `--help` and its complaint
+about finding no control socket: that one is printed exactly when there is
+nobody left to ask which language you chose. What it relays from the compositor
+follows the knob like everything else.
+
+Code comments stay Russian — see the note at the top.
 
 ### Some default keys
 
@@ -242,7 +297,8 @@ dependency is permissive (MIT / Apache-2.0 / BSD / ISC / Zlib); the parts worth
 naming are [Smithay](https://github.com/Smithay/smithay) (MIT), the dwindle
 algorithm ported from [Hyprland](https://github.com/hyprwm/Hyprland)
 (BSD-3-Clause), the gesture model from
-[driftwm](https://github.com/malbiruk/driftwm) (GPL-3.0), the bundled Nunito
+[driftwm](https://github.com/malbiruk/driftwm) (GPL-3.0), the mouse-chord model
+from [hevel](https://git.sr.ht/~dlm/hevel) (ISC), the bundled Nunito
 font (SIL OFL, text in [assets/Nunito-OFL.txt](assets/Nunito-OFL.txt)) and the
 notification tones from [akx/Notifications](https://github.com/akx/Notifications)
 (CC0).

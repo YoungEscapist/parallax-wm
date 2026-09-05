@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""plx-host — раздать свой рабочий стол гостям, из терминала.
+"""plx-host — share your desktop with a guest, from the terminal.
 
-    plx-host              показать состояние (код, адреса, кто подключён)
-    plx-host start [порт] включить раздачу (порт по умолчанию 7373)
-    plx-host stop         выключить
-    plx-host watch        то же, что status, но обновлять каждую секунду
+    plx-host              show the state (code, addresses, who is connected)
+    plx-host start [port] start sharing (port 7373 by default)
+    plx-host stop         stop it
+    plx-host watch        the same as status, refreshed every second
 
-Гость подключается программой plx-share — строку с адресом и кодом эта команда
-печатает готовой, её и надо продиктовать.
+The guest connects with plx-share; the line with the address and the code is
+printed here ready to be read out loud.
 
-Сокет ищется сам: `PLX_CTL_SOCKET`, иначе $XDG_RUNTIME_DIR/plx-<дисплей>.ctl.
-Отдельная команда, а не `ctl.py 'action share_start'`, потому что действие
-умеет ответить только «ok» — а человеку нужен КОД и АДРЕС.
+The socket is found on its own: `PLX_CTL_SOCKET`, else
+$XDG_RUNTIME_DIR/plx-<display>.ctl.
 """
+# Отдельная команда, а не `ctl.py 'action share_start'`, потому что действие
+# умеет ответить только «ok» — а человеку нужен КОД и АДРЕС.
+#
+# Докстрока — это и есть `--help`, поэтому она английская, и объяснение почему
+# живёт здесь, а не в ней.
+#
+# СВОИ строки этой команды (help и две жалобы ниже) языку из `set{ lang }` не
+# следуют, как не следуют ему логи. Иначе и нельзя: «сокета нет» печатается
+# ровно тогда, когда спросить композитор про язык НЕ У КОГО. Ответы самого
+# композитора идут как есть и выбранному языку следуют — их эта команда только
+# передаёт.
 import glob
 import os
 import socket
@@ -38,7 +48,7 @@ def найти_сокет():
         return найденные[0]
     if not найденные:
         return None
-    print("plx-host: несколько сессий, укажи PLX_CTL_SOCKET:", file=sys.stderr)
+    print("plx-host: several sessions, pick one with PLX_CTL_SOCKET:", file=sys.stderr)
     for п in найденные:
         print(f"  {п}", file=sys.stderr)
     sys.exit(2)
@@ -61,20 +71,23 @@ def спросить(сокет, команда):
 
 
 def main():
-    сокет = найти_сокет()
-    if not сокет:
-        print(
-            "plx-host: не нашёл управляющий сокет parallax.\n"
-            "  parallax не запущен? Или запусти из его сеанса, либо задай\n"
-            "  PLX_CTL_SOCKET=/run/user/1000/parallax-wayland-1.ctl",
-            file=sys.stderr,
-        )
-        return 1
-
+    # Справка ПЕРЕД поиском сокета: `--help` спрашивают как раз тогда, когда
+    # ещё ничего не запущено, и отвечать на него «сокета нет» (да ещё кодом 1)
+    # — худшее, что команда может сделать.
     доводы = sys.argv[1:]
     if доводы and доводы[0] in ("-h", "--help", "помощь"):
         print(__doc__)
         return 0
+
+    сокет = найти_сокет()
+    if not сокет:
+        print(
+            "plx-host: no parallax control socket found.\n"
+            "  Is parallax running? Run this from its session, or point at the\n"
+            "  socket: PLX_CTL_SOCKET=/run/user/1000/plx-wayland-1.ctl",
+            file=sys.stderr,
+        )
+        return 1
 
     if доводы and доводы[0] == "watch":
         try:

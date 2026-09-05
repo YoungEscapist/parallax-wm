@@ -59,5 +59,8 @@ cp default_config.lua ~/.config/parallax/config.lua
 - Точки видны крестиками на минимапе (`Super+` \` — показать минимапу).
 
 ## Примечания
-- `launch.zsh` / `launch_tty.zsh` / `build.sh` в репозитории — NixOS-специфичные
-  (хардкод путей `/nix/store`), на другом ПК используй `*_portable.sh`.
+- `build.sh` — скрипт машины автора: собирает тем же системным тулчейном, но
+  кладёт сборку в `/mnt/plx-build` и ставит рядом `plx-host`. На чужом ПК бери
+  `build_portable.sh`.
+- `shell.nix` — для NixOS, и только для него: бинарь, слинкованный в nix-shell,
+  сегфолтится на не-Nix системе (и наоборот). Почему — в шапке `build.sh`.
