@@ -1,8 +1,14 @@
+# DesktopNames — СТРОЧНЫМИ. Отсюда менеджер входа берёт XDG_CURRENT_DESKTOP, а
+# по нему xdg-desktop-portal ищет `<имя>-portals.conf` и сверяет `UseIn=` в
+# `.portal`; сравнение точное, и композитор пишет оба файла со строчным
+# `parallax` (см. portal::install_portal_files). Заглавная буква здесь значит
+# не «красивее в списке» — за неё отвечает Name= ниже, — а «демонстрация экрана
+# не работает».
 [Desktop Entry]
 Name=Parallax
 Comment=Wayland compositor with an infinite canvas
 Exec=/usr/local/bin/parallax-session
 TryExec=/usr/local/bin/parallax-session
 Type=Application
-DesktopNames=Parallax
+DesktopNames=parallax
 Keywords=wayland;compositor;tiling;

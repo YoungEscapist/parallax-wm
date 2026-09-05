@@ -19,11 +19,11 @@ set -euo pipefail
 PLX_DIR="$(cd -- "$(dirname -- "$(realpath -- "$0")")" && pwd)"
 BUILD_DIR="/mnt/plx-build/target"
 # Сеанс идёт на ПОЛНОЙ сборке: шлем, окна в Minecraft и мультиюзер нужны
-# именно здесь. Минимальная лежит рядом — plx-minimal, тот же композитор без них.
+# именно здесь. Минимальная лежит рядом — plx-standart, тот же композитор без них.
 #
 # Каталог — ИМЕННО `extra/release`, тот, куда пишет build.sh. Пока здесь стоял
 # `release/plx-extra`, Super+R работал вхолостую: build.sh с разделением на две
-# сборки кладёт бинари в `extra/` и `minimal/`, а запускался остаток от прежней
+# сборки кладёт бинари в `extra/` и `standart/`, а запускался остаток от прежней
 # общей сборки одним `--workspace` (в `release/` лежат оба бинаря с одним
 # временем — по ним это и видно). Пересборка проходила, `свежие_исходники`
 # продолжали видеть исходники новее ЗАПУСКАЕМОГО файла, и сессия поднималась на
@@ -185,7 +185,19 @@ if [ -f "$HOME/.plx_wldebug" ]; then
     export WAYLAND_DEBUG=1
 fi
 # По этому имени xdg-desktop-portal выбирает бэкенд (см. launch_tty.zsh).
-export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-parallax}"
+#
+# Именно "=", а НЕ ":-", и ровно по той же причине, что у XDG_SESSION_TYPE
+# ниже: значение сюда приходит ИЗВНЕ и приходит неверное. Менеджер входа берёт
+# его из `DesktopNames=` в .desktop-файле сессии, а у поставленного на машину
+# файла там осталось `dawn` — имя до переименования проекта. Дальше всё
+# сходится одно к одному и молча:
+#   · фронтенд читает `dawn-portals.conf`, а тот зовёт бэкенд `dawn`;
+#   · `dawn.portal` объявляет имя `org.freedesktop.impl.portal.desktop.dawn`;
+#   · композитор при этом занимает на шине `…desktop.parallax` (portal.rs,
+#     BUS_NAME) и пишет `parallax.portal` с `UseIn=parallax`.
+# Имя, которого никто не занял, не активируется, ScreenCast отвечает отказом —
+# и снаружи это ровно «OBS не видит экран», без единой строки в логе.
+export XDG_CURRENT_DESKTOP=parallax
 # Именно "=", а НЕ ":-": elogind заводит сессию с tty и выставляет
 # XDG_SESSION_TYPE=tty ещё до нас, поэтому значение по умолчанию не
 # срабатывало никогда. Цена ошибки — вся демонстрация экрана: libwebrtc
@@ -197,6 +209,22 @@ export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-parallax}"
 # не получал ни одного вызова.
 export XDG_SESSION_TYPE=wayland
 export NIXOS_OZONE_WL="${NIXOS_OZONE_WL:-1}"
+
+# Занести окружение в ШИНУ. Она поднята выше (dbus-run-session) и успела снять
+# значения, которые были ДО двух правок над этой строкой. xdg-desktop-portal
+# запускается активацией по имени и наследует окружение шины, а не наше, —
+# без этого вызова обе правки чинили бы окружение всему, кроме того
+# единственного, ради кого они сделаны.
+#
+# Переменные перечислены поимённо и только те, что к этой строке ТОЧНО
+# выставлены: `dbus-update-activation-environment` на незаданном имени ругается
+# и возвращает ошибку, а WAYLAND_DISPLAY здесь ещё неоткуда взяться —
+# компоновщик не запущен. Без `--systemd`: на Void его нет, и флаг превратил бы
+# вызов в отказ целиком.
+if command -v dbus-update-activation-environment >/dev/null; then
+    dbus-update-activation-environment \
+        XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_RUNTIME_DIR >/dev/null 2>&1 || true
+fi
 
 # plx-wall (обои) запускается ПОСЛЕ parallax — см. ниже, после старта компоновщика.
 DWALL_PID=""
