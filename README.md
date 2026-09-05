@@ -8,7 +8,8 @@
   <a href="https://github.com/YoungEscapist/parallax-wm/actions/workflows/ci.yml"><img src="https://github.com/YoungEscapist/parallax-wm/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="License: GPL-3.0-or-later"></a>
   <img src="https://img.shields.io/badge/wayland-smithay-informational" alt="Wayland, on smithay">
-  <img src="https://img.shields.io/badge/status-pre--release-orange" alt="Status: pre-release">
+  <img src="https://img.shields.io/badge/status-beta-orange" alt="Status: beta">
+  <img src="https://img.shields.io/badge/written%20by-Claude%20(Anthropic)-8A63D2" alt="Written by Claude, Anthropic's model">
 </p>
 
 *[Русская версия](README.ru.md)*
@@ -26,9 +27,13 @@ Written in Rust on [smithay](https://github.com/Smithay/smithay), for TTY/DRM an
 (for development) winit. Russian is the language of the code comments and of the
 in-tree docs; this file and the config reference are in English too.
 
-> **Status: pre-release.** It is a daily driver on the author's machine — games
-> under Xwayland, Steam, screen sharing, two monitors — but it has had exactly
-> one set of eyes on it. Expect rough edges, and run it from a TTY you can
+> **Status: beta — and written by a neural network.** The code, the comments,
+> the documentation and the commit messages here are written by Claude
+> (Anthropic's model, driven from Claude Code). The author sets the tasks, reads
+> what comes back and runs the result every day: games under Xwayland, Steam,
+> screen sharing, two monitors. That is the whole of the review it has had — one
+> machine, one pair of human eyes and a model. So: expect rough edges, read the
+> code before you trust a working session to it, and run it from a TTY you can
 > escape from.
 
 <table>

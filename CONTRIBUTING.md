@@ -8,7 +8,7 @@ Write in English or Russian — both are read.
 
 ## Before you start
 
-Two things about this tree surprise everyone who opens it for the first time:
+Three things about this tree surprise everyone who opens it for the first time:
 
 **The comments and the identifiers are in Russian.** Not the strings you see on
 screen (those go through `t!`/`tf!` and exist in both languages), and not the
@@ -18,6 +18,15 @@ deliberate and it is not going to change: the author thinks in Russian, and a
 compositor is mostly reasoning, not API surface. If you send a patch in English
 identifiers it will be taken and translated rather than refused — say so in the
 PR and nobody will spend time confused.
+
+**The code is written by a neural network.** Claude writes it (Anthropic's
+model, driven from Claude Code) — the comments, the docs and the commit messages
+too. The author sets the tasks, reads what comes back and lives in this
+compositor every day; the human eyes on this tree are exactly one pair. This is
+said not as a disclaimer but because it changes what your patch is worth: the
+review here is thinner than usual, and a bug you find is a rarity rather than
+nitpicking. Patches from people are taken like anywhere else, and nobody cares
+where a patch came from.
 
 **Comments explain *why*, at length.** A block that took a day to get right
 carries the story of what was wrong before it, and often the measurement that

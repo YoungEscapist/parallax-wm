@@ -8,7 +8,8 @@
   <a href="https://github.com/YoungEscapist/parallax-wm/actions/workflows/ci.yml"><img src="https://github.com/YoungEscapist/parallax-wm/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="Лицензия: GPL-3.0-or-later"></a>
   <img src="https://img.shields.io/badge/wayland-smithay-informational" alt="Wayland, на smithay">
-  <img src="https://img.shields.io/badge/status-pre--release-orange" alt="Состояние: до релиза">
+  <img src="https://img.shields.io/badge/status-beta-orange" alt="Состояние: бета">
+  <img src="https://img.shields.io/badge/written%20by-Claude%20(Anthropic)-8A63D2" alt="Написано Claude, моделью Anthropic">
 </p>
 
 *[In English](README.md)*
@@ -25,10 +26,14 @@ Wayland-композитор, в котором окна живут на одн�
 Написан на Rust поверх [smithay](https://github.com/Smithay/smithay), бэкенды —
 TTY/DRM и winit (для разработки).
 
-> **Состояние: до релиза.** Композитор используется автором каждый день — игры
-> через Xwayland, Steam, демонстрация экрана, два монитора, — но смотрела на
-> него ровно одна пара глаз. Шероховатости будут; запускайте с того TTY, с
-> которого сможете выйти.
+> **Состояние: бета, и написана она нейросетью.** Код, комментарии,
+> документацию и сообщения коммитов здесь пишет Claude (модель Anthropic, из
+> Claude Code). Автор ставит задачи, читает, что получилось, и работает в этом
+> композиторе каждый день: игры через Xwayland, Steam, демонстрация экрана, два
+> монитора. Это и вся проверка — одна машина, одна пара человеческих глаз и
+> модель. Отсюда и предупреждение: шероховатости будут, читайте код, прежде чем
+> доверить ему рабочий сеанс, и запускайте с того TTY, с которого сможете
+> выйти.
 
 <table>
 <tr>
