@@ -48,16 +48,44 @@ fi
 # Полная сборка предпочтительнее, но сеанс поднимется и на стандартной: у
 # того, кто собрал только `-p plx-standard`, ровно тот же композитор без шлема,
 # Minecraft и мультиюзера, и отказываться его запускать не за что.
-BINARY="$BUILD_DIR/extra/release/plx-extra"
-# Имя переменной ЛАТИНИЦЕЙ: кириллическое bash за идентификатор не считает и
-# падает на `not a valid identifier` — та же грабля, что с chown в build.sh.
-for cand in \
-    "$BUILD_DIR/extra/release/plx-extra" \
-    "$BUILD_DIR/release/plx-extra" \
-    "$BUILD_DIR/standard/release/plx-standard" \
-    "$BUILD_DIR/release/plx-standard"; do
-    if [[ -x "$cand" ]]; then BINARY="$cand"; break; fi
-done
+# Имя переменной и функции ЛАТИНИЦЕЙ: кириллическое bash за идентификатор не
+# считает и падает на `not a valid identifier` — та же грабля, что с chown в
+# build.sh.
+#
+# Внутри одной сборки (extra или standard) профилей теперь два: release и quick
+# (thin LTO, см. [profile.quick] в Cargo.toml — правка одной строки стоит 36 с
+# против пяти минут). Между ними выбирается СВЕЖИЙ ПО ВРЕМЕНИ, а не тот, что
+# раньше в списке: иначе забытый месяц назад quick-бинарь молча выигрывал бы у
+# только что собранного релиза — это ровно та беда «пересобрал, а поднялся
+# прежний бинарь», которая стоила сеанса 03.09.2026.
+#
+# Функцией, а не разом: после пересборки (Super+R) бинарь может появиться в
+# ДРУГОМ каталоге — с PLX_PROFILE=quick он ложится в `quick/`, — и выбирать
+# снова обязаны по тем же правилам.
+pick_binary() {
+    BINARY="$BUILD_DIR/extra/release/plx-extra"
+    local found="" cand
+    for cand in \
+        "$BUILD_DIR/extra/release/plx-extra" \
+        "$BUILD_DIR/extra/quick/plx-extra" \
+        "$BUILD_DIR/release/plx-extra" \
+        "$BUILD_DIR/standard/release/plx-standard" \
+        "$BUILD_DIR/standard/quick/plx-standard" \
+        "$BUILD_DIR/release/plx-standard"; do
+        [[ -x "$cand" ]] || continue
+        if [[ -z "$found" ]]; then
+            found="$cand"
+        # Следующий кандидат берётся, только если он ТОГО ЖЕ имени (то есть
+        # другой профиль той же сборки) и новее. Полная сборка по-прежнему
+        # главнее стандартной, каким бы свежим ни был plx-standard: сеанс идёт
+        # на plx-extra, и подменять его молча нельзя.
+        elif [[ "$(basename "$cand")" == "$(basename "$found")" && "$cand" -nt "$found" ]]; then
+            found="$cand"
+        fi
+    done
+    [[ -n "$found" ]] && BINARY="$found"
+}
+pick_binary
 # Отладочный бинарь лежит там же, где и релизный, только в `debug/`. Пока здесь
 # стояло `$BUILD_DIR/debug/parallax`, `--debug` не работал вовсе: бинаря с
 # именем `parallax` не существует с тех пор, как сборка разделилась на
@@ -331,6 +359,17 @@ rebuild_if_stale() {
         "$PLX_DIR/build.sh" 2>&1 | tee "$build_log" || ok=1
     fi
     set +o pipefail
+    # Бинарь мог лечь в другой каталог: с PLX_PROFILE=quick build.sh пишет в
+    # `quick/`, а не в `release/`. Не перевыбрав, мы бы сравнили исходники со
+    # СТАРЫМ файлом, решили «сборка не обновила бинарь» и подняли прежний —
+    # ровно то, что этот блок и должен ловить.
+    # Отладочный запуск (--debug) перевыбору не подлежит: его бинарь лежит в
+    # `debug/` и релизным правилам не подчиняется. Внутри функции про ключи
+    # командной строки судить нельзя — $1 здесь принадлежит ФУНКЦИИ, — поэтому
+    # смотрим на сам путь, как и ветка сборки выше.
+    if [[ "$BINARY" != */debug/plx-extra ]]; then
+        pick_binary
+    fi
     # Мало нулевого кода возврата: сборка может пройти и НЕ обновить бинарь —
     # так было 23.08.2026, когда cargo от yarik уткнулся в root'овые артефакты
     # в общем каталоге сборки. Проверяем не код, а факт: бинарь обязан стать

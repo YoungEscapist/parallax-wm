@@ -24,6 +24,25 @@ TARGET_DIR=/mnt/plx-build/target
 
 cd "$(dirname "$0")"
 
+# Машинные флаги задаются ЗДЕСЬ, а не в .cargo/config.toml: тот файл едет в
+# каждый клон, и посторонний без mold на нём не собирался вовсе, а бинарь,
+# собранный с target-cpu=native, падал на чужом железе с SIGILL. Скрипт же
+# знает, на какой машине он запущен, — и смотрит, что в ней есть.
+#
+# PLX_NATIVE=1 по умолчанию: это сборка ДЛЯ ЭТОЙ машины, и код под её
+# процессор здесь именно то, что нужно. PLX_NATIVE=0 — если бинарь поедет
+# куда-то ещё.
+plx_flags="${RUSTFLAGS:-}"
+if command -v mold >/dev/null 2>&1; then
+    plx_flags="$plx_flags -C link-arg=-fuse-ld=mold"
+elif command -v ld.lld >/dev/null 2>&1; then
+    plx_flags="$plx_flags -C link-arg=-fuse-ld=lld"
+fi
+if [[ "${PLX_NATIVE:-1}" != 0 ]]; then
+    plx_flags="$plx_flags -C target-cpu=native"
+fi
+export RUSTFLAGS="$plx_flags"
+
 # Собираются ОБА бинаря: plx-standard (без шлема, Minecraft и мультиюзера) и
 # plx-extra (со всем). Это не два разных исходника, а один и тот же крейт с
 # разным набором фич — см. `[features]` в Cargo.toml и заглушки в src/*_stub/.
@@ -36,8 +55,15 @@ cd "$(dirname "$0")"
 # «стандартном» лежали 137 строк openxr. Раздельные каталоги нужны потому, что
 # отпечаток сборки включает набор фич: в общем каталоге каждый вызов вытеснял
 # бы предыдущий и пересобирал библиотеку целиком (fat LTO — это минуты).
-cargo build --release --target-dir "$TARGET_DIR/standard" -p plx-standard "$@"
-cargo build --release --target-dir "$TARGET_DIR/extra"   -p plx-extra   "$@"
+#
+# Профиль: release по умолчанию, `PLX_PROFILE=quick ./build.sh` — тот же
+# оптимизированный код с thin LTO вместо fat (36 с против 4 м 56 с на правку
+# одной строки, см. [profile.quick] в Cargo.toml). Бинарь при этом ложится в
+# `<каталог>/quick/`, а не в `release/`, — про это знают launch_native.sh и
+# harness.sh.
+profile="${PLX_PROFILE:-release}"
+cargo build --profile "$profile" --target-dir "$TARGET_DIR/standard" -p plx-standard "$@"
+cargo build --profile "$profile" --target-dir "$TARGET_DIR/extra"   -p plx-extra   "$@"
 
 # Сборку зовут ДВА разных пользователя: человек (или Super+R внутри сессии) —
 # от yarik, я при проверках — от root. Каталог сборки при этом ОДИН, и после
@@ -76,6 +102,6 @@ chmod +x "$bindir/plx-host"
 
 echo ""
 echo "Бинари:"
-echo "  $TARGET_DIR/standard/release/plx-standard"
-echo "  $TARGET_DIR/extra/release/plx-extra"
+echo "  $TARGET_DIR/standard/$profile/plx-standard"
+echo "  $TARGET_DIR/extra/$profile/plx-extra"
 echo "Команда: $bindir/plx-host"
