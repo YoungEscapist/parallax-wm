@@ -142,29 +142,47 @@ TTY/DRM и winit (для разработки).
   жесты тачпада. Палец, пролежавший неподвижно, — правая кнопка.
 - Настройка — Lua, перечитывается на лету по `Super+Shift+C`.
 
-## Сборка
+## Установка
 
-Нужны Rust (лучше через rustup), pkg-config, C-компилятор и dev-версии
-библиотек: wayland, libxkbcommon, libinput, udev, libseat, libdrm, gbm, EGL,
-GLES, libdisplay-info, PipeWire (вместе с libspa — через него идёт портал
-демонстрации экрана) и pixman (smithay линкует рендерер через `-lpixman-1`). Lua отдельно ставить не надо — `mlua` собирает её из
-исходников. Для запуска нужен ещё `xwayland`.
+Одной командой — зависимости, Rust, сборка, конфиг и пункт в менеджере входа:
 
-Точные имена пакетов по дистрибутивам — в шапке `build_portable.sh`; для Void,
-Arch, Debian/Ubuntu и Fedora их поставит скрипт:
+```sh
+git clone https://github.com/YoungEscapist/parallax-wm.git
+cd parallax-wm
+./install.sh
+```
+
+`install.sh` показывает каждую команду до того, как её выполнить, и спрашивает
+перед всем, что делается от root. Ключи: `--extra` (полная сборка), `--quick`
+(пересборка в 8 раз быстрее), `--update`, `--uninstall`, `--dry-run`.
+
+Готовых пакетов пока нет — собирается из исходников. Нужны Rust (лучше через
+rustup), pkg-config, C-компилятор и dev-версии wayland, libxkbcommon, libinput,
+udev, libseat, libdrm, gbm, EGL, GLES, libdisplay-info, PipeWire (вместе с
+libspa — через него идёт портал демонстрации экрана) и pixman (smithay линкует
+рендерер через `-lpixman-1`). Lua отдельно ставить не надо — `mlua` собирает её
+из исходников; для запуска нужен ещё `xwayland`.
+
+Руками, по шагам:
 
 ```sh
 ./dist/install-deps.sh --print   # показать команду, ничего не делая
-sudo ./dist/install-deps.sh      # поставить
-./build_portable.sh              # release, бинари в target/release/{plx-standard,plx-extra}
+sudo ./dist/install-deps.sh      # поставить пакеты
+./build_portable.sh              # бинари в target/release/{plx-standard,plx-extra}
+sudo ./dist/install-session.sh   # пункт «Parallax» в менеджере входа
 ```
 
 Первая сборка тянет smithay с гита (ревизия закреплена в `Cargo.toml`) и много
-крейтов — нужен интернет; `Cargo.lock` в комплекте.
+крейтов — нужен интернет; `Cargo.lock` в комплекте. Профиль `release` идёт с fat
+LTO: правка одной строки пересобирается около пяти минут, а `--quick` (тот же
+оптимизированный код с thin LTO) — за 36 секунд и на меньшей памяти.
 
 Для NixOS есть `shell.nix` и `build.sh`. Важно: бинарь, слинкованный с
 Nix-glibc, падает на не-Nix системе (и наоборот) — подробности в шапке
 `build.sh`.
+
+**Подробный гайд со всеми дистрибутивами, обновлением, удалением и разбором
+частых бед — [INSTALL.ru.md](INSTALL.ru.md).**
 
 ### Две сборки
 

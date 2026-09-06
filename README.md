@@ -145,29 +145,48 @@ dragging — the wheel pulls it closer, a click on a face flies to that workspac
   touchpad uses. A finger held still is the right button.
 - Configuration is Lua, reloaded live with `Super+Shift+C`.
 
-## Building
+## Installing
 
-Rust (via rustup), pkg-config, a C compiler, and the development packages for
-wayland, libxkbcommon, libinput, udev, libseat, libdrm, gbm, EGL, GLES,
-libdisplay-info, PipeWire (with libspa — the screencast portal goes through it)
-and pixman (smithay's renderer links `-lpixman-1`). Lua is built from source by `mlua`, so you do not need it
-installed. `xwayland` is needed at runtime.
+One command — dependencies, Rust, build, config, and an entry in your display
+manager:
 
-Exact package names per distribution are in the header of `build_portable.sh`;
-on Void, Arch, Debian/Ubuntu and Fedora a script will install them for you:
+```sh
+git clone https://github.com/YoungEscapist/parallax-wm.git
+cd parallax-wm
+./install.sh
+```
+
+It shows every command before running it and asks before anything that needs
+root. Flags: `--extra` (the full build), `--quick` (8× faster rebuilds),
+`--update`, `--uninstall`, `--dry-run`.
+
+There are no binary packages yet; you build from source. You need Rust (via
+rustup), pkg-config, a C compiler, and the development packages for wayland,
+libxkbcommon, libinput, udev, libseat, libdrm, gbm, EGL, GLES, libdisplay-info,
+PipeWire (with libspa — the screencast portal goes through it) and pixman
+(smithay's renderer links `-lpixman-1`). Lua is built from source by `mlua`, so
+you do not need it installed; `xwayland` is needed at runtime.
+
+By hand, step by step:
 
 ```sh
 ./dist/install-deps.sh --print   # show the command it would run
 sudo ./dist/install-deps.sh      # run it
-./build_portable.sh              # release build: target/release/{plx-standard,plx-extra}
+./build_portable.sh              # target/release/{plx-standard,plx-extra}
+sudo ./dist/install-session.sh   # a "Parallax" entry in the display manager
 ```
 
 The first build pulls smithay from git (the revision is pinned in `Cargo.toml`)
-and a lot of crates, so it needs a network. `Cargo.lock` is committed.
+and a lot of crates, so it needs a network. `Cargo.lock` is committed. The
+`release` profile is fat LTO — five minutes to rebuild after a one-line change;
+`--quick` is the same optimised code with thin LTO, 36 seconds, and less memory.
 
 NixOS users: `shell.nix` plus `build.sh` (note that a binary linked against
 Nix's glibc will segfault on a non-Nix system, and vice versa — see the comment
 at the top of `build.sh`).
+
+**The full guide — every distribution, updating, uninstalling and what to do
+when it does not work — is [INSTALL.md](INSTALL.md).**
 
 ### Two builds
 

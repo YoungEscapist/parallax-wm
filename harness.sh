@@ -38,6 +38,13 @@ root=/tmp/parallax-harness
 # launch_native.sh): в `release/` лежит остаток прежней общей сборки, и харнесс
 # проверял бы не то, что только что собрано.
 bin=/mnt/plx-build/target/extra/release/plx-extra
+# Профилей у сборки два: release и quick (thin LTO, [profile.quick] в
+# Cargo.toml). Берём тот, что СВЕЖЕЕ, — харнесс обязан показывать последнее
+# собранное, иначе проверка идёт по коду, которого уже нет. Переопределяется
+# переменной BIN.
+quick=/mnt/plx-build/target/extra/quick/plx-extra
+[ -x "$quick" ] && { [ ! -x "$bin" ] || [ "$quick" -nt "$bin" ]; } && bin=$quick
+bin=${BIN:-$bin}
 user=${SUDO_USER:-yarik}
 # Режимы через запятую = столько мониторов. Двухмониторный прогон обязателен
 # для всего, что считает холст: у второго монитора дом (1 000 000, 0), и
