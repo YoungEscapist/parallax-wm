@@ -135,7 +135,9 @@ dragging — the wheel pulls it closer, a click on a face flies to that workspac
   first button of a chord has to be held back until the second one decides
   (`mouse{}` in `default_config.lua`). The second half can be the wheel instead
   of a button — `"1-scroll"` zooms the canvas while the left button is down, and
-  that pair holds nothing back.
+  that pair holds nothing back — or the same button again: `"3-3"` is a double
+  click, after which the window follows the cursor until you click it down.
+  Resizing pulls the corner your cursor stands in, like a Super+right-drag.
 - **A laptop touchscreen is a first-class input.** On a window the touch goes
   to the client as real `wl_touch`; on the bar, the window map or the overview
   the finger works as the pointer; on empty canvas it drives the camera — one

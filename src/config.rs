@@ -449,6 +449,16 @@ pub struct Config {
     /// ход руки, и общая цифра означала бы, что подгонка под одно устройство
     /// каждый раз портит второе.
     pub mouse_chord_resize_gain: f64,
+    /// Окно ДВОЙНОГО КЛИКА, мс: сколько ждать второй щелчок той же кнопки
+    /// (`chord = "3-3"`). Считается ОТ ОТПУСКАНИЯ первого щелчка, а не от
+    /// нажатия: между щелчками рука проходит весь путь «отпустил — нажал», и
+    /// мерить его сроком ожидания второй КНОПКИ значило бы требовать
+    /// невозможной скорости.
+    ///
+    /// Цена та же, что у аккордов, но больше: пока настроен двойной клик,
+    /// первый щелчок этой кнопки уходит приложению не сразу, а через этот
+    /// срок ЦЕЛИКОМ — и нажатие, и отпускание.
+    pub mouse_double_click: u32,
     /// СЕНСОРНЫЙ ЭКРАН: `set{ touch = true }` (см. сенсор.rs). Выключенный
     /// сенсор не объявляется местом вовсе — клиент, увидевший `wl_touch`, ждёт
     /// касаний вместо эмуляции мыши, и молчащая возможность оставила бы его
@@ -621,6 +631,7 @@ impl Default for Config {
             mouse_chords: Vec::new(),
             mouse_chord_timeout: 250,
             mouse_chord_resize_gain: 4.0,
+            mouse_double_click: 400,
             touch: true,
             touch_pan: true,
             touch_zoom: true,
@@ -958,6 +969,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         Rc::new(RefCell::new(Vec::new()));
     let mouse_chord_timeout: Rc<RefCell<u32>> = Rc::new(RefCell::new(250));
     let mouse_chord_resize_gain: Rc<RefCell<f64>> = Rc::new(RefCell::new(4.0));
+    let mouse_double_click: Rc<RefCell<u32>> = Rc::new(RefCell::new(400));
     let touch: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let touch_pan: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let touch_zoom: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
@@ -1128,12 +1140,17 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                 tracing::warn!("plx/config: mouse{{}}: unknown button in '{chord}', skipping");
                 return Ok(());
             };
-            if вторая == crate::аккорды::Вторая::Кнопка(первая) {
-                // Одна и та же кнопка дважды — не аккорд: второе нажатие без
-                // отпускания физически не придёт, и бинд не сработал бы никогда.
-                tracing::warn!("plx/config: mouse{{}}: '{chord}' is the same button twice, skipping");
-                return Ok(());
-            }
+            // «3-3» — это ДВОЙНОЙ КЛИК, а не пара кнопок. Раньше такая строка
+            // отвергалась со словами «второе нажатие без отпускания физически
+            // не придёт»: верно про пару, но между двумя щелчками приходит
+            // отпускание, и распознаётся такая пара не хуже. Разворачиваем
+            // здесь, чтобы дальше по коду `Вторая::Кнопка(та же)` не
+            // существовало вовсе.
+            let вторая = if вторая == crate::аккорды::Вторая::Кнопка(первая) {
+                crate::аккорды::Вторая::Двойной
+            } else {
+                вторая
+            };
             let action_str: String = tbl.get::<String>("action").unwrap_or_default();
             use crate::аккорды::ДействиеАккорда as Д;
             let действие = match action_str.trim().to_ascii_lowercase().as_str() {
@@ -1221,6 +1238,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let gesture_thresholds = gesture_thresholds.clone();
         let mouse_chord_timeout = mouse_chord_timeout.clone();
         let mouse_chord_resize_gain = mouse_chord_resize_gain.clone();
+        let mouse_double_click = mouse_double_click.clone();
         let touch = touch.clone();
         let touch_pan = touch_pan.clone();
         let touch_zoom = touch_zoom.clone();
@@ -1368,6 +1386,13 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                 if v.is_finite() && v > 0.0 {
                     *mouse_chord_resize_gain.borrow_mut() = v.clamp(0.1, 50.0);
                 }
+            }
+            // Окно двойного клика. Нижняя граница — 150 мс: быстрее двух
+            // щелчков подряд человеческая рука не делает, а верхняя в полторы
+            // секунды это уже не «двойной клик», а два разных, и всё это время
+            // приложение не видело бы первого.
+            if let Ok(Some(v)) = tbl.get::<Option<u32>>("mouse_double_click") {
+                *mouse_double_click.borrow_mut() = v.clamp(150, 1500);
             }
             // Сенсорный экран. Булевы ключи — только через Option<bool>: см.
             // грабли с `blur` выше, из-за них каждый set{} гасил чужие
@@ -1679,7 +1704,12 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             // человек эту цену и узнаёт.
             let mut задержанные: Vec<&str> = таблица
                 .iter()
-                .filter(|б| matches!(б.вторая, crate::аккорды::Вторая::Кнопка(_)))
+                .filter(|б| {
+                    matches!(
+                        б.вторая,
+                        crate::аккорды::Вторая::Кнопка(_) | crate::аккорды::Вторая::Двойной
+                    )
+                })
                 .map(|б| match б.первая {
                     crate::аккорды::Кнопка::Левая => "left",
                     crate::аккорды::Кнопка::Средняя => "middle",
@@ -1699,6 +1729,28 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                     таблица.len(),
                     *mouse_chord_timeout.borrow(),
                     задержанные.join(", ")
+                );
+            }
+            // Двойной клик стоит дороже и по-другому: у этих кнопок
+            // задерживается ВЕСЬ первый щелчок — и нажатие, и отпускание.
+            // Человек, читающий строку выше, про отпускание не догадается.
+            let mut двойные: Vec<&str> = таблица
+                .iter()
+                .filter(|б| б.вторая == crate::аккорды::Вторая::Двойной)
+                .map(|б| match б.первая {
+                    crate::аккорды::Кнопка::Левая => "left",
+                    crate::аккорды::Кнопка::Средняя => "middle",
+                    crate::аккорды::Кнопка::Правая => "right",
+                })
+                .collect();
+            двойные.sort_unstable();
+            двойные.dedup();
+            if !двойные.is_empty() {
+                tracing::info!(
+                    "plx/config: double click: {} (its whole first click reaches the app \
+                     {} ms later)",
+                    двойные.join(", "),
+                    *mouse_double_click.borrow(),
                 );
             }
         }
@@ -1728,6 +1780,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         mouse_chords: mouse_chords.borrow().clone(),
         mouse_chord_timeout: *mouse_chord_timeout.borrow(),
         mouse_chord_resize_gain: *mouse_chord_resize_gain.borrow(),
+        mouse_double_click: *mouse_double_click.borrow(),
         touch: *touch.borrow(),
         touch_pan: *touch_pan.borrow(),
         touch_zoom: *touch_zoom.borrow(),

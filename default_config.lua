@@ -876,7 +876,23 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 -- mouse{ chord = "3-1", action = "close_under" }
 -- mouse{ chord = "3-2", action = "pan" }
 -- mouse{ chord = "2-1", action = "move_window" }
--- mouse{ chord = "2-3", action = "resize_window" }
+-- mouse{ chord = "2-3", action = "resize_window" }   -- grabs the CORNER the cursor is in
+--
+-- Resizing pulls the corner of the window your cursor stands in, exactly like
+-- Super+right-drag: in the top-left quarter the left and top edges follow your
+-- hand and the opposite corner stays put. Before, the size was simply added to
+-- the bottom-right corner and an edge could only be pushed away, never pulled.
+--
+-- DOUBLE CLICK. The same button twice ("3-3") is a chord too — a double click.
+-- Double-click and the window follows the cursor; click again and it is put
+-- down. Drag while the second click is still held and it works as an ordinary
+-- drag, ending on release.
+-- mouse{ chord = "3-3", action = "move_window" }
+-- How long to wait for the second click, measured FROM THE RELEASE of the
+-- first one. The price is the same as with chords, only bigger: while a double
+-- click is configured for a button, its whole first click — press AND release —
+-- reaches the application this much later.
+-- set{ mouse_double_click = 400 }
 -- mouse{ chord = "1-scroll", action = "zoom" }      -- left + wheel = canvas zoom (no Alt)
 -- mouse{ chord = "1-2", action = "zoom" }           -- left, then press wheel: drag up/down = zoom
 -- mouse{ chord = "1-2", action = "toggle_fullscreen" }

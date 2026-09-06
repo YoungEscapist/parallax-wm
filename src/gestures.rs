@@ -713,9 +713,65 @@ impl Parallax {
     ///   меньше) без этого деления окно росло медленнее курсора ровно во
     ///   столько раз, во сколько отдалён вид, — то самое «ресайз слабый».
     pub(crate) fn размер_мышью(&mut self, dx: f64, dy: f64) {
+        use crate::grabs::resize_grab::ResizeEdge as Край;
         let зум = self.viewport.zoom.max(0.05);
         let усиление = self.lua_config.mouse_chord_resize_gain / зум;
-        self.размер_шагом(dx * усиление, dy * усиление);
+        let край = self.аккорд_край;
+
+        // ЗНАК ПО УГЛУ. Тянут левый край — рука идёт влево, а окно при этом
+        // РАСТЁТ: ширина считается от угла, за который взялись, а не от левого
+        // верхнего всегда. Ровно так же переворачивает дельту Super+ПКМ
+        // (см. resize_grab.rs).
+        let (мx, мy) = (
+            if край.intersects(Край::LEFT) { -1.0 } else { 1.0 },
+            if край.intersects(Край::TOP) { -1.0 } else { 1.0 },
+        );
+        self.размер_шагом_краем(dx * усиление * мx, dy * усиление * мy, край);
+    }
+
+    /// Прибавить размер и, если тянут за левый или верхний край, СДВИНУТЬ окно
+    /// на столько же в другую сторону.
+    ///
+    /// Без сдвига «тянуть влево» выглядело бы как «окно растёт вправо»:
+    /// противоположный угол обязан стоять на месте — это и значит «ресайз за
+    /// этот угол». Сдвиг считается по ФАКТИЧЕСКОМУ приросту, а не по дельте
+    /// руки: размер зажат снизу единицей, и на упоре окно иначе уползало бы,
+    /// не меняя ширины.
+    fn размер_шагом_краем(&mut self, dw: f64, dh: f64, край: crate::grabs::resize_grab::ResizeEdge) {
+        use crate::grabs::resize_grab::ResizeEdge as Край;
+        let двигать_x = край.intersects(Край::LEFT);
+        let двигать_y = край.intersects(Край::TOP);
+        if !двигать_x && !двигать_y {
+            self.размер_шагом(dw, dh);
+            return;
+        }
+        let группа = self.gesture_resize_group.clone();
+        for (окно, _) in группа {
+            let текущий = crate::xwin::current_size(&окно);
+            let новый = smithay::utils::Size::from((
+                (текущий.w as f64 + dw).round().clamp(1.0, 20000.0) as i32,
+                (текущий.h as f64 + dh).round().clamp(1.0, 20000.0) as i32,
+            ));
+            crate::xwin::set_size(&окно, Some(новый), crate::xwin::Tiled::Keep);
+            crate::xwin::configure(&окно);
+            let Some(гео) = self.space.element_geometry(&окно) else { continue };
+            let сдвиг_x = if двигать_x { текущий.w - новый.w } else { 0 };
+            let сдвиг_y = if двигать_y { текущий.h - новый.h } else { 0 };
+            if сдвиг_x == 0 && сдвиг_y == 0 {
+                continue;
+            }
+            let место = smithay::utils::Point::from((гео.loc.x + сдвиг_x, гео.loc.y + сдвиг_y));
+            self.space.map_element(окно.clone(), место, false);
+            // Плавающая позиция запоминается там же, где её пишет ведение
+            // окна: иначе следующий `arrange` вернул бы окно на старое место,
+            // и левый край «отпрыгивал» бы обратно.
+            if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| tw.window == окно) {
+                tw.float_position = место;
+                tw.position = место;
+                tw.float_position_set = true;
+            }
+        }
+        self.request_redraw();
     }
 
     /// Общее ядро обоих путей: прибавить к размеру окон группы уже посчитанную
