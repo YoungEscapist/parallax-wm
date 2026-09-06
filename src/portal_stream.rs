@@ -16,9 +16,12 @@
 
 use std::sync::mpsc;
 
+// Rc-варианты (MainLoopRc/ContextRc/StreamRc), а не Box: с pipewire 0.10 крейт
+// развёл владение по трём умным указателям, и поток нам нужен именно общий —
+// его же дёргает замыкание, принимающее кадры из композитора.
 use pipewire::{
-    context::Context,
-    main_loop::MainLoop,
+    context::ContextRc,
+    main_loop::MainLoopRc,
     properties::properties,
     spa::{
         param::{
@@ -32,7 +35,7 @@ use pipewire::{
               SPA_PARAM_BUFFERS_dataType, SPA_PARAM_BUFFERS_size, SPA_PARAM_BUFFERS_stride},
         utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle, SpaTypes},
     },
-    stream::{Stream, StreamFlags, StreamState},
+    stream::{StreamFlags, StreamRc, StreamState},
 };
 
 /// Живой поток: номер ноды для клиента и канал, по которому уезжают кадры.
@@ -149,12 +152,12 @@ fn serve(
     id_tx: mpsc::Sender<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     pipewire::init();
-    let mainloop = MainLoop::new(None)?;
-    let context = Context::new(&mainloop)?;
-    let core = context.connect(None)?;
+    let mainloop = MainLoopRc::new(None)?;
+    let context = ContextRc::new(&mainloop, None)?;
+    let core = context.connect_rc(None)?;
 
-    let stream = std::rc::Rc::new(Stream::new(
-        &core,
+    let stream = StreamRc::new(
+        core,
         "plx-screencast",
         properties! {
             *pipewire::keys::MEDIA_TYPE => "Video",
@@ -162,7 +165,7 @@ fn serve(
             *pipewire::keys::MEDIA_ROLE => "Screen",
             *pipewire::keys::NODE_NAME => "plx-screencast",
         },
-    )?);
+    )?;
 
     let stride = width as i32 * 4;
     let frame_size = stride * height as i32;

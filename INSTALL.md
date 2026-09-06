@@ -106,8 +106,14 @@ sudo xbps-install -y base-devel pkg-config \
 
 ```sh
 sudo pacman -S --needed base-devel pkgconf wayland libxkbcommon libinput \
-  systemd-libs seatd libdrm mesa libdisplay-info pipewire pixman xorg-xwayland
+  systemd-libs seatd libdrm mesa libdisplay-info pipewire pixman xorg-xwayland \
+  clang
 ```
+
+On Arch derivatives without systemd (Artix and friends) there is no
+`systemd-libs` package at all — libudev comes from `libudev` instead. Since
+`pacman` refuses the whole command over one unknown name, put `libudev` in place
+of `systemd-libs` there; `install-deps.sh` picks the right one on its own.
 
 **Debian / Ubuntu**
 

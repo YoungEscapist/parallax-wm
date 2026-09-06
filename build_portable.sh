@@ -18,7 +18,8 @@
 #   Arch:
 #     sudo pacman -S base-devel pkgconf rust wayland libxkbcommon libinput \
 #       systemd-libs seatd libdrm mesa libdisplay-info pipewire pixman \
-#       xorg-xwayland
+#       xorg-xwayland clang
+#     (на Artix и прочей родне без systemd пакета systemd-libs нет — там libudev)
 #
 # Рекомендуется свежий стабильный Rust (rustup). mlua собирает Lua 5.4 из
 # исходников (feature "vendored") — отдельный Lua ставить не нужно.
