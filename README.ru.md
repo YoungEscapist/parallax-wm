@@ -156,6 +156,13 @@ cd parallax-wm
 перед всем, что делается от root. Ключи: `--extra` (полная сборка), `--quick`
 (пересборка в 8 раз быстрее), `--update`, `--uninstall`, `--dry-run`.
 
+Если сборка уже выбрана, на каждую есть свой скрипт — те же шаги и те же ключи:
+
+```sh
+./install-standard.sh    # plx-standard: без VR, Minecraft, гостей и шейдеров
+./install-extra.sh       # plx-extra: всё включено
+```
+
 Готовых пакетов пока нет — собирается из исходников. Нужны Rust (лучше через
 rustup), pkg-config, C-компилятор и dev-версии wayland, libxkbcommon, libinput,
 udev, libseat, libdrm, gbm, EGL, GLES, libdisplay-info, PipeWire (вместе с

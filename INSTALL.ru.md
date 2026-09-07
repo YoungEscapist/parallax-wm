@@ -33,6 +33,24 @@ curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/in
 Ключи в такой форме передаются через `bash -s --`, например
 `… | bash -s -- --extra --quick`.
 
+Если не хочется помнить ключ, на каждую сборку есть свой скрипт. Они делают
+ровно то же, что `install.sh --standard` и `install.sh --extra`, — те же шаги,
+те же вопросы — и принимают те же ключи:
+
+```sh
+./install-standard.sh    # plx-standard: композитор без VR, Minecraft, гостей и шейдеров
+./install-extra.sh       # plx-extra: всё включено
+```
+
+Оба работают и через `curl` — дерево склонируют сами:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/install-extra.sh | bash
+```
+
+Чем сборки отличаются на самом деле — в разделе [Какая сборка](#какая-сборка).
+Собрать обе разом по-прежнему `./install.sh --both`.
+
 `install.sh` делает пять вещей, показывает каждую команду до того, как её
 выполнить, и спрашивает перед всем, что требует root:
 

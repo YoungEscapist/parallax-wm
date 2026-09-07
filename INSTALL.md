@@ -32,6 +32,24 @@ curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/in
 
 Flags go through `bash -s --`, e.g. `… | bash -s -- --extra --quick`.
 
+If you would rather not remember a flag, there is one script per build. They do
+exactly what `install.sh --standard` and `install.sh --extra` do — same steps,
+same questions, same flags — and they accept the same options:
+
+```sh
+./install-standard.sh    # plx-standard: the compositor, no VR/Minecraft/guests/shaders
+./install-extra.sh       # plx-extra: everything switched on
+```
+
+Both work through `curl` too, and clone the tree themselves:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/install-extra.sh | bash
+```
+
+See [Which build](#which-build) for what the difference actually is. Building
+both at once is still `./install.sh --both`.
+
 `install.sh` does five things, shows every command before running it, and asks
 before each one that needs root:
 

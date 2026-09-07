@@ -134,7 +134,8 @@ jobs:
 
       - name: Синтаксис
         run: |
-          for f in install.sh build.sh build_portable.sh launch_native.sh \
+          for f in install.sh install-standard.sh install-extra.sh \
+                   build.sh build_portable.sh launch_native.sh \
                    harness.sh dist/install-deps.sh dist/install-session.sh; do
               bash -n "$f" && echo "ok   $f"
           done
@@ -147,6 +148,10 @@ jobs:
           ./install.sh --help
           ./install.sh --dry-run --both --quick -y
           ./install.sh --dry-run --uninstall
+          # Обёртки на сборку: проверяем, что каждая доходит до cargo и зовёт
+          # ИМЕННО свой крейт — перепутанный ключ иначе виден только у человека.
+          ./install-standard.sh --dry-run -y | grep -q 'plx-standard'
+          ./install-extra.sh --dry-run -y | grep -q 'plx-extra'
 
   # ── Сборка «как у постороннего»: git clone, cd, компилятор ────────────────
   #

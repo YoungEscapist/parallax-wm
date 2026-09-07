@@ -160,6 +160,14 @@ It shows every command before running it and asks before anything that needs
 root. Flags: `--extra` (the full build), `--quick` (8× faster rebuilds),
 `--update`, `--uninstall`, `--dry-run`.
 
+If you already know which build you want, there is a script per build —
+`./install-standard.sh` and `./install-extra.sh`, same steps and same flags:
+
+```sh
+./install-standard.sh    # plx-standard: no VR, Minecraft, guests or shader decoration
+./install-extra.sh       # plx-extra: everything switched on
+```
+
 There are no binary packages yet; you build from source. You need Rust (via
 rustup), pkg-config, a C compiler, and the development packages for wayland,
 libxkbcommon, libinput, udev, libseat, libdrm, gbm, EGL, GLES, libdisplay-info,
