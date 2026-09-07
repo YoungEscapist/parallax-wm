@@ -50,15 +50,18 @@ curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/in
 See [Which build](#which-build) for what the difference actually is. Building
 both at once is still `./install.sh --both`.
 
-`install.sh` does five things, shows every command before running it, and asks
+`install.sh` does six things, shows every command before running it, and asks
 before each one that needs root:
 
 1. installs the system development packages (Void, Arch, Debian/Ubuntu, Fedora);
 2. checks for Rust, offering [rustup](https://rustup.rs) if there is none;
 3. builds the compositor;
-4. copies `default_config.lua` to `~/.config/parallax/config.lua` (an existing
+4. installs [plx-wall](https://github.com/YoungEscapist/plx-wall), the wallpaper
+   client both builds depend on — the compositor paints no background of its
+   own (`--no-wall` skips it);
+5. copies `default_config.lua` to `~/.config/parallax/config.lua` (an existing
    config is never touched);
-5. registers a **Parallax** entry with your display manager.
+6. registers a **Parallax** entry with your display manager.
 
 Useful flags:
 
@@ -68,7 +71,7 @@ Useful flags:
 | `--quick` | build with the `quick` profile: same optimised code, thin LTO, ~8× faster to rebuild, and it fits in less memory |
 | `--native` | compile for *this* CPU (`-C target-cpu=native`); faster, but the binary will `SIGILL` on another machine |
 | `--jobs N` | limit cargo's parallelism on a small machine |
-| `--no-deps`, `--no-rust`, `--no-build`, `--no-config`, `--no-session` | skip a step |
+| `--no-deps`, `--no-rust`, `--no-build`, `--no-wall`, `--no-config`, `--no-session` | skip a step |
 | `--update` | `git pull` and rebuild what you already have |
 | `--uninstall` | remove the session entry (`--purge` removes the config too) |
 | `--dry-run` | print what would happen and do nothing |
@@ -277,9 +280,13 @@ place, in the file itself; the README has the tour. `default_config.ru.lua` is
 the same file with Russian comments (`install.sh` picks it if your locale is
 Russian).
 
-The companion tools are separate and optional: [plx-wall](https://github.com/mifaroslav-dotcom/plx-wall)
-for live wallpapers and the colour palette the desktop tints itself with, and
-`plx-share` / `plx-host` for showing your desktop to a guest.
+[plx-wall](https://github.com/YoungEscapist/plx-wall) is a **dependency of both
+builds**, not an extra: the compositor paints no background of its own, so the
+wallpaper, the picker on `Alt+W` and the palette Parallax takes its accent from
+all come from it. `install.sh` clones and builds it for you (skip with
+`--no-wall`); it is a separate package with its own installer and works under
+any layer-shell compositor. `plx-share` / `plx-host`, for showing your desktop
+to a guest, stay optional.
 
 ---
 

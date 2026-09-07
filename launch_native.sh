@@ -470,6 +470,8 @@ while :; do
         DWALL_PID=$!
     else
         echo "plx-wall не найден по пути $DWALL_BIN — обои не запустятся" >&2
+        echo "  поставить: ./install.sh (шаг «Обои») или сам пакет —" >&2
+        echo "  https://github.com/YoungEscapist/plx-wall" >&2
     fi
 
     # ── История буфера обмена (Super+C) ─────────────────────────────────────────

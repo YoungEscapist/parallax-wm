@@ -40,6 +40,7 @@ do_rust=1
 do_build=1
 do_config=1
 do_session=1
+do_wall=1
 do_update=0
 do_uninstall=0
 assume_yes=0
@@ -64,6 +65,8 @@ install.sh — установка Parallax из исходников.
   --no-build        не собирать (полезно с --session-only)
   --no-config       не класть ~/.config/parallax/config.lua
   --no-session      не регистрировать сессию в менеджере входа
+  --no-wall         не ставить plx-wall (обои); сеанс поднимется и без него,
+                    но будет чёрный фон, а Alt+W и палитра работать не будут
 
 Прочее:
   --native          собрать под ЭТОТ процессор (-C target-cpu=native);
@@ -82,6 +85,7 @@ install.sh — установка Parallax из исходников.
   PLX_SRC   куда клонировать дерево при запуске через curl (по умолчанию
             ~/.local/src/parallax-wm)
   PLX_REPO  откуда клонировать
+  PLX_WALL_SRC, PLX_WALL_REPO   то же для plx-wall
 EOF
 }
 
@@ -101,7 +105,8 @@ while [ $# -gt 0 ]; do
         --no-build)   do_build=0 ;;
         --no-config)  do_config=0 ;;
         --no-session) do_session=0 ;;
-        --session-only) do_deps=0; do_rust=0; do_build=0; do_config=0 ;;
+        --no-wall)    do_wall=0 ;;
+        --session-only) do_deps=0; do_rust=0; do_build=0; do_config=0; do_wall=0 ;;
         --native)     native=1 ;;
         --quick)      profile=quick ;;
         --jobs)       jobs="${2:?--jobs требует число}"; shift ;;
@@ -233,6 +238,7 @@ steps_total=0
 [ "$do_deps" = 1 ]    && steps_total=$((steps_total + 1))
 [ "$do_rust" = 1 ]    && steps_total=$((steps_total + 1))
 [ "$do_build" = 1 ]   && steps_total=$((steps_total + 1))
+[ "$do_wall" = 1 ]    && steps_total=$((steps_total + 1))
 [ "$do_config" = 1 ]  && steps_total=$((steps_total + 1))
 [ "$do_session" = 1 ] && steps_total=$((steps_total + 1))
 steps_total=$((steps_total + 1))   # проверка окружения
@@ -389,7 +395,51 @@ if [ "$do_build" = 1 ]; then
     fi
 fi
 
-# ── 5. Конфиг ─────────────────────────────────────────────────────────────────
+# ── 5. Обои ───────────────────────────────────────────────────────────────────
+#
+# plx-wall — ЗАВИСИМОСТЬ обеих сборок, а не украшение: фон рабочего стола рисует
+# он (композитор сам обоев не рисует вовсе), меню выбора висит на Alt+W, и он же
+# считает палитру, из которой Parallax берёт акцент для свечения окон и рамки
+# выделения. Без него сеанс поднимается, но встречает человека чёрным экраном,
+# и первое впечатление от установки — «ничего не работает».
+#
+# Ставится он СВОИМ скриптом из своего дерева, а не собирается здесь: это
+# отдельный пакет со своими зависимостями (dev-часть ffmpeg и clang для
+# bindgen), и знать их список должен он, а не мы. Дублировать список значило бы
+# завести второе место, где он устаревает.
+if [ "$do_wall" = 1 ]; then
+    step "Обои (plx-wall)"
+    wall_repo=${PLX_WALL_REPO:-https://github.com/YoungEscapist/plx-wall.git}
+    wall_src=${PLX_WALL_SRC:-$HOME/.local/src/plx-wall}
+    info "дерево: $wall_src, бинарь: ~/.local/bin/plx-wall"
+    if [ "$dry_run" = 1 ]; then
+        note "склонировал бы $wall_repo и запустил его install.sh"
+    elif ! command -v git >/dev/null 2>&1; then
+        warn "нет git — plx-wall не поставить; поставьте его отдельно: $wall_repo"
+    elif ask "Поставить plx-wall (обои и палитра)?"; then
+        if [ -d "$wall_src/.git" ]; then
+            run git -C "$wall_src" pull --ff-only || warn "git pull не прошёл — собираю то, что есть"
+        else
+            run mkdir -p "$(dirname -- "$wall_src")"
+            run git clone "$wall_repo" "$wall_src" || warn "не удалось склонировать plx-wall"
+        fi
+        # --no-rust: cargo уже проверен шагом выше, второй раз спрашивать про
+        # rustup незачем. Ответы и -j передаём дальше — человек уже ответил.
+        wall_args=(--no-rust)
+        [ "$assume_yes" = 1 ] && wall_args+=(-y)
+        [ -n "$jobs" ] && wall_args+=(--jobs "$jobs")
+        if [ -x "$wall_src/install.sh" ]; then
+            run bash "$wall_src/install.sh" "${wall_args[@]}" \
+                || warn "plx-wall не поставился — сеанс поднимется, но фон будет чёрный"
+        else
+            warn "в $wall_src нет install.sh — plx-wall пропущен"
+        fi
+    else
+        note "пропущено — фон будет чёрный; поставить потом: $wall_repo"
+    fi
+fi
+
+# ── 6. Конфиг ─────────────────────────────────────────────────────────────────
 if [ "$do_config" = 1 ]; then
     step "Конфиг"
     config_dir="$HOME/.config/parallax"
@@ -408,7 +458,7 @@ if [ "$do_config" = 1 ]; then
     note "правки применяются на лету — сохранили файл, конфиг перечитался"
 fi
 
-# ── 6. Сессия ─────────────────────────────────────────────────────────────────
+# ── 7. Сессия ─────────────────────────────────────────────────────────────────
 if [ "$do_session" = 1 ]; then
     step "Пункт в менеджере входа"
     info "ставятся ровно два файла: /usr/local/bin/parallax-session и"

@@ -51,15 +51,18 @@ curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/in
 Чем сборки отличаются на самом деле — в разделе [Какая сборка](#какая-сборка).
 Собрать обе разом по-прежнему `./install.sh --both`.
 
-`install.sh` делает пять вещей, показывает каждую команду до того, как её
+`install.sh` делает шесть вещей, показывает каждую команду до того, как её
 выполнить, и спрашивает перед всем, что требует root:
 
 1. ставит системные -dev пакеты (Void, Arch, Debian/Ubuntu, Fedora);
 2. проверяет Rust и предлагает [rustup](https://rustup.rs), если его нет;
 3. собирает композитор;
-4. кладёт `default_config.lua` в `~/.config/parallax/config.lua` (уже
+4. ставит [plx-wall](https://github.com/YoungEscapist/plx-wall) — обои, от
+   которых зависят обе сборки: своего фона композитор не рисует вовсе
+   (`--no-wall` — пропустить);
+5. кладёт `default_config.lua` в `~/.config/parallax/config.lua` (уже
    существующий конфиг не трогает);
-5. регистрирует пункт **Parallax** в менеджере входа.
+6. регистрирует пункт **Parallax** в менеджере входа.
 
 Ключи:
 
@@ -69,7 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/in
 | `--quick` | профиль `quick`: тот же оптимизированный код с thin LTO, пересобирается в 8 раз быстрее и требует меньше памяти |
 | `--native` | компилировать под ЭТОТ процессор (`-C target-cpu=native`); быстрее, но на другой машине такой бинарь падает с `SIGILL` |
 | `--jobs N` | ограничить параллельность cargo на слабой машине |
-| `--no-deps`, `--no-rust`, `--no-build`, `--no-config`, `--no-session` | пропустить шаг |
+| `--no-deps`, `--no-rust`, `--no-build`, `--no-wall`, `--no-config`, `--no-session` | пропустить шаг |
 | `--update` | `git pull` и пересборка того, что уже стоит |
 | `--uninstall` | убрать пункт сессии (`--purge` — ещё и конфиг) |
 | `--dry-run` | показать, что было бы сделано, и ничего не делать |
@@ -275,10 +278,13 @@ cp default_config.ru.lua ~/.config/parallax/config.lua
 описан прямо в нём; обзор возможностей — в README. `install.sh` при русской
 локали кладёт русский вариант сам.
 
-Спутники ставятся отдельно и необязательны:
-[plx-wall](https://github.com/mifaroslav-dotcom/plx-wall) — живые обои и
-палитра, в цвет которой красится рабочий стол; `plx-share` / `plx-host` — показ
-своего стола гостю.
+[plx-wall](https://github.com/YoungEscapist/plx-wall) — **зависимость обеих
+сборок**, а не украшение: своего фона композитор не рисует вовсе, так что обои,
+меню выбора на `Alt+W` и палитра, из которой Parallax берёт акцент, приходят
+оттуда. `install.sh` клонирует и собирает его сам (пропустить — `--no-wall`);
+при этом это отдельный пакет со своим установщиком, работающий под любым
+layer-shell компоновщиком. `plx-share` / `plx-host` — показ своего стола
+гостю — остаются необязательными.
 
 ---
 

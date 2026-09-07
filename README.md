@@ -117,7 +117,7 @@ dragging — the wheel pulls it closer, a click on a face flies to that workspac
   (`set{ notify_sound = ..., notify_volume = ... }`, see `assets/sounds/`).
 - Wallpapers can live on the canvas and drift with the camera instead of being
   glued to the screen. Live (video) wallpapers come from the companion tool
-  [plx-wall](https://github.com/mifaroslav-dotcom/plx-wall).
+  [plx-wall](https://github.com/YoungEscapist/plx-wall).
 
 **The rest**
 - Xwayland, with the pointer-clamping and hit-test fixes that games need.
@@ -126,7 +126,7 @@ dragging — the wheel pulls it closer, a click on a face flies to that workspac
 - Multi-monitor: independent workspaces, `monitor{ primary }`, drag a window
   across the edge to send it to the other screen.
 - Guest sharing: show your desktop to someone else with an input seat of their
-  own (`Super+Shift+S`, client: [plx-share](https://github.com/mifaroslav-dotcom/plx-share)).
+  own (`Super+Shift+S`, client: [plx-share](https://github.com/YoungEscapist/plx-share)).
 - VR: put your windows on panels inside a headset over OpenXR/WiVRn
   (`Super+Alt+V`) — experimental, verified against a Monado simulator.
 - Mouse chords, the model from [hevel](https://git.sr.ht/~dlm/hevel): a command
@@ -159,6 +159,11 @@ cd parallax-wm
 It shows every command before running it and asks before anything that needs
 root. Flags: `--extra` (the full build), `--quick` (8× faster rebuilds),
 `--update`, `--uninstall`, `--dry-run`.
+
+It also installs [plx-wall](https://github.com/YoungEscapist/plx-wall), which
+both builds depend on: the compositor paints no background of its own, so the
+wallpaper, the picker and the palette the desktop tints itself with come from
+there (`--no-wall` skips it).
 
 If you already know which build you want, there is a script per build —
 `./install-standard.sh` and `./install-extra.sh`, same steps and same flags:

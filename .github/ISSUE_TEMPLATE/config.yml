@@ -4,5 +4,5 @@ contact_links:
     url: https://github.com/YoungEscapist/parallax-wm/blob/master/default_config.lua
     about: Every knob is documented next to the line that sets it — check here before filing.
   - name: plx-wall (wallpapers)
-    url: https://github.com/mifaroslav-dotcom/plx-wall
+    url: https://github.com/YoungEscapist/plx-wall
     about: Live and static wallpapers are a separate tool — report wallpaper bugs there.
