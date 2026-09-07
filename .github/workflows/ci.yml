@@ -136,7 +136,8 @@ jobs:
         run: |
           for f in install.sh install-standard.sh install-extra.sh \
                    build.sh build_portable.sh launch_native.sh \
-                   harness.sh dist/install-deps.sh dist/install-session.sh; do
+                   harness.sh dist/install-deps.sh dist/install-session.sh \
+                   dist/install-cursor.sh; do
               bash -n "$f" && echo "ok   $f"
           done
           # parallax-session — это /bin/sh, а не bash: его читает менеджер
@@ -152,6 +153,8 @@ jobs:
           # ИМЕННО свой крейт — перепутанный ключ иначе виден только у человека.
           ./install-standard.sh --dry-run -y | grep -q 'plx-standard'
           ./install-extra.sh --dry-run -y | grep -q 'plx-extra'
+          # Тема курсора: --print ничего не качает и не пишет на диск.
+          ./dist/install-cursor.sh --print
 
   # ── Сборка «как у постороннего»: git clone, cd, компилятор ────────────────
   #

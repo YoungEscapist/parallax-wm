@@ -50,7 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/in
 See [Which build](#which-build) for what the difference actually is. Building
 both at once is still `./install.sh --both`.
 
-`install.sh` does six things, shows every command before running it, and asks
+`install.sh` does seven things, shows every command before running it, and asks
 before each one that needs root:
 
 1. installs the system development packages (Void, Arch, Debian/Ubuntu, Fedora);
@@ -59,9 +59,11 @@ before each one that needs root:
 4. installs [plx-wall](https://github.com/YoungEscapist/plx-wall), the wallpaper
    client both builds depend on — the compositor paints no background of its
    own (`--no-wall` skips it);
-5. copies `default_config.lua` to `~/.config/parallax/config.lua` (an existing
+5. installs the **Bibata-Modern-Ice** cursor theme into
+   `~/.local/share/icons` (`--no-cursor` skips it);
+6. copies `default_config.lua` to `~/.config/parallax/config.lua` (an existing
    config is never touched);
-6. registers a **Parallax** entry with your display manager.
+7. registers a **Parallax** entry with your display manager.
 
 Useful flags:
 
@@ -71,7 +73,7 @@ Useful flags:
 | `--quick` | build with the `quick` profile: same optimised code, thin LTO, ~8× faster to rebuild, and it fits in less memory |
 | `--native` | compile for *this* CPU (`-C target-cpu=native`); faster, but the binary will `SIGILL` on another machine |
 | `--jobs N` | limit cargo's parallelism on a small machine |
-| `--no-deps`, `--no-rust`, `--no-build`, `--no-wall`, `--no-config`, `--no-session` | skip a step |
+| `--no-deps`, `--no-rust`, `--no-build`, `--no-wall`, `--no-cursor`, `--no-config`, `--no-session` | skip a step |
 | `--update` | `git pull` and rebuild what you already have |
 | `--uninstall` | remove the session entry (`--purge` removes the config too) |
 | `--dry-run` | print what would happen and do nothing |
@@ -95,6 +97,13 @@ Everything below is the same thing done by hand.
   directory grows to a few GiB.
 * At runtime: `Xwayland` (for X11 applications), and a session D-Bus for the
   tray, the screencast portal and the notification sound.
+* **A cursor theme.** In Wayland the compositor draws the pointer, and it takes
+  the picture from a theme under `/usr/share/icons` or `~/.local/share/icons`.
+  With no theme at all the pointer still moves and still hits buttons, but it is
+  *invisible* — which looks exactly like a broken mouse. Parallax uses
+  **Bibata-Modern-Ice**; `install.sh` fetches it (there is no distribution
+  package for it anywhere), or run `./dist/install-cursor.sh` yourself. Any other
+  theme works too — name it in `XCURSOR_THEME`.
 
 ### Dependencies
 

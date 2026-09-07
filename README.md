@@ -163,7 +163,9 @@ root. Flags: `--extra` (the full build), `--quick` (8× faster rebuilds),
 It also installs [plx-wall](https://github.com/YoungEscapist/plx-wall), which
 both builds depend on: the compositor paints no background of its own, so the
 wallpaper, the picker and the palette the desktop tints itself with come from
-there (`--no-wall` skips it).
+there (`--no-wall` skips it). Same for the **Bibata-Modern-Ice** cursor theme —
+in Wayland the compositor draws the pointer, and with no theme installed it is
+invisible rather than merely plain (`--no-cursor`).
 
 If you already know which build you want, there is a script per build —
 `./install-standard.sh` and `./install-extra.sh`, same steps and same flags:

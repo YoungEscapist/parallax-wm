@@ -41,6 +41,7 @@ do_build=1
 do_config=1
 do_session=1
 do_wall=1
+do_cursor=1
 do_update=0
 do_uninstall=0
 assume_yes=0
@@ -67,6 +68,8 @@ install.sh — установка Parallax из исходников.
   --no-session      не регистрировать сессию в менеджере входа
   --no-wall         не ставить plx-wall (обои); сеанс поднимется и без него,
                     но будет чёрный фон, а Alt+W и палитра работать не будут
+  --no-cursor       не ставить тему курсора Bibata-Modern-Ice; без ЛЮБОЙ темы
+                    указатель жив, но НЕ ВИДЕН
 
 Прочее:
   --native          собрать под ЭТОТ процессор (-C target-cpu=native);
@@ -106,7 +109,8 @@ while [ $# -gt 0 ]; do
         --no-config)  do_config=0 ;;
         --no-session) do_session=0 ;;
         --no-wall)    do_wall=0 ;;
-        --session-only) do_deps=0; do_rust=0; do_build=0; do_config=0; do_wall=0 ;;
+        --no-cursor)  do_cursor=0 ;;
+        --session-only) do_deps=0; do_rust=0; do_build=0; do_config=0; do_wall=0; do_cursor=0 ;;
         --native)     native=1 ;;
         --quick)      profile=quick ;;
         --jobs)       jobs="${2:?--jobs требует число}"; shift ;;
@@ -239,6 +243,7 @@ steps_total=0
 [ "$do_rust" = 1 ]    && steps_total=$((steps_total + 1))
 [ "$do_build" = 1 ]   && steps_total=$((steps_total + 1))
 [ "$do_wall" = 1 ]    && steps_total=$((steps_total + 1))
+[ "$do_cursor" = 1 ]  && steps_total=$((steps_total + 1))
 [ "$do_config" = 1 ]  && steps_total=$((steps_total + 1))
 [ "$do_session" = 1 ] && steps_total=$((steps_total + 1))
 steps_total=$((steps_total + 1))   # проверка окружения
@@ -439,7 +444,28 @@ if [ "$do_wall" = 1 ]; then
     fi
 fi
 
-# ── 6. Конфиг ─────────────────────────────────────────────────────────────────
+# ── 6. Тема курсора ───────────────────────────────────────────────────────────
+#
+# Тоже зависимость, а не украшение. Курсор в Wayland рисует композитор, картинку
+# он берёт из темы, и без темы получается НЕВИДИМЫЙ указатель: он жив, ездит и
+# попадает по кнопкам, но его не видно — со стороны это «установка сломала мышь»
+# (ровно эта беда и разбирается в комментарии к XCURSOR_THEME в launch_native.sh).
+# Пакетом Bibata не берётся нигде, поэтому у неё свой скрипт — он один во всей
+# установке лезет в сеть мимо пакетного менеджера, и это должно быть видно.
+if [ "$do_cursor" = 1 ]; then
+    step "Тема курсора"
+    ./dist/install-cursor.sh --print | sed 's/^/  /'
+    if [ "$dry_run" = 1 ]; then
+        note "(--dry-run: не качаю)"
+    elif ask "Поставить Bibata-Modern-Ice в ~/.local/share/icons?"; then
+        run ./dist/install-cursor.sh \
+            || warn "тема курсора не поставилась — стрелка может оказаться невидимой"
+    else
+        note "пропущено — если своей темы нет, указателя не будет видно"
+    fi
+fi
+
+# ── 7. Конфиг ─────────────────────────────────────────────────────────────────
 if [ "$do_config" = 1 ]; then
     step "Конфиг"
     config_dir="$HOME/.config/parallax"
@@ -458,7 +484,7 @@ if [ "$do_config" = 1 ]; then
     note "правки применяются на лету — сохранили файл, конфиг перечитался"
 fi
 
-# ── 7. Сессия ─────────────────────────────────────────────────────────────────
+# ── 8. Сессия ─────────────────────────────────────────────────────────────────
 if [ "$do_session" = 1 ]; then
     step "Пункт в менеджере входа"
     info "ставятся ровно два файла: /usr/local/bin/parallax-session и"

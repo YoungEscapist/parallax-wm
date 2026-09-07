@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/in
 Чем сборки отличаются на самом деле — в разделе [Какая сборка](#какая-сборка).
 Собрать обе разом по-прежнему `./install.sh --both`.
 
-`install.sh` делает шесть вещей, показывает каждую команду до того, как её
+`install.sh` делает семь вещей, показывает каждую команду до того, как её
 выполнить, и спрашивает перед всем, что требует root:
 
 1. ставит системные -dev пакеты (Void, Arch, Debian/Ubuntu, Fedora);
@@ -60,9 +60,11 @@ curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/in
 4. ставит [plx-wall](https://github.com/YoungEscapist/plx-wall) — обои, от
    которых зависят обе сборки: своего фона композитор не рисует вовсе
    (`--no-wall` — пропустить);
-5. кладёт `default_config.lua` в `~/.config/parallax/config.lua` (уже
+5. ставит тему курсора **Bibata-Modern-Ice** в `~/.local/share/icons`
+   (`--no-cursor` — пропустить);
+6. кладёт `default_config.lua` в `~/.config/parallax/config.lua` (уже
    существующий конфиг не трогает);
-6. регистрирует пункт **Parallax** в менеджере входа.
+7. регистрирует пункт **Parallax** в менеджере входа.
 
 Ключи:
 
@@ -72,7 +74,7 @@ curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/in
 | `--quick` | профиль `quick`: тот же оптимизированный код с thin LTO, пересобирается в 8 раз быстрее и требует меньше памяти |
 | `--native` | компилировать под ЭТОТ процессор (`-C target-cpu=native`); быстрее, но на другой машине такой бинарь падает с `SIGILL` |
 | `--jobs N` | ограничить параллельность cargo на слабой машине |
-| `--no-deps`, `--no-rust`, `--no-build`, `--no-wall`, `--no-config`, `--no-session` | пропустить шаг |
+| `--no-deps`, `--no-rust`, `--no-build`, `--no-wall`, `--no-cursor`, `--no-config`, `--no-session` | пропустить шаг |
 | `--update` | `git pull` и пересборка того, что уже стоит |
 | `--uninstall` | убрать пункт сессии (`--purge` — ещё и конфиг) |
 | `--dry-run` | показать, что было бы сделано, и ничего не делать |
@@ -97,6 +99,13 @@ curl -fsSL https://raw.githubusercontent.com/YoungEscapist/parallax-wm/master/in
   заметно меньше. Каталог сборки разрастается до нескольких гигабайт.
 * Во время работы: `Xwayland` (для приложений X11) и сессионная шина D-Bus —
   через неё идут трей, портал демонстрации экрана и звук уведомлений.
+* **Тема курсора.** В Wayland указатель рисует композитор, а картинку берёт из
+  темы — набора файлов в `/usr/share/icons` или `~/.local/share/icons`. Без темы
+  указатель жив, ездит и попадает по кнопкам, но его НЕ ВИДНО, и выглядит это
+  ровно как сломанная мышь. Parallax рассчитан на **Bibata-Modern-Ice**;
+  `install.sh` её скачивает (пакета для неё нет ни в одном дистрибутиве), либо
+  запустите `./dist/install-cursor.sh` руками. Любая другая тема тоже подойдёт —
+  назовите её в `XCURSOR_THEME`.
 
 ### Зависимости
 
