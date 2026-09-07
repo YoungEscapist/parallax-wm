@@ -596,8 +596,8 @@ impl Parallax {
             const ШАГ: i32 = 36;
             let cx = стол.loc.x + (стол.size.w - size.w) / 2 + i as i32 * ШАГ;
             let cy = стол.loc.y + (стол.size.h - size.h) / 2 + i as i32 * ШАГ;
-            // Зажимаем в границы стола с полем GAP_OUTER.
-            let поле = crate::tiling::GAP_OUTER;
+            // Зажимаем в границы стола с полем GAP_OUTER().
+            let поле = crate::tiling::GAP_OUTER();
             let min_x = стол.loc.x + поле;
             let min_y = стол.loc.y + поле;
             let max_x = (стол.loc.x + стол.size.w - size.w - поле).max(min_x);

@@ -189,6 +189,8 @@ impl Parallax {
         self.overview_active = false;
         self.overview_exit_pending = false;
         self.overview_exit_target_ws = None;
+        // Ячейка сетки — свойство ОДНОГО захода в обзор (см. overview_band_size).
+        self.overview_band = None;
         // Незаконченное закрытие куба тут и кончается: обзора больше нет, а
         // `anim::tick` иначе доиграл бы его и вышел из обзора ВТОРОЙ раз.
         self.куб_выход = None;
@@ -316,10 +318,119 @@ impl Parallax {
         }
     }
 
-    /// Физический размер output'а = размер одной ячейки стола.
+    /// Размер ячейки стола в сетке обзора.
+    ///
+    /// Обычно это ровно экран: стол и есть экран. Но стол, окна которого лежат
+    /// ДРУГ НА ДРУГЕ, обзор раскладывает мозаикой (см. `overview_расклад`), и
+    /// такой ячейке экрана мало. Размер общий на всю сетку — по самому
+    /// «широкому» столу, иначе слоты разъехались бы: `slot_rect` расставляет
+    /// ячейки шагом (w + зазор).
+    ///
+    /// Снимается ОДИН РАЗ при входе (`overview_band`) и дальше не меняется:
+    /// перетаскивание окна внутри обзора меняет раскладку, и пересчёт на лету
+    /// двигал бы под рукой всю сетку разом.
     pub fn overview_band_size(&self) -> Option<(i32, i32)> {
+        if let Some(с) = self.overview_band {
+            return Some(с);
+        }
         let экран = self.screen_size();
         Some((экран.w, экран.h))
+    }
+
+    /// Пересчитать общий размер ячейки по всем столам обзора и запомнить его.
+    /// Зовётся ровно при входе, до первой раскладки.
+    fn overview_band_снять(&mut self) {
+        let экран = self.screen_size();
+        let (mut w, mut h) = (экран.w, экран.h);
+        for &m in &self.overview_order.clone() {
+            let (_, размер) = self.overview_расклад(m);
+            w = w.max(размер.w);
+            h = h.max(размер.h);
+        }
+        self.overview_band = Some((w, h));
+    }
+
+    /// Где стоят окна стола `mask` в обзоре (в домашних координатах) и какой
+    /// прямоугольник занимает стол целиком.
+    ///
+    /// **Зачем не «как на столе».** Обзор показывает стол как есть, и для
+    /// тайлинга это ровно то, что нужно. Но окна, лежащие друг на друге
+    /// (плавающее поверх тайловых, monocle, пара окон в одной точке), в обзоре
+    /// так и остаются одно под другим: видно верхнее, а остальных нет вовсе —
+    /// ни выбрать, ни утащить. Ярик 07.09.2026: «лимит окон в win-обзоре всё
+    /// ещё есть, окна как раньше заходят друг на друга». Замер на харнессе:
+    /// три окна стола, из них два в одной точке, — в обзоре видно два.
+    ///
+    /// Поэтому: перекрытий нет — раскладка стола не трогается вовсе; есть хоть
+    /// одно — ВСЕ окна стола выкладываются мозаикой, каждое в свою клетку.
+    /// Размер окнам при этом не меняется (мельче они станут сами, когда камера
+    /// впишет всю сетку): клетка — по самому большому окну стола, окно стоит в
+    /// ней по центру. Порядок клеток — порядок окон, то есть стабильный:
+    /// пересборка обзора не должна их тасовать.
+    pub(crate) fn overview_расклад(
+        &self,
+        mask: u32,
+    ) -> (Vec<(Window, Point<i32, Logical>)>, Size<i32, Logical>) {
+        let экран = self.screen_size();
+        let дом = self.монитор_дом();
+        let окна: Vec<(Window, Point<i32, Logical>, Size<i32, Logical>)> = self.tagged_windows.iter()
+            .filter(|tw| tw.tags & mask != 0)
+            .map(|tw| {
+                let (loc, size) = self.overview_дом_чтение(&tw.window);
+                (tw.window.clone(), loc, size)
+            })
+            .collect();
+        let пусто = (Vec::new(), Size::from((экран.w, экран.h)));
+        if окна.is_empty() {
+            return пусто;
+        }
+        let перекрытие = окна.iter().enumerate().any(|(i, (_, l1, s1))| {
+            окна.iter().skip(i + 1).any(|(_, l2, s2)| {
+                let r1 = Rectangle::new(*l1, *s1);
+                let r2 = Rectangle::new(*l2, *s2);
+                r1.intersection(r2).is_some_and(|r| r.size.w > 0 && r.size.h > 0)
+            })
+        });
+        if !перекрытие {
+            return (
+                окна.into_iter().map(|(w, l, _)| (w, l)).collect(),
+                Size::from((экран.w, экран.h)),
+            );
+        }
+        const ЗАЗОР: i32 = 60;
+        let n = окна.len();
+        let столбцов = (n as f64).sqrt().ceil().max(1.0) as usize;
+        let строк = n.div_ceil(столбцов);
+        let ячw = окна.iter().map(|(_, _, s)| s.w).max().unwrap_or(экран.w).max(1);
+        let ячh = окна.iter().map(|(_, _, s)| s.h).max().unwrap_or(экран.h).max(1);
+        let места = окна.iter().enumerate().map(|(i, (w, _, s))| {
+            let (кол, ряд) = (i % столбцов, i / столбцов);
+            let x = дом.x + (кол as i32) * (ячw + ЗАЗОР) + (ячw - s.w) / 2;
+            let y = дом.y + (ряд as i32) * (ячh + ЗАЗОР) + (ячh - s.h) / 2;
+            (w.clone(), Point::from((x, y)))
+        }).collect();
+        let размер = Size::from((
+            ((столбцов as i32) * (ячw + ЗАЗОР) - ЗАЗОР).max(экран.w),
+            ((строк as i32) * (ячh + ЗАЗОР) - ЗАЗОР).max(экран.h),
+        ));
+        (места, размер)
+    }
+
+    /// `overview_home` для тех, у кого нет `&mut`: тот же снимок, но без записи
+    /// пропущенного окна. Окно, появившееся уже в обзоре, снимка ещё не имеет —
+    /// его геометрию берём прямо у поверхности, ровно как это сделал бы
+    /// `overview_home`.
+    fn overview_дом_чтение(&self, win: &Window) -> (Point<i32, Logical>, Size<i32, Logical>) {
+        if let Some((_, loc, size)) = self.overview_saved_geo.iter()
+            .find(|(w, _, _)| same_window(w, win))
+        {
+            return (*loc, *size);
+        }
+        let loc = self.tagged_windows.iter()
+            .find(|tw| same_window(&tw.window, win))
+            .map(|tw| tw.position)
+            .unwrap_or_default();
+        (loc, win.geometry().size)
     }
 
     /// Canvas-прямоугольник стола по его слоту (ячейке сетки).
@@ -387,7 +498,12 @@ impl Parallax {
     /// Canvas-прямоугольник стола `mask` (вся его рамка).
     pub fn overview_band_rect(&self, mask: u32) -> Option<Rectangle<i32, Logical>> {
         let (w, h) = self.overview_band_size()?;
-        Some(self.slot_rect(*self.overview_slots.get(&mask).unwrap_or(&(0, 0)), w, h))
+        let слот = self.slot_rect(*self.overview_slots.get(&mask).unwrap_or(&(0, 0)), w, h);
+        // МЕСТО ячейки — по общей сетке, а РАЗМЕР — свой: столу с мозаикой
+        // нужно больше экрана, а соседу с двумя окнами — ровно экран, и рамка
+        // во всю общую ячейку смотрелась бы пустой коробкой вокруг него.
+        let (_, размер) = self.overview_расклад(mask);
+        Some(Rectangle::new(слот.loc, размер))
     }
 
     /// Область ВНУТРИ стола, в которой разрешено находиться окну: рамка минус
@@ -398,10 +514,10 @@ impl Parallax {
     pub fn overview_window_area(&self, mask: u32) -> Option<Rectangle<i32, Logical>> {
         let r = self.overview_band_rect(mask)?;
         Some(Rectangle::new(
-            (r.loc.x + GAP_OUTER, r.loc.y + GAP_OUTER).into(),
+            (r.loc.x + GAP_OUTER(), r.loc.y + GAP_OUTER()).into(),
             (
-                (r.size.w - GAP_OUTER * 2).max(1),
-                (r.size.h - GAP_OUTER * 2).max(1),
+                (r.size.w - GAP_OUTER() * 2).max(1),
+                (r.size.h - GAP_OUTER() * 2).max(1),
             ).into(),
         ))
     }
@@ -559,10 +675,10 @@ impl Parallax {
             self.enter_overview_strip();
             return;
         }
-        let (w, h) = match self.overview_band_size() {
-            Some(s) => s,
-            None => return,
-        };
+        // Прошлый размер ячейки не переживает вход: столы за это время могли
+        // остаться и без мозаики (см. `overview_band_снять` ниже — он идёт
+        // сразу за раздачей слотов, когда состав обзора уже известен).
+        self.overview_band = None;
         let prev_cam = Point::from((self.viewport.cam_x, self.viewport.cam_y));
         let prev_zoom = self.viewport.zoom;
 
@@ -655,6 +771,13 @@ impl Parallax {
         // (в т.ч. для плавающих столов) их надо вернуть как было.
         self.save_pre_overview_geometry();
 
+        // Размер ячейки — ПОСЛЕ снимка геометрии и раздачи слотов: он считается
+        // по раскладкам столов, а те — по домам окон из этого самого снимка.
+        self.overview_band_снять();
+        let (w, h) = self.overview_band_size().unwrap_or((
+            self.screen_size().w, self.screen_size().h,
+        ));
+
         // Раскладываем окна в overview layout
         self.overview_layout(w, h);
 
@@ -744,7 +867,15 @@ impl Parallax {
 
     /// Сдвиг, который переносит стол `mask` из дома в его ячейку сетки.
     fn overview_offset(&self, mask: u32) -> Point<i32, Logical> {
-        self.overview_band_rect(mask).map(|r| r.loc).unwrap_or_default()
+        // Минус ДОМ МОНИТОРА. Дома окон (`tw.position`) считаются от дома
+        // своего монитора — у второго это (1 000 000, 0), см. `monitors::
+        // ШАГ_ДОМА` и `tiling::screen_area`, — и ячейка сетки тоже строится от
+        // него (`slot_rect`). Складывая одно с другим, обзор второго монитора
+        // прибавлял этот миллион ДВАЖДЫ: окна улетали на экран вправо от своей
+        // ячейки, и `overview_clamp_loc` сгребал их все в её угол — одно на
+        // другом. На первом мониторе дом нулевой, и разницы не было вовсе.
+        let дом = self.монитор_дом();
+        self.overview_band_rect(mask).map(|r| r.loc - дом).unwrap_or_default()
     }
 
     /// Разложить дерево стола `mask` в ДОМАШНЕЙ рабочей области и записать
@@ -763,12 +894,12 @@ impl Parallax {
         };
         for (win, rect) in rects {
             let loc: Point<i32, Logical> = (
-                rect.loc.x + GAP_INNER / 2,
-                rect.loc.y + GAP_INNER / 2,
+                rect.loc.x + GAP_INNER() / 2,
+                rect.loc.y + GAP_INNER() / 2,
             ).into();
             let size: Size<i32, Logical> = (
-                (rect.size.w - GAP_INNER).max(1),
-                (rect.size.h - GAP_INNER).max(1),
+                (rect.size.w - GAP_INNER()).max(1),
+                (rect.size.h - GAP_INNER()).max(1),
             ).into();
             crate::xwin::set_size(&win, Some(size), crate::xwin::Tiled::Set);
             crate::xwin::configure(&win);
@@ -811,6 +942,10 @@ impl Parallax {
         let mut placed: Vec<Window> = Vec::new();
         for mask in order {
             let off = self.overview_offset(mask);
+            // Места берём у раскладки стола: обычно это его собственные дома,
+            // но у стола с перекрытиями — клетки мозаики (см.
+            // `overview_расклад`).
+            let (места, _) = self.overview_расклад(mask);
             let wins: Vec<Window> = self.tagged_windows.iter()
                 .filter(|tw| tw.tags & mask != 0)
                 .map(|tw| tw.window.clone())
@@ -818,6 +953,10 @@ impl Parallax {
                 .collect();
             for win in wins {
                 let (home, size) = self.overview_home(&win);
+                let home = места.iter()
+                    .find(|(w, _)| same_window(w, &win))
+                    .map(|(_, l)| *l)
+                    .unwrap_or(home);
                 // Кламп нужен только тем, кого руками утащили далеко за пределы
                 // экрана своего стола (плавающий слой на бесконечном холсте):
                 // иначе такое окно въехало бы в чужую ячейку. Тайловые и так
@@ -1109,7 +1248,7 @@ impl Parallax {
         for tw in self.tagged_windows.iter().filter(|tw| tw.tags & tag != 0) {
             if let Some(g) = self.space.element_geometry(&tw.window) {
                 min_x = min_x.min(g.loc.x);
-                max_x = max_x.max(g.loc.x + g.size.w + GAP_OUTER);
+                max_x = max_x.max(g.loc.x + g.size.w + GAP_OUTER());
             }
         }
         Some(Rectangle::new(
@@ -1160,6 +1299,7 @@ impl Parallax {
         // прошлого захода.
         self.overview_saved_geo.clear();
         self.overview_slots.clear();
+        self.overview_band = None;
         self.momentum.stop();
         self.camera_anim = None;
         self.zoom_anim = None;

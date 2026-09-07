@@ -230,13 +230,13 @@ pub struct Layout {
 /// ячейка панели (`bar::Cell::Handle`), потому что панель и полка не должны
 /// спорить за один и тот же клик.
 ///
-/// Все размеры — доли от высоты острова (`bar::H`), поэтому полка уменьшается
+/// Все размеры — доли от высоты острова (`bar::h()`), поэтому полка уменьшается
 /// вместе с панелью и не требует отдельной настройки.
 /// `hide` — доля убранности ПАНЕЛИ (см. `bar::island_y`). Полка висит под
 /// панелью и обязана уезжать вместе с ней: иначе при входе в обзор столов
 /// панель уходит вверх, а её полка остаётся висеть в пустоте.
 pub fn layout(open: bool, has_battery: bool, screen_w: i32, hide: f64, выезд: f64) -> Layout {
-    let h = crate::bar::H;
+    let h = crate::bar::h();
     let gap = h / 6; // зазор между ячейками
     let pad = h / 6; // поля внутри выехавшего ряда
     let slider_w = h * 2;
@@ -252,7 +252,7 @@ pub fn layout(open: bool, has_battery: bool, screen_w: i32, hide: f64, выез�
     // нажимались бы не там, где нарисованы.
     let выезд = выезд.clamp(0.0, 1.0);
     let сдвиг = ((1.0 - выезд) * (h + gap) as f64).round() as i32;
-    let y = crate::bar::island_y(hide) + crate::bar::H + gap - сдвиг;
+    let y = crate::bar::island_y(hide) + crate::bar::h() + gap - сдвиг;
 
     let mut cells: Vec<Cell> = Vec::new();
     // Пока полка ЕДЕТ (выезд > 0), она обязана быть в раскладке, даже если
@@ -279,7 +279,7 @@ pub fn layout(open: bool, has_battery: bool, screen_w: i32, hide: f64, выез�
     let panel_w = inner + pad * 2;
     // Прижата к правому краю, под своим островом. На узком экране (ряд шире
     // экрана) не уезжаем за левый край — там его вовсе не достать мышью.
-    let panel_x = (screen_w - crate::bar::EDGE - panel_w).max(0);
+    let panel_x = (screen_w - crate::bar::edge() - panel_w).max(0);
     let panel = Rect { x: panel_x, y, w: panel_w, h };
 
     let mut cx = panel_x + pad;

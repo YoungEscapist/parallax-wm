@@ -17,19 +17,101 @@
 use crate::text;
 use crate::{т, тф};
 
-/// Высота острова.
-pub const H: i32 = 34;
-/// Отступ панели от верхнего края экрана.
-pub const TOP: i32 = 8;
-/// Скругление островов.
-pub const RADIUS: i32 = 12;
-/// Поле от боковых краёв экрана до крайних островов. Полка состояния
-/// равняется по нему же (см. `tray::layout`).
-pub const EDGE: i32 = 24;
-/// Поля внутри острова.
-const PAD: i32 = 14;
-/// Зазор между соседними ячейками внутри острова.
-const GAP: i32 = 6;
+// ── Вид панели: ручки вместо констант ────────────────────────────────────────
+//
+// Числа ниже — умолчания, а не закон. Панель — первое, что человек хочет
+// подогнать под себя, и до 07.09.2026 подогнать её можно было только правкой
+// исходника (Ярик: «чтобы не было жёстких рамок и не приходилось форкать
+// проект, чтобы его райсить»). Теперь их ставит `bar{}` из config.lua.
+//
+// Хранилище — один RwLock со структурой-Copy: читают её отовсюду и часто (на
+// каждый кадр и каждый клик), пишут раз в загрузку конфига.
+
+/// Вид панели целиком: геометрия, цвета и состав островов.
+#[derive(Clone, Copy, Debug)]
+pub struct Вид {
+    /// Высота острова.
+    pub h: i32,
+    /// Отступ панели от верхнего края экрана.
+    pub top: i32,
+    /// Скругление островов.
+    pub radius: i32,
+    /// Поле от боковых краёв экрана до крайних островов. Полка состояния
+    /// равняется по нему же (см. `tray::layout`).
+    pub edge: i32,
+    /// Поля внутри острова.
+    pub pad: i32,
+    /// Зазор между соседними ячейками внутри острова.
+    pub gap: i32,
+    /// Заливка островов (premultiplied НЕ нужен — цвет идёт в `pooled_solid`,
+    /// см. udev.rs).
+    pub bg: [f32; 4],
+    /// Основной текст (часы, раскладка, проценты).
+    pub fg: [f32; 4],
+    /// Приглушённый текст (дата).
+    pub dim: [f32; 4],
+    /// Что показываем: часы, дата, раскладка, звук, заряд, трей, чипы окон,
+    /// значки столов.
+    pub clock: bool,
+    pub date: bool,
+    pub keyboard: bool,
+    pub volume: bool,
+    pub battery: bool,
+    pub tray: bool,
+    pub windows: bool,
+    pub tags: bool,
+}
+
+impl Default for Вид {
+    fn default() -> Self {
+        Self {
+            h: 34,
+            top: 8,
+            radius: 12,
+            edge: 24,
+            pad: 14,
+            gap: 6,
+            bg: [0.04, 0.04, 0.07, 0.65],
+            fg: [0.93, 0.95, 1.0, 0.96],
+            dim: [0.85, 0.87, 0.95, 0.55],
+            clock: true,
+            date: true,
+            keyboard: true,
+            volume: true,
+            battery: true,
+            tray: true,
+            windows: true,
+            tags: true,
+        }
+    }
+}
+
+static ВИД: std::sync::RwLock<Вид> = std::sync::RwLock::new(Вид {
+    h: 34, top: 8, radius: 12, edge: 24, pad: 14, gap: 6,
+    bg: [0.04, 0.04, 0.07, 0.65],
+    fg: [0.93, 0.95, 1.0, 0.96],
+    dim: [0.85, 0.87, 0.95, 0.55],
+    clock: true, date: true, keyboard: true, volume: true,
+    battery: true, tray: true, windows: true, tags: true,
+});
+
+/// Текущий вид панели. Отравленный замок (паника в чужом потоке) не повод
+/// ронять отрисовку — берём что есть.
+pub fn вид() -> Вид {
+    *ВИД.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Поставить вид из конфига (`config::load`, единственная точка).
+pub fn установить_вид(v: Вид) {
+    *ВИД.write().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+pub fn h() -> i32 { вид().h }
+pub fn top() -> i32 { вид().top }
+pub fn radius() -> i32 { вид().radius }
+pub fn edge() -> i32 { вид().edge }
+fn pad() -> i32 { вид().pad }
+fn gap() -> i32 { вид().gap }
 /// Сторона значка стола (он же размер иконки трея).
 pub const DOT: i32 = 20;
 /// Сторона значка приложения на чипе — то есть та, в которую его надо
@@ -167,8 +249,8 @@ pub fn island_y(slide: f64) -> i32 {
     // Три высоты острова, а не одна: под панелью висит ещё и полка состояния
     // (`tray::layout`), и уехать надо так, чтобы у кромки не осталось и её
     // (тест `убранная_панель_уходит_за_верхний_край` держит это число).
-    let прячем = (TOP + H * 3) as f64;
-    TOP - (slide.clamp(0.0, 1.0) * прячем).round() as i32
+    let прячем = (top() + h() * 3) as f64;
+    top() - (slide.clamp(0.0, 1.0) * прячем).round() as i32
 }
 
 /// Всё, что панели нужно знать о мире. Собирается один раз (см.
@@ -262,9 +344,13 @@ pub fn fit_text(s: &str, scale: i32, max_w: i32) -> String {
     out
 }
 
-/// Ширина острова столов без заголовка.
+/// Ширина острова столов без заголовка. Ноль, если значки столов выключены
+/// (`bar{ tags = false }`) — тогда левый остров состоит из одних чипов окон.
 fn tags_w() -> i32 {
-    TAGS * DOT + (TAGS - 1) * GAP
+    if !вид().tags {
+        return 0;
+    }
+    TAGS * DOT + (TAGS - 1) * gap()
 }
 
 pub fn layout(d: &Data) -> Layout {
@@ -280,15 +366,15 @@ pub fn layout(d: &Data) -> Layout {
     let center = if d.clock.is_empty() && d.date.is_empty() {
         None
     } else {
-        let inner = clock_w + if date_w > 0 { GAP * 2 + date_w } else { 0 };
-        let w = inner + PAD * 2;
+        let inner = clock_w + if date_w > 0 { gap() * 2 + date_w } else { 0 };
+        let w = inner + pad() * 2;
         let x = ((d.screen_w - w) / 2).max(0);
-        let r = Rect { x, y, w, h: H };
-        cells.push(Item { cell: Cell::Clock, rect: Rect { x: x + PAD, y, w: clock_w, h: H } });
+        let r = Rect { x, y, w, h: h() };
+        cells.push(Item { cell: Cell::Clock, rect: Rect { x: x + pad(), y, w: clock_w, h: h() } });
         if date_w > 0 {
             cells.push(Item {
                 cell: Cell::Date,
-                rect: Rect { x: x + PAD + clock_w + GAP * 2, y, w: date_w, h: H },
+                rect: Rect { x: x + pad() + clock_w + gap() * 2, y, w: date_w, h: h() },
             });
         }
         Some(r)
@@ -298,7 +384,7 @@ pub fn layout(d: &Data) -> Layout {
     // Собираем ширины по порядку, а потом раскладываем ОТ ЛЕВОГО края острова:
     // сам остров прижат к правому краю экрана, поэтому его ширину надо знать
     // до того, как ставить ячейки.
-    let handle_w = (H / 3).max(6);
+    let handle_w = (h() / 3).max(6);
     let mut right_cells: Vec<(Cell, i32)> = Vec::new();
     // Раздача — первой в острове: она временная и должна бросаться в глаза,
     // а не теряться между постоянными раскладкой, звуком и зарядом.
@@ -307,7 +393,7 @@ pub fn layout(d: &Data) -> Layout {
     if let Some((код, гостей)) = d.share.as_ref() {
         right_cells.push((Cell::Share, tws(&share_text(код, *гостей), TEXT)));
         if !d.kb.is_empty() || d.volume.is_some() || d.battery.is_some() {
-            right_cells.push((Cell::Sep, SEP_W + GAP * 2));
+            right_cells.push((Cell::Sep, SEP_W + gap() * 2));
         }
     }
     if !d.kb.is_empty() {
@@ -315,76 +401,85 @@ pub fn layout(d: &Data) -> Layout {
     }
     if let Some((percent, _)) = d.volume {
         // Значок + проценты: значок квадратный со стороной в высоту строки.
-        right_cells.push((Cell::Volume, DOT + GAP + tws(&percent_text(percent), TEXT)));
+        right_cells.push((Cell::Volume, DOT + gap() + tws(&percent_text(percent), TEXT)));
     }
     if let Some((percent, _)) = d.battery {
-        right_cells.push((Cell::Battery, DOT + GAP + tws(&percent_text(percent), TEXT)));
+        right_cells.push((Cell::Battery, DOT + gap() + tws(&percent_text(percent), TEXT)));
     }
     if d.tray > 0 {
         if !right_cells.is_empty() {
-            right_cells.push((Cell::Sep, SEP_W + GAP * 2));
+            right_cells.push((Cell::Sep, SEP_W + gap() * 2));
         }
         for i in 0..d.tray {
             right_cells.push((Cell::Tray(i), DOT));
         }
     }
     if !right_cells.is_empty() {
-        right_cells.push((Cell::Sep, SEP_W + GAP * 2));
+        right_cells.push((Cell::Sep, SEP_W + gap() * 2));
     }
     right_cells.push((Cell::Handle, handle_w));
 
     let right_inner: i32 = right_cells.iter().map(|(_, w)| *w).sum::<i32>()
-        + GAP * (right_cells.len() as i32 - 1);
-    let right_w = right_inner + PAD * 2;
-    let right_x = (d.screen_w - EDGE - right_w).max(0);
-    let right = Rect { x: right_x, y, w: right_w, h: H };
+        + gap() * (right_cells.len() as i32 - 1);
+    let right_w = right_inner + pad() * 2;
+    let right_x = (d.screen_w - edge() - right_w).max(0);
+    let right = Rect { x: right_x, y, w: right_w, h: h() };
     {
-        let mut cx = right_x + PAD;
+        let mut cx = right_x + pad();
         for (cell, w) in right_cells {
-            cells.push(Item { cell, rect: Rect { x: cx, y, w, h: H } });
-            cx += w + GAP;
+            cells.push(Item { cell, rect: Rect { x: cx, y, w, h: h() } });
+            cx += w + gap();
         }
     }
 
     // ── Лево: столы и окна текущего стола ────────────────────────────────────
-    let left_x = EDGE;
+    let left_x = edge();
     let tags = tags_w();
     // Сколько места осталось до центрального острова (а если его нет — до
     // правого). Остров обязан в него уложиться: наехав на часы, он превращает
     // панель в кашу.
-    let предел = center.map(|c| c.x).unwrap_or(right.x) - GAP * 2;
-    let без_окон = left_x + PAD * 2 + tags;
-    let место_под_окна = предел - без_окон - (SEP_W + GAP * 2 + GAP);
+    let предел = center.map(|c| c.x).unwrap_or(right.x) - gap() * 2;
+    let без_окон = left_x + pad() * 2 + tags;
+    let место_под_окна = предел - без_окон - (SEP_W + gap() * 2 + gap());
     // Сколько чипов влезает. Чип квадратный, стороной в значок стола.
     let mut влезает = if место_под_окна <= 0 {
         0
     } else {
-        (((место_под_окна + GAP) / (DOT + GAP)).max(0) as usize).min(d.windows.len())
+        (((место_под_окна + gap()) / (DOT + gap())).max(0) as usize).min(d.windows.len())
     };
     let окна_w = if влезает > 0 {
-        влезает as i32 * DOT + (влезает as i32 - 1) * GAP
+        влезает as i32 * DOT + (влезает as i32 - 1) * gap()
     } else {
         0
     };
 
-    let left_inner = tags + if окна_w > 0 { SEP_W + GAP * 2 + GAP + окна_w } else { 0 };
-    let left = Rect { x: left_x, y, w: left_inner + PAD * 2, h: H };
+    // Разделитель между значками столов и чипами окон — только когда слева от
+    // него что-то есть (`bar{ tags = false }` оставляет остров из одних чипов).
+    let разделитель = tags > 0 && окна_w > 0;
+    let left_inner = tags
+        + if окна_w > 0 { окна_w } else { 0 }
+        + if разделитель { SEP_W + gap() * 2 + gap() } else { 0 };
+    let left = Rect { x: left_x, y, w: left_inner + pad() * 2, h: h() };
     {
-        let mut cx = left_x + PAD;
-        for i in 0..TAGS {
-            cells.push(Item {
-                cell: Cell::Tag(1u32 << i),
-                rect: Rect { x: cx, y, w: DOT, h: H },
-            });
-            cx += DOT + GAP;
+        let mut cx = left_x + pad();
+        if вид().tags {
+            for i in 0..TAGS {
+                cells.push(Item {
+                    cell: Cell::Tag(1u32 << i),
+                    rect: Rect { x: cx, y, w: DOT, h: h() },
+                });
+                cx += DOT + gap();
+            }
+            // Последний зазор лишний — он ушёл в цикле после девятого стола.
+            cx -= gap();
         }
-        // Последний зазор лишний — он ушёл в цикле после девятого стола.
-        cx -= GAP;
         if окна_w > 0 {
-            cells.push(Item {
-                cell: Cell::Sep,
-                rect: Rect { x: cx + GAP, y, w: SEP_W + GAP * 2, h: H },
-            });
+            if разделитель {
+                cells.push(Item {
+                    cell: Cell::Sep,
+                    rect: Rect { x: cx + gap(), y, w: SEP_W + gap() * 2, h: h() },
+                });
+            }
             // Сразу за разделителем: свой зазор у него уже есть с обеих сторон
             // (SEP_W + GAP*2). Лишний GAP здесь съедал бы поле у правого края
             // острова — ширина считается по этой же арифметике чуть выше.
@@ -396,18 +491,18 @@ pub fn layout(d: &Data) -> Layout {
             } else {
                 (влезает, 0)
             };
-            let mut wx = cx + GAP + SEP_W + GAP * 2;
+            let mut wx = if разделитель { cx + gap() + SEP_W + gap() * 2 } else { cx };
             for i in 0..чипов {
                 cells.push(Item {
                     cell: Cell::Window(i),
-                    rect: Rect { x: wx, y, w: DOT, h: H },
+                    rect: Rect { x: wx, y, w: DOT, h: h() },
                 });
-                wx += DOT + GAP;
+                wx += DOT + gap();
             }
             if остаток > 0 {
                 cells.push(Item {
                     cell: Cell::WindowsMore(остаток),
-                    rect: Rect { x: wx, y, w: DOT, h: H },
+                    rect: Rect { x: wx, y, w: DOT, h: h() },
                 });
             }
             влезает = чипов;
@@ -475,23 +570,28 @@ impl crate::state::Parallax {
     /// Всё, что панель показывает, собирается ЗДЕСЬ и одинаково идёт и в
     /// отрисовку, и в хит-тест.
     pub fn bar_data(&self) -> Data {
+        // Состав панели — ручки `bar{}` (см. [`Вид`]). Гасим ЗДЕСЬ, на данных, а
+        // не в раскладке: пустая строка и `None` для неё уже значат «этой
+        // ячейки нет», и второй способ сказать то же самое разъехался бы с
+        // первым — а по этой же раскладке считаются клики.
+        let вид = вид();
         Data {
             hide: self.bar_hide,
             screen_w: self.screen_size().w,
-            windows: self.bar_windows(),
-            clock: self.bar_clock.clone(),
-            date: self.bar_date.clone(),
-            kb: self.bar_kb.clone(),
-            volume: self
+            windows: if вид.windows { self.bar_windows() } else { Vec::new() },
+            clock: if вид.clock { self.bar_clock.clone() } else { String::new() },
+            date: if вид.date { self.bar_date.clone() } else { String::new() },
+            kb: if вид.keyboard { self.bar_kb.clone() } else { String::new() },
+            volume: вид.volume.then(|| self
                 .audio_snapshot()
                 .and_then(|s| s.volume())
-                .map(|(level, muted)| ((level.clamp(0.0, 1.0) * 100.0).round() as u8, muted)),
-            battery: self
+                .map(|(level, muted)| ((level.clamp(0.0, 1.0) * 100.0).round() as u8, muted))).flatten(),
+            battery: вид.battery.then(|| self
                 .tray
                 .as_ref()
                 .and_then(|t| t.snap.battery.as_ref())
-                .map(|b| (b.percent, b.charging)),
-            tray: self.sni_items().len(),
+                .map(|b| (b.percent, b.charging))).flatten(),
+            tray: if вид.tray { self.sni_items().len() } else { 0 },
             // Имена переменных ЦЕЛИКОМ: односимвольные кириллические `р` и `г`
             // рядом с латинскими `p`/`r` из раскладки островов — та самая пара,
             // на которой rustc ругается «found both … which look alike», а
@@ -891,12 +991,12 @@ mod tests {
                 .find(|c| c.cell == Cell::Tag(1u32 << i))
                 .expect("стол на месте");
             let x = (ячейка.rect.x + ячейка.rect.w / 2) as f64;
-            let y = (TOP + H / 2) as f64;
+            let y = (top() + h() / 2) as f64;
             assert_eq!(l.hit(x, y), Some(Cell::Tag(1u32 << i)));
         }
         let sep = l.cells.iter().find(|c| c.cell == Cell::Sep).expect("разделитель есть");
         let x = (sep.rect.x + sep.rect.w / 2) as f64;
-        assert_eq!(l.hit(x, (TOP + H / 2) as f64), None, "разделитель съел клик");
+        assert_eq!(l.hit(x, (top() + h() / 2) as f64), None, "разделитель съел клик");
     }
 
     /// Иконки трея нумеруются подряд и не наезжают друг на друга.
@@ -966,7 +1066,7 @@ mod tests {
     #[test]
     fn убранная_панель_уходит_за_верхний_край() {
         let на_месте = layout(&Data { hide: 0.0, ..данные() });
-        assert_eq!(на_месте.left.y, TOP);
+        assert_eq!(на_месте.left.y, top());
 
         let убрана = layout(&Data { hide: 1.0, ..данные() });
         let полка_y = crate::tray::layout(true, true, 2560, 1.0, 1.0)

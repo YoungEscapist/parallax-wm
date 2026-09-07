@@ -219,6 +219,68 @@ set{ infinite_wallpaper = true }
 -- The quiet fade of a closed window (described in the header above).
 set{ close_anim = true }
 
+-- Going fullscreen (F11) and back rides the camera instead of switching in one
+-- frame: the view zooms in on the window while it grows to the whole monitor.
+set{ fullscreen_anim = true }
+
+-- The bar leaves while you PAN the canvas and comes back half a second after
+-- you stop. It is the only thing that stays put while everything else moves.
+set{ bar_hide_pan = true }
+
+-- Depth in the preview card (hover a workspace dot or a window chip on the
+-- bar): windows deeper in the stack are drawn slightly smaller, dimmer and with
+-- a shadow cast by the one above. 0 turns the card flat again.
+set{ preview_depth = 0.7 }
+
+-- ── Ricing: animations, bar, corners and gaps ──────────────────────────────
+--
+-- Everything below is TASTE. The defaults are picked and argued for in the
+-- code, but nobody should have to fork a compositor over taste: the compositor
+-- asks these knobs, not hardwired constants.
+
+-- Movement durations in milliseconds, by name. One multiplier for all of them
+-- is set{ anim_speed }; here each movement stands on its own. An unknown name
+-- goes to the log together with the list of known ones — a typo never stays
+-- silent.
+-- anim{
+--   window_open = 280,      -- a new window floating up
+--   window_close = 360,     -- a closed one fading out
+--   tiling = 260,           -- a window travelling to its slot AND resizing
+--   nudge = 200,            -- a neighbour stepping aside, a swap
+--   float_scatter = 560,    -- windows scattering into Float
+--   window_jump = 280,      -- the camera hopping to a window
+--   workspace = 400,        -- the flight to another workspace's frame
+--   workspace_slide = 340,  -- workspaces sliding sideways
+--   overview = 360,         -- entering and leaving the overview
+--   fullscreen = 320,       -- the camera pushing into fullscreen
+--   zoom = 380,             -- a commanded change of zoom level
+--   pan_step = 420,         -- a keyboard pan step
+--   bookmark = 400,         -- a jump to a camera bookmark
+--   strip_follow = 300,     -- the camera following the active column
+--   constellation = 320,    -- gathering and breaking a constellation
+--   focus_aura = 200,       -- the focus glow moving over
+--   intro = 1100,           -- the workspace appearing at startup
+-- }
+
+-- A window resize in tiling rides the same spring as its position instead of
+-- switching in one frame. The real size reaches the client immediately either
+-- way — only the picture is animated.
+set{ resize_anim = true }
+
+-- Window corners and tiling gaps (rounding/gaps_in/gaps_out, as in hyprland).
+set{ rounding = 8, rounding_tile = 16 }
+set{ gaps_in = 16, gaps_out = 18 }
+
+-- The look of the bar: geometry, colours, which islands it carries. Colours are
+-- #rrggbb or #rrggbbaa. Any part can be turned off: what is off takes no space
+-- and catches no clicks.
+-- bar{
+--   height = 34, top = 8, radius = 12, edge = 24, pad = 14, gap = 6,
+--   bg = "#0a0a12a6", fg = "#edf2fff5", dim = "#d9dff28c",
+--   clock = true, date = true, keyboard = true, volume = true,
+--   battery = true, tray = true, windows = true, tags = true,
+-- }
+
 -- Blur behind the bar. Off: never watched live, see the description above.
 set{ blur = false }
 
@@ -897,6 +959,15 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 -- mouse{ chord = "1-2", action = "zoom" }           -- left, then press wheel: drag up/down = zoom
 -- mouse{ chord = "1-2", action = "toggle_fullscreen" }
 -- set{ mouse_chord_timeout = 250 }
+-- While one window fills the whole screen, chords do NOT start: the button
+-- reaches the client immediately, with no delay at all. This is why a game gets
+-- its clicks raw — in Dota the left button walks and the right one attacks, and
+-- a held-back "1-…" or "3-3" chord delays both. There is nothing to drag or
+-- resize in a fullscreen window anyway, so the delay would buy nothing. Set
+-- this to true to keep chords (and their delay) working there as well.
+-- Overview and a pulled-back camera do not count as fullscreen: the window
+-- stands there as a thumbnail, and dragging it with the mouse is the point.
+-- set{ mouse_chords_in_fullscreen = false }
 -- How much stronger than the hand a chord resize is (mouse path only; the
 -- touchpad keeps its own gain). The drag is divided by the zoom first, so it
 -- feels the same however far the camera is pulled back.

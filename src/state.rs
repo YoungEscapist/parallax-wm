@@ -367,6 +367,15 @@ pub struct Parallax {
     /// выглядел как мигание. Теперь она спокойно уезжает вверх, пока внизу
     /// собирается предпросмотр столов.
     pub bar_hide: f64,
+    /// Когда камеру в последний раз вели РУКОЙ (пан мышью, тачпадом, пальцем,
+    /// колесом — всё это идёт через `pan_camera_by`).
+    ///
+    /// По этой отметке панель уходит вверх на время пана и возвращается через
+    /// `ПАН_ПОСЛЕСВЕЧЕНИЕ` после остановки (см. `Parallax::пан_идёт`). Отметка,
+    /// а не флаг: у пана нет ни одного общего «конца» — мышь отпускают,
+    /// тачпадный жест обрывается, колесо просто перестаёт крутиться, — а
+    /// начало у всех одно.
+    pub пан_отметка: Option<std::time::Instant>,
     /// Появление рабочего места при запуске (см. `anim::Вход`). `None` — вход
     /// кончился либо выключен настройкой `set{ intro = false }`.
     pub вход: Option<crate::anim::Вход>,
@@ -649,6 +658,11 @@ pub struct Parallax {
     pub фон_побудка: Option<std::time::Instant>,
     /// Анимации появления новых окон "с ростом" (Float-режим).
     pub window_open_anims: Vec<(Window, crate::anim::OpenAnim)>,
+    /// Плавная смена РАЗМЕРА окна в кадре (см. `anim::SizeAnim`): настоящий
+    /// размер клиенту отправлен сразу, а картинка едет пружиной вслед за
+    /// позицией. Заводится там же, где раскладка двигает окно, —
+    /// `tiling::resize_window_animated`.
+    pub window_size_anims: Vec<(Window, crate::anim::SizeAnim)>,
     /// Плитки декораций (тень окна, маска угла, полоса параллакса) и пулы их
     /// буферов — см. decor.rs.
     pub decor: crate::decor::DecorCache,
@@ -931,6 +945,9 @@ pub struct Parallax {
     /// Позиции столов в 2D-сетке обзора: маска тега → (col, row) относительно
     /// центрального (0,0). Сбрасывается при каждом входе в обзор.
     pub overview_slots: std::collections::HashMap<u32, (i32, i32)>,
+    /// Размер ячейки сетки обзора, снятый при входе (см.
+    /// `overview_band_size`). `None` — обзора нет, ячейка равна экрану.
+    pub overview_band: Option<(i32, i32)>,
     /// Позиции и размеры окон ДО входа в обзор — обзор сжимает окна в миниатюры
     /// и раскладывает их по сетке столов, а refresh_tags на выходе сохраняет
     /// эти обзорные координаты в tw.position. Для тайловых столов их чинит
@@ -1022,15 +1039,14 @@ pub type ThemeCursor = (MemoryRenderBuffer, Point<i32, Logical>, Size<i32, Logic
 pub fn load_theme_cursor(names: &[&str], want: i32) -> Option<ThemeCursor> {
     use xcursor::{CursorTheme, parser::parse_xcursor};
 
-    let try_load = || -> Option<ThemeCursor> {
+    let try_load = |theme_name: &str| -> Option<ThemeCursor> {
         // CursorTheme::load() берёт имя темы аргументом, а не из окружения —
         // без этого она искала буквально тему с именем "default", которой
         // почти нигде нет (есть Adwaita/Breeze/...), и курсор вне окон был
         // невидим (клиенты рисуют свой курсор сами через Surface, поэтому
         // внутри окон баг не проявлялся). XCURSOR_THEME — тот же env var,
         // что читают GTK/Qt/wayland-cursor на стороне клиентов.
-        let theme_name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
-        let theme = CursorTheme::load(&theme_name);
+        let theme = CursorTheme::load(theme_name);
         let path = names.iter().find_map(|n| theme.load_icon(n))?;
         let bytes = std::fs::read(path).ok()?;
         let images = parse_xcursor(&bytes)?;
@@ -1099,14 +1115,37 @@ pub fn load_theme_cursor(names: &[&str], want: i32) -> Option<ThemeCursor> {
         Some((buf, hotspot, size))
     };
 
-    let loaded = try_load();
+    // Запасные темы. Названной темы может не быть на этой машине вовсе: Bibata
+    // ставится руками и в репозиториях Arch/Artix её нет, а XCURSOR_THEME при
+    // этом приезжает из чужого окружения (менеджер входа, launch_native.sh,
+    // gsettings). Раньше это означало не «другая стрелка», а НИКАКОЙ: указатель
+    // жив, двигается и попадает по кнопкам, но не нарисован — со стороны ровно
+    // «сборка сломала курсор». Adwaita есть с любым рабочим столом, а на
+    // "default" смотрит /usr/share/icons/default/index.theme.
+    let requested = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
+    let mut loaded = None;
+    let mut использована = requested.clone();
+    for theme_name in [requested.as_str(), "Adwaita", "default"] {
+        if loaded.is_none() {
+            loaded = try_load(theme_name);
+            if loaded.is_some() {
+                использована = theme_name.to_string();
+            }
+        }
+    }
     match &loaded {
-        Some((_, _, sz)) => tracing::info!(
+        Some((_, _, sz)) if использована == requested => tracing::info!(
             "plx: cursor {:?} loaded {}x{} (theme {:?}, requested {})",
-            names.first().copied().unwrap_or("?"), sz.w, sz.h,
-            std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into()), want,
+            names.first().copied().unwrap_or("?"), sz.w, sz.h, requested, want,
         ),
-        None => tracing::warn!("plx: the theme has no cursor {:?}", names),
+        Some((_, _, sz)) => tracing::warn!(
+            "plx: cursor {:?} loaded {}x{} from the fallback theme {:?} — \
+             the theme {:?} asked for by XCURSOR_THEME is not installed here",
+            names.first().copied().unwrap_or("?"), sz.w, sz.h, использована, requested,
+        ),
+        None => tracing::warn!(
+            "plx: no theme has cursor {:?} (tried {:?}, Adwaita, default)", names, requested,
+        ),
     }
     loaded
 }
@@ -1285,6 +1324,7 @@ impl Parallax {
             vr_раскладка: crate::vr::scene::Раскладка::Дуга,
             mine: None,
             bar_hide: 0.0,
+            пан_отметка: None,
             minimap_zoom: 1.0,
             minimap_zoom_target: 1.0,
             minimap_follow: Point::from((0.0, 0.0)),
@@ -1346,6 +1386,7 @@ impl Parallax {
             фон_побудка: None,
             wallpaper_damage: Default::default(),
             window_open_anims: Vec::new(),
+            window_size_anims: Vec::new(),
             decor: crate::decor::DecorCache::new(),
             pre_tiling_view: None,
             gesture_move_window: None,
@@ -1369,6 +1410,7 @@ impl Parallax {
             overview_prev: None,
             overview_order: Vec::new(),
             overview_slots: HashMap::new(),
+            overview_band: None,
             overview_saved_geo: Vec::new(),
             overview_exit_pending: false,
             overview_exit_target_ws: None,
@@ -1697,6 +1739,12 @@ impl Parallax {
     /// сообщает синхронизации, что камера уехала НАМЕРЕННО и курсор уже
     /// приведён в порядок — иначе она повторит ту же работу.
     pub fn pan_camera_by(&mut self, dcam_x: f64, dcam_y: f64) {
+        // Отметка пана — здесь, в единственной точке, через которую проходят
+        // ВСЕ способы вести камеру рукой: Alt+ЛКМ, колесо, жест тачпада, палец
+        // на экране. По ней уезжает панель (см. `Parallax::пан_идёт`).
+        if dcam_x != 0.0 || dcam_y != 0.0 {
+            self.пан_отметка = Some(std::time::Instant::now());
+        }
         self.viewport.cam_x -= dcam_x;
         self.viewport.cam_y -= dcam_y;
         self.apply_camera();
@@ -2269,7 +2317,27 @@ impl Parallax {
         // запоминаем текущие перед уходом, восстанавливаем сохранённые для
         // нового тега.
         let old_tag = self.viewport.current_tags();
-        self.tag_cameras.insert(old_tag, self.view_frame_target());
+        // Кадр покидаемого стола ЗАПОМИНАЕМ ВМЕСТЕ С ЦЕЛЬЮ ДОЕЗДА КОЛЕСА, а сам
+        // доезд гасим — здесь, в одной точке на все ветки ниже.
+        //
+        // `zoom_glide` — ТРЕТЬЯ анимация зума, отдельная и от `zoom_anim`, и от
+        // `camera_anim` (см. `zoom_step_at_cursor` и тот же разбор в
+        // tiling.rs). Ветки ниже гасили две первых и ставили зум нового стола
+        // руками — а доезд колеса переживал переход и на первом же тике
+        // продолжал тянуть масштаб к СВОЕЙ цели, от старого стола. Отсюда
+        // прямая жалоба Ярика 07.09.2026: «зум не сбрасывается после
+        // переключения стола» (в замере на харнессе холст оставался на 0.05
+        // даже на свежем, ни разу не виденном столе, где ветка `is_new` ставит
+        // ровно 1.0). Заодно чинится и «столы смешиваются»: при равных кадрах
+        // переход идёт слайдом, а уползающий из-под него зум показывал оба
+        // стола разом.
+        //
+        // В памяти стола цель доезда важнее текущего масштаба: человек крутанул
+        // колесо и ушёл — вернуться стол обязан туда, КУДА он его крутил.
+        let цель_доезда = self.zoom_glide.as_ref().map(|g| g.target);
+        self.zoom_glide = None;
+        let (кx, кy, кзум) = self.view_frame_target();
+        self.tag_cameras.insert(old_tag, (кx, кy, цель_доезда.unwrap_or(кзум)));
         self.tag_layouts.insert(old_tag, self.tile_config.layout);
 
         // НОВЫЙ (ещё не посещённый) воркспейс → включаем tiling и раскладываем
@@ -2472,10 +2540,9 @@ impl Parallax {
         уходящие: Vec<(Window, Point<i32, Logical>)>,
     ) {
         let Some(экран) = self.screen_area() else { return };
-        // Зазор между столами: без него окно, стоящее у самого края, кажется
-        // перетекающим на соседний стол, а не сменяющимся.
-        const ЗАЗОР: i32 = 120;
-        let шаг = экран.size.w + ЗАЗОР;
+        // Шаг считается по ВИДИМОМУ куску холста (см. `шаг_слайда`), а не по
+        // экрану в логических единицах.
+        let шаг = шаг_слайда(экран.size.w, self.view_frame_target().2);
 
         let Some(сторона) = слайд_сторона(old_tag, tag) else { return };
 
@@ -3496,7 +3563,7 @@ impl Parallax {
         // От ТЕКУЩЕГО места панели: она уезжает вверх при входе в обзор, и
         // карточка обязана ехать вместе с ней.
         let top = crate::bar::island_y(self.bar_hide)
-            + crate::bar::H + crate::canvas::PREVIEW_GAP;
+            + crate::bar::h() + crate::canvas::PREVIEW_GAP;
         Some(crate::canvas::preview_geom(
             rect.x + rect.w / 2, top, self.screen_size().w, self.preview_anim,
         ))
@@ -3568,8 +3635,14 @@ impl Parallax {
             .collect()
     }
 
-    /// Окно под точкой на карточке. Список рисуется в прямом порядке (и то, что
-    /// в кадре добавлено позже, лежит ниже), поэтому ищем с конца — сверху вниз.
+    /// Окно под точкой на карточке. ПОСЛЕДНЕЕ окно списка — верхнее, поэтому
+    /// ищем с конца: сверху вниз.
+    ///
+    /// Отрисовка (`build_bar_preview`) с 07.09.2026 идёт тем же порядком —
+    /// раньше она складывала содержимое НАОБОРОТ (первое окно оказывалось в
+    /// кадре сверху), и на перекрывающихся окнах клик уходил не в то окно,
+    /// которое видно. Заметно это стало сразу, как у карточки появилась
+    /// глубина: стопка показывает, что лежит поверх чего.
     pub fn preview_window_at(&self, screen: Point<f64, Physical>) -> Option<Window> {
         let (g, вид) = self.preview_view()?;
         // Точка в полях карточки (подпись, рамка) окном не считается.
@@ -3579,14 +3652,27 @@ impl Parallax {
         {
             return None;
         }
-        self.preview_frames().iter().rev()
-            .find(|к| {
-                let r = вид.rect(g.content.loc, g.content.size, к.rect);
+        // Глубина стопки — та же, что в отрисовке (`build_bar_preview`), и
+        // считается она в одном месте на двоих (canvas.rs). Иначе клик уходил
+        // бы в прямоугольник, которого на экране нет: дальнее окно нарисовано
+        // мельче и сдвинуто к середине поля, а искали бы его по полному
+        // размеру — промах тем больше, чем глубже окно лежит.
+        let кадры = self.preview_frames();
+        let глубина = self.lua_config.preview_depth.clamp(0.0, 1.0) as f64;
+        let центр = crate::canvas::центр_поля(g.content);
+        кадры.iter().enumerate().rev()
+            .find(|(i, к)| {
+                let k = crate::canvas::масштаб_глубины(
+                    глубина, crate::canvas::доля_глубины(*i, кадры.len()),
+                );
+                let r = crate::canvas::сжать_к(
+                    вид.rect(g.content.loc, g.content.size, к.rect), центр, k,
+                );
                 screen.x >= r.loc.x as f64 && screen.y >= r.loc.y as f64
                     && screen.x < (r.loc.x + r.size.w) as f64
                     && screen.y < (r.loc.y + r.size.h) as f64
             })
-            .map(|к| к.window.clone())
+            .map(|(_, к)| к.window.clone())
     }
 
     /// ЛКМ по миниатюре на карточке: перейти на её стол, сфокусировать окно и
@@ -3955,6 +4041,26 @@ fn дом_окна(
     цель_пружины.or(в_space)
 }
 
+/// На сколько холста уезжает уходящий стол при перелистывании.
+///
+/// Считается по ВИДИМОМУ куску холста, а не по ширине экрана в логических
+/// единицах. На отдалённой камере (зум 0.4) в экран влезает вдвое с лишним
+/// больше холста, и окно, уехавшее ровно на ширину экрана, остаётся на виду —
+/// вместе с окнами приехавшего стола. Отсюда прямая жалоба Ярика 07.09.2026:
+/// «столы смешиваются при переключении, окна двух столов разом».
+///
+/// Зум зажат единицей сверху: на ПРИБЛИЖЕННОЙ камере уменьшать шаг нельзя —
+/// окна разъезжались бы меньше, чем на свой экран, и стол читался бы сдвинутым,
+/// а не сменившимся. Снизу зажат 0.05 (нижний предел зума), чтобы деление не
+/// уводило шаг в бесконечность.
+///
+/// Зазор — чтобы окно у самого края не казалось перетекающим на соседний стол.
+fn шаг_слайда(ширина_экрана: i32, зум: f64) -> i32 {
+    const ЗАЗОР: i32 = 120;
+    let зум = if зум.is_finite() { зум.clamp(0.05, 1.0) } else { 1.0 };
+    (ширина_экрана as f64 / зум).ceil() as i32 + ЗАЗОР
+}
+
 fn слайд_сторона(old_tag: u32, tag: u32) -> Option<i32> {
     if old_tag == 0 || tag == 0 {
         return None;
@@ -3970,6 +4076,31 @@ fn слайд_сторона(old_tag: u32, tag: u32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Уходящий стол обязан уйти за край КАДРА, а не за край экрана в
+    /// логических единицах: на отдалённой камере это разные вещи, и разница
+    /// читается как «окна двух столов разом».
+    #[test]
+    fn шаг_слайда_уводит_за_край_кадра() {
+        let ш = 2560;
+        // Обычный масштаб — ровно как было до правки: экран плюс зазор.
+        assert_eq!(шаг_слайда(ш, 1.0), ш + 120);
+        // Отдалённая камера: шаг обязан перекрыть ВЕСЬ видимый холст.
+        for зум in [0.8, 0.43, 0.2, 0.05] {
+            let видно = (ш as f64 / зум).ceil() as i32;
+            assert!(
+                шаг_слайда(ш, зум) > видно,
+                "зум {зум}: шаг {} не перекрывает видимые {видно}",
+                шаг_слайда(ш, зум),
+            );
+        }
+        // Приближенная камера шаг НЕ уменьшает: окна обязаны разъехаться хотя
+        // бы на свой экран, иначе стол выглядит сдвинутым, а не сменившимся.
+        assert_eq!(шаг_слайда(ш, 2.5), ш + 120);
+        // Мусорный зум не имеет права уводить шаг в бесконечность.
+        assert_eq!(шаг_слайда(ш, f64::NAN), ш + 120);
+        assert!(шаг_слайда(ш, 0.0) > 0);
+    }
 
     /// Перелистывание обязано идти В СТОРОНУ НОМЕРА стола: со второго на пятый
     /// — влево (новый приходит справа), обратно — вправо. Без этого «слайд»

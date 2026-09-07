@@ -27,8 +27,9 @@ fn same_window(a: &Window, b: &Window) -> bool {
 }
 
 /// Зазор между колонками и вокруг них. У niri это `layout { gaps }`, по
-/// умолчанию 16 — совпадает с parallax'овским GAP_INNER, так что берём его.
-pub const COL_GAP: f64 = GAP_INNER as f64;
+/// умолчанию 16 — совпадает с parallax'овским GAP_INNER(), так что берём его.
+#[allow(non_snake_case)]
+pub fn COL_GAP() -> f64 { GAP_INNER() as f64 }
 
 /// Ширина колонки — ровно модель niri: либо доля рабочей области, либо
 /// фиксированное число пикселей (после ручного ресайза).
@@ -72,7 +73,7 @@ impl ColumnWidth {
     /// половинки ровно делят экран вместе с зазором между ними.
     pub fn resolve(self, working_w: f64) -> f64 {
         match self {
-            ColumnWidth::Proportion(p) => ((working_w - COL_GAP) * p - COL_GAP).max(MIN_PX),
+            ColumnWidth::Proportion(p) => ((working_w - COL_GAP()) * p - COL_GAP()).max(MIN_PX),
             ColumnWidth::Fixed(px) => px.clamp(MIN_PX, (working_w * MAX_WIDTH_FACTOR).max(MIN_PX)),
         }
     }
@@ -82,8 +83,8 @@ impl ColumnWidth {
         match self {
             ColumnWidth::Proportion(p) => p,
             ColumnWidth::Fixed(px) => {
-                let full = working_w - COL_GAP;
-                if full <= 0.0 { 1.0 } else { (px + COL_GAP) / full }
+                let full = working_w - COL_GAP();
+                if full <= 0.0 { 1.0 } else { (px + COL_GAP()) / full }
             }
         }
     }
@@ -439,15 +440,15 @@ fn plan_columns(
 ) -> Vec<(Window, Rectangle<i32, Logical>)> {
     let mut plan: Vec<(Window, Rectangle<i32, Logical>)> = Vec::new();
     {
-        let avail_h = (geo.size.h - GAP_OUTER * 2).max(1);
+        let avail_h = (geo.size.h - GAP_OUTER() * 2).max(1);
         let working_w = geo.size.w as f64;
-        // Первая колонка стоит на COL_GAP от начала полосы — в niri это поле
+        // Первая колонка стоит на COL_GAP() от начала полосы — в niri это поле
         // даёт view_offset, но parallax возит камеру по холсту, поэтому проще
         // заложить его прямо в координаты.
-        let mut x = geo.loc.x + COL_GAP as i32;
+        let mut x = geo.loc.x + COL_GAP() as i32;
         for col in &layout.columns {
             let win_w = col.width_px(working_w).round().max(1.0) as i32;
-            let col_full_w = win_w + COL_GAP as i32;
+            let col_full_w = win_w + COL_GAP() as i32;
             let n = col.windows.len();
             // Высоты по весам строк (niri-стиль); при рассинхроне — равные.
             let weights: Vec<f64> = if col.row_weights.len() == n && n > 0 {
@@ -462,7 +463,7 @@ fn plan_columns(
             // переключении вкладки окно уже было нужного размера.
             if col.tabbed {
                 let rect = Rectangle::new(
-                    (x, floor_y + GAP_OUTER).into(),
+                    (x, floor_y + GAP_OUTER()).into(),
                     (win_w, avail_h).into(),
                 );
                 for w in &col.windows {
@@ -471,20 +472,20 @@ fn plan_columns(
                 x += col_full_w;
                 continue;
             }
-            let mut acc_top = floor_y + GAP_OUTER;
+            let mut acc_top = floor_y + GAP_OUTER();
             for (ri, w) in col.windows.iter().enumerate() {
                 let top = acc_top;
                 // Последнее окно дотягивается до низа (компенсируем остаток округления).
                 let bottom = if ri + 1 == n {
-                    floor_y + GAP_OUTER + avail_h
+                    floor_y + GAP_OUTER() + avail_h
                 } else {
                     top + (avail_h as f64 * weights[ri] / wsum).round() as i32
                 };
                 acc_top = bottom;
-                let ry = top + GAP_INNER / 2;
-                let rh = (bottom - GAP_INNER / 2 - ry).max(1);
+                let ry = top + GAP_INNER() / 2;
+                let rh = (bottom - GAP_INNER() / 2 - ry).max(1);
                 // x — левый край окна: зазор между колонками уже заложен в
-                // col_full_w, так что половинку GAP_INNER здесь прибавлять не
+                // col_full_w, так что половинку GAP_INNER() здесь прибавлять не
                 // нужно (иначе колонки разъезжались бы с расчётом прокрутки).
                 let rect = Rectangle::new((x, ry).into(), (win_w, rh).into());
                 plan.push((w.clone(), rect));
@@ -515,9 +516,9 @@ fn remove_window_from(layout: &mut ColumnLayout, window: &Window) {
 /// расхождение не проявлялось; на втором подсказка вставки уезжала на миллион
 /// пикселей, а бросок окна всегда попадал в конец полосы.
 fn column_x_in(layout: &ColumnLayout, idx: usize, working_w: f64, начало: f64) -> f64 {
-    let mut x = начало + COL_GAP;
+    let mut x = начало + COL_GAP();
     for col in layout.columns.iter().take(idx) {
-        x += col.width_px(working_w) + COL_GAP;
+        x += col.width_px(working_w) + COL_GAP();
     }
     x
 }
@@ -535,7 +536,7 @@ fn insert_target_in(
     for i in 0..layout.columns.len() {
         let x = column_x_in(layout, i, working_w, начало);
         let w = layout.columns[i].width_px(working_w);
-        if pos_x < x - COL_GAP / 2.0 {
+        if pos_x < x - COL_GAP() / 2.0 {
             return (i, false);
         }
         if pos_x < x + w {
@@ -1054,7 +1055,7 @@ impl Parallax {
     pub fn columns_insert_hint_rect(&self, pos_x: f64) -> Option<Rectangle<i32, Logical>> {
         let geo = self.columns_screen_geo()?;
         let working_w = geo.size.w as f64;
-        let avail_h = (geo.size.h - GAP_OUTER * 2).max(1);
+        let avail_h = (geo.size.h - GAP_OUTER() * 2).max(1);
         let этаж = self.columns_cur_y().round() as i32;
         let (idx, into_stack) = self.columns_insert_target(pos_x);
         if into_stack {
@@ -1064,15 +1065,15 @@ impl Parallax {
             // Подсказка «в стопку» — нижняя половина колонки.
             let h = avail_h / 2;
             Some(Rectangle::new(
-                (x.round() as i32, этаж + GAP_OUTER + avail_h - h).into(),
+                (x.round() as i32, этаж + GAP_OUTER() + avail_h - h).into(),
                 (w.round() as i32, h).into(),
             ))
         } else {
             // Новая колонка: узкая полоса в шов между колонками.
             let x = self.columns_column_x(idx, working_w);
-            let w = (COL_GAP as i32).max(6);
+            let w = (COL_GAP() as i32).max(6);
             Some(Rectangle::new(
-                ((x - COL_GAP) as i32, этаж + GAP_OUTER).into(),
+                ((x - COL_GAP()) as i32, этаж + GAP_OUTER()).into(),
                 (w, avail_h).into(),
             ))
         }
@@ -1264,7 +1265,7 @@ impl Parallax {
             max_y = max_y.max(floor_y + geo.size.h);
             if let Some(g) = self.space.element_geometry(&tw.window) {
                 min_x = min_x.min(g.loc.x);
-                max_x = max_x.max(g.loc.x + g.size.w + COL_GAP as i32);
+                max_x = max_x.max(g.loc.x + g.size.w + COL_GAP() as i32);
             }
         }
         // Ни одного окна в ленте — показываем хотя бы текущий этаж.
@@ -1418,7 +1419,7 @@ impl Parallax {
         let mut best = 0usize;
         let mut best_d = f64::MAX;
         for i in 0..self.columns.columns.len() {
-            let d = (self.columns_column_x(i, working_w) - COL_GAP - view_x).abs();
+            let d = (self.columns_column_x(i, working_w) - COL_GAP() - view_x).abs();
             if d < best_d {
                 best_d = d;
                 best = i;
@@ -1458,16 +1459,16 @@ impl Parallax {
         let geo = self.columns_screen_geo()?;
         let working_w = geo.size.w as f64;
         let x = self.columns_column_x(ci, working_w);
-        let avail_h = (geo.size.h - GAP_OUTER * 2).max(1);
+        let avail_h = (geo.size.h - GAP_OUTER() * 2).max(1);
         // Полоска живёт в зазоре слева от колонки, как в niri.
-        let strip_w = (COL_GAP as i32 / 2).max(3);
+        let strip_w = (COL_GAP() as i32 / 2).max(3);
         let n = col.windows.len();
         let tab_h = (avail_h / n as i32).max(4);
         Some((
             x.round() as i32 - strip_w - 2,
             // Y — от этажа своего стола: на втором и дальше этажах полоска
             // вкладок рисовалась бы на первом.
-            self.columns_cur_y().round() as i32 + GAP_OUTER,
+            self.columns_cur_y().round() as i32 + GAP_OUTER(),
             strip_w,
             tab_h,
             n,
@@ -1551,7 +1552,7 @@ impl Parallax {
         let начало = geo.loc.x as f64;
         let right = self.columns_column_x(last, view_w)
             + self.columns.columns[last].width_px(view_w)
-            + COL_GAP;
+            + COL_GAP();
         let max_x = (right - view_w).max(начало);
         let cur = self.columns_target_view_x();
         if cur > max_x + 0.5 {
@@ -1588,7 +1589,7 @@ impl Parallax {
 
     /// Левый край колонки `idx` на бесконечной полосе (niri: `column_x`).
     /// Сумма ширин предыдущих колонок с зазорами; начало полосы смещено на
-    /// COL_GAP, как и в apply_columns_layout.
+    /// COL_GAP(), как и в apply_columns_layout.
     /// Левый край колонки `idx` текущей полосы НА ХОЛСТЕ (см. `column_x_in`):
     /// от дома своего монитора, а не от нуля полосы. С этим значением
     /// сравнивают камеру (`viewport.cam_x`) и позицию курсора — обе абсолютны.
@@ -1619,7 +1620,7 @@ impl Parallax {
         if view_w <= col_w {
             return col_x;
         }
-        let padding = ((view_w - col_w) / 2.0).clamp(0.0, COL_GAP);
+        let padding = ((view_w - col_w) / 2.0).clamp(0.0, COL_GAP());
         let new_x = col_x - padding;
         let new_right = col_x + col_w + padding;
         if cur_x <= new_x && new_right <= cur_x + view_w {
@@ -1677,7 +1678,7 @@ impl Parallax {
                     col_x - src_x + col_w
                 } else {
                     src_x - col_x + src_w
-                } + COL_GAP * 2.0;
+                } + COL_GAP() * 2.0;
                 if total <= view_w {
                     self.columns_fit_view(cur, view_w, col_x, col_w)
                 } else {

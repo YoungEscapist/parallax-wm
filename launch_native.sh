@@ -233,7 +233,32 @@ fi
 # Обе переменные читают и клиенты (GTK/Qt/wayland-cursor), и сам компоновщик
 # (см. load_default_cursor), так что стрелка везде одна. Размер дублируется
 # в config.lua через set{ cursor_size }: env читают клиенты, set — компоновщик.
-export XCURSOR_THEME="${XCURSOR_THEME:-Bibata-Modern-Ice}"
+# Тема назначается, только если она ЕСТЬ на этой машине. Bibata ставится
+# руками (в репозиториях Arch/Artix её нет вовсе), и на чужой машине зашитое
+# имя означало не «другая стрелка», а НИКАКОЙ: компоновщик пишет в лог
+# «the theme has no cursor [...] cursor will be invisible» и рисует пустоту —
+# указатель при этом жив, двигается и попадает по кнопкам, поэтому со стороны
+# это выглядит как «сборка сломала курсор». Запасной вариант — Adwaita, она
+# приезжает с любым рабочим столом, и на неё же смотрит /usr/share/icons/default.
+plx_cursor_theme_exists() {
+    [ -d "/usr/share/icons/$1/cursors" ] \
+        || [ -d "$HOME/.icons/$1/cursors" ] \
+        || [ -d "$HOME/.local/share/icons/$1/cursors" ]
+}
+if [ -z "${XCURSOR_THEME:-}" ]; then
+    for plx_theme in Bibata-Modern-Ice Adwaita default; do
+        if plx_cursor_theme_exists "$plx_theme"; then
+            export XCURSOR_THEME="$plx_theme"
+            break
+        fi
+    done
+    [ -n "${XCURSOR_THEME:-}" ] \
+        || echo "plx: не нашёл ни одной темы курсора в /usr/share/icons — стрелки не будет" >&2
+else
+    export XCURSOR_THEME
+    plx_cursor_theme_exists "$XCURSOR_THEME" \
+        || echo "plx: темы курсора '$XCURSOR_THEME' нет на этой машине — стрелка будет невидимой" >&2
+fi
 export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
 # debug по умолчанию: диагностические строки (PTR HIT, PTR КАДР, PTR ЛОКАЛЬ,
 # КУРСОР КЛИЕНТА) пишутся в файл лога, а не на экран, зато после жалобы

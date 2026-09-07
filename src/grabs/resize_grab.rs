@@ -137,7 +137,7 @@ impl PointerGrab<Parallax> for ResizeSurfaceGrab {
                 let win = self.window.clone();
                 let экран = data.screen_size();
                 let (out_w, out_h) = (экран.w as f64, экран.h as f64);
-                let avail_h = (out_h - (crate::tiling::GAP_OUTER * 2) as f64).max(1.0);
+                let avail_h = (out_h - (crate::tiling::GAP_OUTER() * 2) as f64).max(1.0);
                 let base_w = match self.col_resize_base {
                     Some(b) => b,
                     None => {

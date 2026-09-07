@@ -450,13 +450,13 @@ impl Parallax {
         let (w, h) = match self.tile_config.layout {
             // Columns: колонка в полэкрана, полная высота (см. apply_columns_layout).
             Layout::Columns => (
-                (output_size.w / 2 - GAP_INNER).max(1),
-                (output_size.h - GAP_OUTER * 2).max(1),
+                (output_size.w / 2 - GAP_INNER()).max(1),
+                (output_size.h - GAP_OUTER() * 2).max(1),
             ),
             Layout::Float => (output_size.w / 2, output_size.h / 2),
             Layout::Monocle => (
-                (output_size.w - GAP_OUTER * 2).max(1),
-                (output_size.h - GAP_OUTER * 2).max(1),
+                (output_size.w - GAP_OUTER() * 2).max(1),
+                (output_size.h - GAP_OUTER() * 2).max(1),
             ),
             // Tile: половина слота сфокусированного окна — именно его дерево и
             // разделит при вставке (см. tiling::predict_tile_size).
@@ -587,27 +587,18 @@ impl Parallax {
             self.columns_scroll_to_active();
         }
 
-        // Появление "с ростом" (Hyprland-style) — только Float: в тайлинге
-        // размер и так уже точный (см. predict_new_window_size), а позицию уже
-        // анимирует arrange().
+        // Появление «с ростом» (Hyprland-style) — теперь ВСЕМ окнам.
         //
-        // X11 из этого исключён: каждый кадр анимации — это отдельный
-        // configure по X-соединению, а перерисоваться в такт им X11-клиент всё
-        // равно не успевает, так что «рост» выйдет рванным и недешёвым.
-        if !is_tile && !window.is_x11() {
-            let center = Point::from((
-                (spawn.x + size.w / 2) as f64,
-                (spawn.y + size.h / 2) as f64,
-            ));
-            self.window_open_anims.push((
-                window.clone(),
-                crate::anim::OpenAnim::new(
-                    center,
-                    (size.w as f64, size.h as f64),
-                    crate::anim::дуг::открытие_окна(),
-                ),
-            ));
-        }
+        // Раньше здесь стояли два исключения, и оба были про старую механику
+        // (рост настоящими configure, см. `anim::OpenAnim`): тайлинг — потому
+        // что там размер предсказан заранее и трогать его нельзя, X11 — потому
+        // что каждый кадр уходил отдельным `ConfigureWindow` по X-соединению.
+        // Клиенту теперь не отправляется ничего вовсе: всплытие живёт в
+        // отрисовке кадра, поэтому оба исключения отпали сами.
+        self.window_open_anims.push((
+            window.clone(),
+            crate::anim::OpenAnim::new(crate::anim::дуг::открытие_окна()),
+        ));
 
         // Автоматически отдаём фокус новому окну (как sway/hyprland). В режиме
         // Minecraft `focus()` сам отдаёт его месту мода, не трогая ни верх

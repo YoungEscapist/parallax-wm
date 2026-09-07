@@ -2210,11 +2210,10 @@ fn build_parallax_elements(
 /// чёрные куски поверх обоев; теперь их режет шейдер (`rounded.rs`), и цвет
 /// этот к скруглению отношения не имеет.
 const CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
-/// Радиус скругления в логических пикселях (до умножения на zoom).
-const CORNER_RADIUS_LOGICAL: f64 = 8.0;
-/// В Tile-режиме окна крупнее и без хаотичного разброса Float — заметнее
-/// более крупное скругление (по просьбе пользователя).
-const CORNER_RADIUS_LOGICAL_TILE: f64 = 16.0;
+// Радиус скругления окна в логических пикселях (до умножения на zoom) — ручки
+// `set{ rounding, rounding_tile }`. Умолчания те же, что были константами: во
+// Float окна мельче и разбросаны, в Tile — крупные и ровные, там заметнее
+// более крупная дуга.
 
 /// Ширина "среза" для каждой строки квадратного угла радиуса `radius_px`
 /// (в физических пикселях), от уравнения окружности x = r - sqrt(r² - y²).
@@ -2378,11 +2377,13 @@ fn build_insert_hint(state: &mut Parallax) -> Vec<OutputRenderElements> {
 /// Радиус скругления окон для текущей раскладки (логические px).
 fn corner_radius_logical(state: &Parallax) -> i32 {
     let r = if state.tile_config.layout == crate::tiling::Layout::Tile {
-        CORNER_RADIUS_LOGICAL_TILE
+        state.lua_config.rounding_tile
     } else {
-        CORNER_RADIUS_LOGICAL
+        state.lua_config.rounding
     };
-    (r.round() as i32).clamp(2, 32)
+    // Верхняя граница — не вкус: дуга больше 64 px на маленьком окне съедает
+    // его целиком, а нижняя (0) выключает скругление совсем, и это законно.
+    (r.round() as i32).clamp(0, 64)
 }
 
 /// Геометрия окна на экране: (x0, y0, ширина, высота) в физических пикселях.
@@ -2827,26 +2828,36 @@ fn rounded_solid(
 // Геометрия панели живёт в bar.rs — там же, где её считает хит-тест кликов.
 // Здесь остались только цвета и то, что нужно рисованию.
 //
-// Имена BAR_H/BAR_TOP/BAR_W когда-то лежали тут, и от них считали себя ещё
+// Имена BAR_H()/BAR_TOP()/BAR_W когда-то лежали тут, и от них считали себя ещё
 // двое: полка состояния и резерв места под окна (tiling::BAR_RESERVED). Теперь
 // панель — три отдельных острова, «ширины бара» у неё нет вовсе, а высота и
-// отступ переехали в bar::H и bar::TOP.
+// отступ переехали в bar::h() и bar::top().
 use crate::bar;
 
-const BAR_RADIUS: i32 = bar::RADIUS;
+// Геометрия и цвета панели — ручки конфига (`bar{}`, см. bar::Вид), поэтому
+// здесь не константы, а короткие чтения. Читаются они часто (каждый кадр,
+// каждый клик), но это чтение RwLock без блокировки на общем пути.
+#[allow(non_snake_case)]
+fn BAR_RADIUS() -> i32 { bar::radius() }
 const DOT: i32 = bar::DOT;
 const DOT_RADIUS: i32 = 10;        // скругление точек = круги
 /// Высота бара — её всё ещё спрашивает полка и меню рядом.
-pub const BAR_H: i32 = bar::H;
+#[allow(non_snake_case)]
+pub fn BAR_H() -> i32 { bar::h() }
 /// Отступ бара от верхнего края экрана.
-pub const BAR_TOP: i32 = bar::TOP;
-const PAD_V: i32 = (BAR_H - DOT) / 2;
+#[allow(non_snake_case)]
+pub fn BAR_TOP() -> i32 { bar::top() }
+#[allow(non_snake_case)]
+fn PAD_V() -> i32 { (BAR_H() - DOT) / 2 }
 /// Фон островов и значка блютуза — тёмный полупрозрачный.
-const BAR_BG: [f32; 4] = [0.04, 0.04, 0.07, 0.65];
+#[allow(non_snake_case)]
+fn BAR_BG() -> [f32; 4] { bar::вид().bg }
 /// Основной цвет текста панели и приглушённый для второстепенного (дата,
 /// разделители, неактивные столы).
-const BAR_TEXT: [f32; 4] = [0.93, 0.95, 1.0, 0.96];
-const BAR_DIM: [f32; 4] = [0.85, 0.87, 0.95, 0.55];
+#[allow(non_snake_case)]
+fn BAR_TEXT() -> [f32; 4] { bar::вид().fg }
+#[allow(non_snake_case)]
+fn BAR_DIM() -> [f32; 4] { bar::вид().dim }
 const BAR_SEP: [f32; 4] = [1.0, 1.0, 1.0, 0.16];
 
 /// Скруглённый прямоугольник ПЛИТКАМИ: четыре угла-текстуры и до трёх сплошных
@@ -2952,7 +2963,7 @@ fn build_bar_elements(
         for (i, r) in [Some(lay.left), lay.center, Some(lay.right)].into_iter().enumerate() {
             let Some(r) = r else { continue };
             let i = БЛЮР_ОСТРОВ + i;
-            if let Some(el) = build_blur_patch(state, renderer, r, BAR_RADIUS as f32, 0.85, i) {
+            if let Some(el) = build_blur_patch(state, renderer, r, BAR_RADIUS() as f32, 0.85, i) {
                 els.push(el);
             }
         }
@@ -2962,7 +2973,7 @@ fn build_bar_elements(
     for r in [Some(lay.left), lay.center, Some(lay.right)].into_iter().flatten() {
         rounded_tex(
             state, renderer, &mut pool, &mut idx,
-            r.x, r.y, r.w, r.h, BAR_RADIUS, BAR_BG, &mut slot, &mut els,
+            r.x, r.y, r.w, r.h, BAR_RADIUS(), BAR_BG(), &mut slot, &mut els,
         );
     }
 
@@ -2975,7 +2986,7 @@ fn build_bar_elements(
                 let посещённый = layout.is_some()
                     || tag == current_tags
                     || state.visited_tags.contains(&tag);
-                let y = r.y + PAD_V;
+                let y = r.y + PAD_V();
                 if !посещённый {
                     // Новый, ещё не посещённый стол — серая круглая точка.
                     const DOT_GRAY: [f32; 4] = [0.5, 0.5, 0.55, 0.6];
@@ -3029,10 +3040,10 @@ fn build_bar_elements(
             }
             bar::Cell::Sep => {
                 // Волосок в один пиксель: скруглять нечего, идёт сплошным.
-                let h = BAR_H / 2;
+                let h = BAR_H() / 2;
                 els.push(pooled_solid(
                     &mut pool, &mut idx,
-                    (r.x + r.w / 2, r.y + (BAR_H - h) / 2), (1, h), BAR_SEP,
+                    (r.x + r.w / 2, r.y + (BAR_H() - h) / 2), (1, h), BAR_SEP,
                 ));
             }
             bar::Cell::Handle => {
@@ -3080,7 +3091,7 @@ fn build_bar_elements(
                 if !есть_картинка {
                     rounded_tex(
                         state, renderer, &mut pool, &mut idx,
-                        r.x, r.y + PAD_V, DOT, DOT, DOT / 3,
+                        r.x, r.y + PAD_V(), DOT, DOT, DOT / 3,
                         [1.0, 1.0, 1.0, 0.14], &mut slot, &mut els,
                     );
                 }
@@ -3089,7 +3100,7 @@ fn build_bar_elements(
                     let d = (DOT / 4).max(4);
                     rounded_tex(
                         state, renderer, &mut pool, &mut idx,
-                        r.x + DOT - d, r.y + PAD_V, d, d, d / 2,
+                        r.x + DOT - d, r.y + PAD_V(), d, d, d / 2,
                         TRAY_WARN, &mut slot, &mut els,
                     );
                 }
@@ -3102,7 +3113,16 @@ fn build_bar_elements(
     // ── Текст и значки ───────────────────────────────────────────────────────
     // Текст ставится по вертикали от своей высоты, а не «на глаз»: у мелкой
     // даты она другая, и общая константа увела бы её вниз.
-    let по_центру = |scale: i32| BAR_TOP + (BAR_H - crate::text::height(scale)) / 2;
+    //
+    // Отсчёт — от ЯЧЕЙКИ (`r.y`), а не от постоянной `BAR_TOP()`. Пока панель
+    // стояла на месте, это было одно и то же, но панель теперь уезжает вверх
+    // (обзор, полный экран и особенно пан холста — см. `bar_hide_target`), и
+    // константа держала текст на месте: плашки островов уходили за край, а
+    // часы, дата, раскладка и проценты оставались висеть в воздухе поверх
+    // холста. Ровно это и есть «бар скрывается сразу, а текст опаздывает».
+    // Значки (звук, заряд) считались от `r.y` с самого начала и уезжали
+    // правильно — отсюда и разнобой.
+    let по_центру = |r: bar::Rect, scale: i32| r.y + (r.h - crate::text::height(scale)) / 2;
     for item in &lay.cells {
         let r = item.rect;
         match item.cell {
@@ -3125,17 +3145,17 @@ fn build_bar_elements(
             }
             bar::Cell::Clock => {
                 let clock = data.clock.clone();
-                draw_text_w(state, renderer, r.x, по_центру(bar::TEXT), &clock, bar::STRONG, bar::TEXT, BAR_TEXT, slot, &mut els);
+                draw_text_w(state, renderer, r.x, по_центру(r, bar::TEXT), &clock, bar::STRONG, bar::TEXT, BAR_TEXT(), slot, &mut els);
                 slot += 1;
             }
             bar::Cell::Date => {
                 let date = data.date.clone();
-                draw_text(state, renderer, r.x, по_центру(bar::TEXT_SMALL), &date, bar::TEXT_SMALL, BAR_DIM, slot, &mut els);
+                draw_text(state, renderer, r.x, по_центру(r, bar::TEXT_SMALL), &date, bar::TEXT_SMALL, BAR_DIM(), slot, &mut els);
                 slot += 1;
             }
             bar::Cell::Kb => {
                 let kb = data.kb.clone();
-                draw_text_w(state, renderer, r.x, по_центру(bar::TEXT), &kb, bar::STRONG, bar::TEXT, BAR_TEXT, slot, &mut els);
+                draw_text_w(state, renderer, r.x, по_центру(r, bar::TEXT), &kb, bar::STRONG, bar::TEXT, BAR_TEXT(), slot, &mut els);
                 slot += 1;
             }
             bar::Cell::Share => {
@@ -3146,7 +3166,7 @@ fn build_bar_elements(
                 let цвет = крась(crate::share::цвет(0));
                 let текст = bar::share_text(&код, гостей);
                 draw_text_w(
-                    state, renderer, r.x, по_центру(bar::TEXT),
+                    state, renderer, r.x, по_центру(r, bar::TEXT),
                     &текст, bar::STRONG, bar::TEXT, цвет, slot, &mut els,
                 );
                 slot += 1;
@@ -3163,32 +3183,32 @@ fn build_bar_elements(
                 } else {
                     ("bar-vol", &VOLUME)
                 };
-                let color = if muted { TRAY_WARN } else { BAR_TEXT };
+                let color = if muted { TRAY_WARN } else { BAR_TEXT() };
                 let значок = bar::Rect { x: r.x, y: r.y, w: DOT, h: r.h };
-                // Маска звука 24×18 — при высоте BAR_H/2 она шире ячейки в DOT
+                // Маска звука 24×18 — при высоте BAR_H()/2 она шире ячейки в DOT
                 // и залезала бы на проценты рядом.
-                let h = mask_h_fit(VOLUME_W, VOLUME.len() as i32, BAR_H / 2, DOT);
+                let h = mask_h_fit(VOLUME_W, VOLUME.len() as i32, BAR_H() / 2, DOT);
                 draw_mask(state, renderer, name, mask, VOLUME_W, значок, h, color, &mut els);
                 let text = bar::percent_text(percent);
                 draw_text_w(
-                    state, renderer, r.x + DOT + BAR_H / 6, по_центру(bar::TEXT),
+                    state, renderer, r.x + DOT + BAR_H() / 6, по_центру(r, bar::TEXT),
                     &text, bar::STRONG, bar::TEXT,
-                    if muted { TRAY_WARN } else { BAR_DIM }, slot, &mut els,
+                    if muted { TRAY_WARN } else { BAR_DIM() }, slot, &mut els,
                 );
                 slot += 1;
             }
             bar::Cell::Battery => {
                 let Some((percent, charging)) = data.battery else { continue };
                 let тревога = percent <= 20 && !charging;
-                let color = if тревога { TRAY_WARN } else { BAR_TEXT };
+                let color = if тревога { TRAY_WARN } else { BAR_TEXT() };
                 let значок = bar::Rect { x: r.x, y: r.y, w: DOT, h: r.h };
                 let (_, _, _, h) = battery_box_fit(значок, DOT);
                 draw_mask(state, renderer, "bar-battery", &BATTERY, BATTERY_W, значок, h, color, &mut els);
                 let text = bar::percent_text(percent);
                 draw_text_w(
-                    state, renderer, r.x + DOT + BAR_H / 6, по_центру(bar::TEXT),
+                    state, renderer, r.x + DOT + BAR_H() / 6, по_центру(r, bar::TEXT),
                     &text, bar::STRONG, bar::TEXT,
-                    if тревога { TRAY_WARN } else { BAR_DIM }, slot, &mut els,
+                    if тревога { TRAY_WARN } else { BAR_DIM() }, slot, &mut els,
                 );
                 slot += 1;
             }
@@ -3268,39 +3288,80 @@ fn build_bar_preview(
     let поле = g.content;
     let карточка = g.card;
 
-    // ── Живое содержимое ─────────────────────────────────────────────────────
-    let mut содержимое = Vec::new();
-    for кадр in &кадры {
-        // Окно целиком за пределами показанного куска холста не рисуем вовсе:
-        // сурфейсы всё равно обрежутся, а работа была бы настоящая.
-        if вид.rect(поле.loc, поле.size, кадр.rect).intersection(поле).is_none() {
-            continue;
-        }
-        let сурфейсы: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = кадр.window.render_elements(
-            renderer,
-            вид.pre_scale(поле.loc, поле.size, кадр.root),
-            smithay::utils::Scale::from(1.0),
-            видимость,
-        );
-        содержимое.extend(сурфейсы.into_iter().filter_map(|el| {
-            let ужатое = RescaleRenderElement::from_element(el, поле.loc, вид.scale);
-            CropRenderElement::from_element(ужатое, 1.0, поле).map(OutputRenderElements::Minimap)
-        }));
-    }
+    // ── Глубина ──────────────────────────────────────────────────────────────
+    //
+    // Стопка окон в карточке рисовалась плоской: все миниатюры одного масштаба,
+    // одной яркости, и понять, что лежит поверх чего, можно было только по
+    // тому, что кого перекрывает. Теперь стопка видна как стопка — окно тем
+    // мельче, темнее и ниже, чем оно глубже. Ровно тот же приём, что даёт
+    // глубину в куб (`куб::затенение`) и в свете окон: масштаб плюс затенение
+    // плюс тень от ближнего соседа.
+    //
+    // ПОРЯДОК стопки берём тот же, что и хит-тест (`preview_window_at`): он
+    // ищет с конца, значит ПОСЛЕДНЕЕ окно списка — верхнее. Раньше содержимое
+    // складывалось в обратном порядке (первое окно оказывалось в кадре сверху),
+    // и на перекрывающихся окнах клик уходил не в то окно, которое видно.
+    // Сама арифметика глубины (доля, масштаб, сжатие к центру поля) лежит в
+    // canvas.rs: по ней же ищет окно под курсором `preview_window_at`. Стояла
+    // бы она тут — клик уходил бы в прямоугольник, которого на экране нет.
+    let глубина = state.lua_config.preview_depth.clamp(0.0, 1.0) as f64;
+    let центр = crate::canvas::центр_поля(поле);
 
-    // Подложки и рамки — списком «прямоугольник + цвет», обрезаются ПОЛЕМ
-    // карточки (см. пункт 2 в шапке функции).
-    let mut рамки: Vec<(Rectangle<i32, Physical>, [f32; 4])> = Vec::new();
-    let mut подложки: Vec<(Rectangle<i32, Physical>, [f32; 4])> = Vec::new();
+    // Подложки, рамки и тени — списком «прямоугольник + цвет», обрезаются ПОЛЕМ
+    // карточки (см. пункт 2 в шапке функции). Живое содержимое идёт отдельным
+    // списком: у каждого окна свой кусок.
+    let mut слои: Vec<(
+        Vec<(Rectangle<i32, Physical>, [f32; 4])>, // рамка
+        Vec<OutputRenderElements>,                 // содержимое
+        (Rectangle<i32, Physical>, [f32; 4]),      // подложка
+        Option<(Rectangle<i32, Physical>, [f32; 4])>, // тень
+    )> = Vec::new();
     const РАМКА_ЧИП: [f32; 4] = [0.55, 0.75, 1.0, 0.95];
     const РАМКА_НАВЕДЕНИЕ: [f32; 4] = [1.0, 1.0, 1.0, 0.95];
     const КОНТУР: [f32; 4] = [1.0, 1.0, 1.0, 0.22];
     const ПОДЛОЖКА: [f32; 4] = [0.09, 0.10, 0.13, 0.55];
-    for кадр in &кадры {
-        let r = вид.rect(поле.loc, поле.size, кадр.rect);
+    for (i, кадр) in кадры.iter().enumerate() {
+        let d = crate::canvas::доля_глубины(i, кадры.len());
+        let k = crate::canvas::масштаб_глубины(глубина, d);
+        let r = crate::canvas::сжать_к(вид.rect(поле.loc, поле.size, кадр.rect), центр, k);
+        // Окно целиком за пределами показанного куска холста не рисуем вовсе:
+        // сурфейсы всё равно обрежутся, а работа была бы настоящая.
         if r.intersection(поле).is_none() {
             continue;
         }
+        // Затенение дальних: гасим альфой всё окно целиком — и живые
+        // поверхности, и его подложку с рамкой, иначе тёмная подложка
+        // просвечивала бы сквозь непотускневшее содержимое.
+        let свет = (1.0 - глубина * crate::canvas::ГЛУБИНА_ТЕНЬ * d) as f32;
+        let альфа = видимость * свет;
+
+        // Масштаб глубины и масштаб карточки — ОДНОЙ обёрткой Rescale.
+        //
+        // Двух вложенных здесь быть не может: `OutputRenderElements::Minimap`
+        // — это ровно `Crop<Rescale<поверхность>>`, и второй Rescale внутри
+        // дал бы другой тип. Обёртка одна, а её остриё считает
+        // `canvas::двойное_остриё` — при k = 1 (глубины нет) оно равно
+        // `поле.loc`, ровно как было раньше.
+        let s = вид.scale;
+        let остриё = crate::canvas::двойное_остриё(
+            (поле.loc.x as f64, поле.loc.y as f64), s, центр, k,
+        )
+        .map(|a| Point::from((a.0.round() as i32, a.1.round() as i32)))
+        // Масштаб карточки заведомо меньше единицы, а глубина её только
+        // уменьшает: `s·k = 1` здесь недостижимо. Запасной путь — прежнее
+        // остриё, то есть карточка без глубины.
+        .unwrap_or(поле.loc);
+        let сурфейсы: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = кадр.window.render_elements(
+            renderer,
+            вид.pre_scale(поле.loc, поле.size, кадр.root),
+            smithay::utils::Scale::from(1.0),
+            альфа,
+        );
+        let содержимое: Vec<OutputRenderElements> = сурфейсы.into_iter().filter_map(|el| {
+            let ужатое = RescaleRenderElement::from_element(el, остриё, s * k);
+            CropRenderElement::from_element(ужатое, 1.0, поле).map(OutputRenderElements::Minimap)
+        }).collect();
+
         let (толщина, цвет) = if наведено.as_ref() == Some(&кадр.window) {
             (2, РАМКА_НАВЕДЕНИЕ)
         } else if выделить.as_ref() == Some(&кадр.window) {
@@ -3308,21 +3369,45 @@ fn build_bar_preview(
         } else {
             (1, КОНТУР)
         };
+        let цвет = [цвет[0], цвет[1], цвет[2], цвет[3] * свет as f32];
+        let mut рамка = Vec::new();
         for (x, y, w, h) in [
             (r.loc.x, r.loc.y, r.size.w, толщина),
             (r.loc.x, r.loc.y + r.size.h - толщина, r.size.w, толщина),
             (r.loc.x, r.loc.y, толщина, r.size.h),
             (r.loc.x + r.size.w - толщина, r.loc.y, толщина, r.size.h),
         ] {
-            рамки.push((
+            рамка.push((
                 Rectangle::new(Point::from((x, y)), Size::from((w.max(1), h.max(1)))),
                 цвет,
             ));
         }
+        // Тень под окном — единственное, что отделяет ближнее окно от дальнего,
+        // когда они не перекрываются вовсе. Смещение тем больше, чем окно выше
+        // в стопке: так читается высота, а не просто «тёмная кайма».
+        //
+        // Снос и плотность подняты 07.09.2026 («глубины на предпросмотрах
+        // нет»): чёрное на 34% поверх и без того тёмной карточки на тёмных же
+        // окнах не читалось вовсе. Тень — единственный признак глубины,
+        // который виден и на чёрном терминале: затенение самого окна на нём не
+        // видно по определению, а разница в размере мала.
+        let высота = 1.0 - d;
+        let снос = (глубина * (3.0 + 8.0 * высота)).round() as i32;
+        let тень = (снос > 0).then(|| (
+            Rectangle::new(
+                Point::from((r.loc.x + снос, r.loc.y + снос)),
+                r.size,
+            ),
+            // Видимость карточки здесь НЕ множим: её накладывает `плашка`
+            // ниже, и второй раз тень уходила бы в ничто.
+            [0.0, 0.0, 0.0, 0.55 * глубина as f32],
+        ));
         // Подложка — ПОД содержимым: окно без буфера иначе не видно вовсе, а
         // прозрачный терминал сливается с карточкой (та же правка, что в карте
         // окон: подложка ТЁМНАЯ, а не серая).
-        подложки.push((r, ПОДЛОЖКА));
+        слои.push((рамка, содержимое, (r, [
+            ПОДЛОЖКА[0], ПОДЛОЖКА[1], ПОДЛОЖКА[2], ПОДЛОЖКА[3] * свет as f32,
+        ]), тень));
     }
 
     // ── Сборка: от переднего плана к заднему ─────────────────────────────────
@@ -3369,12 +3454,20 @@ fn build_bar_preview(
             }
         }
     };
-    for (r, цвет) in &рамки {
-        плашка(*r, *цвет, &mut els);
-    }
-    els.extend(содержимое);
-    for (r, цвет) in &подложки {
-        плашка(*r, *цвет, &mut els);
+    // Окна — стопкой, каждое своим слоем: сперва верхнее целиком (рамка,
+    // содержимое, подложка, его тень), потом то, что под ним. Раньше все рамки
+    // шли одним куском поверх всего содержимого, а все подложки — одним куском
+    // под ним; с глубиной это заметно сразу: рамка дальнего окна лежала бы
+    // поверх ближнего, а тень падала бы не на соседа, а на пустое поле.
+    for (рамка, содержимое, подложка, тень) in слои.into_iter().rev() {
+        for (r, цвет) in рамка {
+            плашка(r, цвет, &mut els);
+        }
+        els.extend(содержимое);
+        плашка(подложка.0, подложка.1, &mut els);
+        if let Some((r, цвет)) = тень {
+            плашка(r, цвет, &mut els);
+        }
     }
 
     // Радиус — не больше половины стороны: у только начавшей раскрываться
@@ -3541,7 +3634,7 @@ fn draw_tray_icon(
     let w = crate::text::width_of(&буква, bar::STRONG, bar::TEXT);
     let x = cell.x + (DOT - w) / 2;
     let y = cell.y + (cell.h - crate::text::height(bar::TEXT)) / 2;
-    let color = [BAR_TEXT[0], BAR_TEXT[1], BAR_TEXT[2], BAR_TEXT[3] * alpha];
+    let color = [BAR_TEXT()[0], BAR_TEXT()[1], BAR_TEXT()[2], BAR_TEXT()[3] * alpha];
     draw_text_w(state, renderer, x, y, &буква, bar::STRONG, bar::TEXT, color, slot, out);
 }
 
@@ -5236,6 +5329,91 @@ pub fn собрать_элементы(
             // Теперь порога нет: радиус просто зажимается половиной меньшей
             // стороны — маленькое окно выходит «таблеткой», а не мигает.
             let geo = window.geometry();
+
+            // ── Всплытие только что открывшегося окна ────────────────────────
+            //
+            // Окно уже стоит в своём настоящем размере и на своём месте
+            // (клиенту ничего не отправляется, см. `anim::OpenAnim`); растёт и
+            // проявляется ТОЛЬКО картинка в этом кадре.
+            //
+            // Масштаб всплытия и зум холста накладываются ОДНОЙ обёрткой
+            // Rescale, а не двумя вложенными: тип элемента кадра
+            // (`OutputRenderElements::Layer`/`Rounded`) — это ровно один
+            // Rescale вокруг поверхности, и второй внутри означал бы новый тип
+            // на каждую комбинацию. Остриё считается так, чтобы одна обёртка
+            // дала то же, что дали бы две:
+            // (`canvas::двойное_остриё`). При k = 1 остриё равно нулю — ровно
+            // то, что стояло здесь раньше.
+            let (рост, проявление) = state.открытие_окна(&window).unwrap_or((1.0, 1.0));
+            // ...и ВТОРАЯ анимация картинки: смена размера в тайлинге
+            // (`anim::SizeAnim`). Она растягивает окно ПО КАЖДОЙ ОСИ отдельно —
+            // слот меняет ширину и высоту независимо, — поэтому дальше весь
+            // расчёт идёт парой чисел, а не одним масштабом.
+            let (растx, расty) = state.размер_окна(&window, geo.size).unwrap_or((1.0, 1.0));
+            let движется = рост < 1.0 || (растx - 1.0).abs() > 1e-6 || (расty - 1.0).abs() > 1e-6;
+            // Цепочка из трёх масштабов складывается в ОДНУ обёртку Rescale
+            // (`canvas::остриё_цепочки`). Двух вложенных здесь быть не может:
+            // тип элемента кадра (`OutputRenderElements::Layer`/`Rounded`) —
+            // это ровно один Rescale вокруг поверхности, и второй внутри
+            // означал бы новый вариант перечисления на каждую комбинацию.
+            //
+            // Порядок шагов — от окна наружу:
+            //   1) растяжка ресайза вокруг ЛЕВОГО ВЕРХНЕГО УГЛА окна: угол едет
+            //      пружиной позиции, и картинка обязана держаться за него;
+            //   2) всплытие открытия вокруг ЦЕНТРА окна: новое окно проступает
+            //      из себя, а не выезжает из угла;
+            //   3) зум холста вокруг нуля.
+            let (масштаб, остриё) = if !движется {
+                ((zoom, zoom), Point::<i32, Physical>::from((0, 0)))
+            } else {
+                let угол = (
+                    phys.x as f64 + geo.loc.x as f64,
+                    phys.y as f64 + geo.loc.y as f64,
+                );
+                let центр = (
+                    угол.0 + geo.size.w as f64 * 0.5,
+                    угол.1 + geo.size.h as f64 * 0.5,
+                );
+                // Масштаб, вплотную подошедший к единице, — это чистый СДВИГ,
+                // которого Rescale не умеет; отодвигаем на пару процентов (на
+                // кадр-другой быстрого движения глазу не видно), лишь бы не
+                // делить на ноль. Случай законный: окно открылось или сменило
+                // размер на приближенном холсте.
+                let отодвинуть = |s: f64| {
+                    if (1.0 - s).abs() >= 0.02 { s }
+                    else if s < 1.0 { 0.98 } else { 1.02 }
+                };
+                let ось = |r: f64, p: f64, c: f64| -> (f64, f64) {
+                    let s = отодвинуть(r * рост * zoom);
+                    let t = zoom * (p * (1.0 - r) * рост + c * (1.0 - рост));
+                    (s, crate::canvas::остриё_цепочки(s, t).unwrap_or(0.0))
+                };
+                let (sx, ax) = ось(растx, угол.0, центр.0);
+                let (sy, ay) = ось(расty, угол.1, центр.1);
+                ((sx, sy), Point::from((ax.round() as i32, ay.round() as i32)))
+            };
+            // Точка окна в кадре по её СДВИГУ ОТ `phys` до зума (для рамки
+            // скругления и заплаты размытия это всегда `geo.loc`).
+            // Преобразование обязано быть тем же, что у элементов окна:
+            // разъехавшись с картинкой, маска даёт светлую кайму по краю.
+            let в_кадре = |ox: f64, oy: f64| -> (f64, f64) {
+                if !движется {
+                    // Прежняя формула — с округлением `phys·зум` (см. разбор
+                    // «мигающей маски» ниже): менять её на общую нельзя, дуга
+                    // от этого начинает дрожать на движении холста.
+                    ((phys.x as f64 * zoom).round() + ox * zoom,
+                     (phys.y as f64 * zoom).round() + oy * zoom)
+                } else {
+                    (
+                        остриё.x as f64 + (phys.x as f64 + ox - остриё.x as f64) * масштаб.0,
+                        остриё.y as f64 + (phys.y as f64 + oy - остриё.y as f64) * масштаб.1,
+                    )
+                }
+            };
+            // Масштаб для того, что меряется ОДНИМ числом: радиус скругления и
+            // ширина свечения. Берём меньший из двух — по нему дуга гарантированно
+            // влезает в обе стороны окна.
+            let масштаб_1 = масштаб.0.min(масштаб.1);
             // Кадр, который у окна ЗАПРОСИЛИ (xwin::set_size), против того,
             // что клиент реально нарисовал (`geo.size`). Расходятся они
             // ровно тогда, когда клиент не умеет ужиматься дальше своего
@@ -5295,11 +5473,10 @@ pub fn собрать_элементы(
                     // Начало ДЕРЕВА ПОВЕРХНОСТЕЙ после зума — ровно то, что
                     // RescaleRenderElement сделает с элементом, — плюс сдвиг
                     // до видимой части (клиентские рамки CSD).
-                    let x0 = (phys.x as f64 * zoom).round() + geo.loc.x as f64 * zoom;
-                    let y0 = (phys.y as f64 * zoom).round() + geo.loc.y as f64 * zoom;
-                    let w = size.w as f64 * zoom;
-                    let h = size.h as f64 * zoom;
-                    let r = (радиус_лог as f64 * zoom).min(w / 2.0).min(h / 2.0);
+                    let (x0, y0) = в_кадре(geo.loc.x as f64, geo.loc.y as f64);
+                    let w = size.w as f64 * масштаб.0;
+                    let h = size.h as f64 * масштаб.1;
+                    let r = (радиус_лог as f64 * масштаб_1).min(w / 2.0).min(h / 2.0);
                     // Порог «мельче двух радиусов не скругляем» — только для
                     // обычного (не режущего) случая: жёсткая обрезка обязана
                     // сработать, даже если дуга по углам вышла бы нулевой.
@@ -5328,7 +5505,7 @@ pub fn собрать_элементы(
                 state.палитра_обоев,
                 state.lua_config.glow,
                 state.lua_config.glow_width,
-                zoom,
+                масштаб_1,
                 в_фокусе,
             )
             // ...и свет от источника на холсте: сторона окна, обращённая к
@@ -5340,9 +5517,9 @@ pub fn собрать_элементы(
                 state.палитра_обоев,
                 state.lua_config.sun,
                 свет,
-                (
-                    (phys.x as f64 + geo.loc.x as f64 + geo.size.w as f64 * 0.5) * zoom,
-                    (phys.y as f64 + geo.loc.y as f64 + geo.size.h as f64 * 0.5) * zoom,
+                в_кадре(
+                    geo.loc.x as f64 + geo.size.w as f64 * 0.5,
+                    geo.loc.y as f64 + geo.size.h as f64 * 0.5,
                 ),
             );
 
@@ -5366,14 +5543,14 @@ pub fn собрать_элементы(
                             let pel: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                                 render_elements_from_surface_tree(
                                     renderer, popup.wl_surface(), phys + offset,
-                                    smithay::utils::Scale::from(1.0), 1.0f32, Kind::Unspecified,
+                                    smithay::utils::Scale::from(1.0), проявление, Kind::Unspecified,
                                 );
                             window_els.extend(pel.into_iter().map(|el| (el, false)));
                         }
                         let mel: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                             render_elements_from_surface_tree(
                                 renderer, wl, phys,
-                                smithay::utils::Scale::from(1.0), 1.0f32, Kind::Unspecified,
+                                smithay::utils::Scale::from(1.0), проявление, Kind::Unspecified,
                             );
                         window_els.extend(mel.into_iter().map(|el| (el, true)));
                     }
@@ -5384,14 +5561,14 @@ pub fn собрать_элементы(
                         // каждое по своему размеру. Значит всё дерево целиком
                         // подлежит обрезке.
                         let els: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = window.render_elements(
-                            renderer, phys, smithay::utils::Scale::from(1.0), 1.0f32,
+                            renderer, phys, smithay::utils::Scale::from(1.0), проявление,
                         );
                         window_els.extend(els.into_iter().map(|el| (el, true)));
                     }
                 }
             } else {
                 let els: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = window.render_elements(
-                    renderer, phys, smithay::utils::Scale::from(1.0), 1.0f32,
+                    renderer, phys, smithay::utils::Scale::from(1.0), проявление,
                 );
                 window_els.extend(els.into_iter().map(|el| (el, false)));
             }
@@ -5400,7 +5577,7 @@ pub fn собрать_элементы(
             let скруглить_попап = if нужен_кроп { скругление_для(geo.size, false) } else { None };
 
             elements.extend(window_els.into_iter().map(|(el, обрезать)| {
-                let el = RescaleRenderElement::from_element(el, (0, 0).into(), zoom);
+                let el = RescaleRenderElement::from_element(el, остриё, масштаб);
                 let маска = if обрезать || !нужен_кроп { &скруглить } else { &скруглить_попап };
                 match маска {
                     Some((ш, rect, r, hard)) => OutputRenderElements::Rounded(
@@ -5428,15 +5605,14 @@ pub fn собрать_элементы(
                 && crate::xwin::has_transparency(&window)
             {
                 let размер = if нужен_кроп { целевой.unwrap() } else { geo.size };
-                let x0 = (phys.x as f64 * zoom).round() + geo.loc.x as f64 * zoom;
-                let y0 = (phys.y as f64 * zoom).round() + geo.loc.y as f64 * zoom;
-                let w = размер.w as f64 * zoom;
-                let h = размер.h as f64 * zoom;
+                let (x0, y0) = в_кадре(geo.loc.x as f64, geo.loc.y as f64);
+                let w = размер.w as f64 * масштаб.0;
+                let h = размер.h as f64 * масштаб.1;
                 if w >= 1.0 && h >= 1.0 {
                     let r = if state.is_fullscreen(&window) {
                         0.0
                     } else {
-                        (радиус_лог as f64 * zoom).min(w / 2.0).min(h / 2.0).max(0.0)
+                        (радиус_лог as f64 * масштаб_1).min(w / 2.0).min(h / 2.0).max(0.0)
                     };
                     let слот = БЛЮР_ОКНО + окон_с_блюром;
                     окон_с_блюром += 1;
@@ -7133,7 +7309,7 @@ fn battery_box(cell: crate::tray::Rect) -> (i32, i32, i32, i32) {
 /// брало высоту от бара и ширину от пропорций маски — две разные арифметики.
 fn battery_box_fit(cell: crate::tray::Rect, max_w: i32) -> (i32, i32, i32, i32) {
     let rows = BATTERY.len() as i32;
-    let mut h = (BAR_H * 7 / 16).max(6);
+    let mut h = (BAR_H() * 7 / 16).max(6);
     let mut w = h * BATTERY_W / rows;
     if w > max_w {
         w = max_w;
@@ -7225,17 +7401,17 @@ fn build_tray_elements(
         // Стекло ПЕРЕД заливкой: список полки собирается от заднего плана к
         // переднему и разворачивается в конце (els.reverse()), значит
         // добавленное раньше окажется ниже.
-        if let Some(el) = стекло(state, renderer, p.x, p.y, p.w, p.h, BAR_RADIUS, БЛЮР_ПОЛКА) {
+        if let Some(el) = стекло(state, renderer, p.x, p.y, p.w, p.h, BAR_RADIUS(), БЛЮР_ПОЛКА) {
             els.push(el);
         }
-        rounded_solid(&mut pool, &mut idx, p.x, p.y, p.w, p.h, BAR_RADIUS, BAR_BG, &mut els);
+        rounded_solid(&mut pool, &mut idx, p.x, p.y, p.w, p.h, BAR_RADIUS(), BAR_BG(), &mut els);
     }
 
     for cell in &lay.cells {
         let r = cell.rect;
         match cell.kind {
             CellKind::VolumeSlider => {
-                let track_h = (BAR_H / 5).max(3);
+                let track_h = (BAR_H() / 5).max(3);
                 let ty = r.y + (r.h - track_h) / 2;
                 rounded_solid(
                     &mut pool, &mut idx, r.x, ty, r.w, track_h, track_h / 2,
@@ -7276,7 +7452,7 @@ fn build_tray_elements(
             // уже сработает.
             CellKind::Power(a) if armed == Some(a) => {
                 rounded_solid(
-                    &mut pool, &mut idx, r.x, r.y, r.w, r.h, BAR_RADIUS / 2,
+                    &mut pool, &mut idx, r.x, r.y, r.w, r.h, BAR_RADIUS() / 2,
                     [0.95, 0.45, 0.30, 0.30], &mut els,
                 );
             }
@@ -7290,13 +7466,13 @@ fn build_tray_elements(
         let r = cell.rect;
         match cell.kind {
             CellKind::Bluetooth => {
-                draw_mask(state, renderer, "bt-rune", &BT_RUNE, 11, r, BAR_H * 2 / 3, bt_color, &mut els);
+                draw_mask(state, renderer, "bt-rune", &BT_RUNE, 11, r, BAR_H() * 2 / 3, bt_color, &mut els);
             }
             CellKind::Wifi => {
                 // Дуг горит столько же, сколько на любом другом индикаторе
                 // сигнала: 1 из 3 при слабом, все три при сильном. Выключенный
                 // радиомодуль — оранжевая точка при погашенных дугах.
-                let h = BAR_H / 2;
+                let h = BAR_H() / 2;
                 let (lit, dot) = match wifi.as_ref() {
                     None => (0, TRAY_OFF),
                     Some(w) if !w.present => (0, TRAY_OFF),
@@ -7323,7 +7499,7 @@ fn build_tray_elements(
                     Some(_) if muted => TRAY_WARN,
                     Some(_) => TRAY_DIM,
                 };
-                draw_mask(state, renderer, name, mask, VOLUME_W, r, BAR_H / 2, color, &mut els);
+                draw_mask(state, renderer, name, mask, VOLUME_W, r, BAR_H() / 2, color, &mut els);
             }
             CellKind::Battery => {
                 let Some(b) = snap.battery.as_ref() else { continue };
@@ -7338,7 +7514,7 @@ fn build_tray_elements(
                     PowerAction::Sleep => ("pwr-sleep", &SLEEP),
                 };
                 let color = if armed == Some(a) { TRAY_WARN } else { TRAY_DIM };
-                draw_mask(state, renderer, name, mask, POWER_W, r, BAR_H * 3 / 5, color, &mut els);
+                draw_mask(state, renderer, name, mask, POWER_W, r, BAR_H() * 3 / 5, color, &mut els);
             }
             CellKind::VolumeSlider => {}
         }
@@ -7351,7 +7527,7 @@ fn build_tray_elements(
         let w = crate::text::width(&text, 1);
         draw_text(
             state, renderer,
-            (panel.x + panel.w - w).max(0), panel.y + panel.h + BAR_H / 6,
+            (panel.x + panel.w - w).max(0), panel.y + panel.h + BAR_H() / 6,
             &text, 1, color, 0, &mut els,
         );
     }
@@ -7447,7 +7623,7 @@ mod tests {
 
     /// Ячейка панели: квадрат в bar::DOT по ширине во всю высоту острова.
     fn ячейка_панели() -> crate::tray::Rect {
-        crate::tray::Rect { x: 100, y: crate::bar::TOP, w: crate::bar::DOT, h: crate::bar::H }
+        crate::tray::Rect { x: 100, y: crate::bar::top(), w: crate::bar::DOT, h: crate::bar::h() }
     }
 
     fn экран() -> Size<i32, smithay::utils::Logical> {
@@ -7524,7 +7700,7 @@ mod tests {
     fn маска_звука_не_шире_ячейки() {
         let ячейка = ячейка_панели();
         let rows = VOLUME.len() as i32;
-        let хотелось = crate::bar::H / 2;
+        let хотелось = crate::bar::h() / 2;
         let ширина = |h: i32| (h * VOLUME_W / rows).max(1);
         assert!(
             ширина(хотелось) > ячейка.w,

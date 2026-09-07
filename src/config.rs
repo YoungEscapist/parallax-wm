@@ -459,6 +459,20 @@ pub struct Config {
     /// первый щелчок этой кнопки уходит приложению не сразу, а через этот
     /// срок ЦЕЛИКОМ — и нажатие, и отпускание.
     pub mouse_double_click: u32,
+    /// Работают ли аккорды, пока весь экран занят одним окном: `set{
+    /// mouse_chords_in_fullscreen = true }`. По умолчанию НЕТ, и это не вкус, а
+    /// единственный способ не платить задержкой там, где она невыносима.
+    ///
+    /// Цена аккорда — задержанное первое нажатие (250 мс) и целиком задержанный
+    /// первый щелчок двойного клика. В окне это незаметно, в Dota это «клики с
+    /// задержкой»: там левая кнопка ходит, правая атакует, и обе задержаны. А
+    /// вести и менять размер полноэкранного окна всё равно нечего — аккорды в
+    /// этот миг не делают ничего полезного, за что стоило бы платить.
+    ///
+    /// Признак — `wallpaper_hidden()`: окно этого стола ровно в кадре и ровно в
+    /// размер монитора. В обзоре и на отдалённой камере он ложен, и аккорды там
+    /// остаются: окно стоит миниатюрой, и водить его мышью — обычное дело.
+    pub mouse_chords_in_fullscreen: bool,
     /// СЕНСОРНЫЙ ЭКРАН: `set{ touch = true }` (см. сенсор.rs). Выключенный
     /// сенсор не объявляется местом вовсе — клиент, увидевший `wl_touch`, ждёт
     /// касаний вместо эмуляции мыши, и молчащая возможность оставила бы его
@@ -554,6 +568,45 @@ pub struct Config {
     /// — свет пропадает вместе с ним. Настоящее солнце далеко: смещается при
     /// ходьбе, но позади не остаётся.
     pub sun_far: f32,
+    /// `set{ bar_hide_pan = ... }` — убирать панель на время ПАНА холста
+    /// (см. `Parallax::пан_идёт`). Включено: панель — плашка поверх холста, и
+    /// когда холст едут рукой, она единственная стоит на месте и мешает
+    /// смотреть. Возвращается сама через полсекунды после остановки.
+    pub bar_hide_pan: bool,
+    /// `set{ preview_depth = ... }` — глубина в карточке предпросмотра
+    /// (см. `build_bar_preview`): окна, лежащие ниже в стопке, чуть мельче,
+    /// темнее и с тенью под ближним соседом. 0 — плоская карточка, как было.
+    pub preview_depth: f32,
+    /// `set{ fullscreen_anim = ... }` — переход в полный экран и обратно едет
+    /// камерой, а не переключается кадром (см. fullscreen.rs). Включено.
+    pub fullscreen_anim: bool,
+    /// `set{ rounding = 8, rounding_tile = 16 }` — радиус скругления углов окна
+    /// в логических пикселях: во Float и в тайлинге он свой (в тайлинге окна
+    /// крупнее, и дуга там заметнее). 0 — прямые углы.
+    pub rounding: f64,
+    pub rounding_tile: f64,
+    /// `set{ gaps_in = 16, gaps_out = 18 }` — зазоры тайлинга: между окнами и
+    /// от края экрана. Живут атомиками в tiling.rs (`GAP_INNER`/`GAP_OUTER`) —
+    /// их спрашивают дерево и обзор, куда состояние не дотягивается, — а здесь
+    /// остаются ради перечитывания конфига.
+    pub gaps_in: i32,
+    pub gaps_out: i32,
+    /// `bar{ height = 34, bg = "#0a0a12a6", clock = false, ... }` — вид панели:
+    /// геометрия, цвета, состав островов (см. `bar::Вид`). Применяется в
+    /// `config::load` — там же, где темп анимаций, и по той же причине: панель
+    /// спрашивают из мест, куда состояние не дотягивается.
+    pub bar: crate::bar::Вид,
+    /// `anim{ window_open = 220, tiling = 300, ... }` — длительности движений в
+    /// миллисекундах, по имени (см. `anim::дуг::ИМЕНА`). Пустой список —
+    /// «как задумано». Применяются в `config::load` (атомики в anim.rs), в поле
+    /// остаются ради перечитывания конфига: убранная из файла строка обязана
+    /// перестать действовать.
+    pub anim_ms: Vec<(String, u32)>,
+    /// `set{ resize_anim = ... }` — смена размера окна в тайлинге едет
+    /// пружиной, а не переключается кадром (см. `anim::SizeAnim`). Клиенту
+    /// настоящий размер уходит сразу в любом случае: анимируется только
+    /// картинка, поэтому выключение экономит лишь перерисовки самого кадра.
+    pub resize_anim: bool,
     /// `set{ blur = ... }` — размывать фон под островами панели (см. blur.rs).
     /// ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО: код проходом рендера живьём не отсмотрен, а
     /// ошибка там стоит чёрного экрана.
@@ -632,6 +685,7 @@ impl Default for Config {
             mouse_chord_timeout: 250,
             mouse_chord_resize_gain: 4.0,
             mouse_double_click: 400,
+            mouse_chords_in_fullscreen: false,
             touch: true,
             touch_pan: true,
             touch_zoom: true,
@@ -658,6 +712,16 @@ impl Default for Config {
             sun_x: 0.78,
             sun_y: 0.18,
             sun_far: 0.25,
+            bar_hide_pan: true,
+            preview_depth: 0.7,
+            fullscreen_anim: true,
+            rounding: 8.0,
+            rounding_tile: 16.0,
+            gaps_in: 16,
+            gaps_out: 18,
+            bar: crate::bar::Вид::default(),
+            anim_ms: Vec::new(),
+            resize_anim: true,
             blur: false,
             close_anim: true,
             intro: true,
@@ -946,13 +1010,41 @@ pub fn load() -> Config {
     // лету, без перезапуска.
     crate::lang::установить(cfg.lang);
     crate::anim::set_tempo(cfg.anim_speed);
+    // Длительности поимённо (`anim{}`) — тем же порядком и по той же причине,
+    // что и темп. Сброс перед раздачей обязателен: строка, убранная из конфига
+    // при перечитывании, иначе продолжала бы действовать до перезапуска.
+    crate::bar::установить_вид(cfg.bar);
+    crate::tiling::установить_зазоры(cfg.gaps_in, cfg.gaps_out);
+    crate::anim::дуг::сбросить_подмены();
+    for (имя, ms) in &cfg.anim_ms {
+        crate::anim::дуг::подменить(имя, *ms);
+    }
     // Дальность броска окна живёт там же и по той же причине (атомик в anim.rs).
     crate::anim::set_fling(cfg.fling_distance);
     cfg
 }
 
+/// `#rrggbb` или `#rrggbbaa` → четыре доли 0…1.
+///
+/// Своя, а не общая с `обои::цвет_из_hex`: там цвет всегда непрозрачный (три
+/// канала), а у панели альфа — половина смысла настройки. Без альфы её пришлось
+/// бы задавать отдельным числом, и человек, скопировавший `#0a0a12a6` из чужой
+/// темы, получил бы непрозрачную плашку.
+fn цвет_из_hex(s: &str) -> Option<[f32; 4]> {
+    let s = s.strip_prefix('#').unwrap_or(s);
+    if s.len() != 6 && s.len() != 8 {
+        return None;
+    }
+    let к = |от: usize| u8::from_str_radix(&s[от..от + 2], 16).ok().map(|v| v as f32 / 255.0);
+    Some([
+        к(0)?, к(2)?, к(4)?,
+        if s.len() == 8 { к(6)? } else { 1.0 },
+    ])
+}
+
 /// Evaluates a Lua config source string, exposing `bind{}`, `xkb{}` and
 /// `set{}` as globals that accumulate into the returned [`Config`].
+
 pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let lua = Lua::new();
     let bindings: Rc<RefCell<Vec<KeyBinding>>> = Rc::new(RefCell::new(Vec::new()));
@@ -970,6 +1062,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let mouse_chord_timeout: Rc<RefCell<u32>> = Rc::new(RefCell::new(250));
     let mouse_chord_resize_gain: Rc<RefCell<f64>> = Rc::new(RefCell::new(4.0));
     let mouse_double_click: Rc<RefCell<u32>> = Rc::new(RefCell::new(400));
+    let mouse_chords_in_fullscreen: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let touch: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let touch_pan: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let touch_zoom: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
@@ -999,6 +1092,16 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let share_guest_all: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let keyboard_grab_apps: Rc<RefCell<Vec<String>>> =
         Rc::new(RefCell::new(vec!["plx-share".to_string()]));
+    let bar_hide_pan: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let preview_depth: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.7));
+    let fullscreen_anim: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let resize_anim: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let anim_ms: Rc<RefCell<Vec<(String, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+    let rounding: Rc<RefCell<f64>> = Rc::new(RefCell::new(8.0));
+    let rounding_tile: Rc<RefCell<f64>> = Rc::new(RefCell::new(16.0));
+    let gaps_in: Rc<RefCell<i32>> = Rc::new(RefCell::new(16));
+    let gaps_out: Rc<RefCell<i32>> = Rc::new(RefCell::new(18));
+    let bar_вид: Rc<RefCell<crate::bar::Вид>> = Rc::new(RefCell::new(crate::bar::Вид::default()));
     let blur: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let glow: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
     let glow_width: Rc<RefCell<f32>> = Rc::new(RefCell::new(12.0));
@@ -1239,6 +1342,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let mouse_chord_timeout = mouse_chord_timeout.clone();
         let mouse_chord_resize_gain = mouse_chord_resize_gain.clone();
         let mouse_double_click = mouse_double_click.clone();
+        let mouse_chords_in_fullscreen = mouse_chords_in_fullscreen.clone();
         let touch = touch.clone();
         let touch_pan = touch_pan.clone();
         let touch_zoom = touch_zoom.clone();
@@ -1247,6 +1351,14 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let touch_tap_slop = touch_tap_slop.clone();
         let touch_emulate_pointer = touch_emulate_pointer.clone();
         let автодовод = автодовод.clone();
+        let bar_hide_pan = bar_hide_pan.clone();
+        let preview_depth = preview_depth.clone();
+        let fullscreen_anim = fullscreen_anim.clone();
+        let resize_anim = resize_anim.clone();
+        let rounding = rounding.clone();
+        let rounding_tile = rounding_tile.clone();
+        let gaps_in = gaps_in.clone();
+        let gaps_out = gaps_out.clone();
         let blur = blur.clone();
         let glow = glow.clone();
         let glow_width = glow_width.clone();
@@ -1361,6 +1473,30 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun_far") {
                 *sun_far.borrow_mut() = v.clamp(0.0, 1.0);
             }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("bar_hide_pan") {
+                *bar_hide_pan.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("preview_depth") {
+                *preview_depth.borrow_mut() = v.clamp(0.0, 1.0);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("fullscreen_anim") {
+                *fullscreen_anim.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("resize_anim") {
+                *resize_anim.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f64>>("rounding") {
+                *rounding.borrow_mut() = if v.is_finite() { v.clamp(0.0, 64.0) } else { 8.0 };
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f64>>("rounding_tile") {
+                *rounding_tile.borrow_mut() = if v.is_finite() { v.clamp(0.0, 64.0) } else { 16.0 };
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<i32>>("gaps_in") {
+                *gaps_in.borrow_mut() = v.clamp(0, 400);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<i32>>("gaps_out") {
+                *gaps_out.borrow_mut() = v.clamp(0, 400);
+            }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("blur") {
                 *blur.borrow_mut() = v;
             }
@@ -1391,6 +1527,9 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             // щелчков подряд человеческая рука не делает, а верхняя в полторы
             // секунды это уже не «двойной клик», а два разных, и всё это время
             // приложение не видело бы первого.
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("mouse_chords_in_fullscreen") {
+                *mouse_chords_in_fullscreen.borrow_mut() = v;
+            }
             if let Ok(Some(v)) = tbl.get::<Option<u32>>("mouse_double_click") {
                 *mouse_double_click.borrow_mut() = v.clamp(150, 1500);
             }
@@ -1475,6 +1614,91 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             Ok(())
         })?;
         lua.globals().set("set", set_fn)?;
+    }
+    {
+        // bar{} — вид панели: геометрия, цвета, состав.
+        //
+        // Цвета — строкой `#rrggbb` или `#rrggbbaa`: так их пишут во всех
+        // темах, откуда человек их и скопирует. Числа зажимаются по здравому
+        // смыслу: высота в 4 пикселя или в пол-экрана — это не вкус, а
+        // невозможность попасть по панели мышью.
+        let bar_вид = bar_вид.clone();
+        let bar_fn = lua.create_function(move |_, tbl: Table| {
+            let mut в = bar_вид.borrow_mut();
+            let число = |tbl: &Table, имя: &str| -> Option<i32> {
+                tbl.get::<Option<f64>>(имя).ok().flatten()
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.round() as i32)
+            };
+            if let Some(v) = число(&tbl, "height") { в.h = v.clamp(12, 200); }
+            if let Some(v) = число(&tbl, "top") { в.top = v.clamp(0, 400); }
+            if let Some(v) = число(&tbl, "radius") { в.radius = v.clamp(0, 64); }
+            if let Some(v) = число(&tbl, "edge") { в.edge = v.clamp(0, 400); }
+            if let Some(v) = число(&tbl, "pad") { в.pad = v.clamp(0, 100); }
+            if let Some(v) = число(&tbl, "gap") { в.gap = v.clamp(0, 100); }
+            for (имя, цель) in [
+                ("bg", 0usize), ("fg", 1), ("text", 1), ("dim", 2),
+            ] {
+                let Ok(Some(s)) = tbl.get::<Option<String>>(имя) else { continue };
+                match цвет_из_hex(&s) {
+                    Some(c) => match цель {
+                        0 => в.bg = c,
+                        1 => в.fg = c,
+                        _ => в.dim = c,
+                    },
+                    None => tracing::warn!(
+                        "plx/config: bar{{ {имя} = {s:?} }} — expected #rrggbb or #rrggbbaa"
+                    ),
+                }
+            }
+            for (имя, цель) in [
+                ("clock", 0usize), ("date", 1), ("keyboard", 2), ("volume", 3),
+                ("battery", 4), ("tray", 5), ("windows", 6), ("tags", 7),
+            ] {
+                let Ok(Some(v)) = tbl.get::<Option<bool>>(имя) else { continue };
+                match цель {
+                    0 => в.clock = v,
+                    1 => в.date = v,
+                    2 => в.keyboard = v,
+                    3 => в.volume = v,
+                    4 => в.battery = v,
+                    5 => в.tray = v,
+                    6 => в.windows = v,
+                    _ => в.tags = v,
+                }
+            }
+            Ok(())
+        })?;
+        lua.globals().set("bar", bar_fn)?;
+    }
+    {
+        // anim{} — длительности движений поимённо, в миллисекундах.
+        //
+        // Отдельной функцией, а не ключами в `set{}`: имён семнадцать, и в
+        // общей куче настроек они потерялись бы. Незнакомое имя — не молчаливый
+        // пропуск, а строка в лог: опечатка в конфиге обязана быть видна, иначе
+        // «я поставил, а не работает».
+        let anim_ms = anim_ms.clone();
+        let anim_fn = lua.create_function(move |_, tbl: Table| {
+            for пара in tbl.pairs::<String, f64>() {
+                let (имя, v) = match пара {
+                    Ok(п) => п,
+                    Err(_) => continue,
+                };
+                if !crate::anim::дуг::ИМЕНА.contains(&имя.as_str()) {
+                    tracing::warn!(
+                        "plx/config: anim{{ {имя} = ... }} — no such animation; known names: {}",
+                        crate::anim::дуг::ИМЕНА.join(", "),
+                    );
+                    continue;
+                }
+                let ms = if v.is_finite() { v.max(0.0).round() as u32 } else { 0 };
+                anim_ms.borrow_mut().retain(|(н, _)| *н != имя);
+                anim_ms.borrow_mut().push((имя, ms));
+            }
+            Ok(())
+        })?;
+        lua.globals().set("anim", anim_fn)?;
     }
     {
         // dwindle{} — те же ручки, что dwindle:* в hyprland.conf (см. dwindle.rs).
@@ -1753,6 +1977,22 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                     *mouse_double_click.borrow(),
                 );
             }
+            // Где эта задержка НЕ действует. Печатается вместе с ценой нарочно:
+            // человек, прочитавший «held back 250 ms», должен тут же узнать,
+            // что в игре её нет, — иначе он выключит аккорды из-за Dota.
+            if !задержанные.is_empty() || !двойные.is_empty() {
+                if *mouse_chords_in_fullscreen.borrow() {
+                    tracing::info!(
+                        "plx/config: mouse chords stay active in fullscreen \
+                         (games pay the delay too)"
+                    );
+                } else {
+                    tracing::info!(
+                        "plx/config: mouse chords are off while a window fills the \
+                         screen — clicks reach games undelayed"
+                    );
+                }
+            }
         }
     }
 
@@ -1781,6 +2021,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         mouse_chord_timeout: *mouse_chord_timeout.borrow(),
         mouse_chord_resize_gain: *mouse_chord_resize_gain.borrow(),
         mouse_double_click: *mouse_double_click.borrow(),
+        mouse_chords_in_fullscreen: *mouse_chords_in_fullscreen.borrow(),
         touch: *touch.borrow(),
         touch_pan: *touch_pan.borrow(),
         touch_zoom: *touch_zoom.borrow(),
@@ -1818,6 +2059,16 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         sun_y: *sun_y.borrow(),
         sun_far: *sun_far.borrow(),
         glow_width: *glow_width.borrow(),
+        bar_hide_pan: *bar_hide_pan.borrow(),
+        preview_depth: *preview_depth.borrow(),
+        fullscreen_anim: *fullscreen_anim.borrow(),
+        rounding: *rounding.borrow(),
+        rounding_tile: *rounding_tile.borrow(),
+        gaps_in: *gaps_in.borrow(),
+        gaps_out: *gaps_out.borrow(),
+        bar: *bar_вид.borrow(),
+        anim_ms: anim_ms.borrow().clone(),
+        resize_anim: *resize_anim.borrow(),
         blur: *blur.borrow(),
         close_anim: *close_anim.borrow(),
         intro: *intro.borrow(),

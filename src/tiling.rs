@@ -34,16 +34,35 @@ impl Layout {
 }
 
 
+// Зазоры тайлинга — ручки конфига (`set{ gaps_in, gaps_out }`), а не константы:
+// это первое, что подгоняют под себя, и ради двух чисел форкать композитор
+// незачем (Ярик 07.09.2026). Хранятся атомиками — их спрашивает раскладка,
+// дерево dwindle и обзор, то есть места, куда состояние не дотягивается.
+static ЗАЗОР_ВНУТРИ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(16);
+static ЗАЗОР_СНАРУЖИ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(18);
+
 /// Отступ между окнами в Tile (логические пиксели; итоговый зазор между
-/// соседними окнами = GAP_INNER, т.к. каждое окно ужимается на GAP_INNER/2).
-pub const GAP_INNER: i32 = 16;
+/// соседними окнами = `GAP_INNER()`, т.к. каждое окно ужимается на половину).
+#[allow(non_snake_case)]
+pub fn GAP_INNER() -> i32 {
+    ЗАЗОР_ВНУТРИ.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Отступ от краёв экрана до крайних окон в Tile.
-pub const GAP_OUTER: i32 = 18;
+#[allow(non_snake_case)]
+pub fn GAP_OUTER() -> i32 {
+    ЗАЗОР_СНАРУЖИ.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Поставить зазоры из конфига (`config::load`, единственная точка).
+pub fn установить_зазоры(внутри: i32, снаружи: i32) {
+    ЗАЗОР_ВНУТРИ.store(внутри.clamp(0, 400), std::sync::atomic::Ordering::Relaxed);
+    ЗАЗОР_СНАРУЖИ.store(снаружи.clamp(0, 400), std::sync::atomic::Ordering::Relaxed);
+}
 /// Сколько места сверху занимает бар рабочих столов (высота + отступ). Под ним
 /// плавающие окна не размещаем — иначе их заголовок оказывается под баром.
 /// Считается от самой панели (см. udev::BAR_H): поменяли её — резерв поехал
 /// следом, а не остался прежним литералом.
-pub const BAR_RESERVED: i32 = crate::udev::BAR_TOP + crate::udev::BAR_H + 10;
+#[allow(non_snake_case)]
+pub fn BAR_RESERVED() -> i32 { crate::udev::BAR_TOP() + crate::udev::BAR_H() + 10 }
 
 /// Сжимает прямоугольник на `inset` с каждой стороны (не уходя в отрицательный размер).
 fn inset_rect(rect: Rectangle<i32, Logical>, inset: i32) -> Rectangle<i32, Logical> {
@@ -89,9 +108,9 @@ impl Parallax {
     /// Рабочая область тайлинга: экран от НАЧАЛА ХОЛСТА (0,0), а НЕ от
     /// output_geometry.loc (= позиция камеры). Иначе тайлинг "уезжает" вслед за
     /// камерой; при фиксированном (0,0) камере можно красиво перелетать к нему
-    /// (см. set_layout). Внешний отступ GAP_OUTER уже вычтен.
+    /// (см. set_layout). Внешний отступ GAP_OUTER() уже вычтен.
     pub fn tile_work_area(&self) -> Option<Rectangle<i32, Logical>> {
-        Some(inset_rect(self.screen_area()?, GAP_OUTER))
+        Some(inset_rect(self.screen_area()?, GAP_OUTER()))
     }
 
     /// Экран как прямоугольник холста от (0,0), размером С САМ ЭКРАН и
@@ -233,7 +252,7 @@ impl Parallax {
         let rects = match self.dwindle_trees.get(&current_tags) {
             // Внутренний отступ — между соседями (половина зазора с каждой стороны).
             Some(tree) => tree.leaf_rects().into_iter()
-                .map(|(w, r)| (w, inset_rect(r, GAP_INNER / 2)))
+                .map(|(w, r)| (w, inset_rect(r, GAP_INNER() / 2)))
                 .collect::<Vec<_>>(),
             None => return,
         };
@@ -248,7 +267,7 @@ impl Parallax {
     /// будет разделён (сфокусированного), по тем же правилам.
     pub fn predict_tile_size(&self) -> Option<Size<i32, Logical>> {
         let area = self.tile_work_area()?;
-        let inner = GAP_INNER / 2;
+        let inner = GAP_INNER() / 2;
         let tags = self.viewport.current_tags();
         let tree = self.dwindle_trees.get(&tags);
         let cfg = self.lua_config.dwindle;
@@ -290,7 +309,7 @@ impl Parallax {
             .filter(|tw| tw.tags & current_tags != 0 && !tw.floating)
             .map(|tw| tw.window.clone())
             .collect();
-        let geo = inset_rect(geo, GAP_OUTER);
+        let geo = inset_rect(geo, GAP_OUTER());
         for window in &visible {
             self.resize_window(window, geo);
         }
@@ -362,18 +381,29 @@ impl Parallax {
             return;
         }
         let rect = self.fit_to_constraints(window, rect);
+        // Размер, с которого начинается движение, снимаем ДО configure: после
+        // него `geometry()` у X11-окон уже равен новому (см. разбор в udev.rs).
+        let было = self.space.element_geometry(window)
+            .map(|g| g.size)
+            .unwrap_or_else(|| window.geometry().size);
         crate::xwin::set_size(window, Some(rect.size), crate::xwin::Tiled::Set);
         crate::xwin::configure(window);
-        // Размер применяется сразу (клиент сам не умеет анимировать resize),
-        // а позиция едет плавным LERP — "сборка" в тайлинг (см. anim::tick).
+        // Настоящий размер клиенту отправлен, а КАРТИНКА едет пружиной — той
+        // же, что везёт позицию (см. anim::SizeAnim). Раньше здесь стояло
+        // «размер применяется сразу, клиент сам не умеет анимировать resize»:
+        // окно доезжало до слота плавно, а раздувалось до него одним кадром.
         if animate {
+            self.animate_window_size(window, было, rect.size);
             self.animate_window_to(window, rect.loc);
         } else {
             // Живой ресайз: никакого LERP — снимаем идущую анимацию позиции,
-            // иначе она перебьёт map_element на следующем тике.
+            // иначе она перебьёт map_element на следующем тике. Пружину размера
+            // снимаем по той же причине: окно тянут рукой, и «доезд» размера
+            // отставал бы от края, за который тянут.
             self.window_pos_anims.retain(|(w, _)| {
                 w != window
             });
+            self.window_size_anims.retain(|(w, _)| !crate::dwindle::same_window(w, window));
             self.space.map_element(window.clone(), rect.loc, false);
         }
         if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
@@ -478,6 +508,43 @@ impl Parallax {
 
     fn animate_window_to(&mut self, window: &Window, target: Point<i32, Logical>) {
         self.animate_window_to_dur(window, target, crate::anim::дуг::сборка_тайлинга());
+    }
+
+    /// Пустить КАРТИНКУ окна из размера `было` в размер `стало` (см.
+    /// `anim::SizeAnim`). Настоящий размер клиенту к этому моменту уже
+    /// отправлен — здесь только показ.
+    ///
+    /// Длительность и пружина — те же, что у позиции: угол окна и его край
+    /// обязаны ехать вместе.
+    fn animate_window_size(
+        &mut self,
+        window: &Window,
+        было: Size<i32, Logical>,
+        стало: Size<i32, Logical>,
+    ) {
+        if !self.lua_config.resize_anim {
+            return;
+        }
+        let dur = crate::anim::дуг::сборка_тайлинга();
+        let цель = (стало.w as f64, стало.h as f64);
+        if let Some((_, anim)) = self.window_size_anims.iter_mut()
+            .find(|(w, _)| crate::dwindle::same_window(w, window))
+        {
+            anim.retarget(цель, dur);
+            return;
+        }
+        // Разница меньше пикселя — ехать не за чем, а лишняя анимация стоит
+        // перерисовки окна каждый кадр.
+        if (было.w - стало.w).abs() < 1 && (было.h - стало.h).abs() < 1 {
+            return;
+        }
+        if было.w <= 0 || было.h <= 0 || стало.w <= 0 || стало.h <= 0 {
+            return;
+        }
+        self.window_size_anims.push((
+            window.clone(),
+            crate::anim::SizeAnim::new((было.w as f64, было.h as f64), цель, dur),
+        ));
     }
 
     /// Смена раскладки ПО КОМАНДЕ пользователя (Win+D/Win+T/Win+N): окна
@@ -813,8 +880,8 @@ impl Parallax {
                     // во весь экран, иначе занимало бы во Float ровно столько
                     // же — три таких окна ложились друг на друга стопкой, и
                     // «разлёта» было не видно.
-                    let доступно_w = (vis.w.round() as i32 - 2 * GAP_OUTER).max(200);
-                    let доступно_h = (vis.h.round() as i32 - BAR_RESERVED - GAP_OUTER).max(150);
+                    let доступно_w = (vis.w.round() as i32 - 2 * GAP_OUTER()).max(200);
+                    let доступно_h = (vis.h.round() as i32 - BAR_RESERVED() - GAP_OUTER()).max(150);
                     let предел_w = (доступно_w as f64 * 0.7).round() as i32;
                     let предел_h = (доступно_h as f64 * 0.7).round() as i32;
                     let желаемый = tw.float_size.unwrap_or(текущий);
@@ -835,8 +902,8 @@ impl Parallax {
                     // чтобы окно целиком помещалось в видимую область, а сверху
                     // оставалась полоса под бар.
                     let зажать = |p: smithay::utils::Point<i32, Logical>| {
-                        let поле = GAP_OUTER;
-                        let верх = BAR_RESERVED;
+                        let поле = GAP_OUTER();
+                        let верх = BAR_RESERVED();
                         // Коробка размером с экран, центрированная на (cx, cy).
                         let x0 = (cx - vis.w / 2.0).round() as i32;
                         let y0 = (cy - vis.h / 2.0).round() as i32;
@@ -928,8 +995,8 @@ impl Parallax {
             Layout::Columns => {
                 // Выравниваем сфокусированную колонку в кадр, не центрируя.
                 let view_w = out_geo.size.w as f64; // zoom=1 в Columns
-                let left = geo.loc.x as f64 - GAP_INNER as f64 / 2.0;
-                let right = (geo.loc.x + geo.size.w) as f64 + GAP_INNER as f64 / 2.0;
+                let left = geo.loc.x as f64 - GAP_INNER() as f64 / 2.0;
+                let right = (geo.loc.x + geo.size.w) as f64 + GAP_INNER() as f64 / 2.0;
                 let mut cam_x = self.viewport.cam_x;
                 if right > cam_x + view_w { cam_x = right - view_w; }
                 if left < cam_x { cam_x = left; }

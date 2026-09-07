@@ -495,9 +495,19 @@ impl Parallax {
         // перестанет выполняться, и правка сработает как раньше.
         let летит_домой = self.window_anim_target(&window) == Some(loc);
         let место_сходится = текущее == Some(loc) || (текущее.is_some() && летит_домой);
+        // Камера, КОТОРАЯ ЛЕТИТ, судится по цели, а не по текущему кадру, —
+        // тот же довод, что и у окна строкой выше. Иначе наезд в полный экран
+        // (см. `наезд_в_полный_экран`) обрывался бы на первом же кадре: он
+        // нарочно начинается в стороне и подъезжает к `loc`, а здесь это
+        // выглядело бы как «камера не на месте».
+        let (кам_x, кам_y) = if self.zoom_anim.is_some() || self.camera_anim.is_some() {
+            (цель_x, цель_y)
+        } else {
+            (self.viewport.cam_x, self.viewport.cam_y)
+        };
         let кадр_сходится = место_сходится
-            && (self.viewport.cam_x - loc.x as f64).abs() < 0.5
-            && (self.viewport.cam_y - loc.y as f64).abs() < 0.5;
+            && (кам_x - loc.x as f64).abs() < 0.5
+            && (кам_y - loc.y as f64).abs() < 0.5;
         if кадр_сходится {
             return;
         }
@@ -575,11 +585,20 @@ impl Parallax {
             tw.position = loc;
         }
         if свой_стол {
+            // Кадр, из которого едем: тот, что стоял на экране до этой строки.
+            // Окно в нём занимало свой прежний прямоугольник (`prev_*`) — по
+            // нему и считается начало наезда, см. `наезд_в_полный_экран`.
+            let откуда = (self.viewport.cam_x, self.viewport.cam_y, self.viewport.zoom);
+            let прежнее = self.fullscreen_index(window)
+                .map(|i| (self.fullscreens[i].prev_loc, self.fullscreens[i].prev_size));
             self.viewport.zoom = 1.0;
             self.viewport.cam_x = loc.x as f64;
             self.viewport.cam_y = loc.y as f64;
             self.apply_camera();
             self.space.map_element(window.clone(), loc, true);
+            if let Some((prev_loc, prev_size)) = прежнее {
+                self.наезд_в_полный_экран(откуда, prev_loc, prev_size, loc, size);
+            }
         } else {
             // В space окно НЕ кладём: там живут окна текущего стола, и чужое
             // оказалось бы на экране поверх своих (refresh_tags уберёт его лишь
@@ -599,6 +618,73 @@ impl Parallax {
             if готов { "" } else { " (the client was too slow, switched on timeout)" },
             if свой_стол { "" } else { " (not the current workspace — geometry only)" },
         );
+    }
+
+    /// Наезд камеры в полный экран.
+    ///
+    /// **Что здесь на самом деле движется.** К этому моменту окно уже стоит в
+    /// углу кадра во весь монитор, а кадр уже переключён на «зум 1, камера в
+    /// углу окна» — то есть картинка ГОТОВА, и переключалась она одним кадром.
+    /// Анимировать поэтому нужно не окно, а ВЗГЛЯД: кадр отматывается назад,
+    /// в то место и масштаб, где окно занимало ровно свой прежний
+    /// прямоугольник на экране, и оттуда наезжает на монитор. Со стороны это и
+    /// читается как «окно разворачивается»: оно растёт из себя же, а не
+    /// прыгает в угол.
+    ///
+    /// Так дешевле и честнее, чем гнать клиенту configure на каждый кадр
+    /// (см. `anim::OpenAnim` — там от этого отказались по той же причине): весь
+    /// переход стоит одной анимации камеры, а окно всё это время держит один
+    /// большой буфер.
+    fn наезд_в_полный_экран(
+        &mut self,
+        откуда: (f64, f64, f64),
+        prev_loc: Point<i32, Logical>,
+        prev_size: Size<i32, Logical>,
+        loc: Point<i32, Logical>,
+        size: Size<i32, Logical>,
+    ) {
+        if !self.lua_config.fullscreen_anim || size.w <= 0 || size.h <= 0 {
+            return;
+        }
+        if prev_size.w <= 0 || prev_size.h <= 0 {
+            return;
+        }
+        let (cam_x, cam_y, zoom) = откуда;
+        let zoom = zoom.max(0.01);
+        // Прямоугольник окна на экране ДО перехода, в тех же единицах, в
+        // которых считает кадр: (холст − камера) · зум.
+        let ш = prev_size.w as f64 * zoom;
+        let в = prev_size.h as f64 * zoom;
+        let x = (prev_loc.x as f64 - cam_x) * zoom;
+        let y = (prev_loc.y as f64 - cam_y) * zoom;
+        // Начальный зум — по ТЕСНОЙ стороне: кадр монитора и окно почти
+        // никогда не одной формы, и по широкой окно вылезало бы за свой
+        // прежний прямоугольник, то есть наезд начинался бы с рывка наружу.
+        let старт = (ш / size.w as f64).min(в / size.h as f64).clamp(0.05, 4.0);
+        // Уже почти во весь экран (окно и было размером с монитор) — ехать не
+        // за чем, а короткая анимация на ровном месте читается как дёрганье.
+        if (старт - 1.0).abs() < 0.02 {
+            return;
+        }
+        // Центр будущего кадра совмещаем с центром прежнего прямоугольника:
+        // окно растёт ИЗ СЕБЯ, а не из угла экрана.
+        let центр_холста = (loc.x as f64 + size.w as f64 / 2.0, loc.y as f64 + size.h as f64 / 2.0);
+        let центр_экрана = (x + ш / 2.0, y + в / 2.0);
+        let from_cam = Point::<f64, Logical>::from((
+            центр_холста.0 - центр_экрана.0 / старт,
+            центр_холста.1 - центр_экрана.1 / старт,
+        ));
+        let to_cam = Point::<f64, Logical>::from((loc.x as f64, loc.y as f64));
+        // Кадр ставим в начало полёта прямо сейчас: `tick` пройдёт раньше
+        // отрисовки, но между ними успевает встать `resync_fullscreen_frame`,
+        // и оставлять ему кадр «уже приехали» значит спорить с самим собой.
+        self.viewport.zoom = старт;
+        self.viewport.cam_x = from_cam.x;
+        self.viewport.cam_y = from_cam.y;
+        self.zoom_anim = Some(crate::anim::ZoomAnim::new_pan(
+            from_cam, to_cam, старт, 1.0, crate::anim::дуг::полный_экран(),
+        ));
+        self.apply_camera();
     }
 
     /// F11 по развёрнутому окну ТЕКУЩЕГО стола.
@@ -647,9 +733,28 @@ impl Parallax {
                 self.camera_anim = None;
                 self.zoom_anim = None;
                 self.zoom_glide = None;
-                self.viewport.cam_x = fs.prev_cam.0;
-                self.viewport.cam_y = fs.prev_cam.1;
-                self.viewport.zoom = fs.prev_zoom;
+                let откуда = Point::<f64, Logical>::from((self.viewport.cam_x, self.viewport.cam_y));
+                let от_зума = self.viewport.zoom;
+                let куда = Point::<f64, Logical>::from((fs.prev_cam.0, fs.prev_cam.1));
+                // Отъезд — то же движение, что и наезд, только в другую
+                // сторону: кадр возвращается туда, откуда его забрал F11.
+                // Ставить его сразу нельзя ровно по той же причине, по которой
+                // нельзя было прыгать в полный экран, — это второе движение
+                // подряд, а глазу нужно одно.
+                let едем = self.lua_config.fullscreen_anim
+                    && ((от_зума - fs.prev_zoom).abs() > 0.02
+                        || (откуда.x - куда.x).abs() > 1.0
+                        || (откуда.y - куда.y).abs() > 1.0);
+                if едем {
+                    self.zoom_anim = Some(crate::anim::ZoomAnim::new_pan(
+                        откуда, куда, от_зума, fs.prev_zoom,
+                        crate::anim::дуг::полный_экран(),
+                    ));
+                } else {
+                    self.viewport.cam_x = куда.x;
+                    self.viewport.cam_y = куда.y;
+                    self.viewport.zoom = fs.prev_zoom;
+                }
                 self.apply_camera();
             } else {
                 let tags = self.window_tags(&window);
