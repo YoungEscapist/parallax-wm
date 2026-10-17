@@ -56,7 +56,7 @@ use smithay::utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, 
 // Геометрия — общий файл с минимальной сборкой (см. его шапку).
 #[path = "куб_math.rs"]
 mod math;
-pub use math::{Куб, оборот, стол_грани, шагов_до};
+pub use math::{Куб, Плоскость, оборот, стол_грани, шагов_до};
 
 /// Исходник фрагментного шейдера.
 ///
@@ -92,24 +92,41 @@ uniform float tint;
 #endif
 
 // Геометрия куба: радиус вписанной окружности, расстояние до камеры,
-// фокусное расстояние, угол ЭТОЙ грани (радианы).
+// фокусное расстояние (четвёртое число не используется).
 uniform vec4 cube_geom;
+// Плоскость ЭТОЙ поверхности в пространстве куба: центр и два
+// ортонормированных направления вдоль u и вдоль v (x вправо, y вниз, z на
+// зрителя). Поворот куба и его наклон уже в них — шейдеру всё равно, грань
+// это, крышка или развёрнутое окно.
+uniform vec3 cube_o;
+uniform vec3 cube_eu;
+uniform vec3 cube_ev;
 // Прямоугольник этой поверхности В ПЛОСКОСТИ ГРАНИ: u0, v0, u1, v1.
 // Начало координат — центр грани, v растёт ВНИЗ (как gl_FragCoord у smithay,
 // см. разбор в rounded.rs — проекция уже кладёт логический ноль в нулевую
 // строку фрагментов).
 uniform vec4 cube_rect;
+// Видимая часть поверхности в тех же координатах: всё, что за ней, гасится.
+// Обычно совпадает с cube_rect. Отличается у обрезанных поверхностей — окно
+// с буфером больше слота, колонка ленты за краем грани: координаты текстуры
+// обязаны идти от ЦЕЛОЙ поверхности, иначе весь буфер сжимался бы в вырез.
+uniform vec4 cube_clip;
 // Точка экрана, в которую проецируется ОСЬ куба (физические пиксели).
 uniform vec2 cube_axis;
 // Затемнение дальнего края, 0…1: без него грани сливаются и куб читается
 // плоской мозаикой.
 uniform float cube_shade;
+// Крышка: число граней (0 — это не крышка), апофема угольника и яркость.
+uniform vec3 cube_poly;
+// Скругление углов наклонённого окна: его видимая рамка в координатах
+// плоскости (u0, v0, u1, v1) и радиус дуги. Радиус 0 — углы прямые.
+uniform vec4 cube_round;
+uniform float cube_radius;
 
 void main() {
     float r = cube_geom.x;
     float D = cube_geom.y;
     float F = cube_geom.z;
-    float a = cube_geom.w;
 
     if (F <= 0.0) {
         // Куба нет — обычная отрисовка, ровно как без обёртки.
@@ -123,28 +140,42 @@ void main() {
         return;
     }
 
-    vec2 p = gl_FragCoord.xy - cube_axis;
-    float ca = cos(a);
-    float sa = sin(a);
-
-    // Обратная перспектива: из экранного x достаём координату вдоль грани.
-    float denom = p.x * sa - F * ca;
+    // Луч из камеры (0, 0, D) через этот пиксель и его пересечение с
+    // плоскостью. Вывод — у `Куб::обратно_на` в куб_math.rs, строка в строку.
+    vec3 w = vec3(gl_FragCoord.xy - cube_axis, -F);
+    vec3 n = cross(cube_eu, cube_ev);
+    float denom = dot(n, w);
     if (abs(denom) < 1e-4) {
         discard;
     }
-    float u = (F * r * sa + p.x * (r * ca - D)) / denom;
-    float d = D - (r * ca - u * sa);
+    vec3 toO = cube_o - vec3(0.0, 0.0, D);
+    float t = dot(n, toO) / denom;
+    float d = t * F;
     if (d <= 1.0) {
         // Точка за камерой или в её плоскости: показывать нечего.
         gl_FragColor = vec4(0.0);
         return;
     }
-    float v = p.y * d / F;
+    vec3 rel = w * t - toO;
+    float u = dot(rel, cube_eu);
+    float v = dot(rel, cube_ev);
+
+    // Крышка — правильный угольник: точка внутри, если её проекция на нормаль
+    // ближайшей грани не дальше апофемы. Нормаль грани i в координатах
+    // крышки — (sin iθ, cos iθ), ближайшая — по углу точки.
+    if (cube_poly.x > 0.5) {
+        float sector = 6.2831853 / cube_poly.x;
+        float k = floor(atan(u, v) / sector + 0.5);
+        if (u * sin(k * sector) + v * cos(k * sector) > cube_poly.y) {
+            gl_FragColor = vec4(0.0);
+            return;
+        }
+    }
 
     // За краем этой поверхности — пусто. Гасим ЦЕЛИКОМ, а не только альфу:
     // кадр смешивается с предумноженной альфой, и живой цвет при нулевой альфе
     // остался бы виден (та же грабля разобрана в rounded.rs).
-    if (u < cube_rect.x || u > cube_rect.z || v < cube_rect.y || v > cube_rect.w) {
+    if (u < cube_clip.x || u > cube_clip.z || v < cube_clip.y || v > cube_clip.w) {
         gl_FragColor = vec4(0.0);
         return;
     }
@@ -166,9 +197,23 @@ void main() {
         color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
 #endif
 
+    // Скруглённые углы — расстояние до скруглённого прямоугольника. Край
+    // сглаживается на ширину ОДНОГО ПИКСЕЛЯ ЭКРАНА, а не плоскости: у дальнего
+    // края наклонённого окна в пиксель экрана помещается больше плоскости
+    // (d/F), и сглаживание в единицах плоскости там шло бы лесенкой.
+    // (Имя `hs`, а не `half`: `half` в GLSL ES 1.00 зарезервировано.)
+    if (cube_radius > 0.0) {
+        vec2 c = 0.5 * (cube_round.xy + cube_round.zw);
+        vec2 hs = 0.5 * (cube_round.zw - cube_round.xy);
+        float rr = min(cube_radius, min(hs.x, hs.y));
+        vec2 q = abs(vec2(u, v) - c) - (hs - vec2(rr));
+        float dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr;
+        color *= clamp(0.5 - dist * F / d, 0.0, 1.0);
+    }
+
     // Глубина: 0 у ближайшей точки куба (D − r), 1 у самой дальней (D + r).
     float depth = clamp((d - (D - r)) / max(2.0 * r, 1e-4), 0.0, 1.0);
-    color *= 1.0 - cube_shade * depth;
+    color *= (1.0 - cube_shade * depth) * cube_poly.z;
 
     gl_FragColor = color;
 }
@@ -182,9 +227,16 @@ impl Шейдер {
     pub fn new(renderer: &mut GlesRenderer) -> Option<Self> {
         let uniforms = [
             UniformName::new("cube_geom", UniformType::_4f),
+            UniformName::new("cube_o", UniformType::_3f),
+            UniformName::new("cube_eu", UniformType::_3f),
+            UniformName::new("cube_ev", UniformType::_3f),
+            UniformName::new("cube_poly", UniformType::_3f),
             UniformName::new("cube_rect", UniformType::_4f),
+            UniformName::new("cube_clip", UniformType::_4f),
             UniformName::new("cube_axis", UniformType::_2f),
             UniformName::new("cube_shade", UniformType::_1f),
+            UniformName::new("cube_round", UniformType::_4f),
+            UniformName::new("cube_radius", UniformType::_1f),
         ];
         match renderer.compile_custom_texture_shader(ФРАГМЕНТ, &uniforms) {
             Ok(program) => Some(Self(program)),
@@ -220,6 +272,28 @@ impl<E> Грань<E> {
             program: шейдер.0.clone(),
             uniforms: куб.uniforms(угол, rect),
         }
+    }
+
+    /// Та же картинка на произвольной плоскости — крышке куба. `uniforms` —
+    /// из `Куб::uniforms_крышки`.
+    pub fn на_плоскости(inner: E, шейдер: &Шейдер, uniforms: Vec<Uniform<'static>>) -> Self {
+        Self {
+            inner,
+            program: шейдер.0.clone(),
+            uniforms,
+        }
+    }
+
+    /// Показать только часть поверхности: `clip` — видимый вырез в плоскости
+    /// грани, а `rect` из `new` остаётся рамкой ЦЕЛОЙ поверхности (по ней
+    /// считаются координаты текстуры).
+    pub fn с_отсечением(mut self, clip: (f32, f32, f32, f32)) -> Self {
+        for u in &mut self.uniforms {
+            if u.name == "cube_clip" {
+                *u = Uniform::new("cube_clip", [clip.0, clip.1, clip.2, clip.3]);
+            }
+        }
+        self
     }
 }
 

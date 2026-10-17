@@ -65,6 +65,19 @@ pub fn установить_зазоры(внутри: i32, снаружи: i32)
 pub fn BAR_RESERVED() -> i32 { crate::udev::BAR_TOP() + crate::udev::BAR_H() + 10 }
 
 /// Сжимает прямоугольник на `inset` с каждой стороны (не уходя в отрицательный размер).
+/// Ближайшее к `loc` место, где окно размера `size` целиком лежит в `рамка`.
+/// Окно крупнее рамки прижимается к её левому верхнему углу: заголовок и
+/// кнопки остаются под рукой.
+pub(crate) fn зажать_в_рамку(
+    рамка: Rectangle<i32, Logical>,
+    loc: Point<i32, Logical>,
+    size: Size<i32, Logical>,
+) -> Point<i32, Logical> {
+    let max_x = (рамка.loc.x + рамка.size.w - size.w).max(рамка.loc.x);
+    let max_y = (рамка.loc.y + рамка.size.h - size.h).max(рамка.loc.y);
+    Point::from((loc.x.clamp(рамка.loc.x, max_x), loc.y.clamp(рамка.loc.y, max_y)))
+}
+
 fn inset_rect(rect: Rectangle<i32, Logical>, inset: i32) -> Rectangle<i32, Logical> {
     let w = (rect.size.w - inset * 2).max(1);
     let h = (rect.size.h - inset * 2).max(1);
@@ -109,6 +122,7 @@ impl Parallax {
     /// output_geometry.loc (= позиция камеры). Иначе тайлинг "уезжает" вслед за
     /// камерой; при фиксированном (0,0) камере можно красиво перелетать к нему
     /// (см. set_layout). Внешний отступ GAP_OUTER() уже вычтен.
+    /// Панель приложений места не отнимает: она лежит поверх окон (01.10.2026).
     pub fn tile_work_area(&self) -> Option<Rectangle<i32, Logical>> {
         Some(inset_rect(self.screen_area()?, GAP_OUTER()))
     }
@@ -233,6 +247,33 @@ impl Parallax {
             }
         }
         tree.recalc(area, &cfg);
+    }
+
+    /// Разошлось ли BSP-дерево текущего стола с его набором окон: есть
+    /// тайловое окно, которого в дереве нет (приехало с другого стола), или в
+    /// дереве остался лист от окна, которое уже ушло.
+    ///
+    /// Нужно на ВХОДЕ на посещённый тайловый стол. `view_tag_inner` там
+    /// `arrange` не зовёт — стол уже разложен, и лишний проход дёргал бы все
+    /// окна анимацией на каждом переключении. Но окно, присланное сюда через
+    /// Win+Shift+цифра, в дерево не входило: оно осталось стоять там, где его
+    /// застал перенос, поверх соседей и своего прежнего размера — ровно
+    /// жалоба «окно не занимает место, а прячется за другими».
+    pub(crate) fn тайлинг_разошёлся(&self) -> bool {
+        let tags = self.viewport.current_tags();
+        let видимые: Vec<&Window> = self.tagged_windows.iter()
+            .filter(|tw| tw.tags & tags != 0 && !tw.floating)
+            .map(|tw| &tw.window)
+            .collect();
+        match self.dwindle_trees.get(&tags) {
+            Some(tree) => {
+                видимые.iter().any(|w| !tree.contains(*w))
+                    || tree.windows().iter()
+                        .any(|w| !видимые.iter().any(|v| crate::dwindle::same_window(v, w)))
+            }
+            // Дерева нет вовсе, а тайловые окна есть — раскладывать точно надо.
+            None => !видимые.is_empty(),
+        }
     }
 
     pub fn apply_tile_layout(&mut self) {
@@ -405,6 +446,10 @@ impl Parallax {
             });
             self.window_size_anims.retain(|(w, _)| !crate::dwindle::same_window(w, window));
             self.space.map_element(window.clone(), rect.loc, false);
+            // Вместо пружины — растяжка до запрошенного, пока клиент не
+            // перерисовался: соседи по делению тянутся за рукой вместе, а не
+            // догоняют её каждый в своём темпе (см. `живая_растяжка`).
+            self.отметить_живой_размер(window);
         }
         if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
             &tw.window == window
@@ -463,6 +508,46 @@ impl Parallax {
         target.to_i32_round()
     }
 
+    /// Бросок с заранее известной точкой остановки (склейка: окно тормозит
+    /// ровно у края соседа). Пружина стартует со скоростью курсора, как в
+    /// `fling_window`, а ω подбирается под длину пути: путь = |v|/ω, значит
+    /// окно, чей полёт укоротили до касания, тормозит резче и встаёт впритык,
+    /// не перелетая. Цель чуть в стороне от линии полёта (подравнивание вдоль
+    /// стыка) пружина доводит сама.
+    pub(crate) fn fling_window_to(
+        &mut self,
+        window: &Window,
+        vel: Point<f64, Logical>,
+        target: Point<i32, Logical>,
+    ) {
+        let from = self.space.element_geometry(window)
+            .map(|g| g.loc.to_f64())
+            .unwrap_or_default();
+        let target = target.to_f64();
+        let speed = (vel.x * vel.x + vel.y * vel.y).sqrt();
+        let (dx, dy) = (target.x - from.x, target.y - from.y);
+        let path = (dx * dx + dy * dy).sqrt();
+        // Скорость — только вдоль пути: боковая составляющая при сильно
+        // укороченном полёте тащила бы окно мимо стыка и назад.
+        let along = if path > 0.5 { (vel.x * dx + vel.y * dy) / path } else { 0.0 };
+        let vel = Point::from((dx / path.max(0.5) * along, dy / path.max(0.5) * along));
+        if along <= 0.0 || path <= 0.5 {
+            // Лететь некуда или цель позади (окно уже стояло впритык, и
+            // остался только сдвиг вдоль стыка) — обычный доезд.
+            self.window_pos_anims.retain(|(w, _)| !crate::dwindle::same_window(w, window));
+            if path > 0.5 {
+                self.animate_window_to_dur(window, target.to_i32_round(), crate::anim::дуг::толчок_соседа());
+            }
+            return;
+        }
+        let omega = (along / path).max(crate::anim::glide_omega(speed));
+        self.window_pos_anims.retain(|(w, _)| !crate::dwindle::same_window(w, window));
+        self.window_pos_anims.push((
+            window.clone(),
+            PosAnim::with_velocity(from, target, vel, omega),
+        ));
+    }
+
     /// Толчок окна «по инерции»: добавляет скорость к тому движению, что у окна
     /// уже есть, и пересчитывает точку остановки (путь доезда = |v|/ω). Окно,
     /// которое стояло, начинает лететь; окно, которое уже летело, ускоряется —
@@ -503,7 +588,168 @@ impl Parallax {
             tw.position = target;
             tw.float_position_set = true;
         }
-        target
+        // Поверх тайлинга толчок не выносит окно за экран.
+        self.удержать_на_экране(std::slice::from_ref(window));
+        self.window_anim_target(window).unwrap_or(target)
+    }
+
+    /// Снять окно с полёта: оно остаётся там, где его застал этот кадр, без
+    /// скорости и без метки «летит свободно».
+    ///
+    /// Нужно перед тем, как вести окно в НАЗНАЧЕННОЕ место (сборка и разборка
+    /// созвездия). `animate_window_to_dur` летящему окну только меняет цель:
+    /// скорость броска и `PosAnim::fling` переживают смену, и столкновения на
+    /// лету (anim::resolve_fling_collisions) на первом же касании с соседом
+    /// по грозди пересчитывали цель от скорости — окно уезжало из своего
+    /// места по инерции и расталкивало остальных.
+    pub(crate) fn остановить_полёт(&mut self, window: &Window) {
+        self.window_pos_anims.retain(|(w, _)| !crate::dwindle::same_window(w, window));
+    }
+
+    /// Рамка, в которой обязано оставаться окно, плавающее ПОВЕРХ ТАЙЛИНГА.
+    ///
+    /// В Tile и Monocle камера стоит на месте и пан запрещён: окно, уехавшее
+    /// за край, достать уже нечем. Во Float холст бесконечный, в ленте кадр
+    /// прокручивается — там рамки нет.
+    pub(crate) fn рамка_плавающих(&self) -> Option<Rectangle<i32, Logical>> {
+        if self.overview_active {
+            return None;
+        }
+        match self.tile_config.layout {
+            Layout::Tile | Layout::Monocle => self.tile_work_area(),
+            Layout::Columns | Layout::Float => None,
+        }
+    }
+
+    /// Вернуть в рамку плавающие окна тайлинга из `окна`: и стоящие, и те, что
+    /// ещё летят (бросок мышью тормозит у края, а не за ним).
+    pub(crate) fn удержать_на_экране(&mut self, окна: &[Window]) {
+        let Some(рамка) = self.рамка_плавающих() else { return };
+        let tags = self.viewport.current_tags();
+        for w in окна {
+            let годится = self.tagged_windows.iter().any(|tw| {
+                crate::dwindle::same_window(&tw.window, w)
+                    && tw.floating && tw.tags & tags != 0
+                    && !tw.виджет && tw.закреплено.is_none()
+            });
+            if !годится || self.is_fullscreen(w) {
+                continue;
+            }
+            let Some(g) = self.space.element_geometry(w) else { continue };
+            let было = self.window_anim_target(w).unwrap_or(g.loc);
+            // Размер — тот, к которому окно ИДЁТ, а не тот, что на экране в
+            // этот кадр. Прилипание к краю ставит цель места сразу, а клиент
+            // ужимается позже: по старой ширине правая половина «не влезала»,
+            // и окно отпихивало влево от края, к которому его приложили.
+            let размер = crate::xwin::видимый_размер(w, g.size);
+            let стало = зажать_в_рамку(рамка, было, размер);
+            if стало == было {
+                continue;
+            }
+            let бросок = self.window_pos_anims.iter()
+                .find(|(a, _)| crate::dwindle::same_window(a, w))
+                .filter(|(_, anim)| anim.fling)
+                .map(|(_, anim)| anim.vel);
+            match бросок {
+                Some(v) => self.fling_window_to(w, v, стало),
+                None => self.animate_window_to_dur(w, стало, crate::anim::дуг::толчок_соседа()),
+            }
+            if let Some(tw) = self.tagged_windows.iter_mut()
+                .find(|tw| crate::dwindle::same_window(&tw.window, w))
+            {
+                tw.float_position = стало;
+                tw.position = стало;
+                tw.float_position_set = true;
+            }
+            tracing::debug!("plx/float: window kept on screen {:?} → {:?}", было, стало);
+        }
+    }
+
+    /// Выход из тайлинга во Float: запомнить, какие окна плавали поверх
+    /// раскладки и где, а им самим вернуть их место на холсте.
+    fn запомнить_плавающие_тайлинга(&mut self) {
+        let tags = self.viewport.current_tags();
+        let места: Vec<(Window, Rectangle<i32, Logical>)> = self.tagged_windows.iter()
+            .filter(|tw| tw.tags & tags != 0 && tw.floating && tw.float_pinned
+                && !tw.виджет && tw.закреплено.is_none())
+            .filter_map(|tw| {
+                let g = self.space.element_geometry(&tw.window)?;
+                let loc = self.window_anim_target(&tw.window).unwrap_or(g.loc);
+                Some((tw.window.clone(), Rectangle::new(loc, g.size)))
+            })
+            .collect();
+        for tw in self.tagged_windows.iter_mut().filter(|tw| tw.tags & tags != 0) {
+            tw.tile_float = места.iter()
+                .find(|(w, _)| crate::dwindle::same_window(w, &tw.window))
+                .map(|(_, r)| *r);
+            if tw.tile_float.is_none() {
+                continue;
+            }
+            if let Some((место, размер)) = tw.canvas_float.take() {
+                tw.float_position = место;
+                tw.float_position_set = true;
+                if размер.is_some() {
+                    tw.float_size = размер;
+                }
+            }
+        }
+    }
+
+    /// Вход в тайлинг: окна, оставшиеся плавающими, встают туда, где плавали
+    /// поверх раскладки в прошлый раз, и в любом случае — в кадр. Их место на
+    /// холсте Float откладывается в `canvas_float` до обратного перехода.
+    fn вернуть_плавающие_тайлинга(&mut self, с_холста: bool) {
+        let Some(рамка) = self.рамка_плавающих() else { return };
+        let tags = self.viewport.current_tags();
+        let окна: Vec<(Window, Option<Rectangle<i32, Logical>>)> = self.tagged_windows.iter()
+            .filter(|tw| tw.tags & tags != 0 && tw.floating
+                && !tw.виджет && tw.закреплено.is_none())
+            .map(|tw| (tw.window.clone(), tw.tile_float))
+            .collect();
+        for (w, прежнее) in окна {
+            if self.is_fullscreen(&w) {
+                continue;
+            }
+            let Some(g) = self.space.element_geometry(&w) else { continue };
+            let сейчас = Rectangle::new(self.window_anim_target(&w).unwrap_or(g.loc), g.size);
+            let цель = match прежнее {
+                Some(r) => Rectangle::new(зажать_в_рамку(рамка, r.loc, r.size), r.size),
+                // Окно поверх раскладки ещё не жило. Если оно хотя бы краем в
+                // кадре — подвигаем до целого, иначе кладём посередине: от
+                // далёкого места на холсте осмысленного «ближайшего края» нет.
+                None if сейчас.intersection(рамка).is_some() => {
+                    Rectangle::new(зажать_в_рамку(рамка, сейчас.loc, сейчас.size), сейчас.size)
+                }
+                None => {
+                    let по_центру = Point::from((
+                        рамка.loc.x + (рамка.size.w - сейчас.size.w) / 2,
+                        рамка.loc.y + (рамка.size.h - сейчас.size.h) / 2,
+                    ));
+                    Rectangle::new(зажать_в_рамку(рамка, по_центру, сейчас.size), сейчас.size)
+                }
+            };
+            if цель.size != g.size {
+                crate::xwin::set_size(&w, Some(цель.size), crate::xwin::Tiled::Unset);
+                crate::xwin::configure(&w);
+            }
+            self.остановить_полёт(&w);
+            self.animate_window_to(&w, цель.loc);
+            if let Some(tw) = self.tagged_windows.iter_mut()
+                .find(|tw| crate::dwindle::same_window(&tw.window, &w))
+            {
+                if с_холста {
+                    tw.canvas_float = Some((tw.float_position, tw.float_size));
+                }
+                // Прочитано — и больше не нужно: следующий выход во Float
+                // запишет место заново, а до него оно бы только устаревало.
+                tw.tile_float = None;
+                tw.float_position = цель.loc;
+                tw.position = цель.loc;
+                tw.float_position_set = true;
+                tw.float_size = Some(цель.size);
+            }
+            tracing::debug!("plx/float: floating window back over the tiling at {:?}", цель);
+        }
     }
 
     fn animate_window_to(&mut self, window: &Window, target: Point<i32, Logical>) {
@@ -583,6 +829,26 @@ impl Parallax {
         if self.overview_active || self.overview_exit_pending {
             self.exit_overview_immediate(None);
         }
+        // Сборка окон командой (Win+D/Win+T/Win+N) при развёрнутом окне на
+        // этом столе: сперва возвращаем его из полного экрана. Иначе окно
+        // оставалось «полноэкранным» внутри раскладки — тайлинг давал ему
+        // слот, а `resync_fullscreen_frame` каждый кадр тащил его в угол кадра
+        // за чужие окна, и панель пропадала (жалоба 02.10.2026: «прилипает к
+        // краю экрана и ничего не нажать»). При переходе на стол
+        // (restore_layout) игру в F11 не трогаем — у неё свой кадр.
+        if move_windows {
+            if let Some(window) = self.fullscreen_window_here() {
+                self.unset_fullscreen_window(&window);
+            }
+            let недоигранные: Vec<Window> = self.fullscreens.iter()
+                .map(|f| f.window.clone())
+                .filter(|w| self.fullscreen_requested(w) && !self.is_fullscreen(w)
+                    && self.window_here(w))
+                .collect();
+            for w in недоигранные {
+                self.unset_fullscreen_window(&w);
+            }
+        }
         let prev = self.tile_config.layout;
         self.tile_config.prev_layout = prev;
         self.tile_config.layout = layout;
@@ -653,6 +919,9 @@ impl Parallax {
                 }
                 // Строго ПОСЛЕ восстановления камеры: разлёт считает кольцо от
                 // центра ЭКРАНА, то есть от текущего положения камеры.
+                if prev != Layout::Float {
+                    self.запомнить_плавающие_тайлинга();
+                }
                 self.scatter_to_float(prev);
             }
         } else {
@@ -800,6 +1069,9 @@ impl Parallax {
                 self.columns_set_active_to_focus();
             }
             self.arrange();
+            if move_windows {
+                self.вернуть_плавающие_тайлинга(prev == Layout::Float);
+            }
         }
         tracing::info!("plx: layout → {}", layout.symbol());
     }
@@ -973,6 +1245,11 @@ impl Parallax {
     /// пустоту по бокам), слева направо, cam_x ≥ 0. Tile/Monocle — камера
     /// зафиксирована на (0,0), не трогаем.
     pub(crate) fn snap_camera_to_window(&mut self, window: &Window) {
+        // Прыжок к окну — намеренный выбор места: инерция прошлого пана тут
+        // больше ни при чём. Гасим сразу, а не только через camera_anim: окно
+        // может оказаться уже в кадре (перелёта нет), и тогда остаточная
+        // скорость унесла бы камеру от него.
+        self.momentum.stop();
         // Кадр = видимая часть холста (экран ⁄ зум).
         let vis = self.visible_canvas_size();
         let out_geo = Rectangle::<i32, Logical>::new(
@@ -1124,6 +1401,46 @@ impl Parallax {
         self.request_redraw();
     }
 
+    /// Растянуть тайловое окно на `dw`×`dh` во ВСЕ стороны (щипок Super+2
+    /// пальца): половина прироста уходит в правое/нижнее деление, половина — в
+    /// левое/верхнее. Сторона, упёртая в край рабочей области, двигаться не
+    /// может — весь прирост достаётся противоположной.
+    pub fn dwindle_resize_centered(&mut self, window: &Window, dw: f64, dh: f64) {
+        let Some(area) = self.tile_work_area() else { return };
+        let key = if self.overview_active {
+            let Some(mask) = self.overview_mask_of_window(window) else { return };
+            mask
+        } else {
+            self.viewport.current_tags()
+        };
+        let Some(b) = self.dwindle_trees.get(&key).and_then(|t| t.box_of(window)) else { return };
+        // Тот же допуск «прилип к краю», что у самого дерева (dwindle::resize).
+        const STICK: f64 = 5.0;
+        let at_left = (b.x - area.loc.x as f64).abs() < STICK;
+        let at_right = ((b.x + b.w) - (area.loc.x + area.size.w) as f64).abs() < STICK;
+        let at_top = (b.y - area.loc.y as f64).abs() < STICK;
+        let at_bottom = ((b.y + b.h) - (area.loc.y + area.size.h) as f64).abs() < STICK;
+        let split = |d: f64, lo: bool, hi: bool| match (lo, hi) {
+            (false, false) => (d / 2.0, d / 2.0),
+            (true, false) => (0.0, d),
+            (false, true) => (d, 0.0),
+            (true, true) => (0.0, 0.0),
+        };
+        let (left, right) = split(dw, at_left, at_right);
+        let (top, bottom) = split(dh, at_top, at_bottom);
+        use crate::dwindle::Corner;
+        if right != 0.0 || bottom != 0.0 {
+            let corner = Corner { left: false, top: false, right: right != 0.0, bottom: bottom != 0.0 };
+            self.dwindle_resize_focused(window, Point::from((right, bottom)), corner);
+        }
+        if left != 0.0 || top != 0.0 {
+            // Левый/верхний край растёт навстречу отрицательной дельте —
+            // знак как у курсора при Super+ПКМ за этот угол.
+            let corner = Corner { left: left != 0.0, top: top != 0.0, right: false, bottom: false };
+            self.dwindle_resize_focused(window, Point::from((-left, -top)), corner);
+        }
+    }
+
     /// Схлопывание группы окон в стопку (2.4): все видимые окна текущего тега
     /// съезжаются в одну точку с вертикальным сдвигом заголовков на 30px.
     /// Повторный вызов (когда что-то уже схлопнуто) — разворачивает обратно
@@ -1216,6 +1533,8 @@ impl Parallax {
             // Игра занимает весь экран, и «фокус вправо» из панели всегда
             // попадал бы в неё — то есть в никуда (см. `mine::в_переборе`).
             .filter(|tw| crate::mine::в_переборе(self, &tw.window))
+            // Виджет — не цель навигации (см. виджеты.rs).
+            .filter(|tw| !tw.виджет)
             .filter_map(|tw| {
                 self.space.element_geometry(&tw.window).map(|g| {
                     let cx = g.loc.x as f64 + g.size.w as f64 / 2.0;
@@ -1269,6 +1588,9 @@ impl Parallax {
             // Окно Minecraft из кольца вычитается: попав на него, перебор
             // застревал навсегда (см. `mine::в_переборе`).
             .filter(|tw| crate::mine::в_переборе(self, &tw.window))
+            // Виджеты в переборе не участвуют — это и есть половина смысла
+            // метки (см. виджеты.rs): часы на обоях не должны отнимать Tab.
+            .filter(|tw| !tw.виджет)
             .map(|tw| tw.window.clone())
             .collect();
         if visible.is_empty() { return; }
@@ -1329,6 +1651,13 @@ impl Parallax {
     pub fn move_focused_window(&mut self, dx: i32, dy: i32) {
         let focused = self.focused_surface();
         let fs = match focused { Some(f) => f, None => return };
+        // Виджет прибит к холсту: ни мышью, ни жестом, ни биндом. Двигает его
+        // только `plx ctl widget move` (см. виджеты.rs).
+        if let Some(w) = self.space.elements().find(|w| crate::xwin::is_surface(w, &fs)).cloned() {
+            if self.виджет_ли(&w) {
+                return;
+            }
+        }
         let w = match self.space.elements()
             .find(|w| crate::xwin::is_surface(w, &fs))
             .cloned()
@@ -1336,7 +1665,15 @@ impl Parallax {
             Some(w) => w, None => return,
         };
         let loc = match self.space.element_location(&w) { Some(l) => l, None => return };
-        let new_loc = (loc.x + dx, loc.y + dy).into();
+        let mut new_loc: Point<i32, Logical> = (loc.x + dx, loc.y + dy).into();
+        // Поверх тайлинга окно упирается в край экрана (см. рамка_плавающих).
+        let плавает = self.tagged_windows.iter()
+            .any(|tw| tw.window == w && tw.floating && tw.закреплено.is_none());
+        if let (true, Some(рамка), Some(g)) =
+            (плавает, self.рамка_плавающих(), self.space.element_geometry(&w))
+        {
+            new_loc = зажать_в_рамку(рамка, new_loc, g.size);
+        }
         self.space.map_element(w.clone(), new_loc, false);
         if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
             tw.window == w

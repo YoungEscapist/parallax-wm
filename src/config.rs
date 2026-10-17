@@ -43,7 +43,7 @@ impl ModMask {
 pub enum Action {
     Spawn(String),
     Quit,
-    /// Super+R: перезапуск компоновщика на месте — сессия сохраняется, parallax
+    /// Super+R: перезапуск компоновщика на месте: parallax
     /// выходит с кодом [`crate::state::RESTART_EXIT_CODE`], а launch_native.sh
     /// пересобирает (если исходники новее бинаря) и поднимает его заново.
     /// Нужен, чтобы забирать свежую сборку без перелогина в ly.
@@ -83,6 +83,7 @@ pub enum Action {
     ToggleBookmarksMode,
     ToggleSnapping,
     ToggleMagnetism,
+    ToggleGlue,
     ToggleFoldStack,
     VtSwitch(i32),
     LayoutNext,
@@ -111,6 +112,11 @@ pub enum Action {
     WindowHeightAdjust(f64),
     /// `reset-window-height`
     WindowHeightReset,
+    /// Наклонить/повернуть окно под курсором (иначе в фокусе): приращения в
+    /// градусах — рыскание, тангаж, крен (см. наклон.rs).
+    WindowTilt(f32, f32, f32),
+    /// Поставить окно под курсором ровно.
+    WindowTiltReset,
     /// `maximize-column`
     ColumnMaximize,
     /// `center-column`
@@ -144,6 +150,21 @@ pub enum Action {
     WifiMenu,
     /// Меню устройств вывода и ввода звука (см. audio.rs).
     AudioMenu,
+    /// Меню питания: режимы и подсветка (см. питание.rs).
+    PowerMenu,
+    /// Яркость экрана на шаг (доля, со знаком).
+    Brightness(f32),
+    /// Подсветка клавиатуры: шаг со знаком; 0 — по кругу.
+    KbdBacklight(i32),
+    /// Закрепить окно на экране и открепить обратно (см. pin.rs): приклеено
+    /// к камере, не зумится и не панится.
+    TogglePin,
+    /// Показать и спрятать панель приложений (см. dock.rs).
+    DockToggle,
+    /// Режим правки панели приложений: перетаскивание, удаление, «+».
+    DockEdit,
+    /// Окно «Параметры панели» (см. dock_settings.rs).
+    DockSettings,
     // ── Шлем: VR и дополненная реальность (см. vr/) ───────────────────────
     /// Войти в шлем и выйти обратно. Мониторы при этом продолжают работать:
     /// VR — дополнительный «выход», а не замена сеансу.
@@ -189,6 +210,24 @@ pub enum Action {
     /// раздачу двумя разными сочетаниями незачем, а забыть, что она идёт,
     /// легко (отсюда же чип с кодом на панели).
     ShareToggle(u16),
+    // ── Мышь и камера с клавиатуры (см. клавимышь.rs) ─────────────────────
+    /// Шаг указателя: направление (dx, dy) и шаг в экранных пикселях.
+    /// Удержание клавиши разгоняет шаг само (автоповтор xkb).
+    PointerMove(f64, f64, f64),
+    /// Клик кнопкой мыши: код кнопки в нумерации evdev (`synth::КНОПКА_ЛКМ`).
+    PointerClick(u32),
+    /// Тумблер удержания кнопки мыши — драг с клавиатуры: первое нажатие
+    /// прижимает кнопку, второе отпускает.
+    PointerDrag(u32),
+    /// Колесо: (горизонталь, вертикаль) в зубцах, вниз и вправо положительны.
+    PointerScroll(f64, f64),
+    /// Поставить курсор в точку интерфейса: окно в фокусе, центр экрана,
+    /// правый остров панели.
+    PointerWarp(crate::клавимышь::Цель),
+    /// Шаг камеры по холсту: направление (dx, dy).
+    CameraPan(f64, f64),
+    /// Зум холста: множитель > 0 — щелчок зума у курсора, <= 0 — вернуть 1:1.
+    CameraZoom(f64),
 }
 
 #[derive(Clone, Debug)]
@@ -348,6 +387,71 @@ impl Default for MineConfig {
     }
 }
 
+// ── Правила окон (виджеты) ───────────────────────────────────────────────────
+
+/// `window{}` в `config.lua` — что сделать с окном, как только оно появится.
+///
+/// Модель взята у driftwm один в один, вместе с именем главного ключа: окно,
+/// помеченное `widget = true`, ПРИБИТО к холсту. Его нельзя увести мышью,
+/// жестом или биндом, оно лежит ПОД обычными окнами, выпадает из Super+Tab, из
+/// пространственной навигации, из поиска и из панели задач. Это и есть
+/// «виджет»: часы, монитор нагрузки, календарь — всё, что должно висеть на
+/// обоях и не мешаться в переборе окон.
+///
+/// Само окно при этом остаётся обычным клиентом (conky, eww, своя gtk-поделка):
+/// компоновщик не рисует виджеты сам и ничего о них не знает, кроме правила.
+#[derive(Clone, Debug, Default)]
+pub struct ПравилоОкна {
+    /// `app_id` целиком или с `*` на конце: `app_id = "eww-*"`. Пусто — не
+    /// смотрим на app_id вовсе.
+    pub app_id: Option<String>,
+    /// Заголовок — подстрокой. Нужен там, где одно приложение даёт и виджет, и
+    /// обычные окна (терминал с запущенным в нём монитором).
+    pub title: Option<String>,
+    /// Прибить к холсту (см. описание типа).
+    pub widget: bool,
+    /// Где поставить, в координатах ХОЛСТА. Ставится один раз, при появлении.
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    /// Размер в логических пикселях — окну уходит configure с этими числами.
+    pub w: Option<i32>,
+    pub h: Option<i32>,
+    /// Плавающее, но обычное — то же, что toggle_floating сразу при появлении.
+    /// `widget = true` подразумевает `float = true`: прибитое окно в раскладке
+    /// участвовать не может.
+    pub float: bool,
+}
+
+impl ПравилоОкна {
+    /// Подходит ли правило окну. Пустое правило (ни app_id, ни title) не
+    /// подходит НИКОМУ: иначе опечатка в ключе накрыла бы все окна разом.
+    pub fn подходит(&self, app_id: &str, title: &str) -> bool {
+        if self.app_id.is_none() && self.title.is_none() {
+            return false;
+        }
+        if let Some(шаблон) = &self.app_id {
+            if !совпало(шаблон, app_id) {
+                return false;
+            }
+        }
+        if let Some(кусок) = &self.title {
+            if !title.to_lowercase().contains(&кусок.to_lowercase()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Сравнение `app_id` с шаблоном: точное совпадение без регистра либо префикс,
+/// если шаблон кончается на `*`.
+fn совпало(шаблон: &str, значение: &str) -> bool {
+    match шаблон.strip_suffix('*') {
+        Some(начало) => значение.to_lowercase().starts_with(&начало.to_lowercase()),
+        None => значение.eq_ignore_ascii_case(шаблон),
+    }
+}
+
 // ── Config ───────────────────────────────────────────────────────────────────
 
 pub struct Config {
@@ -363,6 +467,8 @@ pub struct Config {
     pub bluetooth_autoconnect: bool,
     /// `monitor{}` — конфигурация выходов: имя, разрешение, частота, позиция.
     pub monitors: Vec<MonitorConfig>,
+    /// `window{}` — правила окон: виджеты, место, размер (см. `ПравилоОкна`).
+    pub window_rules: Vec<ПравилоОкна>,
     /// `vr{}` — шлем: раскладка панелей, их размер, зона (см. vr/).
     pub vr: VrConfig,
     /// `mine{}` — режим Minecraft: зона панелей и их размер (см. mine/).
@@ -378,6 +484,12 @@ pub struct Config {
     /// больше — медленнее и спокойнее, меньше — резче. Одна ручка на все
     /// движения сразу; сами длительности живут в `anim::дуг`.
     pub anim_speed: f64,
+    /// `set{ anim_bounce = ... }` — ОТСКОК окон, едущих в своё место: в слот
+    /// раскладки, к соседу, в новый размер. 0 (по умолчанию) — пружина без
+    /// перелёта, как было; 0.25 — окно чуть проскакивает цель (~3%) и
+    /// садится обратно; дальше — заметнее, потолок 0.6. Броски мышью и толчки
+    /// по инерции НЕ пружинят никогда (см. `anim::PosAnim::with_velocity`).
+    pub anim_bounce: f64,
     /// `set{ lang = "ru" | "en" }` — язык интерфейса; по умолчанию английский.
     /// Накрывает то, что человек читает: панель, меню, подсказки, уведомления
     /// и ответы терминальных команд. Логи всегда английские — см. `lang.rs`.
@@ -388,6 +500,11 @@ pub struct Config {
     /// пользователя», но самой ручки не было — значение стояло литералом в
     /// state.rs. Теперь оно и правда ручка.
     pub pan_drift: f64,
+    /// `set{ edge_pan = ... }` — с какой скоростью (пикселей ЭКРАНА в секунду)
+    /// едет камера, пока курсор КАСАЕТСЯ края экрана во Float. Толкать мышь в
+    /// край не нужно: коснулся и держишь — холст едет сам, как в RTS. 0 —
+    /// выключено (остаётся только перелив толчком, как раньше).
+    pub edge_pan: f64,
     /// `set{ fling_distance = ... }` — как далеко улетает БРОШЕННОЕ окно:
     /// 1.0 — как задумано (~2000 px холста на резком броске), 0 — окно встаёт
     /// там же, где его отпустили, 2.0 — вдвое дальше. Ручка-близнец
@@ -397,6 +514,24 @@ pub struct Config {
     /// камерой (одной копией, с затуханием) вместо того, чтобы быть
     /// приклеенными к экрану. См. `udev::build_wallpaper_backdrop`.
     pub infinite_wallpaper: bool,
+    /// `set{ fullscreen_boost = ... }` — облегчать кадр, пока экран занят ОДНИМ
+    /// окном целиком (игра, плеер, браузер в F11).
+    ///
+    /// Под таким окном не видно ни обоев, ни панели, ни теней, ни ярлыков — и
+    /// всё это перестаёт считаться: свёртка размытия, экранный шейдер со
+    /// свечением, плитки обоев, тени и виджеты стола. Сверх экономии это
+    /// возвращает игре ПРЯМОЙ ВЫВОД: пока сцена не уезжает в офскрин шейдера,
+    /// smithay кладёт буфер игры прямо на плоскость монитора, и композитор в
+    /// такие кадры не рисует вовсе (см. udev::flags_кадра).
+    ///
+    /// Признак — `Parallax::wallpaper_hidden`, тот же, по которому под
+    /// полноэкранным окном засыпают живые обои. В обзоре, на зуме и при любом
+    /// окне меньше экрана он false, так что на виде рабочего стола не меняется
+    /// ничего.
+    ///
+    /// `false` — считать всё как раньше (например, чтобы дымка экранного
+    /// шейдера лежала и поверх игры).
+    pub fullscreen_boost: bool,
     /// `set{ share_guest_all = ... }` — снять с гостя ПОСЛЕДНИЕ ограничения.
     ///
     /// Гость и так получает все бинды композитора (это прямое требование
@@ -427,6 +562,23 @@ pub struct Config {
     /// бинды, даже если приложение зависло. Без этой лазейки повисший plx-share
     /// запирал бы человека в его собственном сеансе намертво.
     pub keyboard_grab_apps: Vec<String>,
+    /// `set{ keymouse_block_apps = {"dota2"} }` — приложения, у которых мышь и
+    /// камера С КЛАВИАТУРЫ (см. `клавимышь.rs`) не работают, пока они в фокусе:
+    /// Alt+HJKL, Alt+Enter, Alt+колесо, Alt+стрелки и зум уходят прямо в окно.
+    ///
+    /// **Зачем.** В Dota 2 на Alt висит половина игры: Alt+клик — пинг, Alt+Q/W/E
+    /// — сообщения о способностях, Alt+стрелки и Alt+пробел смотрят на героя.
+    /// Композитор съедал их у игры целиком — «vim-режим» оказывался включённым
+    /// внутри матча, и жалоба Ярика 12.09.2026 была ровно про это.
+    ///
+    /// **Почему не `keyboard_grab_apps`.** Тот отдаёт окну ВСЕ клавиши: из игры
+    /// стали бы недоступны Super+столы, Super+Q и обзор, то есть композитор
+    /// исчезал бы на время матча. Здесь отнимается ровно семь действий
+    /// клавиатурной мыши, а остальные бинды работают как работали.
+    ///
+    /// Клавиша при этом не съедается, а УХОДИТ В ОКНО (`FilterResult::Forward`):
+    /// Alt+клик обязан долететь до игры, иначе пинг просто исчезнет.
+    pub keymouse_block_apps: Vec<String>,
     /// Жесты тачпада таблицей — `gesture{}` в `config.lua`. См. `gestures.rs`.
     ///
     /// Пустая таблица = поведение parallax до 30.08.2026: жесты обрабатывают
@@ -500,19 +652,36 @@ pub struct Config {
     /// (старые игры под Xwayland, java-клиенты): без этого они на палец не
     /// отзываются вовсе.
     pub touch_emulate_pointer: bool,
+    /// `set{ touch_edge = 24 }` — ширина полосы у края экрана, из которой
+    /// палец, потянутый внутрь, даёт жест края (`touch{ gesture = "edge-…" }`).
+    /// 0 — жестов края нет.
+    pub touch_edge: f64,
+    /// `set{ touch_hold_drag = true }` — палец, пролежавший на окне срок
+    /// долгого нажатия и потом поехавший, ВЕДЁТ ОКНО. Отпущенный на месте —
+    /// по-прежнему правая кнопка, только на отпускании, а не сразу.
+    pub touch_hold_drag: bool,
+    /// Таблица `touch{ gesture = "…", action = "…" }` поверх встроенных
+    /// жестов сенсора (см. `сенсор::ЖестПальца`); `None` — `action = "none"`.
+    pub touch_binds: Vec<(crate::сенсор::ЖестПальца, Option<Action>)>,
     /// Автодовод курсора по краям НАКЛАДКИ тачпада:
     /// `set{ touchpad_edge_motion = true, touchpad_edge_zone = 0.08,
     ///       touchpad_edge_speed = 900.0 }`. См. touchpad.rs.
     pub автодовод: crate::touchpad::Автодовод,
-    /// `set{ glow = ... }` — светящаяся кайма по краю окна В ЦВЕТ ОБОЕВ
-    /// (см. rounded.rs, `Свечение`; цвет берётся из палитры plx-wall —
-    /// src/обои.rs). Сила 0.0…1.0, 0 — выключено.
-    ///
-    /// Гаснет сама на светлых обоях и у окон не в фокусе — так кайма
-    /// показывает, где ввод, а не просто красит края.
-    pub glow: f32,
-    /// `set{ glow_width = ... }` — ширина этой каймы в логических пикселях.
-    pub glow_width: f32,
+    /// Тап, клик и прокрутка тачпада в libinput:
+    /// `set{ touchpad_tap = true, touchpad_tap_drag = true,
+    ///       touchpad_clickfinger = true, touchpad_natural_scroll = false,
+    ///       touchpad_dwt = true }`. См. touchpad.rs, `НастройкиТачпада`.
+    pub тачпад: crate::touchpad::НастройкиТачпада,
+    /// `set{ dissolve = 8 }` — окна открываются и закрываются ПИКСЕЛЬНЫМ
+    /// РАСТВОРЕНИЕМ: рваные кляксы из квадратных клеток (см. rounded.rs,
+    /// `Растворение`). Значение — сторона клетки в логических пикселях,
+    /// 0 — выключено (тогда обычное всплытие и затухание).
+    pub dissolve: f32,
+    /// `set{ dissolve_mosaic = true }` — внутри клякс растворения картинка
+    /// сперва крупными пикселями (клетка — один цвет) и дробится до резкой к
+    /// концу открытия: окно СОБИРАЕТСЯ из пикселей. false — клетки сразу
+    /// резкие, как до 05.10.2026. Работает только вместе с `dissolve`.
+    pub dissolve_mosaic: bool,
     /// `set{ cube = ... }` — КУБ РАБОЧИХ СТОЛОВ, тот самый из Compiz
     /// (см. куб.rs). Столы встают на грани призмы, обзор перестаёт быть
     /// плоской сеткой. Сила 0.0…1.0, 0 — выключено.
@@ -541,33 +710,49 @@ pub struct Config {
     /// `set{ cube_switch = ... }` — крутить куб при переходе на соседний стол
     /// (Super+PgUp/PgDn), а не только в обзоре. Ровно поведение Compiz.
     pub cube_switch: bool,
-    /// `set{ sun = ... }` — СВЕТ НА ХОЛСТЕ в цвет обоев (см. свет.rs).
-    /// Сила 0.0…1.0, 0 — выключено.
+    /// `set{ carousel = ... }` — обзор ЛЕНТЫ (niri) показывается каруселью, а
+    /// не кубом: каждая колонка этажа — своя панель, панели стоят по кругу, и
+    /// видны все окна стола сразу, а не кусок этажа шириной в экран. Соседние
+    /// этажи — такие же барабаны выше и ниже. `false` — в ленте снова куб.
+    pub carousel: bool,
+    /// `set{ desk_carousel = ... }` — сеточный обзор (tile, monocle) в 3D
+    /// показывается каруселью СТОЛОВ, а не кубом: каждый стол — своя панель,
+    /// видны все столы сразу. Столов кратно четырём — панели стоят квадратом
+    /// (четыре стола — ровно куб), иначе по кругу. `false` — снова куб.
+    pub desk_carousel: bool,
+    /// `set{ cube_lift = ... }` — НА СКОЛЬКО ОКНА ПОДНЯТЫ НАД ГРАНЬЮ куба,
+    /// в долях ширины экрана. 0 — старое поведение, окна лежат в плоскости
+    /// грани и куб с ними одно целое.
     ///
-    /// Не рисованное солнце: диска на экране нет. Есть источник, стоящий в
-    /// точке холста, и от него светятся сцена (мягкая заливка поверх обоев) и
-    /// ОКНА — сторона, обращённая к свету, ярче, обратная уходит в тень, а
-    /// кайма горит сильнее там, где на неё падает. Отсюда и ориентир «откуда
-    /// светит», и объём у окон, которого не даёт ровная кайма.
-    pub sun: f32,
-    /// `set{ sun_size = ... }` — как далеко достаёт свет, в ширинах экрана.
-    /// Это радиус спада, а не радиус видимого пятна: за ним свет сходит в ноль.
-    pub sun_size: f32,
-    /// `set{ sun_x = ..., sun_y = ... }` — где стоит источник, в долях экрана
-    /// от левого верхнего угла ДОМА монитора (0.5, 0.5 — ровно в середине
-    /// первого экрана стола). Значения вне 0…1 допустимы: источник может
-    /// висеть и за краем первого экрана, холст бесконечен.
-    pub sun_x: f32,
-    pub sun_y: f32,
-    /// `set{ sun_far = ... }` — насколько источник ДАЛЕКО: 0 — приклеен к
-    /// экрану (не реагирует ни на камеру, ни на зум), 1 — лежит на холсте
-    /// наравне с окнами и уезжает вместе с ним.
+    /// Куб при ненулевом подъёме становится тем, чем он является в расширении
+    /// GNOME: отдельной коробкой из обоев, над которой висят окна. Окна при
+    /// этом ближе к зрителю, чем грань, — то есть заметно крупнее её масштаба,
+    /// и перекрытия между ними читаются глубиной, а не просто порядком.
+    pub cube_lift: f32,
+    /// `set{ cube_lift_step = ... }` — насколько выше грани встаёт КАЖДОЕ
+    /// СЛЕДУЮЩЕЕ окно стопки, в долях `cube_lift`. Ради этого шага перекрытие
+    /// окон и видно: два окна, лежащие внахлёст, висят на разной высоте.
+    pub cube_lift_step: f32,
+    /// `set{ cube_inertia = ... }` — ВЫБЕГ куба после драга, секунды. Куб,
+    /// которому придали скорость рукой, доворачивается не к ближайшей грани, а
+    /// к той, до которой он докрутился бы по инерции. 0 — выбега нет.
+    pub cube_inertia: f32,
+    /// `set{ flip3d = ... }` — окно ОТКРЫВАЕТСЯ И ЗАКРЫВАЕТСЯ РАЗВОРОТОМ В 3D:
+    /// въезжает, поворачиваясь вокруг своей вертикальной оси, и уходит тем же
+    /// движением обратно (анимация в духе Compiz, тем же шейдером, что и куб).
+    /// Значение — начальный угол в ГРАДУСАХ, 0 — выключено.
     ///
-    /// По умолчанию четверть: холст бесконечен, и источник, честно стоящий в
-    /// его точке, уходит из кадра навсегда после первого же дальнего перелёта
-    /// — свет пропадает вместе с ним. Настоящее солнце далеко: смещается при
-    /// ходьбе, но позади не остаётся.
-    pub sun_far: f32,
+    /// Работает вместо всплытия и затухания; при включённом `dissolve`
+    /// растворение главнее — две анимации одного события мешали бы друг другу.
+    pub flip3d: f32,
+    /// `set{ screen_shader = "путь.frag" }` — ЭКРАННЫЙ ШЕЙДЕР: свой GLSL
+    /// поверх всего кадра, как `decoration:screen_shader` в Hyprland.
+    ///
+    /// Пусто — прохода нет вовсе (по умолчанию). Формат файла хайпрлендовский
+    /// (`tex`, `v_texcoord`, `time`, `wl_output_resolution`), чужие шейдеры
+    /// работают без правок; файл перечитывается по времени правки, без
+    /// перезапуска сеанса. См. src/экран.rs.
+    pub screen_shader: String,
     /// `set{ bar_hide_pan = ... }` — убирать панель на время ПАНА холста
     /// (см. `Parallax::пан_идёт`). Включено: панель — плашка поверх холста, и
     /// когда холст едут рукой, она единственная стоит на месте и мешает
@@ -628,6 +813,8 @@ pub struct Config {
     pub notify_sound: String,
     /// `set{ notify_volume = ... }` — громкость этого тона, 0.0…1.0.
     pub notify_volume: f32,
+    /// `dock{}` — панель приложений: край, размер, состав (см. dock.rs).
+    pub dock: crate::dock::DockConfig,
 }
 
 impl Config {
@@ -668,17 +855,24 @@ impl Default for Config {
             dwindle: crate::dwindle::DwindleConfig::default(),
             bluetooth_autoconnect: true,
             monitors: Vec::new(),
+            window_rules: Vec::new(),
             vr: VrConfig::default(),
             mine: MineConfig::default(),
             cursor_size: 0,
             cursor_client_max: -1,
             anim_speed: 1.0,
+            anim_bounce: 0.0,
             lang: crate::lang::Язык::default(),
             pan_drift: 0.5,
+            edge_pan: 1400.0,
             fling_distance: 1.0,
             infinite_wallpaper: true,
+            fullscreen_boost: true,
             share_guest_all: false,
             keyboard_grab_apps: vec!["plx-share".to_string()],
+            // Dota 2 в списке по умолчанию: Alt там — игровой модификатор, и
+            // клавиатурная мышь отбирала его у игры (жалоба 12.09.2026).
+            keymouse_block_apps: vec!["dota2".to_string()],
             gestures: Vec::new(),
             gesture_thresholds: crate::gestures::Пороги::default(),
             mouse_chords: Vec::new(),
@@ -693,27 +887,33 @@ impl Default for Config {
             touch_long_press: 500,
             touch_tap_slop: 12.0,
             touch_emulate_pointer: false,
+            touch_edge: 24.0,
+            touch_hold_drag: true,
+            touch_binds: Vec::new(),
             автодовод: crate::touchpad::Автодовод::default(),
+            тачпад: crate::touchpad::НастройкиТачпада::default(),
             // Выключено по умолчанию: эффект вкусовой, а включается одной
             // строкой в config.lua.
-            glow: 0.0,
-            glow_width: 12.0,
+            dissolve: 0.0,
+            dissolve_mosaic: true,
             cube: 0.0,
             cube_faces: 4,
             cube_focal: 2.2,
             cube_fill: 0.62,
             cube_shade: 0.35,
             cube_switch: true,
-            sun: 0.0,
+            carousel: true,
+            desk_carousel: true,
+            cube_lift: 0.09,
+            cube_lift_step: 0.55,
+            cube_inertia: 0.22,
+            flip3d: 55.0,
+            screen_shader: String::new(),
             // Крупное и высоко справа: пятно радиусом почти в экран читается
             // светом, а не кругом, а угол — то место, где оно реже всего
             // оказывается ровно за окном.
-            sun_size: 1.6,
-            sun_x: 0.78,
-            sun_y: 0.18,
-            sun_far: 0.25,
             bar_hide_pan: true,
-            preview_depth: 0.7,
+            preview_depth: 0.0,
             fullscreen_anim: true,
             rounding: 8.0,
             rounding_tile: 16.0,
@@ -727,13 +927,14 @@ impl Default for Config {
             intro: true,
             notify_sound: String::new(),
             notify_volume: 0.35,
+            dock: crate::dock::DockConfig::default(),
         }
     }
 }
 
 const DEFAULT_CONFIG_LUA: &str = include_str!("../default_config.lua");
 
-fn config_path() -> Option<PathBuf> {
+pub(crate) fn config_path() -> Option<PathBuf> {
     // parallax обычно запускается через `sudo openvt` (см. launch.zsh), поэтому
     // HOME=/root и конфиг читался бы из /root/.config/parallax/ — НЕ там, где его
     // правит пользователь. Если задан SUDO_USER — берём конфиг реального
@@ -789,7 +990,10 @@ const ЖЕСТЫ_ПО_УМОЛЧАНИЮ: &str = r#"
 -- Ресайз висит на SUPER, а не на alt, как в driftwm: alt в parallax уже занят
 -- паном холста, и жест приходилось начинать с пустого места (01.09.2026,
 -- жалоба «ресайз на alt работает слабо»).
-gesture{ mods = "super", fingers = 3, kind = "swipe", where = "window", action = "resize-window" }
+-- Super+2 и Super+3 пальца здесь НЕ занимать: таблица идёт раньше input.rs и
+-- забирала жест целиком. С 05.10.2026 Super+3 пальца (свайп и щипок) = перенос
+-- окна тем же grab, что Win+ЛКМ, а Super+щипок двумя = ресайз от центра
+-- (PinchResize) — оба живут в input.rs. Ресайз свайпом остался на super+shift.
 gesture{ mods = "super+shift", fingers = 3, kind = "swipe", where = "window", action = "resize-window-snapped" }
 gesture{ mods = "alt", fingers = 3, kind = "pinch-in", where = "window", action = "toggle_fullscreen" }
 gesture{ mods = "alt", fingers = 3, kind = "pinch-out", where = "window", action = "toggle_fullscreen" }
@@ -803,13 +1007,9 @@ gesture{ fingers = 2, kind = "pinch", where = "canvas", action = "zoom" }
 gesture{ fingers = 3, kind = "swipe", action = "pan-viewport" }
 -- ПЕРЕБИВАЕТ: там же четырьмя пальцами листалась полоса наравне с тремя.
 gesture{ fingers = 4, kind = "swipe", action = "center-nearest" }
-gesture{ mods = "super", fingers = 3, kind = "swipe", action = "center-nearest" }
-gesture{ mods = "super", fingers = 2, kind = "pinch", action = "zoom" }
 gesture{ fingers = 3, kind = "pinch", action = "zoom" }
 gesture{ fingers = 4, kind = "pinch-out", action = "toggle_overview" }
-gesture{ mods = "super", fingers = 3, kind = "pinch-out", action = "toggle_overview" }
 gesture{ fingers = 4, kind = "hold", action = "center_window" }
-gesture{ mods = "super", fingers = 3, kind = "hold", action = "center_window" }
 "#;
 
 fn действие_жеста(имя: &str, tbl: &Table) -> Option<crate::gestures::ДействиеЖеста> {
@@ -848,10 +1048,27 @@ fn непрерывное_подходит(
     }
 }
 
+/// Кнопка мыши из поля `button` (по умолчанию левая). `None` — имя незнакомое;
+/// бинд тогда не заводится вовсе, а не молча превращается в ЛКМ: «нажимается
+/// не та кнопка» искали бы дольше, чем «бинд не работает».
+fn кнопка_из_lua(tbl: &Table) -> Option<u32> {
+    match tbl.get::<String>("button") {
+        Err(_) => Some(crate::synth::КНОПКА_ЛКМ),
+        Ok(имя) => match crate::synth::кнопка_по_имени(&имя) {
+            Some(к) => Some(к),
+            None => {
+                tracing::warn!("plx/config: unknown mouse button '{}', skipping bind", имя);
+                None
+            }
+        },
+    }
+}
+
 fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
     use Action::*;
     let get_i32 = |k: &str, default: i32| tbl.get::<i32>(k).unwrap_or(default);
     let get_f32 = |k: &str, default: f32| tbl.get::<f32>(k).unwrap_or(default);
+    let get_f64 = |k: &str, default: f64| tbl.get::<f64>(k).unwrap_or(default);
     let get_tag_mask = |default: u32| -> u32 {
         let n = tbl.get::<i64>("tag").unwrap_or(default as i64).max(1);
         1u32 << (n - 1).min(31)
@@ -882,6 +1099,13 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
         "tray_menu" => TrayMenu,
         "wifi_menu" => WifiMenu,
         "audio_menu" => AudioMenu,
+        "power_menu" => PowerMenu,
+        "brightness" => Brightness(get_f32("step", 0.05)),
+        "kbd_backlight" => KbdBacklight(get_i32("step", 0)),
+        "toggle_pin" | "pin_window" => TogglePin,
+        "dock_toggle" => DockToggle,
+        "dock_edit" => DockEdit,
+        "dock_settings" => DockSettings,
         "vr_toggle" => VrToggle,
         "vr_mode" => VrMode,
         "vr_ar" => VrAr,
@@ -915,6 +1139,7 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
         "toggle_bookmarks_mode" => ToggleBookmarksMode,
         "toggle_snapping" => ToggleSnapping,
         "toggle_magnetism" => ToggleMagnetism,
+        "toggle_glue" => ToggleGlue,
         "share_start" => ShareStart(get_i32("port", 0).clamp(0, 65535) as u16),
         "share_stop" => ShareStop,
         "share_toggle" => ShareToggle(get_i32("port", 0).clamp(0, 65535) as u16),
@@ -934,6 +1159,8 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
         "column_width_adjust" => ColumnWidthAdjust(get_f32("percent", 10.0) as f64),
         "window_height_adjust" => WindowHeightAdjust(get_f32("percent", 10.0) as f64),
         "window_height_reset" => WindowHeightReset,
+        "window_tilt" => WindowTilt(get_f32("yaw", 0.0), get_f32("pitch", 0.0), get_f32("roll", 0.0)),
+        "window_tilt_reset" => WindowTiltReset,
         "column_maximize" => ColumnMaximize,
         "column_center" => ColumnCenter,
         "column_focus_first" => ColumnFocusEdge(false),
@@ -952,6 +1179,36 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
                 "on-overflow" | "on_overflow" => C::OnOverflow,
                 _ => C::Never,
             })
+        }
+        // ── Мышь и камера с клавиатуры (см. клавимышь.rs) ─────────────────
+        //
+        // Кнопка задаётся именем, а не числом: `button = "right"` читается,
+        // а 0x111 — нет. Имена разбирает та же функция, что и у харнесса
+        // (`synth::кнопка_по_имени`), чтобы `mouse click right` из сокета и
+        // бинд значили ровно одно и то же.
+        "pointer_move" => PointerMove(
+            get_f64("dx", 0.0),
+            get_f64("dy", 0.0),
+            get_f64("step", 12.0).abs(),
+        ),
+        "pointer_click" => PointerClick(кнопка_из_lua(tbl)?),
+        "pointer_drag" | "pointer_hold" => PointerDrag(кнопка_из_lua(tbl)?),
+        "pointer_scroll" => PointerScroll(get_f64("dx", 0.0), get_f64("dy", 1.0)),
+        "pointer_warp" => {
+            let куда = tbl.get::<String>("to").unwrap_or_else(|_| "window".into());
+            match crate::клавимышь::Цель::разобрать(&куда) {
+                Some(ц) => PointerWarp(ц),
+                None => {
+                    tracing::warn!("plx/config: unknown pointer_warp target '{}'", куда);
+                    return None;
+                }
+            }
+        }
+        "pan_camera" => CameraPan(get_f64("dx", 0.0), get_f64("dy", 0.0)),
+        // `reset = true` и `factor = 0` — одно и то же: вернуть масштаб 1:1.
+        "zoom_camera" => {
+            let сброс = tbl.get::<bool>("reset").unwrap_or(false);
+            CameraZoom(if сброс { 0.0 } else { get_f64("factor", 1.1) })
         }
         "workspace_step" => WorkspaceStep(get_i32("dir", 1)),
         "move_column_to_workspace" => MoveColumnToWorkspace(get_i32("dir", 1)),
@@ -1010,6 +1267,9 @@ pub fn load() -> Config {
     // лету, без перезапуска.
     crate::lang::установить(cfg.lang);
     crate::anim::set_tempo(cfg.anim_speed);
+    // Отскок — тем же атомиком и в той же точке, что и темп: пружины заводятся
+    // в tiling.rs, куда конфиг не передаётся.
+    crate::anim::set_bounce(cfg.anim_bounce);
     // Длительности поимённо (`anim{}`) — тем же порядком и по той же причине,
     // что и темп. Сброс перед раздачей обязателен: строка, убранная из конфига
     // при перечитывании, иначе продолжала бы действовать до перезапуска.
@@ -1070,30 +1330,43 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let touch_long_press: Rc<RefCell<u32>> = Rc::new(RefCell::new(500));
     let touch_tap_slop: Rc<RefCell<f64>> = Rc::new(RefCell::new(12.0));
     let touch_emulate_pointer: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let touch_edge: Rc<RefCell<f64>> = Rc::new(RefCell::new(24.0));
+    let touch_hold_drag: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    #[allow(clippy::type_complexity)]
+    let touch_binds: Rc<RefCell<Vec<(crate::сенсор::ЖестПальца, Option<Action>)>>> =
+        Rc::new(RefCell::new(Vec::new()));
     let gesture_thresholds: Rc<RefCell<crate::gestures::Пороги>> =
         Rc::new(RefCell::new(crate::gestures::Пороги::default()));
     let автодовод: Rc<RefCell<crate::touchpad::Автодовод>> =
         Rc::new(RefCell::new(crate::touchpad::Автодовод::default()));
+    let тачпад: Rc<RefCell<crate::touchpad::НастройкиТачпада>> =
+        Rc::new(RefCell::new(crate::touchpad::НастройкиТачпада::default()));
     let xkb_settings: Rc<RefCell<XkbSettings>> = Rc::new(RefCell::new(XkbSettings::default()));
     let bird_eye_key: Rc<RefCell<u32>> = Rc::new(RefCell::new(xkb::keysyms::KEY_space));
     let dwindle_cfg: Rc<RefCell<crate::dwindle::DwindleConfig>> =
         Rc::new(RefCell::new(crate::dwindle::DwindleConfig::default()));
     let bt_autoconnect: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let monitors: Rc<RefCell<Vec<MonitorConfig>>> = Rc::new(RefCell::new(Vec::new()));
+    let window_rules: Rc<RefCell<Vec<ПравилоОкна>>> = Rc::new(RefCell::new(Vec::new()));
     let vr_cfg: Rc<RefCell<VrConfig>> = Rc::new(RefCell::new(VrConfig::default()));
     let mine_cfg: Rc<RefCell<MineConfig>> = Rc::new(RefCell::new(MineConfig::default()));
     let cursor_size: Rc<RefCell<i32>> = Rc::new(RefCell::new(0));
     let cursor_client_max: Rc<RefCell<i32>> = Rc::new(RefCell::new(-1));
     let anim_speed: Rc<RefCell<f64>> = Rc::new(RefCell::new(1.0));
+    let anim_bounce: Rc<RefCell<f64>> = Rc::new(RefCell::new(0.0));
     let lang: Rc<RefCell<crate::lang::Язык>> = Rc::new(RefCell::new(crate::lang::Язык::default()));
     let pan_drift: Rc<RefCell<f64>> = Rc::new(RefCell::new(0.5));
+    let edge_pan: Rc<RefCell<f64>> = Rc::new(RefCell::new(1400.0));
     let fling_distance: Rc<RefCell<f64>> = Rc::new(RefCell::new(1.0));
     let infinite_wallpaper: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let fullscreen_boost: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let share_guest_all: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let keymouse_block_apps: Rc<RefCell<Vec<String>>> =
+        Rc::new(RefCell::new(vec!["dota2".to_string()]));
     let keyboard_grab_apps: Rc<RefCell<Vec<String>>> =
         Rc::new(RefCell::new(vec!["plx-share".to_string()]));
     let bar_hide_pan: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
-    let preview_depth: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.7));
+    let preview_depth: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
     let fullscreen_anim: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let resize_anim: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let anim_ms: Rc<RefCell<Vec<(String, u32)>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1103,23 +1376,27 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let gaps_out: Rc<RefCell<i32>> = Rc::new(RefCell::new(18));
     let bar_вид: Rc<RefCell<crate::bar::Вид>> = Rc::new(RefCell::new(crate::bar::Вид::default()));
     let blur: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-    let glow: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
-    let glow_width: Rc<RefCell<f32>> = Rc::new(RefCell::new(12.0));
+    let dissolve: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
+    let dissolve_mosaic: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let cube: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
     let cube_faces: Rc<RefCell<u32>> = Rc::new(RefCell::new(4));
     let cube_focal: Rc<RefCell<f32>> = Rc::new(RefCell::new(2.2));
     let cube_fill: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.62));
     let cube_shade: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.35));
     let cube_switch: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
-    let sun: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
-    let sun_size: Rc<RefCell<f32>> = Rc::new(RefCell::new(1.6));
-    let sun_x: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.78));
-    let sun_y: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.18));
-    let sun_far: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.25));
+    let carousel: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let desk_carousel: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let cube_lift: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.09));
+    let cube_lift_step: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.55));
+    let cube_inertia: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.22));
+    let flip3d: Rc<RefCell<f32>> = Rc::new(RefCell::new(55.0));
+    let screen_shader: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
     let close_anim: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let intro: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let notify_sound: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
     let notify_volume: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.35));
+    let dock_cfg: Rc<RefCell<crate::dock::DockConfig>> =
+        Rc::new(RefCell::new(crate::dock::DockConfig::default()));
 
     {
         let bindings = bindings.clone();
@@ -1304,6 +1581,36 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         lua.globals().set("mouse", mouse_fn)?;
     }
     {
+        // Жесты сенсорного экрана сверх встроенных пана/щипка/таблицы:
+        //   touch{ gesture = "edge-left", action = "workspace_step", dir = -1 }
+        //   touch{ gesture = "tap-3", action = "spawn", cmd = "fuzzel" }
+        //   touch{ gesture = "doubletap", action = "none" }   -- выключить
+        // Без строки жест работает по умолчанию (см. `сенсор::ЖестПальца`).
+        let touch_binds_c = touch_binds.clone();
+        let touch_fn = lua.create_function(move |_, tbl: mlua::Table| {
+            let имя: String = tbl.get::<String>("gesture").unwrap_or_default();
+            let Some(жест) = crate::сенсор::ЖестПальца::разобрать(&имя) else {
+                tracing::warn!("plx/config: touch{{}}: unknown gesture '{имя}', skipping");
+                return Ok(());
+            };
+            let action_str: String = tbl.get::<String>("action").unwrap_or_default();
+            let действие = if action_str.trim().eq_ignore_ascii_case("none") {
+                None
+            } else {
+                match action_from_lua(&action_str, &tbl) {
+                    Some(a) => Some(a),
+                    None => {
+                        tracing::warn!("plx/config: touch{{}}: unknown action '{action_str}', skipping");
+                        return Ok(());
+                    }
+                }
+            };
+            touch_binds_c.borrow_mut().push((жест, действие));
+            Ok(())
+        })?;
+        lua.globals().set("touch", touch_fn)?;
+    }
+    {
         let xkb_settings = xkb_settings.clone();
         let xkb_fn = lua.create_function(move |_, tbl: Table| {
             let mut s = xkb_settings.borrow_mut();
@@ -1332,12 +1639,16 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let cursor_size = cursor_size.clone();
         let cursor_client_max = cursor_client_max.clone();
         let anim_speed = anim_speed.clone();
+        let anim_bounce = anim_bounce.clone();
         let lang = lang.clone();
         let pan_drift = pan_drift.clone();
+        let edge_pan = edge_pan.clone();
         let fling_distance = fling_distance.clone();
         let infinite_wallpaper = infinite_wallpaper.clone();
+        let fullscreen_boost = fullscreen_boost.clone();
         let share_guest_all = share_guest_all.clone();
         let keyboard_grab_apps = keyboard_grab_apps.clone();
+        let keymouse_block_apps = keymouse_block_apps.clone();
         let gesture_thresholds = gesture_thresholds.clone();
         let mouse_chord_timeout = mouse_chord_timeout.clone();
         let mouse_chord_resize_gain = mouse_chord_resize_gain.clone();
@@ -1350,7 +1661,10 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let touch_long_press = touch_long_press.clone();
         let touch_tap_slop = touch_tap_slop.clone();
         let touch_emulate_pointer = touch_emulate_pointer.clone();
+        let touch_edge = touch_edge.clone();
+        let touch_hold_drag = touch_hold_drag.clone();
         let автодовод = автодовод.clone();
+        let тачпад = тачпад.clone();
         let bar_hide_pan = bar_hide_pan.clone();
         let preview_depth = preview_depth.clone();
         let fullscreen_anim = fullscreen_anim.clone();
@@ -1360,19 +1674,21 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let gaps_in = gaps_in.clone();
         let gaps_out = gaps_out.clone();
         let blur = blur.clone();
-        let glow = glow.clone();
-        let glow_width = glow_width.clone();
+        let dissolve = dissolve.clone();
+        let dissolve_mosaic = dissolve_mosaic.clone();
         let cube = cube.clone();
         let cube_faces = cube_faces.clone();
         let cube_focal = cube_focal.clone();
         let cube_fill = cube_fill.clone();
         let cube_shade = cube_shade.clone();
         let cube_switch = cube_switch.clone();
-        let sun = sun.clone();
-        let sun_size = sun_size.clone();
-        let sun_x = sun_x.clone();
-        let sun_y = sun_y.clone();
-        let sun_far = sun_far.clone();
+        let carousel = carousel.clone();
+        let desk_carousel = desk_carousel.clone();
+        let cube_lift = cube_lift.clone();
+        let cube_lift_step = cube_lift_step.clone();
+        let cube_inertia = cube_inertia.clone();
+        let flip3d = flip3d.clone();
+        let screen_shader = screen_shader.clone();
         let close_anim = close_anim.clone();
         let intro = intro.clone();
         let notify_sound = notify_sound.clone();
@@ -1405,6 +1721,9 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             if let Ok(v) = tbl.get::<f64>("anim_speed") {
                 *anim_speed.borrow_mut() = v;
             }
+            if let Ok(Some(v)) = tbl.get::<Option<f64>>("anim_bounce") {
+                *anim_bounce.borrow_mut() = if v.is_finite() { v.clamp(0.0, 0.6) } else { 0.0 };
+            }
             // Опечатку в языке НЕ проглатываем молча: человек написал
             // `lang = "рус"`, интерфейс остался английским, и понять почему
             // без этой строчки было бы нечем.
@@ -1431,11 +1750,14 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             // Только Option<…>: голый get срабатывает на ОТСУТСТВУЮЩЕМ ключе
             // (см. разбор выше про blur) и каждый set{} гасил бы чужие
             // настройки.
-            if let Ok(Some(v)) = tbl.get::<Option<f32>>("glow") {
-                *glow.borrow_mut() = v.clamp(0.0, 1.0);
+            // `glow`/`glow_width` вырезаны 17.09.2026: в старом config.lua
+            // они молча игнорируются — лишний ключ таблицы ничего не ломает.
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("dissolve") {
+                *dissolve.borrow_mut() = v.clamp(0.0, 64.0);
             }
-            if let Ok(Some(v)) = tbl.get::<Option<f32>>("glow_width") {
-                *glow_width.borrow_mut() = v.max(0.0);
+            // Булев ключ — только Option<bool> (см. разбор про blur выше).
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("dissolve_mosaic") {
+                *dissolve_mosaic.borrow_mut() = v;
             }
             if let Ok(Some(v)) = tbl.get::<Option<f32>>("cube") {
                 *cube.borrow_mut() = v.clamp(0.0, 1.0);
@@ -1456,22 +1778,26 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("cube_switch") {
                 *cube_switch.borrow_mut() = v;
             }
-            if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun") {
-                *sun.borrow_mut() = v.clamp(0.0, 1.0);
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("carousel") {
+                *carousel.borrow_mut() = v;
             }
-            if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun_size") {
-                // Нижняя граница не косметическая: из радиуса считается сторона
-                // картинки на экране, а нулевая сторона — вырожденный dst.
-                *sun_size.borrow_mut() = v.clamp(0.05, 8.0);
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("desk_carousel") {
+                *desk_carousel.borrow_mut() = v;
             }
-            if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun_x") {
-                *sun_x.borrow_mut() = v;
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("cube_lift") {
+                *cube_lift.borrow_mut() = v.clamp(0.0, 0.5);
             }
-            if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun_y") {
-                *sun_y.borrow_mut() = v;
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("cube_lift_step") {
+                *cube_lift_step.borrow_mut() = v.clamp(0.0, 4.0);
             }
-            if let Ok(Some(v)) = tbl.get::<Option<f32>>("sun_far") {
-                *sun_far.borrow_mut() = v.clamp(0.0, 1.0);
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("cube_inertia") {
+                *cube_inertia.borrow_mut() = v.clamp(0.0, 2.0);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("flip3d") {
+                *flip3d.borrow_mut() = v.clamp(0.0, 85.0);
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<String>>("screen_shader") {
+                *screen_shader.borrow_mut() = v.trim().to_string();
             }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("bar_hide_pan") {
                 *bar_hide_pan.borrow_mut() = v;
@@ -1503,11 +1829,17 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("infinite_wallpaper") {
                 *infinite_wallpaper.borrow_mut() = v;
             }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("fullscreen_boost") {
+                *fullscreen_boost.borrow_mut() = v;
+            }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("share_guest_all") {
                 *share_guest_all.borrow_mut() = v;
             }
             if let Ok(Some(v)) = tbl.get::<Option<Vec<String>>>("keyboard_grab_apps") {
                 *keyboard_grab_apps.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<Vec<String>>>("keymouse_block_apps") {
+                *keymouse_block_apps.borrow_mut() = v;
             }
             // Сколько ждать вторую кнопку аккорда (hevel: chord_click_timeout_ms).
             // Потолок в секунду — не вкус: столько задерживается ОБЫЧНЫЙ клик
@@ -1550,6 +1882,14 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("touch_emulate_pointer") {
                 *touch_emulate_pointer.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f64>>("touch_edge") {
+                if v.is_finite() {
+                    *touch_edge.borrow_mut() = v.clamp(0.0, 200.0);
+                }
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touch_hold_drag") {
+                *touch_hold_drag.borrow_mut() = v;
             }
             // Долгое нажатие. Потолок в три секунды — не вкус: столько человек
             // держит палец, не понимая, случилось ли что-нибудь, а нижняя
@@ -1598,8 +1938,28 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("touchpad_edge_only_drag") {
                 автодовод.borrow_mut().только_при_тяге = v;
             }
+            // Тап и клик тачпада (libinput). Option<bool> — см. грабля с
+            // отсутствующими булевыми ключами: голый bool дал бы Ok(false).
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touchpad_tap") {
+                тачпад.borrow_mut().тап = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touchpad_tap_drag") {
+                тачпад.borrow_mut().тап_тяга = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touchpad_clickfinger") {
+                тачпад.borrow_mut().клик_пальцами = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touchpad_natural_scroll") {
+                тачпад.borrow_mut().естественная_прокрутка = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<bool>>("touchpad_dwt") {
+                тачпад.borrow_mut().глушить_при_наборе = v;
+            }
             if let Ok(v) = tbl.get::<f64>("pan_drift") {
                 *pan_drift.borrow_mut() = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.5 };
+            }
+            if let Ok(v) = tbl.get::<f64>("edge_pan") {
+                *edge_pan.borrow_mut() = if v.is_finite() { v.clamp(0.0, 20000.0) } else { 1400.0 };
             }
             if let Ok(v) = tbl.get::<f64>("fling_distance") {
                 *fling_distance.borrow_mut() = if v.is_finite() { v.clamp(0.0, 8.0) } else { 1.0 };
@@ -1670,6 +2030,16 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             Ok(())
         })?;
         lua.globals().set("bar", bar_fn)?;
+    }
+    {
+        // dock{} — панель приложений (см. dock.rs). Ключи накладываются
+        // поверх прежних: два вызова dock{} в файле складываются, как bar{}.
+        let dock_cfg = dock_cfg.clone();
+        let dock_fn = lua.create_function(move |_, tbl: Table| {
+            crate::dock::из_lua(&mut dock_cfg.borrow_mut(), &tbl);
+            Ok(())
+        })?;
+        lua.globals().set("dock", dock_fn)?;
     }
     {
         // anim{} — длительности движений поимённо, в миллисекундах.
@@ -1845,6 +2215,23 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         lua.globals().set("vr", vr_fn)?;
     }
     {
+        // cam{} — ВЫРЕЗАННАЯ настройка (жесты рукой в вебку, убраны 14.09.2026).
+        //
+        // Заглушка, а не пустое место, и это не косметика: Lua падает на вызове
+        // неизвестной глобали, а `config.lua` читается ОДНИМ куском — то есть
+        // один осиротевший `cam{}` на 569-й строке отменял ВСЁ, что стояло ниже
+        // (у Ярика это полсотни строк настроек, молча не применявшихся с
+        // 14.09). Ровно та же грабля, что в [[dawn-config-silent-fallback]].
+        // Отвечаем как `vr status` в сборке без фичи — строкой в логе.
+        let cam_fn = lua.create_function(move |_, _tbl: Table| {
+            tracing::warn!(
+                "plx/config: cam{{}} is gone (webcam gestures were removed) — the line is ignored"
+            );
+            Ok(())
+        })?;
+        lua.globals().set("cam", cam_fn)?;
+    }
+    {
         // monitor{} — конфигурация выхода: имя коннектора (DP-2, HDMI-A-1) или
         // модель из EDID. Режим ищется по width/height/refresh; если точного
         // нет — берётся ближайший по частоте среди подходящих по размеру.
@@ -1876,6 +2263,38 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             Ok(())
         })?;
         lua.globals().set("monitor", monitor_fn)?;
+    }
+
+    // ── window{} — правила окон и виджеты (см. `ПравилоОкна`) ────────────────
+    {
+        let window_rules = Rc::clone(&window_rules);
+        let window_fn = lua.create_function(move |_, tbl: Table| {
+            // Ключи читаем по одному: `tbl.get::<T>` на отсутствующем ключе
+            // отдаёт Err, а не None, и `unwrap_or` тут означал бы «ключа нет».
+            // Для чисел это важно: x = 0 и «x не задан» — разные вещи (та же
+            // грабля, что у monitor{ x = 0 }, см. MonitorConfig::layout_set).
+            let строка = |ключ: &str| -> Option<String> {
+                tbl.get::<String>(ключ).ok().filter(|s| !s.is_empty())
+            };
+            let число = |ключ: &str| -> Option<i32> { tbl.get::<i32>(ключ).ok() };
+            let правило = ПравилоОкна {
+                app_id: строка("app_id").or_else(|| строка("class")),
+                title: строка("title"),
+                widget: tbl.get::<bool>("widget").unwrap_or(false),
+                x: число("x"),
+                y: число("y"),
+                w: число("w").or_else(|| число("width")),
+                h: число("h").or_else(|| число("height")),
+                float: tbl.get::<bool>("float").unwrap_or(false),
+            };
+            if правило.app_id.is_none() && правило.title.is_none() {
+                tracing::warn!("plx/config: window{{}} without app_id/title — skipped");
+                return Ok(());
+            }
+            window_rules.borrow_mut().push(правило);
+            Ok(())
+        })?;
+        lua.globals().set("window", window_fn)?;
     }
 
     lua.load(source).exec()?;
@@ -2009,6 +2428,12 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             *touch_long_press.borrow(),
             if *touch_emulate_pointer.borrow() { ", pointer emulation" } else { "" },
         );
+        tracing::info!(
+            "plx/config: touch gestures: edges {} px, hold-drag={}, touch{{}} overrides: {}",
+            *touch_edge.borrow(),
+            *touch_hold_drag.borrow(),
+            touch_binds.borrow().len(),
+        );
     } else {
         tracing::info!("plx/config: touchscreen: off (wl_touch is not advertised)");
     }
@@ -2029,36 +2454,47 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         touch_long_press: *touch_long_press.borrow(),
         touch_tap_slop: *touch_tap_slop.borrow(),
         touch_emulate_pointer: *touch_emulate_pointer.borrow(),
+        touch_edge: *touch_edge.borrow(),
+        touch_hold_drag: *touch_hold_drag.borrow(),
+        touch_binds: touch_binds.borrow().clone(),
         автодовод: *автодовод.borrow(),
+        тачпад: *тачпад.borrow(),
         xkb: xkb_settings.borrow().clone(),
         bird_eye_key: *bird_eye_key.borrow(),
         dwindle: *dwindle_cfg.borrow(),
         bluetooth_autoconnect: *bt_autoconnect.borrow(),
         monitors: monitors.borrow().clone(),
+        window_rules: window_rules.borrow().clone(),
         vr: vr_cfg.borrow().clone(),
         mine: mine_cfg.borrow().clone(),
         cursor_size: *cursor_size.borrow(),
         cursor_client_max: *cursor_client_max.borrow(),
         anim_speed: *anim_speed.borrow(),
+        anim_bounce: *anim_bounce.borrow(),
         lang: *lang.borrow(),
         pan_drift: *pan_drift.borrow(),
+        edge_pan: *edge_pan.borrow(),
         fling_distance: *fling_distance.borrow(),
         infinite_wallpaper: *infinite_wallpaper.borrow(),
+        fullscreen_boost: *fullscreen_boost.borrow(),
         share_guest_all: *share_guest_all.borrow(),
         keyboard_grab_apps: keyboard_grab_apps.borrow().clone(),
-        glow: *glow.borrow(),
+        keymouse_block_apps: keymouse_block_apps.borrow().clone(),
+        dissolve: *dissolve.borrow(),
+        dissolve_mosaic: *dissolve_mosaic.borrow(),
         cube: *cube.borrow(),
         cube_faces: *cube_faces.borrow(),
         cube_focal: *cube_focal.borrow(),
         cube_fill: *cube_fill.borrow(),
         cube_shade: *cube_shade.borrow(),
         cube_switch: *cube_switch.borrow(),
-        sun: *sun.borrow(),
-        sun_size: *sun_size.borrow(),
-        sun_x: *sun_x.borrow(),
-        sun_y: *sun_y.borrow(),
-        sun_far: *sun_far.borrow(),
-        glow_width: *glow_width.borrow(),
+        carousel: *carousel.borrow(),
+        desk_carousel: *desk_carousel.borrow(),
+        cube_lift: *cube_lift.borrow(),
+        cube_lift_step: *cube_lift_step.borrow(),
+        cube_inertia: *cube_inertia.borrow(),
+        flip3d: *flip3d.borrow(),
+        screen_shader: screen_shader.borrow().clone(),
         bar_hide_pan: *bar_hide_pan.borrow(),
         preview_depth: *preview_depth.borrow(),
         fullscreen_anim: *fullscreen_anim.borrow(),
@@ -2074,20 +2510,21 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         intro: *intro.borrow(),
         notify_sound: notify_sound.borrow().clone(),
         notify_volume: *notify_volume.borrow(),
+        dock: dock_cfg.borrow().clone(),
     };
 
     // Ручки шейдеров разбираются в ОБЕИХ сборках: разбор к фиче отношения не
     // имеет, а `#[cfg]` вокруг десятка `tbl.get` дал бы «unknown key» там, где
     // ключ на самом деле известен. Но в plx-standard шейдеров нет вовсе (см.
-    // шейдеры_stub/), и молча съеденное `glow = 0.6` читается как поломка.
+    // шейдеры_stub/), и молча съеденное `dissolve = 8` читается как поломка.
     // Отвечаем тем же, чем `vr status` в сборке без шлема: этого нет В ЭТОЙ
     // сборке. Строка уходит в лог на каждое чтение конфигурации, в том числе
     // по Super+Shift+C, — ровно тогда, когда человек и подкручивает ручку.
     #[cfg(not(feature = "shaders"))]
     {
         let заданные: Vec<&str> = [
-            ("glow", result.glow > 0.0),
-            ("sun", result.sun > 0.0),
+            ("dissolve", result.dissolve > 0.0),
+            ("screen_shader", !result.screen_shader.is_empty()),
             ("cube", result.cube > 0.0),
         ]
         .into_iter()
@@ -2117,7 +2554,6 @@ impl Parallax {
             Spawn(cmd) => self.spawn(&cmd),
             Quit => {
                 tracing::info!("plx: quit");
-                crate::session::save(&self.tagged_windows);
                 // Флаг, а не только loop_signal: главный цикл в main.rs
                 // крутится вручную и сигнал не смотрит (см. state::ExitAction).
                 self.exit = Some(crate::state::ExitAction::Quit);
@@ -2125,7 +2561,6 @@ impl Parallax {
             }
             Restart => {
                 tracing::info!("plx: restart");
-                crate::session::save(&self.tagged_windows);
                 self.exit = Some(crate::state::ExitAction::Restart);
                 self.loop_signal.stop();
             }
@@ -2155,6 +2590,10 @@ impl Parallax {
                         // Float/Columns/Monocle → Tile (сборка)
                         self.gather_all_into_tiling();
                     }
+                } else if let Some(idx) = self.selection_glue_grid() {
+                    // Выделена целиком сетка склейки (Super+M) — Win+D её
+                    // распускает так же, как целое созвездие.
+                    self.dissolve_glue_grid(idx);
                 } else if self.selection_is_constellation() && !self.selection_is_torn() {
                     // Решает не картинка, а то, ТРОГАЛИ ли гроздь руками: целое
                     // созвездие нажатие разбирает, растащенное — собирает
@@ -2219,6 +2658,8 @@ impl Parallax {
                 }
             }
             ResizeFocused(dw, dh) => self.keyboard_resize_focused(dw, dh),
+            WindowTilt(yaw, pitch, roll) => self.наклонить_по_действию(yaw, pitch, roll),
+            WindowTiltReset => self.сбросить_наклон_по_действию(),
             // Super+1-9 double as camera-bookmark slots while bookmarks_mode
             // is on (Super+B) — same override the old hardcoded handler had.
             ViewTag(mask) => {
@@ -2288,6 +2729,7 @@ impl Parallax {
                 self.is_magnetism_enabled = !self.is_magnetism_enabled;
                 tracing::info!("plx: is_magnetism_enabled={}", self.is_magnetism_enabled);
             }
+            ToggleGlue => self.glue_toggle_or_grid(),
             ShareStart(порт) => self.раздача_по_команде(порт),
             ShareStop => self.раздача_закончить(),
             // Повторное нажатие НЕ выключает раздачу, а открывает панель
@@ -2296,6 +2738,14 @@ impl Parallax {
             // одного назойливого гостя было нельзя, не выгнав заодно всех
             // остальных. См. `share::Parallax::раздача_переключить`.
             ShareToggle(порт) => self.раздача_переключить(порт),
+            // ── Мышь и камера с клавиатуры (см. клавимышь.rs) ──────────────
+            PointerMove(dx, dy, шаг) => self.курсор_шаг(dx, dy, шаг),
+            PointerClick(кнопка) => self.курсор_клик(кнопка),
+            PointerDrag(кнопка) => self.курсор_держать(кнопка),
+            PointerScroll(гор, верт) => self.курсор_колесо(гор, верт),
+            PointerWarp(цель) => self.курсор_к(цель),
+            CameraPan(dx, dy) => self.камера_шаг(dx, dy),
+            CameraZoom(множитель) => self.камера_зум(множитель),
             ToggleFoldStack => self.toggle_fold_stack(),
             VtSwitch(vt) => {
                 tracing::info!("plx: VT switch → {}", vt);
@@ -2401,7 +2851,20 @@ impl Parallax {
             BluetoothMenu => self.bt_toggle_menu(),
             TrayMenu => self.tray_toggle(),
             WifiMenu => self.wifi_toggle_menu(),
+            TogglePin => self.toggle_pin_focused(),
+            DockToggle => self.dock_toggle(),
+            DockEdit => self.dock_edit_toggle(),
+            DockSettings => self.dock_settings_toggle(),
             AudioMenu => self.audio_toggle_menu(),
+            PowerMenu => self.питание_меню(),
+            Brightness(шаг) => self.питание_послать(crate::питание::Cmd::ЭкранШаг(шаг)),
+            KbdBacklight(0) => self.питание_послать(crate::питание::Cmd::КлавиатураКруг),
+            KbdBacklight(шаг) => {
+                let сейчас = self.питание.as_ref()
+                    .and_then(|п| п.снимок.клавиатура.as_ref())
+                    .map(|к| к.сейчас as i32).unwrap_or(0);
+                self.питание_послать(crate::питание::Cmd::Клавиатура((сейчас + шаг).max(0) as u32));
+            }
             BluetoothPower => {
                 let on = self.bt.as_ref().is_some_and(|b| b.snap.powered);
                 self.bt_send(crate::bluetooth::Cmd::Power(!on));
@@ -2500,11 +2963,19 @@ impl Parallax {
                 tracing::warn!("plx/config: failed to apply reloaded xkb config: {:?}", e);
             }
         }
+        // Место мода живёт всю сессию — раскладка обязана ехать и к нему.
+        if let Some(kb) = self.mine_место.as_ref().and_then(|м| м.get_keyboard()) {
+            if let Err(e) = kb.set_xkb_config(self, new_cfg.xkb_config()) {
+                tracing::warn!("plx/config: failed to apply reloaded xkb config to plx-mine: {:?}", e);
+            }
+        }
         tracing::info!("plx: config reloaded ({} binds)", new_cfg.bindings.len());
         // Инерция холста живёт в MomentumState, а не спрашивается у конфига на
         // каждый кадр — значит при перечитывании её надо переставить руками.
         self.momentum.drift = new_cfg.pan_drift;
         self.lua_config = new_cfg;
+        // Панель приложений: край, размер, состав — из свежего dock{}.
+        self.dock_apply_config();
         // Список раскладок мог смениться прямо сейчас — надпись в панели берёт
         // коды именно из конфига (см. Parallax::refresh_kb_layout).
         self.refresh_kb_layout();
@@ -2616,6 +3087,25 @@ mod tests {
     /// по умолчанию. Опечатка здесь не ломает ни сборку, ни запуск — настройка
     /// просто молча не применится, ровно как с именами действий.
     #[test]
+    /// Мышь с клавиатуры отдаётся играм списком, и Dota 2 в нём с самого начала.
+    ///
+    /// Проверка не про Lua, а про уговор: в Dota 2 Alt — игровой модификатор, и
+    /// стоит имени выпасть из умолчаний, «vim-режим» снова заберёт у игры
+    /// Alt+клик, а узнается это только внутри матча.
+    #[test]
+    fn мышь_с_клавиатуры_отдаётся_играм() {
+        let по_умолчанию = load_from_str(DEFAULT_CONFIG_LUA).unwrap();
+        assert_eq!(по_умолчанию.keymouse_block_apps, vec!["dota2".to_string()]);
+
+        let cfg = load_from_str(r#"set{ keymouse_block_apps = { "cs2", "Dota2" } }"#).unwrap();
+        assert_eq!(cfg.keymouse_block_apps, vec!["cs2".to_string(), "Dota2".to_string()]);
+
+        // Пустой список — законный выбор «пусть работает везде», а не описка.
+        let cfg = load_from_str("set{ keymouse_block_apps = {} }").unwrap();
+        assert!(cfg.keymouse_block_apps.is_empty());
+    }
+
+    #[test]
     fn ручки_анимации_разбираются() {
         let по_умолчанию = load_from_str(DEFAULT_CONFIG_LUA).unwrap();
         assert_eq!(по_умолчанию.anim_speed, 1.0);
@@ -2646,13 +3136,136 @@ mod tests {
         assert_eq!(cfg.fling_distance, 1.0);
     }
 
+    /// Мышь с клавиатуры: бинды по умолчанию действительно доходят до
+    /// действий, а не теряются на разборе.
+    ///
+    /// Проверять это тестом стоит по той же причине, что и остальные бинды:
+    /// незнакомое имя действия или ключа parallax пропускает С ПРЕДУПРЕЖДЕНИЕМ
+    /// в лог и работает дальше — в живом сеансе такая опечатка выглядит как
+    /// «клавиша просто ничего не делает», и искать её нечем.
+    #[test]
+    fn мышь_с_клавиатуры_разбирается() {
+        let cfg = load_from_str(DEFAULT_CONFIG_LUA).unwrap();
+        let alt = ModMask { ctrl: false, alt: true, shift: false, logo: false };
+        let alt_ctrl = ModMask { ctrl: true, alt: true, shift: false, logo: false };
+
+        // Движение: направление, шаг и точный шаг по Ctrl.
+        assert_eq!(
+            действие(&cfg, alt, xkb::keysyms::KEY_h),
+            "Some(PointerMove(-1.0, 0.0, 12.0))"
+        );
+        assert_eq!(
+            действие(&cfg, alt, xkb::keysyms::KEY_j),
+            "Some(PointerMove(0.0, 1.0, 12.0))"
+        );
+        assert_eq!(
+            действие(&cfg, alt_ctrl, xkb::keysyms::KEY_k),
+            "Some(PointerMove(0.0, -1.0, 1.0))"
+        );
+
+        // Кнопки: имя разбирается в evdev-код, а не в «что-нибудь».
+        assert_eq!(
+            действие(&cfg, alt, xkb::keysyms::KEY_Return),
+            format!("Some(PointerClick({}))", crate::synth::КНОПКА_ЛКМ)
+        );
+        assert_eq!(
+            действие(&cfg, alt_ctrl, xkb::keysyms::KEY_Return),
+            format!("Some(PointerClick({}))", crate::synth::КНОПКА_ПКМ)
+        );
+        assert_eq!(
+            действие(&cfg, alt, xkb::keysyms::KEY_m),
+            format!("Some(PointerClick({}))", crate::synth::КНОПКА_СКМ)
+        );
+        assert_eq!(
+            действие(&cfg, alt, xkb::keysyms::KEY_space),
+            format!("Some(PointerDrag({}))", crate::synth::КНОПКА_ЛКМ)
+        );
+
+        // Колесо, телепорт курсора и камера.
+        assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_e), "Some(PointerScroll(0.0, 1.0))");
+        assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_y), "Some(PointerScroll(0.0, -1.0))");
+        assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_w), "Some(PointerWarp(Окно))");
+        assert_eq!(действие(&cfg, alt_ctrl, xkb::keysyms::KEY_w), "Some(PointerWarp(Экран))");
+        assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_t), "Some(PointerWarp(Панель))");
+        assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_Left), "Some(CameraPan(-1.0, 0.0))");
+        assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_equal), "Some(CameraZoom(1.1))");
+        // `reset = true` — это ноль множителя, то есть «вернуть 1:1».
+        assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_0), "Some(CameraZoom(0.0))");
+
+        // Вимовская навигация по окнам рядом со стрелками.
+        let logo = ModMask { ctrl: false, alt: false, shift: false, logo: true };
+        assert_eq!(действие(&cfg, logo, xkb::keysyms::KEY_h), "Some(FocusDirection(-1, 0))");
+        assert_eq!(действие(&cfg, logo, xkb::keysyms::KEY_l), "Some(FocusDirection(1, 0))");
+    }
+
+    /// Ни один бинд не висит на `alt+shift`, пока в `xkb{}` стоит
+    /// `grp:alt_shift_toggle`.
+    ///
+    /// Это не вкусовщина, а замер: Alt+Shift — переключение раскладки, и xkb
+    /// съедает Shift такой комбинации ДО того, как parallax смотрит бинды (на
+    /// харнессе при зажатом Alt нажатие Shift оставляет `shift=false`). Бинд
+    /// на alt+shift поэтому не сработает никогда, а нажатие ещё и перекинет
+    /// раскладку — то есть «работает через раз и не то». Сюда однажды уже
+    /// уехали быстрый шаг курсора, правый клик и телепорт в центр экрана.
+    #[test]
+    fn на_alt_shift_биндов_нет_пока_на_нём_раскладка() {
+        let cfg = load_from_str(DEFAULT_CONFIG_LUA).unwrap();
+        let переключатель = cfg
+            .xkb
+            .options
+            .as_deref()
+            .is_some_and(|о| о.contains("alt_shift_toggle"));
+        assert!(переключатель, "в умолчаниях больше нет grp:alt_shift_toggle — тест пора менять");
+        let мёртвые: Vec<u32> = cfg
+            .bindings
+            .iter()
+            .filter(|b| b.mods.alt && b.mods.shift)
+            .map(|b| b.keysym)
+            .collect();
+        assert!(
+            мёртвые.is_empty(),
+            "бинды на alt+shift не сработают (раскладка съедает Shift): keysym'ы {мёртвые:?}"
+        );
+    }
+
+    /// Незнакомая кнопка или цель телепорта НЕ заводит бинд.
+    ///
+    /// Молча подставить левую кнопку было бы хуже опечатки: «нажимается не та
+    /// кнопка» ищут дольше, чем «клавиша не работает», — и то же самое у
+    /// `pointer_warp` с целью, которой нет.
+    #[test]
+    fn кривая_кнопка_мыши_не_заводит_бинд() {
+        let alt = ModMask { ctrl: false, alt: true, shift: false, logo: false };
+        let cfg = load_from_str(
+            r#"bind{ mods = "alt", key = "F5", action = "pointer_click", button = "четвёртая" }"#,
+        )
+        .unwrap();
+        assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_F5), "None");
+
+        let cfg = load_from_str(
+            r#"bind{ mods = "alt", key = "F5", action = "pointer_warp", to = "куда-нибудь" }"#,
+        )
+        .unwrap();
+        assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_F5), "None");
+
+        // А без поля `button` кнопка левая — это умолчание, а не ошибка.
+        let cfg =
+            load_from_str(r#"bind{ mods = "alt", key = "F5", action = "pointer_click" }"#).unwrap();
+        assert_eq!(
+            действие(&cfg, alt, xkb::keysyms::KEY_F5),
+            format!("Some(PointerClick({}))", crate::synth::КНОПКА_ЛКМ)
+        );
+    }
+
     #[test]
     fn alt_tab_перебирает_стопку() {
         let cfg = load_from_str(DEFAULT_CONFIG_LUA).unwrap();
         let alt = ModMask { ctrl: false, alt: true, shift: false, logo: false };
-        let alt_shift = ModMask { ctrl: false, alt: true, shift: true, logo: false };
+        // Назад — Ctrl, а не Shift: Alt+Shift занят переключением раскладки и
+        // до биндов не доходит (см. `на_alt_shift_биндов_нет_пока_на_нём_раскладка`).
+        let alt_ctrl = ModMask { ctrl: true, alt: true, shift: false, logo: false };
         assert_eq!(действие(&cfg, alt, xkb::keysyms::KEY_Tab), "Some(CycleStack(1))");
-        assert_eq!(действие(&cfg, alt_shift, xkb::keysyms::KEY_Tab), "Some(CycleStack(-1))");
+        assert_eq!(действие(&cfg, alt_ctrl, xkb::keysyms::KEY_Tab), "Some(CycleStack(-1))");
     }
 
     /// Снимок экрана и история буфера (12.08.2026). Проверяем ровно то, что на
@@ -2666,7 +3279,9 @@ mod tests {
         let logo_ctrl = ModMask { ctrl: true, alt: false, shift: false, logo: true };
         assert_eq!(
             действие(&cfg, без, xkb::keysyms::KEY_Print),
-            r#"Some(Spawn("grim - | wl-copy"))"#,
+            // С 26.09.2026 — встроенные «Ножницы» (snip.rs): grim падал, у
+            // parallax нет wlr-screencopy.
+            "Some(Screenshot)",
         );
         assert!(
             действие(&cfg, logo, xkb::keysyms::KEY_c).contains("cliphist"),

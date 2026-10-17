@@ -36,7 +36,7 @@ use smithay::{
     },
     xwayland::{
         X11Surface, X11Wm, XWayland, XWaylandEvent, XwmHandler,
-        xwm::{Reorder, ResizeEdge as X11ResizeEdge, XwmId},
+        xwm::{Reorder, ResizeEdge as X11ResizeEdge, WmWindowProperty, XwmId},
     },
 };
 
@@ -300,15 +300,75 @@ impl Parallax {
 
 }
 
-impl XwmHandler for Parallax {
-    fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
-        self.xwm.as_mut().unwrap()
-    }
+/// Страховка для свёрнутого при появлении окна, которое так и не попросило
+/// Normal: показываем его сами. Wine такой Normal примет как «unexpected» и
+/// развернёт окно (SC_RESTORE) — сворачивания у parallax всё равно нет.
+///
+/// Срок длинный нарочно. Поток Wine, создавший окно игры, сразу уходит в
+/// инициализацию D3D и X-события не читает секундами; WM_STATE он читает
+/// не из события, а заново с сервера. При 1.5 с наш Normal ложился поверх
+/// Iconic раньше, чем Wine доходил до очереди, оба PropertyNotify читали 0x1 —
+/// и MK X снова оставался без клавиатуры. Wine сам попросит Normal через
+/// WM_HINTS, как только увидит Iconic, так что страховка нужна только прочим
+/// клиентам, стартующим свёрнутыми.
+const ICONIC_FALLBACK: std::time::Duration = std::time::Duration::from_secs(15);
+/// Пауза между новыми WM_HINTS и нашим WM_STATE = Normal (см. `property_notify`).
+const ICONIC_RESTORE_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
-    fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
-    fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+/// Клиент мапит окно свёрнутым: WM_HINTS initial_state = Iconic.
+fn starts_iconic(surface: &X11Surface) -> bool {
+    use smithay::reexports::x11rb::properties::WmHintsState;
+    surface
+        .hints()
+        .and_then(|h| h.initial_state)
+        .is_some_and(|s| matches!(s, WmHintsState::Iconic))
+}
 
-    fn map_window_request(&mut self, _xwm: XwmId, surface: X11Surface) {
+/// Вывести свёрнутое окно на экран через `delay`. Повторный вызов для того же
+/// окна безвреден: показывает только первый сработавший таймер.
+fn show_iconic_later(state: &mut Parallax, surface: X11Surface, delay: std::time::Duration) {
+    use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+    let _ = state.петля.insert_source(Timer::from_duration(delay), move |_, _, state| {
+        if let Some(i) = state.x11_iconic.iter().position(|s| *s == surface) {
+            state.x11_iconic.swap_remove(i);
+            if surface.alive() {
+                tracing::info!(
+                    "plx/xwayland: iconic window {:?} shown after {:?}",
+                    surface.window_id(),
+                    delay
+                );
+                state.map_x11(surface.clone());
+            }
+        }
+        TimeoutAction::Drop
+    });
+}
+
+/// Снятое с экрана окно — WM_STATE = Withdrawn (ICCCM 4.1.4: свойство стирает WM).
+///
+/// smithay при unmap сам WM_STATE не трогает, а наш `set_mapped(false)` после
+/// него уже ничего не пишет — фрейма нет. Оставался Iconic. Wine разворачивает
+/// свёрнутое окно через «снять и показать заново» (обход Mutter): шлёт unmap и
+/// ждёт WM_STATE 0x3 → 0, только потом мапит. Не дождавшись, не мапит вовсе —
+/// MK X после ответа Iconic так и не появлялся на экране.
+///
+/// Соединение XWM у smithay наружу не отдаётся, пишем своим (`icons.rs`).
+fn withdraw_wm_state(window: u32) {
+    use smithay::reexports::x11rb::{connection::Connection as _, protocol::xproto::ConnectionExt as _};
+    static WM_STATE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let Some((conn, _)) = crate::icons::x11_связь() else { return };
+    let Some(atom) = *WM_STATE.get_or_init(|| {
+        conn.intern_atom(false, b"WM_STATE").ok()?.reply().ok().map(|r| r.atom)
+    }) else {
+        return;
+    };
+    let _ = conn.delete_property(window, atom);
+    let _ = conn.flush();
+}
+
+impl Parallax {
+    /// Вывести X11-окно на экран: WM_STATE = Normal, кадр замаплен, окно в раскладке.
+    fn map_x11(&mut self, surface: X11Surface) {
         if let Err(err) = surface.set_mapped(true) {
             tracing::warn!("plx/xwayland: set_mapped: {}", err);
             return;
@@ -331,6 +391,75 @@ impl XwmHandler for Parallax {
         xwin::set_size(&window, Some(size), xwin::Tiled::Keep);
         self.insert_new_window(window, size, floating);
     }
+}
+
+impl XwmHandler for Parallax {
+    fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
+        self.xwm.as_mut().unwrap()
+    }
+
+    fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    fn map_window_request(&mut self, _xwm: XwmId, surface: X11Surface) {
+        // Окно просится на экран СВЁРНУТЫМ (WM_HINTS initial_state = Iconic).
+        // Так делает Wine с играми, создающими главное окно минимизированным
+        // (Mortal Kombat X): он ставит запрос WithdrawnState → IconicState и ждёт
+        // в ответ ровно WM_STATE = Iconic. Ответ Normal он отбрасывает как
+        // «transient» (обход Mutter), и пока ответа нет, все прочие запросы
+        // состояния копятся, а WM_TAKE_FOCUS игнорируется «during WM_STATE
+        // change» — навсегда. Окно рисуется, но клавиатура в игру не идёт.
+        //
+        // Сворачивания у parallax нет, поэтому подтверждаем Iconic и показываем
+        // окно, как только клиент ответит (см. `property_notify`), — либо по
+        // страховке, если не ответит.
+        if starts_iconic(&surface) && !self.x11_iconic.contains(&surface) {
+            if let Err(err) = surface.set_mapped(false) {
+                tracing::warn!("plx/xwayland: set_mapped(false): {}", err);
+            } else {
+                tracing::info!(
+                    "plx/xwayland: window {:?} maps iconic, answering WM_STATE=Iconic",
+                    surface.window_id()
+                );
+                self.x11_iconic.push(surface.clone());
+                show_iconic_later(self, surface, ICONIC_FALLBACK);
+                return;
+            }
+        }
+        self.map_x11(surface);
+    }
+
+    /// Свёрнутое при появлении окно ответило на наш IconicState: Wine
+    /// переписывает WM_HINTS (initial_state = Normal) ровно тогда, когда
+    /// хочет окно развернуть. Отвечаем не сразу — свой XMapWindow Wine шлёт
+    /// следом за подсказками, и наш WM_STATE должен прийти к нему позже этого
+    /// запроса, иначе он сочтёт ответ старым.
+    fn property_notify(&mut self, _xwm: XwmId, surface: X11Surface, property: WmWindowProperty) {
+        if property == WmWindowProperty::Hints
+            && self.x11_iconic.contains(&surface)
+            && !starts_iconic(&surface)
+        {
+            show_iconic_later(self, surface, ICONIC_RESTORE_DELAY);
+        }
+    }
+
+    fn unmapped_window(&mut self, _xwm: XwmId, surface: X11Surface) {
+        self.x11_iconic.retain(|s| *s != surface);
+        if let Some(window) = self.window_for_x11(&surface) {
+            self.forget_window(&window);
+        }
+        if !surface.is_override_redirect() {
+            let _ = surface.set_mapped(false);
+            withdraw_wm_state(surface.window_id());
+        }
+    }
+
+    fn destroyed_window(&mut self, _xwm: XwmId, surface: X11Surface) {
+        self.x11_iconic.retain(|s| *s != surface);
+        if let Some(window) = self.window_for_x11(&surface) {
+            self.forget_window(&window);
+        }
+    }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, surface: X11Surface) {
         // Меню, тултипы, drag-иконки: позицию выбрал клиент в корневых
@@ -350,20 +479,6 @@ impl XwmHandler for Parallax {
         self.request_redraw();
     }
 
-    fn unmapped_window(&mut self, _xwm: XwmId, surface: X11Surface) {
-        if let Some(window) = self.window_for_x11(&surface) {
-            self.forget_window(&window);
-        }
-        if !surface.is_override_redirect() {
-            let _ = surface.set_mapped(false);
-        }
-    }
-
-    fn destroyed_window(&mut self, _xwm: XwmId, surface: X11Surface) {
-        if let Some(window) = self.window_for_x11(&surface) {
-            self.forget_window(&window);
-        }
-    }
 
     /// X11-клиент просит полный экран (_NET_WM_STATE_FULLSCREEN): игры,
     /// видеоплееры, полноэкранный режим браузера. Тот же путь, что и F11.
@@ -450,7 +565,9 @@ impl XwmHandler for Parallax {
             return;
         };
         self.freeze_window_anim(&window);
-        let grab = ResizeSurfaceGrab::start(start_data, window, x11_edges(edges), geo, Vec::new());
+        let edge = x11_edges(edges);
+        let glue = self.glue_cluster_snapshot_for_resize(&window, edge);
+        let grab = ResizeSurfaceGrab::start(start_data, window, edge, geo, Vec::new(), glue);
         pointer.set_grab(self, grab, SERIAL_COUNTER.next_serial(), Focus::Clear);
     }
 

@@ -406,6 +406,68 @@ pub fn довод(пальцы: &[Палец], н: &Автодовод) -> (f64,
     (dx * dx.abs() * н.скорость, dy * dy.abs() * н.скорость)
 }
 
+// ── Настройки libinput ───────────────────────────────────────────────────────
+
+/// Как libinput обращается с тачпадом: тап, клик, прокрутка.
+///
+/// До 29.09.2026 parallax устройства не настраивал вовсе, и тачпад жил на
+/// умолчаниях libinput, а они на ноутбуке неудобные: **тап-клик выключен**,
+/// а правая кнопка — только нажатием в правом нижнем углу накладки
+/// (`button-areas`). Снаружи это выглядело как «тапы и клики не всегда
+/// распознаются» (замер `libinput list-devices`, ELAN067B).
+#[derive(Clone, Copy, Debug)]
+pub struct НастройкиТачпада {
+    /// `touchpad_tap`: тап = клик (1 палец ЛКМ, 2 ПКМ, 3 средняя).
+    pub тап: bool,
+    /// `touchpad_tap_drag`: тап и сразу повести — перетаскивание.
+    pub тап_тяга: bool,
+    /// `touchpad_clickfinger`: нажатие накладки считает пальцы (2 = ПКМ)
+    /// вместо зон в нижних углах.
+    pub клик_пальцами: bool,
+    /// `touchpad_natural_scroll`: прокрутка «как на телефоне».
+    pub естественная_прокрутка: bool,
+    /// `touchpad_dwt`: глушить тачпад, пока печатают.
+    pub глушить_при_наборе: bool,
+}
+
+impl Default for НастройкиТачпада {
+    fn default() -> Self {
+        Self {
+            тап: true,
+            тап_тяга: true,
+            клик_пальцами: true,
+            естественная_прокрутка: false,
+            глушить_при_наборе: true,
+        }
+    }
+}
+
+/// Применить настройки к устройству libinput. Всё, что не тачпад (нет тапа),
+/// пропускается: мышь и клавиатуру это не касается.
+pub fn настроить(устройство: &mut smithay::reexports::input::Device, н: &НастройкиТачпада) {
+    if устройство.config_tap_finger_count() == 0 {
+        return;
+    }
+    let _ = устройство.config_tap_set_enabled(н.тап);
+    let _ = устройство.config_tap_set_button_map(smithay::reexports::input::TapButtonMap::LeftRightMiddle);
+    let _ = устройство.config_tap_set_drag_enabled(н.тап_тяга);
+    let метод = if н.клик_пальцами {
+        smithay::reexports::input::ClickMethod::Clickfinger
+    } else {
+        smithay::reexports::input::ClickMethod::ButtonAreas
+    };
+    if устройство.config_click_methods().contains(&метод) {
+        let _ = устройство.config_click_set_method(метод);
+    }
+    if устройство.config_scroll_has_natural_scroll() {
+        let _ = устройство.config_scroll_set_natural_scroll_enabled(н.естественная_прокрутка);
+    }
+    if устройство.config_dwt_is_available() {
+        let _ = устройство.config_dwt_set_enabled(н.глушить_при_наборе);
+    }
+    tracing::info!("plx/touchpad: libinput config for {:?}: {:?}", устройство.name(), н);
+}
+
 // ── Привод ───────────────────────────────────────────────────────────────────
 
 use crate::Parallax;

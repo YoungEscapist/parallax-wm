@@ -48,6 +48,22 @@ impl CompositorHandler for Parallax {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
+        // Первый буфер окна — пустить часы анимации открытия (см.
+        // `anim::OpenAnim::ждёт_кадра`). Ищем по всему списку, а не по space:
+        // окно, открытое на скрытом столе, тоже обязано дождаться своего кадра.
+        if self.window_open_anims.iter().any(|(_, a)| a.ждёт_кадра) {
+            let есть_буфер = smithay::backend::renderer::utils::with_renderer_surface_state(
+                surface, |s| s.buffer().is_some(),
+            ).unwrap_or(false);
+            if есть_буфер {
+                for (w, a) in self.window_open_anims.iter_mut() {
+                    if a.ждёт_кадра && crate::xwin::is_surface(w, surface) {
+                        a.пустить();
+                    }
+                }
+            }
+        }
+
         if let Some(window) = self
             .space
             .elements()

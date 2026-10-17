@@ -98,18 +98,13 @@ dragging — the wheel pulls it closer, a click on a face flies to that workspac
 - Hovering a window chip shows a live preview of where that window is.
 - Rounded corners, drop shadows, optional background blur behind the bar,
   shelf, menus and preview cards.
-- Windows can be rim-lit in the wallpaper's own colour: a shader traces the
-  window edge with the accent colour Parallax reads from the palette plx-wall
-  computes for the current wallpaper, so the desktop re-tints itself whenever
-  the wallpaper changes. It fades out on bright wallpapers, where a coloured
-  rim reads as grime, and the focused window glows twice as bright as the rest
-  (`set{ glow = 0.6 }`, `plx-extra` only).
-- A light that stands on the canvas rather than on the screen, lit from the same
-  wallpaper colour: it pools softly over the wallpaper, the side of a window
-  facing it is brighter and the far side falls into shade, and a window's shadow
-  falls away from the light instead of always downwards. On a plane without
-  edges it doubles as a landmark — you can tell where you are by where the light
-  is (`set{ sun = 0.6 }`, `plx-extra` only).
+- Windows can open and close by pixel dissolve: the window tears into ragged
+  blots cut into square cells (`set{ dissolve = 8 }`, `plx-extra` only).
+- A screen shader: your own GLSL over the whole frame, in Hyprland's format
+  (`tex`, `v_texcoord`, `time`, `wl_output_resolution`), so foreign shaders work
+  unedited and the file is re-read as you save it
+  (`set{ screen_shader = "~/.config/parallax/shaders/haze.frag" }`, `plx-extra`
+  only; `dist/shaders/haze.frag` is a soft haze with bloom and matte blacks).
 - A quiet entrance: at startup the canvas eases out of the dark to its own zoom
   while the bar arrives from above (`set{ intro = false }` to skip it).
 - A short, unobtrusive tone on every notification. Parallax hears notifications
@@ -143,6 +138,21 @@ dragging — the wheel pulls it closer, a click on a face flies to that workspac
   the finger works as the pointer; on empty canvas it drives the camera — one
   finger pans, two pinch-zoom, three or more run the same `gesture{}` table the
   touchpad uses. A finger held still is the right button.
+- **Desktop icons** live on the wallpaper, on the canvas itself: a left click
+  launches, a drag moves (saved the moment you let go), a right click opens
+  their properties — name, image, command, size — and a right click on bare
+  desktop offers a new icon right there. The image is looked up as a file path
+  first, then as an icon name in the theme, then as an app_id through its
+  `.desktop`, so `firefox` alone is enough. They live in
+  `~/.local/state/parallax/icons.json` and can be laid out from a script with
+  `plx ctl icon add`.
+- **Widgets, the model from [driftwm](https://github.com/malbiruk/driftwm)**: a
+  window rule, not a separate kind of surface. `window{ app_id = "conky",
+  widget = true, x = 40, y = 80 }` pins that window to the canvas — it cannot be
+  dragged by hand, gesture or bind, it lies below ordinary windows, and it drops
+  out of Super+Tab, directional focus, the Super+F search and the taskbar chips.
+  Any client works, and `plx ctl widget on|off|move` lets you place one live
+  instead of guessing coordinates.
 - Configuration is Lua, reloaded live with `Super+Shift+C`.
 
 ## Installing
@@ -217,12 +227,12 @@ both.
 | VR headset (`vr`) | — | yes |
 | windows inside Minecraft (`mine`) | — | yes |
 | multi-user desktop sharing (`share`) | — | yes |
-| window glow, canvas light, desktop cube (`shaders`) | — | yes |
+| window dissolve, screen shader, desktop cube (`shaders`) | — | yes |
 
 `plx-standard` is about 0.9 MiB smaller and does not link OpenXR. With the
 optional parts off, their commands answer plainly — `vr status` says the
 feature is not in this build rather than failing in some obscure way, and a
-`glow`, `sun` or `cube` left in the config is read like any other setting and
+`dissolve`, `screen_shader` or `cube` left in the config is read like any other setting and
 answered in the log with a line saying this build has no shaders.
 
 `shaders` is not there to save bytes — it adds no dependency and barely any
@@ -296,8 +306,8 @@ xkb{ layout = "us,ru" }                       -- keyboard layouts, Ctrl+Space to
 bind{ mods = "super", key = "Return",         -- your terminal
       action = "spawn", cmd = "ghostty" }
 set{ blur = true }                            -- frosted glass behind the bar
-set{ glow = 0.6 }                             -- rim-lit windows (plx-extra)
-set{ sun = 0.6 }                              -- a light standing on the canvas (plx-extra)
+set{ dissolve = 8 }                           -- windows open/close by pixel dissolve (plx-extra)
+set{ screen_shader = "~/.config/parallax/shaders/haze.frag" } -- your shader over the frame (plx-extra)
 set{ cube = 0.6 }                             -- workspaces on a cube (plx-extra)
 set{ anim_speed = 1.0 }                       -- tempo of every animation
 set{ infinite_wallpaper = true }              -- wallpaper rides the canvas
@@ -354,7 +364,9 @@ naming are [Smithay](https://github.com/Smithay/smithay) (MIT), the dwindle
 algorithm ported from [Hyprland](https://github.com/hyprwm/Hyprland)
 (BSD-3-Clause), the gesture model from
 [driftwm](https://github.com/malbiruk/driftwm) (GPL-3.0), the mouse-chord model
-from [hevel](https://git.sr.ht/~dlm/hevel) (ISC), the bundled Nunito
+from [hevel](https://git.sr.ht/~dlm/hevel) (ISC), the hand-gesture networks
+from [hand-gesture-recognition-mediapipe](https://github.com/kinivi/hand-gesture-recognition-mediapipe)
+(Apache-2.0), the bundled Nunito
 font (SIL OFL, text in [assets/Nunito-OFL.txt](assets/Nunito-OFL.txt)) and the
 notification tones from [akx/Notifications](https://github.com/akx/Notifications)
 (CC0).

@@ -297,7 +297,10 @@ fn прочитать_png(путь: &Path, цель: u32) -> Option<Icon> {
     if sw == 0 || sh == 0 || sw > 2048 || sh > 2048 {
         return None;
     }
-    let цвет = инфо.color_type;
+    // Цвет — ПОСЛЕ преобразований, а не тот, что в файле: палитровый PNG
+    // (`Indexed`, так сохранён значок minewire) развёртывается в Rgb/Rgba, и
+    // сверка с исходным типом отказывала ему целиком — вместо значка буква.
+    let (цвет, _) = чтение.output_color_type();
     let mut буфер = vec![0u8; чтение.output_buffer_size()?];
     let кадр = чтение.next_frame(&mut буфер).ok()?;
     let байт = кадр.buffer_size() / (sw as usize * sh as usize);
@@ -361,6 +364,20 @@ fn прочитать_svg(путь: &Path, цель: u32) -> Option<Icon> {
     Some(Icon { w: w as i32, h: h as i32, rgba: холст.take() })
 }
 
+/// Картинка ПО ПУТИ к файлу — png или svg, по расширению. `None` — файла нет
+/// или он не разобрался.
+///
+/// Отдельно от `найти` (та ищет по имени в теме) потому, что иконкам рабочего
+/// стола человек указывает свой файл: снимок, вырезанный логотип, картинку из
+/// загрузок. В теме такого нет и быть не может.
+pub fn прочитать_файл(путь: &Path, цель: u32) -> Option<Icon> {
+    if !путь.is_file() {
+        return None;
+    }
+    let вектор = путь.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+    if вектор { прочитать_svg(путь, цель) } else { прочитать_png(путь, цель) }
+}
+
 /// Значок по имени из темы. `None` — не нашёлся или не разобрался.
 pub fn найти(имя: &str, цель: u32) -> Option<Icon> {
     let путь = путь_значка(имя, цель)?;
@@ -419,7 +436,7 @@ pub fn имя_значка_приложения(app_id: &str) -> Option<String> 
 /// Заводится один раз и живёт до конца сеанса; `DISPLAY` к моменту первого
 /// окна уже выставлен (`xwayland.rs`). Ошибку соединения запоминаем как
 /// «нет X11» — повторять попытку на каждое окно незачем.
-fn x11_связь() -> Option<&'static (
+pub(crate) fn x11_связь() -> Option<&'static (
     smithay::reexports::x11rb::rust_connection::RustConnection,
     u32,
 )> {
@@ -469,7 +486,6 @@ pub fn значок_окна_x11(окно: u32, цель: u32) -> Option<Icon> {
 /// сокета и есть pid этого окна. У Wayland-клиентов то же берётся из
 /// `wl_client`, а у Xwayland — только отсюда: с точки зрения Wayland все
 /// X11-окна принадлежат одному процессу, самому Xwayland.
-#[cfg(feature = "mine")]
 pub fn pid_окна_x11(окно: u32) -> Option<u32> {
     use smithay::reexports::x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
     let (conn, _) = x11_связь()?;
@@ -528,7 +544,7 @@ fn разобрать_net_wm_icon(данные: &[u32], цель: u32) -> Option
 }
 
 /// Каталоги с .desktop-файлами: свои раньше системных.
-fn базы_каталогов() -> Vec<PathBuf> {
+pub(crate) fn базы_каталогов() -> Vec<PathBuf> {
     let mut базы: Vec<PathBuf> = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
         базы.push(PathBuf::from(&home).join(".local/share/applications"));

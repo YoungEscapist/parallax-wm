@@ -256,6 +256,9 @@ impl Parallax {
             // Искать в игре саму игру нечего: выбрать её значит отдать фокус
             // окну, которое человек и так видит вокруг себя.
             .filter(|tw| crate::mine::в_переборе(self, &tw.window))
+            // Виджеты ищут не так: часы на обоях человек видит глазами, а в
+            // выдаче они только мешали бы (см. виджеты.rs).
+            .filter(|tw| !tw.виджет)
             .filter_map(|tw| {
                 let app = crate::xwin::app_id(&tw.window).unwrap_or_default();
                 let title = crate::xwin::title(&tw.window)

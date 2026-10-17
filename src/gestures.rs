@@ -330,7 +330,7 @@ impl Parallax {
 
     /// Под курсором окно?
     fn под_курсором_окно(&self) -> bool {
-        self.space.element_under(self.pointer_location).is_some()
+        self.окно_под(self.pointer_location).is_some()
     }
 
     /// Начало жеста. `false` — в таблице ничего нет, пусть работают прежние ветки.
@@ -421,10 +421,15 @@ impl Parallax {
         let точка = self.pointer_location;
         match н {
             Непрерывное::ВестиОкно | Непрерывное::ВестиСоСнапом => {
-                self.gesture_move_window = self.space.element_under(точка).map(|(w, _)| w.clone());
+                // Виджет жестом тоже не двигается: прибит — значит прибит
+                // (см. виджеты.rs).
+                self.gesture_move_window = self
+                    .окно_под(точка)
+                    .map(|(w, _)| w)
+                    .filter(|w| !self.виджет_ли(w));
             }
             Непрерывное::РазмерОкна | Непрерывное::РазмерСоСнапом => {
-                let окно = self.space.element_under(точка).map(|(w, _)| w.clone());
+                let окно = self.окно_под(точка).map(|(w, _)| w);
                 self.gesture_resize_window = окно.clone();
                 if let Some(окно) = окно {
                     // Из тайлинга вытаскиваем во float: иначе `arrange` вернёт
@@ -481,6 +486,12 @@ impl Parallax {
         let порог_отработал = идёт.порог_отработал;
 
         if let Some(н) = непрерывное {
+            // Пан из таблицы (тачпад и сенсор) под тем же гейтом раскладки,
+            // что встроенный: в Tile и Columns жест съедается. Мышиный аккорд
+            // зовёт `применить_непрерывное` напрямую и гейта не видит.
+            if н == Непрерывное::ПанВида && !self.touchpad_camera_allowed() {
+                return true;
+            }
             self.применить_непрерывное(н, dx, dy, время);
             return true;
         }
@@ -787,6 +798,7 @@ impl Parallax {
             ));
             crate::xwin::set_size(&окно, Some(новый), crate::xwin::Tiled::Keep);
             crate::xwin::configure(&окно);
+            self.отметить_живой_размер(&окно);
             if !двигать_x && !двигать_y {
                 continue;
             }

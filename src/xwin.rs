@@ -263,6 +263,22 @@ pub fn requested_size(window: &Window) -> Option<Size<i32, Logical>> {
     }
 }
 
+/// Какого размера окно ВИДНО на экране: меньшее из «что клиент нарисовал» и
+/// «что у него запросили». Одна точка правды для всех, кто должен совпасть с
+/// нарисованной рамкой окна: тень и свечение (udev::window_screen_rect) и —
+/// с 10.09.2026 — хит-тест (Parallax::окно_под).
+///
+/// Клиент со своим внутренним минимумом (Electron, GTK) на configure меньше
+/// минимума отвечает старым размером, и рендер режет его буфер по запросу
+/// (udev.rs, "нужен_кроп"). Всё, что считает окно по `geometry()`, видит при
+/// этом НЕобрезанный размер — отсюда расхождение картинки и поведения.
+pub fn видимый_размер(window: &Window, факт: Size<i32, Logical>) -> Size<i32, Logical> {
+    match requested_size(window) {
+        Some(t) if t.w > 0 && t.h > 0 => Size::from((t.w.min(факт.w), t.h.min(факт.h))),
+        _ => факт,
+    }
+}
+
 /// Размер буфера, прикреплённого к поверхности (в логических пикселях).
 /// Нужен для курсоров клиентов: их картинку мы приводим к своему размеру.
 pub fn surface_buffer_size(surface: &WlSurface) -> Option<Size<i32, Logical>> {
@@ -434,6 +450,30 @@ pub fn focus(state: &mut Parallax, window: &Window) {
 // ── Появление нового окна ────────────────────────────────────────────────────
 
 impl Parallax {
+    /// Процесс, которому принадлежит окно.
+    ///
+    /// У Wayland-клиента — из `wl_client`; у X11 этот путь бесполезен: все
+    /// X11-окна принадлежат одному процессу, самому Xwayland. Поэтому для них
+    /// спрашиваем `_NET_WM_PID` у самого окна.
+    pub(crate) fn pid_окна(&self, окно: &Window) -> Option<u32> {
+        match окно.underlying_surface() {
+            // У X11-окна pid знает сам XWM — он читает `_NET_WM_PID` при
+            // отображении окна. Прямое чтение свойства оставлено запасным
+            // путём: клиент вправе выставить его и позже.
+            smithay::desktop::WindowSurface::X11(s) => {
+                s.pid().or_else(|| crate::icons::pid_окна_x11(s.window_id()))
+            }
+            smithay::desktop::WindowSurface::Wayland(t) => {
+                use smithay::reexports::wayland_server::Resource as _;
+                let клиент = t.wl_surface().client()?;
+                клиент
+                    .get_credentials(&self.display_handle)
+                    .ok()
+                    .and_then(|c| u32::try_from(c.pid).ok())
+            }
+        }
+    }
+
     /// Размер, который получит новое окно в текущей раскладке. Считается ДО
     /// создания окна, чтобы клиенту ушёл ровно один configure, а не два
     /// (наш «предварительный» и потом ещё один от arrange()).
@@ -561,10 +601,20 @@ impl Parallax {
                 // Диалоги плавают по своей природе — сборка в тайлинг их не
                 // трогает (см. TaggedWindow::float_pinned).
                 float_pinned: floating,
+                desk_geometry: std::collections::HashMap::new(),
                 folded: false,
                 pre_constellation: None,
                 pre_constellation_size: None,
+                tile_float: None,
+                canvas_float: None,
                 constellation_torn: false,
+                pre_glue: None,
+                закреплено: None,
+                // Правило `window{ widget = true }` применяется ниже, отдельным
+                // шагом: у wayland-клиента app_id на этот момент ещё пустой,
+                // и решать по нему здесь было бы гаданием (см.
+                // `Parallax::применить_правила`).
+                виджет: false,
             },
         );
 
@@ -604,6 +654,12 @@ impl Parallax {
         // Minecraft `focus()` сам отдаёт его месту мода, не трогая ни верх
         // стопки, ни хозяйскую клавиатуру, — своей ветки здесь не нужно.
         focus(self, &window);
+
+        // Правила окон (`window{}` в config.lua): виджеты, место, размер. У
+        // X11-окна WM_CLASS известен уже здесь; wayland-клиент скажет app_id
+        // позже, и там правило применится вторым вызовом — см.
+        // `XdgShellHandler::app_id_changed`.
+        self.применить_правила(&window);
 
         tracing::info!(
             "plx: new window ({}) idx={} tags={:#b} spawn=({},{}) size={}x{}",
@@ -663,6 +719,10 @@ impl Parallax {
             group.retain(|w| w != window);
         }
         self.constellations.retain(|g| g.len() > 1);
+        for group in &mut self.glue_grids {
+            group.retain(|w| w != window);
+        }
+        self.glue_grids.retain(|g| g.len() > 1);
         self.space.unmap_elem(window);
         // Закрытие окна могло опустошить стол в середине ленты — в niri-режиме
         // лента столов плотная, дыр в ней не бывает (в остальных раскладках
@@ -693,10 +753,22 @@ impl Parallax {
         if !свой_стол {
             return;
         }
-        let Some(rect) = self.space.element_geometry(window) else { return };
+        let Some(geo) = self.space.element_geometry(window) else { return };
+        // Снимаем то, что было НА ЭКРАНЕ: видимую рамку и её место с
+        // масштабами последнего кадра (см. `udev::ВидОкна`). Запись старше
+        // секунды не берём — окно с тех пор не рисовалось, и верить ей нечем.
+        let вид = window.user_data()
+            .get::<std::cell::RefCell<crate::udev::ВидОкна>>()
+            .map(|c| *c.borrow())
+            .filter(|в| в.когда.elapsed() < std::time::Duration::from_secs(1));
+        let (rect, холст) = match вид {
+            Some(в) => (smithay::utils::Rectangle::new(geo.loc, в.рамка), в.холст),
+            None => (geo, geo.to_f64()),
+        };
         let окно = window.clone();
+        let стекло = self.lua_config.blur && has_transparency(window);
         let уход = crate::udev::with_primary_renderer(self, |_state, renderer| {
-            crate::close::снять(renderer, &окно, rect, crate::anim::дуг::закрытие_окна())
+            crate::close::снять(renderer, &окно, rect, холст, стекло, crate::anim::дуг::закрытие_окна())
         });
         if let Some(Some(уход)) = уход {
             // Копиться им незачем: закрыть подряд можно и десяток, а каждый

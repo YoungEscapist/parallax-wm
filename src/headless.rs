@@ -38,6 +38,20 @@ use smithay::{
 
 use crate::Parallax;
 
+thread_local! {
+    static РЕНДЕРЕР: std::cell::Cell<*mut GlesRenderer> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Рендерер headless-бэкенда, если он поднят (см. `init_headless`).
+///
+/// # Safety
+/// Звать только из главного потока ВНЕ такта отрисовки — тогда ссылка
+/// единственная (такт берёт рендерер сам и сюда не заходит).
+pub unsafe fn рендерер() -> Option<&'static mut GlesRenderer> {
+    let р = РЕНДЕРЕР.with(|р| р.get());
+    if р.is_null() { None } else { Some(unsafe { &mut *р }) }
+}
+
 /// Всё, что живёт между кадрами у ОДНОГО выхода: сам выход и его шейдеры.
 ///
 /// Полный аналог `udev::Surface`, только без DRM-компоновщика: показывать
@@ -48,6 +62,9 @@ struct Экран {
     output: Output,
     rounded: Option<crate::rounded::Шейдер>,
     blur: Option<crate::blur::Блюр>,
+    /// Экранный шейдер (`set{ screen_shader = ... }`, см. экран.rs). Он же и
+    /// здесь — иначе ручку нельзя было бы отсмотреть иначе как на живом tty.
+    шейдер: crate::экран::Экран,
     last_elements: usize,
 }
 
@@ -117,7 +134,12 @@ pub fn init_headless(
     let gbm = GbmDevice::new(DrmDeviceFd::new(DeviceFd::from(std::os::fd::OwnedFd::from(file))))?;
     let egl = unsafe { EGLDisplay::new(gbm)? };
     let ctx = EGLContext::new(&egl)?;
-    let mut gles = unsafe { GlesRenderer::new(ctx)? };
+    let mut gles = Box::new(unsafe { GlesRenderer::new(ctx)? });
+    // Адрес рендерера — для `udev::with_primary_renderer` (снимок закрытия
+    // окна): без него закрытие в харнессе не проверить вовсе. Box держит
+    // адрес на месте, а сам рендерер живёт в замыкании таймера до конца
+    // процесса.
+    РЕНДЕРЕР.with(|р| р.set(&mut *gles as *mut GlesRenderer));
     tracing::info!("plx/headless: GLES on {}", путь);
 
     let режимы = режимы_из_окружения();
@@ -237,12 +259,14 @@ pub fn init_headless(
         экраны.push(Экран {
             rounded: crate::rounded::Шейдер::new(&mut gles),
             blur: crate::blur::Блюр::new(&mut gles),
+            шейдер: crate::экран::Экран::new(),
             output,
             last_elements: 0,
         });
     }
     if state.blur_shape.is_none() {
         state.blur_shape = crate::rounded::Шейдер::new(&mut gles);
+        state.стекло = crate::blur::Стекло::new(&mut gles);
         state.куб_шейдер = crate::куб::Шейдер::new(&mut gles);
     }
     state.apply_camera_all();
@@ -305,6 +329,7 @@ fn такт(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mu
                 Some(выход.clone())
             });
         }
+        crate::udev::отдать_кадр_курсору(state, &выход, теперь, Some(Duration::ZERO));
     }
     let _ = state.display_handle.flush_clients();
 }
@@ -342,7 +367,22 @@ fn снимок(экраны: &mut [Экран], gles: &mut GlesRenderer, state:
         // нет вовсе (`курсорных` = 0), а с ним снимок сравнивать не с чем.
         crate::snip::serve(state, &экран.output.clone(), gles, &elements[курсорных..]);
         let size = (mode.size.w, mode.size.h).into();
-        let пиксели = crate::screencopy::capture(gles, &экран.output, &elements, size);
+        // Экранный шейдер: снимок обязан показывать то же, что ушло бы на
+        // монитор, — иначе проверять ручку было бы негде (см. экран.rs).
+        let путь_шейдера: &str = if cfg!(feature = "shaders") {
+            state.lua_config.screen_shader.as_str()
+        } else {
+            ""
+        };
+        let через_шейдер = экран.шейдер.кадр(
+            gles, &экран.output, путь_шейдера, &elements, crate::udev::CLEAR_COLOR,
+        );
+        let пиксели = match через_шейдер {
+            Some(эл) => crate::screencopy::capture(
+                gles, &экран.output, std::slice::from_ref(&эл), size,
+            ),
+            None => crate::screencopy::capture(gles, &экран.output, &elements, size),
+        };
         state.покинуть_монитор(вернуть);
 
         let Some(пиксели) = пиксели else {

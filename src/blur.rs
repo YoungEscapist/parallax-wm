@@ -133,6 +133,8 @@ pub struct Плитка {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// Зеркало плитки (режим cycle кладёт соседние плитки отражёнными).
+    pub поворот: smithay::utils::Transform,
 }
 
 impl Блюр {
@@ -235,7 +237,7 @@ impl Блюр {
                     );
                     let Some(видно) = dst.intersection(полный) else { continue };
                     frame.render_texture_from_to(
-                        исходник, src_full, dst, &[видно], &[], Transform::Normal, 1.0, None, &[],
+                        исходник, src_full, dst, &[видно], &[], п.поворот, 1.0, None, &[],
                     ).ok()?;
                 }
             }
@@ -283,6 +285,314 @@ impl Блюр {
         }
 
         Some(мут_b)
+    }
+
+    /// Ещё одна пара проходов (по горизонтали и по вертикали) поверх
+    /// результата прошлого `размыть`. Нужна широкому свечению экранного
+    /// шейдера: девять выборок одного прохода на большом радиусе стоят редко,
+    /// и яркая точка расплывается не в ореол, а в «бусы». Второй проход
+    /// складывает гауссы (σ растёт в √2 раза), и шаг между выборками
+    /// замазывается. Буферы те же, аллокаций нет.
+    pub fn ещё_проход(&mut self, renderer: &mut GlesRenderer, радиус: f32) -> Option<GlesTexture> {
+        let (мут_a, мут_b, _) = self.буферы.clone()?;
+        let мал = self.размер;
+        let полный = Rectangle::<i32, Physical>::new((0, 0).into(), мал);
+        let texel = [1.0 / мал.w as f32, 1.0 / мал.h as f32];
+        let радиус = (радиус / УЖАТИЕ as f32).max(0.5);
+        let src = Rectangle::<f64, BufferCoords>::from_size(Size::from((мал.w as f64, мал.h as f64)));
+        for (из, в, dir) in [(&мут_b, &мут_a, [1.0f32, 0.0]), (&мут_a, &мут_b, [0.0f32, 1.0])] {
+            let mut цель = в.clone();
+            let mut fb = renderer.bind(&mut цель).ok()?;
+            let mut frame = renderer.render(&mut fb, мал, Transform::Normal).ok()?;
+            frame.render_texture_from_to(
+                из, src, полный, &[полный], &[], Transform::Normal, 1.0,
+                Some(&self.программа),
+                &[
+                    Uniform::new("blur_dir", dir),
+                    Uniform::new("blur_texel", texel),
+                    Uniform::new("blur_radius", радиус),
+                ],
+            ).ok()?;
+            let _ = frame.finish().ok()?;
+        }
+        Some(мут_b)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Настоящее матовое стекло под окном (05.10.2026)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Жалоба Ярика: «блюр под окном показывает размытые обои, а не то, что за
+// окном, — окно за окном не видно», и «после смены обоев стекло окон не
+// меняется». Обе — от одного устройства: заплата под окном брала ОДНУ общую
+// текстуру размытых обоев, собранную до кадра, а её Id с постоянным счётчиком
+// коммитов не давал damage tracker'у узнать, что картинка внутри сменилась.
+//
+// Теперь под прозрачным окном лежит элемент-ЭФФЕКТ (`is_framebuffer_effect`,
+// штатный механизм smithay): перед его отрисовкой smithay зовёт
+// `capture_framebuffer`, и в этот момент в буфере кадра уже нарисовано всё,
+// что лежит ПОД ним, — обои, окна ниже, их стекло. Мы ужимаем этот кусок в
+// свой буфер, размываем теми же двумя проходами и кладём на место. Повторный
+// захват smithay делает сам и ровно тогда, когда под элементом что-то
+// изменилось (сменились обои, сдвинулось окно ниже), — отдельной проверки
+// свежести не нужно, и починка «стекло не видит новых обоев» выходит даром.
+
+use smithay::backend::renderer::{
+    FrameContext as _,
+    element::{Element, Id, Kind, RenderElement, UnderlyingStorage},
+    gles::{GlesError, GlesFrame, ffi},
+    utils::CommitCounter,
+};
+use smithay::utils::{Scale, user_data::UserDataMap};
+
+/// Общее для всех стёкол кадра: программа свёртки. Живёт в `Parallax`
+/// (`стекло`), собирается вместе с прочими шейдерами.
+#[derive(Clone, Debug)]
+pub struct Стекло {
+    программа: GlesTexProgram,
+}
+
+impl Стекло {
+    pub fn new(renderer: &mut GlesRenderer) -> Option<Self> {
+        let uniforms = [
+            UniformName::new("blur_dir", UniformType::_2f),
+            UniformName::new("blur_texel", UniformType::_2f),
+            UniformName::new("blur_radius", UniformType::_1f),
+        ];
+        match renderer.compile_custom_texture_shader(ФРАГМЕНТ, &uniforms) {
+            Ok(программа) => Some(Self { программа }),
+            Err(e) => {
+                tracing::warn!("plx/blur: backdrop shader failed to compile: {:?}", e);
+                None
+            }
+        }
+    }
+
+    /// Стекло в прямоугольнике `rect` (физические пиксели кадра) на кадре
+    /// размера `экран`. `None` — прямоугольник целиком за краем.
+    pub fn подложка(
+        &self,
+        id: Id,
+        rect: Rectangle<i32, Physical>,
+        экран: Size<i32, Physical>,
+    ) -> Option<Подложка> {
+        // Захват читает буфер кадра — за его краем читать нечего, поэтому
+        // элемент сразу обрезан по экрану. Скругление и растворение снаружи
+        // считают по ПОЛНОЙ рамке окна (`gl_FragCoord`), так что обрезка им не
+        // мешает.
+        let rect = rect.intersection(Rectangle::from_size(экран))?;
+        if rect.size.w <= 0 || rect.size.h <= 0 {
+            return None;
+        }
+        Some(Подложка { id, rect, программа: self.программа.clone(), радиус: РАДИУС })
+    }
+}
+
+/// Стекло под одним окном (см. заметку выше).
+#[derive(Debug)]
+pub struct Подложка {
+    id: Id,
+    rect: Rectangle<i32, Physical>,
+    программа: GlesTexProgram,
+    радиус: f32,
+}
+
+/// Что стекло держит между кадрами — в `cache` эффекта (smithay заводит его
+/// по Id элемента и хранит, пока элемент жив). Три буфера, как у `Блюр`:
+/// ужатый захват, горизонтальный проход, вертикальный (он же результат).
+struct Снимок {
+    c: GlesTexture,
+    a: GlesTexture,
+    b: GlesTexture,
+    мал: Size<i32, Physical>,
+    /// Захват удался хоть раз — до этого рисовать нечего.
+    готов: bool,
+}
+
+type ЯчейкаСнимка = std::cell::RefCell<Option<Снимок>>;
+
+impl Подложка {
+    fn мал(&self) -> Size<i32, Physical> {
+        Size::from((
+            ((self.rect.size.w + УЖАТИЕ - 1) / УЖАТИЕ).max(1),
+            ((self.rect.size.h + УЖАТИЕ - 1) / УЖАТИЕ).max(1),
+        ))
+    }
+
+    fn захватить(&self, frame: &mut GlesFrame<'_, '_>, dst: Rectangle<i32, Physical>, cache: &UserDataMap) -> Option<()> {
+        let мал = self.мал();
+        let ячейка = cache.get_or_insert(|| ЯчейкаСнимка::new(None));
+
+        // Буфер кадра, в который сейчас рисуют, — его и читаем. Узнаём ДО
+        // того, как свои буферы перебьют привязку.
+        let кадр_fbo = frame.with_context(|gl| unsafe {
+            let mut fbo: ffi::types::GLint = 0;
+            gl.GetIntegerv(ffi::FRAMEBUFFER_BINDING, &mut fbo);
+            fbo as ffi::types::GLuint
+        }).ok()?;
+
+        let mut г = frame.renderer();
+        let r: &mut GlesRenderer = г.as_mut();
+
+        let нужно_заново = ячейка.borrow().as_ref().is_none_or(|с| с.мал != мал);
+        if нужно_заново {
+            let буфер = |r: &mut GlesRenderer| -> Option<GlesTexture> {
+                let s = Size::<i32, BufferCoords>::from((мал.w, мал.h));
+                Offscreen::<GlesTexture>::create_buffer(r, Fourcc::Abgr8888, s)
+                    .map_err(|e| tracing::warn!("plx/blur: backdrop buffer {:?}: {:?}", s, e))
+                    .ok()
+            };
+            let (c, a, b) = (буфер(r)?, буфер(r)?, буфер(r)?);
+            // Края — ПРИЖАТЬ, а не повторять: по умолчанию у текстуры REPEAT,
+            // и выборки Гаусса у нижнего края стекла брали верхний ряд захвата
+            // (замер: полосы окна, торчащего из-под заголовка, проступали
+            // цветной каймой внизу).
+            r.with_context(|gl| unsafe {
+                for t in [&c, &a, &b] {
+                    gl.BindTexture(ffi::TEXTURE_2D, t.tex_id());
+                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+                }
+                gl.BindTexture(ffi::TEXTURE_2D, 0);
+            }).ok()?;
+            *ячейка.borrow_mut() = Some(Снимок { c, a, b, мал, готов: false });
+        }
+        let (c, a, b) = {
+            let с = ячейка.borrow();
+            let с = с.as_ref()?;
+            (с.c.clone(), с.a.clone(), с.b.clone())
+        };
+
+        // ── Захват: кусок кадра под окном → C, сразу ужатый ─────────────────
+        // glBlitFramebuffer, а не glCopyTexSubImage2D: копия требует, чтобы у
+        // буфера кадра были все каналы текстуры, а сканаут обычно XRGB без
+        // альфы — на таком мониторе копия молча не работала бы. Блит же
+        // заодно ужимает с линейной фильтрацией — первая ступень размытия.
+        // Ось Y та же, что у экрана (см. заметку о `gl_FragCoord` в rounded.rs).
+        let полный = Rectangle::<i32, Physical>::new((0, 0).into(), мал);
+        {
+            // Привязку буфера делает `render`, а не `bind`: блит — изнутри
+            // кадра своего буфера, тогда FRAMEBUFFER_BINDING и есть он.
+            let mut цель = c.clone();
+            let mut fb = r.bind(&mut цель).ok()?;
+            let mut f = r.render(&mut fb, мал, Transform::Normal).ok()?;
+            f.with_context(|gl| unsafe {
+                let mut своё: ffi::types::GLint = 0;
+                gl.GetIntegerv(ffi::FRAMEBUFFER_BINDING, &mut своё);
+                gl.Disable(ffi::SCISSOR_TEST);
+                gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, кадр_fbo);
+                gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, своё as ffi::types::GLuint);
+                gl.BlitFramebuffer(
+                    dst.loc.x, dst.loc.y, dst.loc.x + dst.size.w, dst.loc.y + dst.size.h,
+                    0, 0, мал.w, мал.h,
+                    ffi::COLOR_BUFFER_BIT, ffi::LINEAR,
+                );
+                gl.BindFramebuffer(ffi::FRAMEBUFFER, своё as ffi::types::GLuint);
+                gl.Enable(ffi::SCISSOR_TEST);
+            }).ok()?;
+            let _ = f.finish().ok()?;
+        }
+
+        // ── Два прохода Гаусса: C → A → B ───────────────────────────────────
+        let texel = [1.0 / мал.w as f32, 1.0 / мал.h as f32];
+        let радиус = (self.радиус / УЖАТИЕ as f32).max(0.5);
+        let src = Rectangle::<f64, BufferCoords>::from_size(Size::from((мал.w as f64, мал.h as f64)));
+        for (из, в, dir) in [(&c, &a, [1.0f32, 0.0]), (&a, &b, [0.0f32, 1.0])] {
+            let mut цель = в.clone();
+            let mut fb = r.bind(&mut цель).ok()?;
+            let mut f = r.render(&mut fb, мал, Transform::Normal).ok()?;
+            f.render_texture_from_to(
+                из, src, полный, &[полный], &[], Transform::Normal, 1.0,
+                Some(&self.программа),
+                &[
+                    Uniform::new("blur_dir", dir),
+                    Uniform::new("blur_texel", texel),
+                    Uniform::new("blur_radius", радиус),
+                ],
+            ).ok()?;
+            let _ = f.finish().ok()?;
+        }
+        if let Some(с) = ячейка.borrow_mut().as_mut() {
+            с.готов = true;
+        }
+        Some(())
+        // `г` уходит здесь: его Drop возвращает привязку к буферу кадра,
+        // вьюпорт, ножницы и смешивание (GlesFrameGuard).
+    }
+}
+
+impl Element for Подложка {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    /// Свой счётчик не нужен: о смене того, что ПОД стеклом, smithay узнаёт
+    /// сам (эффект перезахватывается по повреждению под ним).
+    fn current_commit(&self) -> CommitCounter {
+        CommitCounter::default()
+    }
+
+    fn src(&self) -> Rectangle<f64, BufferCoords> {
+        Rectangle::from_size(Size::from((self.rect.size.w as f64, self.rect.size.h as f64)))
+    }
+
+    fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.rect
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Unspecified
+    }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        true
+    }
+}
+
+impl RenderElement<GlesRenderer> for Подложка {
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        _src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), GlesError> {
+        let Some(ячейка) = cache.and_then(|c| c.get::<ЯчейкаСнимка>()) else { return Ok(()) };
+        let (текстура, мал) = {
+            let с = ячейка.borrow();
+            match с.as_ref() {
+                Some(с) if с.готов => (с.b.clone(), с.мал),
+                _ => return Ok(()),
+            }
+        };
+        let src = Rectangle::<f64, BufferCoords>::from_size(Size::from((мал.w as f64, мал.h as f64)));
+        // Программа — None: скругление (и растворение) ставит обёртка
+        // `Rounded` через override, как у любой текстуры окна.
+        frame.render_texture_from_to(
+            &текстура, src, dst, damage, &[], Transform::Normal, 1.0, None, &[],
+        )
+    }
+
+    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        _src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), GlesError> {
+        // Отказ мягкий: без захвата стекло просто не нарисуется в этом кадре,
+        // а ронять из-за него весь кадр нельзя.
+        if self.захватить(frame, dst, cache).is_none() {
+            tracing::debug!("plx/blur: backdrop capture failed for {:?}", dst);
+        }
+        Ok(())
     }
 }
 

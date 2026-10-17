@@ -99,8 +99,8 @@
 --
 -- Available actions and their extra fields:
 --   spawn            cmd = "ghostty"
---   quit             (saves session, stops the compositor)
---   restart          (saves session and restarts the compositor in place:
+--   quit             (stops the compositor)
+--   restart          (restarts the compositor in place:
 --                     parallax exits with code 42 and launch_native.sh brings it
 --                     back up, rebuilding first if the sources are newer than
 --                     the binary. Picks up a fresh build without logging out;
@@ -134,6 +134,19 @@
 --   toggle_bookmarks_mode  (Super+1-9 jump/save camera bookmarks instead of tags)
 --   toggle_snapping    (collision: windows shove each other while being moved)
 --   toggle_magnetism   (an edge snaps to a neighbour once, on release)
+--   toggle_glue        (driftwm mode: floating windows touching edge-to-edge
+--                        resize/push together for as long as the resize drag
+--                        lasts; a window thrown with inertia stops flush
+--                        against what it hits; with 2+ selected windows it
+--                        packs them into an edge-to-edge grid; the same key on
+--                        a selected grid (or Super+D) dissolves it back, see
+--                        src/cluster.rs)
+--   toggle_pin         (pin the focused window to the SCREEN: it stays glued
+--                        to the camera, neither zooms nor pans; again — unpin,
+--                        see src/pin.rs)
+--   dock_toggle        (show/hide the application dock, see dock{} below)
+--   dock_edit          (dock edit mode: a cross on every icon removes it)
+--   dock_settings      (the "Dock settings" window, like the Windows taskbar's)
 --   toggle_fold_stack
 --   share_start / share_stop / share_toggle   port = 7373
 --                      (multi-user: show the desktop to guests, up to five)
@@ -150,6 +163,22 @@
 --                        lowest free slot 1-9; jump to it in bookmarks mode with Super+N)
 --   column_width_cycle  (Columns/niri mode: cycle active column width 1/3→1/2→2/3→full)
 --   toggle_niri_mode    (toggles Columns ↔ Tile)
+--
+-- The mouse and the camera from the keyboard (see клавимышь.rs):
+--   pointer_move     dx = -1|0|1, dy = -1|0|1, step = <px per press, 12>
+--                     (holding the key accelerates the step up to 9x)
+--   pointer_click    button = "left" | "right" | "middle"
+--                     (the button stays down while the key is held, so
+--                     Alt+Enter plus Alt+HJKL is a drag)
+--   pointer_drag     button = ... (toggle: press the button down, press again
+--                     to release — that is a drag with the movement keys)
+--   pointer_scroll   dx = <detents>, dy = <detents> (down and right positive;
+--                     holding the key keeps scrolling)
+--   pointer_warp     to = "window" | "screen" | "bar"
+--   pan_camera       dx = -1|0|1, dy = -1|0|1 (held — keeps panning)
+--   zoom_camera      factor = 1.1 | 0.9, or reset = true (back to 1:1; held —
+--                     keeps zooming). Pan and zoom do nothing in tile and
+--                     columns (niri) — the key goes to the window instead.
 --
 -- Column actions (Columns/niri), all named after the niri commands:
 --   window_height_cycle     (switch-preset-window-height)
@@ -212,9 +241,35 @@ set{ cursor_size = 0, cursor_client_max = -1 }
 -- above one is longer and calmer, below one is sharper.
 set{ anim_speed = 1.0, pan_drift = 0.5, fling_distance = 1.0 }
 
+-- BOUNCE of windows that travel to their place — a tiling slot, a new size, a
+-- neighbour's edge: the window overshoots a little and settles back, like
+-- Hyprland's "overshot" curve. 0 — a spring with no overshoot (as before);
+-- 0.25 — about 3% of the way past the target; the ceiling is 0.6. A window
+-- thrown with the mouse never bounces: where it stops is computed from its
+-- speed, and an overshoot would carry it past that point.
+set{ anim_bounce = 0.0 }
+
+-- The camera at the screen edge (Float only): touch an edge with the cursor
+-- and the canvas keeps sliding that way for as long as the cursor stays
+-- there; no need to keep pushing the mouse. Speed in screen pixels per
+-- second, 0 turns it off. It stays put over bar islands and layers
+-- (notifications, launcher), at an edge leading to another monitor, while a
+-- button is held and under a fullscreen game.
+set{ edge_pan = 1400 }
+
 -- An infinite wallpaper: the image lies on the canvas and rides with the
 -- camera (one copy, with a falloff — no seams and no repeats).
 set{ infinite_wallpaper = true }
+
+-- Going light under a fullscreen window: while one window owns the whole screen
+-- (a game, a player, a browser in F11), the compositor stops computing what is
+-- not visible under it anyway — the blur, the screen shader, the wallpaper, the
+-- shadows, the desktop icons and widgets. On top of the saving this gives the
+-- game DIRECT SCANOUT: its buffer goes straight to the monitor plane and the
+-- frame is not composited at all.
+-- false — compute everything as before (say, to keep the screen shader's haze
+-- over the game as well).
+set{ fullscreen_boost = true }
 
 -- The quiet fade of a closed window (described in the header above).
 set{ close_anim = true }
@@ -229,8 +284,8 @@ set{ bar_hide_pan = true }
 
 -- Depth in the preview card (hover a workspace dot or a window chip on the
 -- bar): windows deeper in the stack are drawn slightly smaller, dimmer and with
--- a shadow cast by the one above. 0 turns the card flat again.
-set{ preview_depth = 0.7 }
+-- a shadow cast by the one above. Off by default (0 = flat card); try 0.7.
+set{ preview_depth = 0 }
 
 -- ── Ricing: animations, bar, corners and gaps ──────────────────────────────
 --
@@ -284,52 +339,87 @@ set{ gaps_in = 16, gaps_out = 18 }
 -- Blur behind the bar. Off: never watched live, see the description above.
 set{ blur = false }
 
--- Windows rim-lit IN THE WALLPAPER'S COLOUR: a glowing rim runs along the
--- inside of the window edge in a colour taken from the palette of the current
--- wallpaper (plx-wall computes it and writes ~/.cache/plx-wall/palette.json —
--- the same colour that goes to the terminal and to the shell). Change the
--- wallpaper and the glow changes with it, without a restart.
+-- The application dock: icons to launch programs, dots under the running
+-- ones. Off by default — enabled = true turns it on. Everything here can also
+-- be changed ON THE DOCK ITSELF, and the result is written back into this very
+-- block (the rest of the file is not touched):
+--   · left click — launch, or show the running window; middle — a new window;
+--   · drag an icon along the dock — reorder; drag it away — remove;
+--   · drag the empty part of the dock to another screen edge — move it there;
+--   · wheel over the dock — icon size;
+--   · right click — the app's menu or the dock's menu (edge, size, autohide);
+--   · "+" — every installed application, type to search;
+--   · right click → "Dock settings…" (or action = "dock_settings") — a settings
+--     window like the Windows taskbar settings: everything below as switches.
+-- apps are .desktop file names without the extension (ghostty is
+-- "com.mitchellh.ghostty"), or tables { name = , cmd = , icon = }.
+-- dock{
+--   enabled = true,
+--   position = "bottom",    -- bottom | top | left | right
+--   size = 48,              -- icon side, px (24…128)
+--   margin = 10,            -- gap to the screen edge
+--   autohide = false,       -- hide until the pointer touches that edge
+--   align = "center",       -- center | start: icons centred or from the start
+--   full_width = false,     -- a strip along the whole edge, like Windows
+--   opacity = 55,           -- opacity of the dock background, % (0…100)
+--   locked = false,         -- lock: the mouse no longer edits the dock
+--   show_running = true,    -- show running apps that have no icon
+--   apps = {
+--     "com.mitchellh.ghostty",
+--     "firefox",
+--     { name = "Btop", cmd = "ghostty -e btop", icon = "utilities-system-monitor" },
+--   },
+-- }
+
+-- Windows open and close by PIXEL DISSOLVE: the window tears into ragged blots
+-- cut into square cells, instead of growing in and fading out.
 --
---   glow       — strength, 0.0…1.0; 0 turns it off. It fades out on BRIGHT
---                wallpapers by itself: there a coloured rim reads as grime
---                rather than as light.
---   glow_width — the width of the rim in logical pixels (it follows the zoom).
+--   dissolve        — the side of a cell in logical pixels (it follows the
+--                     zoom); 0 turns it off and brings back the usual pop-in
+--                     and fade.
+--   dissolve_mosaic — the window ASSEMBLES FROM PIXELS: inside the blots the
+--                     picture first shows as big pixels (a whole cell in one
+--                     colour) that split in half step by step until it is
+--                     sharp; closing runs it backwards. false — the cells are
+--                     sharp from the start.
 --
--- The same knob lights the window's OUTLINE — a halo outside, reaching twice
--- as far out as the rim reaches in. The outline is not a separate thing: the
--- shadow around the window and the rim inside it are computed by ONE shader
--- from one frame (src/rounded.rs), so they cannot drift apart, and the shadow
--- falls AWAY FROM the light source (sun below) instead of always downwards.
---
--- The window being worked in glows at full strength, the rest at half: that is
--- how you see where the input goes even with a dozen windows on the canvas.
+-- Each cell fades in over a few frames instead of popping, so the blots grow
+-- rather than flicker. The durations are the same anim{} knobs: window_open
+-- and window_close. 3D flip (flip3d below) wins over dissolve — set
+-- flip3d = 0 to see it.
 --
 -- plx-extra ONLY (the `shaders` feature). The standard build has no such
 -- shader at all; the knob is read as usual and does nothing, and a line about
 -- that goes to the log when the config is read, so that "I set it and nothing
 -- happens" does not look like a fault.
-set{ glow = 0.0, glow_width = 12.0 }
+set{ dissolve = 0, dissolve_mosaic = true }
 
--- A LIGHT ON THE CANVAS in the wallpaper's colour. Not a drawn sun: there is
--- no disc on the screen. There is a source standing at a point of the canvas,
--- and from it the scene is lit (a soft pool over the wallpaper) and so are the
--- WINDOWS — the side facing the light is brighter, the far side falls into
--- shade, and the rim (glow above) burns stronger where the light lands. Hence
--- both a sense of "where the light is" on an endless canvas and a sense of
--- volume in the windows.
+-- A SCREEN SHADER — your own GLSL over the whole frame, like
+-- decoration:screen_shader in Hyprland. Empty (the default) means no such pass
+-- at all.
 --
---   sun       — strength, 0.0…1.0; 0 turns it off. Fades on bright wallpapers.
---   sun_size  — how far the light reaches, in screen widths (the falloff).
---   sun_x/y   — where the source stands, in screen fractions from the
---               monitor's home. Outside 0…1 is fine: the canvas is endless and
---               the source may well hang past the edge of the screen.
---   sun_far   — how FAR away it is: 0 is glued to the screen, 1 lies on the
---               canvas alongside the windows. A quarter by default: a source
---               honestly standing on the canvas leaves the frame after the
---               first long flight, and a real sun does not stay behind you.
+-- The file is in Hyprland's format, so foreign shaders work unedited:
 --
--- plx-extra ONLY (the `shaders` feature), like glow above.
-set{ sun = 0.0, sun_size = 1.6, sun_x = 0.78, sun_y = 0.18, sun_far = 0.25 }
+--   precision mediump float;
+--   varying vec2 v_texcoord;              // point of the frame, 0…1
+--   uniform sampler2D tex;                // the frame itself
+--   uniform float time;                   // seconds since start
+--   uniform vec2 wl_output_resolution;    // screen size in pixels
+--   void main() { gl_FragColor = texture2D(tex, v_texcoord); }
+--
+-- The file is re-read by its modification time: edit the .frag and the screen
+-- changes, no session restart. If it does not compile, a line goes to the log
+-- (plx/screen) and the frame stays as it was. An example lives in dist/shaders/:
+-- haze.frag — a soft haze: bloom on bright spots, lifted matte blacks tinted by
+-- the wallpaper, a touch less contrast.
+--
+-- THE COST: with a shader on, the frame is drawn into its own buffer and
+-- redrawn IN FULL every frame (the picture changes from `time` alone), so
+-- damage tracking stops saving anything. While the knob is empty it costs
+-- nothing.
+--
+-- plx-extra ONLY (the `shaders` feature), like dissolve above.
+set{ screen_shader = "" }
 
 -- THE DESKTOP CUBE, the one from Compiz: the workspaces stand on the faces of
 -- a prism, and the overview (tap Super) stops being a flat grid. The wheel
@@ -352,11 +442,49 @@ set{ sun = 0.0, sun_size = 1.6, sun_x = 0.78, sun_y = 0.18, sun_far = 0.25 }
 --   cube_switch — turn the cube when stepping to the neighbouring workspace
 --                 (Super+PgUp/PgDn) too, not only in the overview. Exactly what
 --                 Compiz did.
+--   carousel    — in the ribbon layout (niri) the overview is a CAROUSEL rather
+--                 than a cube: every column is its own panel, the panels stand
+--                 in a ring, and every window of the workspace is visible at
+--                 once; neighbouring workspaces are rings above and below.
+--                 Drag or Shift+wheel spins the ring, the wheel moves between
+--                 workspaces, Ctrl+wheel tilts, a click lands on the column.
+--   desk_carousel — the grid overview (tile, monocle) is a CAROUSEL OF
+--                 WORKSPACES rather than a cube: every workspace is a panel and
+--                 all of them are visible at once. A multiple of four
+--                 workspaces stands as a square (four is exactly a cube),
+--                 any other count stands in a circle. The wheel or a drag
+--                 spins it, Ctrl+wheel or a vertical drag tilts, a click lands.
 --
 -- plx-extra ONLY (the `shaders` feature). Without it the overview stays a flat
 -- grid of workspaces and Super+PgUp/PgDn is a plain workspace switch.
 set{ cube = 0.0, cube_faces = 4, cube_fill = 0.62, cube_focal = 2.2 }
-set{ cube_shade = 0.35, cube_switch = true }
+set{ cube_shade = 0.35, cube_switch = true, carousel = true, desk_carousel = true }
+
+-- WINDOWS ABOVE THE CUBE (like the GNOME extension). The cube itself is a box
+-- made of wallpapers, and the windows float ABOVE its faces: closer to the
+-- viewer, larger than the face, and where two of them overlap that reads as
+-- depth rather than mere draw order. The frame is sorted by real depth, so a
+-- window raised on a side face honestly covers the front one.
+--
+--   cube_lift      — the lift above the face in screen widths; 0 keeps the
+--                    windows in the plane of the face, as before.
+--   cube_lift_step — how much higher every next window of the stack sits, in
+--                    fractions of cube_lift.
+--   cube_inertia   — coasting after a drag, seconds: a cube thrown with a
+--                    swing keeps turning instead of snapping to the nearest
+--                    face.
+set{ cube_lift = 0.09, cube_lift_step = 0.55, cube_inertia = 0.22 }
+
+-- 3D WINDOW FLIP on open and close (a Compiz-style animation): the window
+-- arrives turned around its own vertical axis and swings to face you, and
+-- leaves by the same movement reversed. The value is the starting angle in
+-- DEGREES, 0 turns it off.
+--
+-- While a window is turned it has square corners and no shadow: the flip
+-- shader and the rounding shader are two programs for the same place in the
+-- frame. On the last frame the angle is zero and the window matches the usual
+-- one pixel for pixel. With dissolve on, dissolve wins. plx-extra ONLY.
+set{ flip3d = 55 }
 
 -- The entrance of the desktop at startup: the canvas swims out of the dark to
 -- its own zoom while the bar arrives from above. A second and a bit, exactly
@@ -454,7 +582,7 @@ bind{ mods = "super+shift", key = "space", action = "focus_floating_or_tiling" }
 -- How the view follows the active column: never (the default, as in niri),
 -- always, on-overflow. Changed on the fly.
 bind{ mods = "super+alt", key = "c", action = "center_focused_column", mode = "always" }
-bind{ mods = "super+alt+shift", key = "c", action = "center_focused_column", mode = "never" }
+bind{ mods = "super+ctrl+alt", key = "c", action = "center_focused_column", mode = "never" }
 -- niri workspaces: Super+PageUp/Down switch the workspace (in Columns you stay
 -- in Columns); Super+Ctrl+PageUp/Down move the active column to the neighbour.
 bind{ mods = "super", key = "Next",  action = "workspace_step", dir = 1 }
@@ -477,6 +605,11 @@ bind{ mods = "super", key = "Left",  action = "focus_direction", dx = -1, dy = 0
 bind{ mods = "super", key = "Right", action = "focus_direction", dx = 1, dy = 0 }
 bind{ mods = "super", key = "Up",    action = "focus_direction", dx = 0, dy = -1 }
 bind{ mods = "super", key = "Down",  action = "focus_direction", dx = 0, dy = 1 }
+-- Vim keys for the same thing: Super+H/L walk the neighbours to the side
+-- (in Columns — the columns), Super+J/K walk the stack, exactly like the
+-- arrows above.
+bind{ mods = "super", key = "h", action = "focus_direction", dx = -1, dy = 0 }
+bind{ mods = "super", key = "l", action = "focus_direction", dx = 1, dy = 0 }
 bind{ mods = "super", key = "j",   action = "focus_stack", dir = 1 }
 bind{ mods = "super", key = "Tab", action = "focus_stack", dir = 1 }
 bind{ mods = "super", key = "k", action = "focus_stack", dir = -1 }
@@ -486,8 +619,13 @@ bind{ mods = "super+shift", key = "Tab", action = "focus_stack", dir = -1 }
 -- not reach them: those look for a neighbour to the side). The order is fixed
 -- on the first Tab and held until Alt is released. With nothing under the
 -- window, it cycles every window of the workspace.
+-- Backwards is Alt+Ctrl+Tab, not Alt+Shift+Tab: with `grp:alt_shift_toggle` in
+-- the xkb line above, Alt+Shift is the layout switch and xkb eats one of the
+-- two modifiers before parallax sees them (measured on the harness — press
+-- Shift under a held Alt and shift stays false; press Alt under a held Shift
+-- and alt stays false). The old alt+shift bind could not fire at all.
 bind{ mods = "alt", key = "Tab", action = "cycle_stack", dir = 1 }
-bind{ mods = "alt+shift", key = "Tab", action = "cycle_stack", dir = -1 }
+bind{ mods = "alt+ctrl", key = "Tab", action = "cycle_stack", dir = -1 }
 
 -- ── Move / resize floating windows ───────────────────────────────────────
 bind{ mods = "super+ctrl", key = "h",     action = "move_focused", dx = -20, dy = 0 }
@@ -508,6 +646,92 @@ bind{ mods = "super+shift", key = "j",     action = "resize_focused", dw = 0, dh
 bind{ mods = "super+shift", key = "Down",  action = "resize_focused", dw = 0, dh = 30 }
 bind{ mods = "super+shift", key = "Left",  action = "resize_focused", dw = -30, dh = 0 }
 bind{ mods = "super+shift", key = "Right", action = "resize_focused", dw = 30, dh = 0 }
+
+-- ── The mouse and the camera from the keyboard (vim keys) ────────────────
+--
+-- Everything that lives under the cursor — the panel's shelf and chips, the
+-- minimap, the preview card, an application's context menu, the area snip,
+-- dragging a window — was reachable with a hand on the mouse only. These binds
+-- give the pointer itself to the keyboard.
+--
+-- There is NO separate "mouse mode" here on purpose: these are ordinary
+-- actions, so they can be moved to other keys, switched off (delete the line)
+-- or handed to a gesture / a headset button — gesture{} and vr{} take the very
+-- same action names.
+--
+-- NOTE ON MODIFIERS: there are no alt+shift binds here, and that is not an
+-- oversight. The xkb line at the top of this file carries
+-- `grp:alt_shift_toggle` — Alt+Shift is the LAYOUT SWITCH, and xkb eats the
+-- Shift of that combination before any bind is looked at (measured on the
+-- harness: with Alt held, a Shift press leaves shift=false). An alt+shift bind
+-- would be dead and would flip the layout on every press. Ctrl is the second
+-- modifier here instead.
+--
+-- Alt+H/J/K/L move the pointer. One press is one `step` of screen pixels;
+-- HOLDING the key keeps it going and accelerates — from 30 steps a second up
+-- to nine times that — so a tap stays pixel-accurate while a held key crosses
+-- a 4K screen in about a second and a half. Alt+Ctrl is exactly one pixel, for
+-- aiming at a window border.
+--
+-- IN GAMES THESE BINDS ARE OFF. Dota 2 keeps half of its own controls on Alt —
+-- Alt+click is the ping, Alt+Q/W/E announce abilities, Alt+arrows look around —
+-- and the compositor used to eat every one of them: inside a match the
+-- "vim mode" looked stuck on. While a window from `set{ keymouse_block_apps }`
+-- has focus, these seven actions (pointer_move / click / drag / scroll / warp,
+-- pan_camera, zoom_camera) do nothing and the key goes straight to the window;
+-- every other bind — workspaces, overview, window search — keeps working.
+-- The list is by window class, case-insensitive, and it is yours to extend:
+--   set{ keymouse_block_apps = { "dota2", "cs2" } }
+-- An empty list ({}) turns the block off everywhere.
+bind{ mods = "alt", key = "h", action = "pointer_move", dx = -1, dy =  0, step = 12 }
+bind{ mods = "alt", key = "j", action = "pointer_move", dx =  0, dy =  1, step = 12 }
+bind{ mods = "alt", key = "k", action = "pointer_move", dx =  0, dy = -1, step = 12 }
+bind{ mods = "alt", key = "l", action = "pointer_move", dx =  1, dy =  0, step = 12 }
+bind{ mods = "alt+ctrl", key = "h", action = "pointer_move", dx = -1, dy =  0, step = 1 }
+bind{ mods = "alt+ctrl", key = "j", action = "pointer_move", dx =  0, dy =  1, step = 1 }
+bind{ mods = "alt+ctrl", key = "k", action = "pointer_move", dx =  0, dy = -1, step = 1 }
+bind{ mods = "alt+ctrl", key = "l", action = "pointer_move", dx =  1, dy =  0, step = 1 }
+
+-- The buttons. Alt+Enter clicks, Alt+Space HOLDS the left button down and the
+-- second press releases it — that is a drag: hold, walk with Alt+H/J/K/L,
+-- release. A toggle rather than "while the key is held" because the walking
+-- keys are held themselves, and there would be nothing left to hold the button
+-- with. A held button is announced by a notification, so it cannot be
+-- forgotten.
+bind{ mods = "alt",      key = "Return", action = "pointer_click", button = "left" }
+bind{ mods = "alt+ctrl", key = "Return", action = "pointer_click", button = "right" }
+bind{ mods = "alt",      key = "m",      action = "pointer_click", button = "middle" }
+bind{ mods = "alt",      key = "space",  action = "pointer_drag",  button = "left" }
+bind{ mods = "alt+ctrl", key = "space",  action = "pointer_drag",  button = "right" }
+
+-- The wheel, vim-style: Ctrl+E / Ctrl+Y in vim scroll by a line, here it is
+-- Alt+E / Alt+Y by a detent and Alt+Ctrl+E / Alt+Ctrl+Y by five. Comma and
+-- period tilt it sideways (a browser scrolls horizontally with that).
+bind{ mods = "alt", key = "e", action = "pointer_scroll", dy =  1 }
+bind{ mods = "alt", key = "y", action = "pointer_scroll", dy = -1 }
+bind{ mods = "alt+ctrl", key = "e", action = "pointer_scroll", dy =  5 }
+bind{ mods = "alt+ctrl", key = "y", action = "pointer_scroll", dy = -5 }
+bind{ mods = "alt", key = "comma",  action = "pointer_scroll", dx = -1, dy = 0 }
+bind{ mods = "alt", key = "period", action = "pointer_scroll", dx =  1, dy = 0 }
+
+-- Teleporting the pointer: to the focused window, to the middle of the screen,
+-- to the panel's right island (its shelf opens from there — and the shelf, the
+-- bluetooth, wifi and audio menus are walked with J/K/Enter already).
+bind{ mods = "alt",      key = "w", action = "pointer_warp", to = "window" }
+bind{ mods = "alt+ctrl", key = "w", action = "pointer_warp", to = "screen" }
+bind{ mods = "alt",      key = "t", action = "pointer_warp", to = "bar" }
+
+-- The camera over the canvas: Alt+arrows pan (the auto-repeat adds up into one
+-- continuous glide), Alt+Minus / Alt+Equal zoom around the cursor like the
+-- wheel does, Alt+0 returns to 1:1. Super+Space is still the loupe — a pulled
+-- back view where the bare arrows pan.
+bind{ mods = "alt", key = "Left",  action = "pan_camera", dx = -1, dy =  0 }
+bind{ mods = "alt", key = "Right", action = "pan_camera", dx =  1, dy =  0 }
+bind{ mods = "alt", key = "Up",    action = "pan_camera", dx =  0, dy = -1 }
+bind{ mods = "alt", key = "Down",  action = "pan_camera", dx =  0, dy =  1 }
+bind{ mods = "alt", key = "minus", action = "zoom_camera", factor = 0.9 }
+bind{ mods = "alt", key = "equal", action = "zoom_camera", factor = 1.1 }
+bind{ mods = "alt", key = "0",     action = "zoom_camera", reset = true }
 
 -- ── Tags / workspaces (Super+1-9 view, Super+Shift+1-9 assign) ───────────
 -- When bookmarks_mode is on (Super+B), these instead jump to / save camera
@@ -535,7 +759,19 @@ bind{ mods = "super", key = "a", action = "toggle_snapping" }
 -- they are being moved, while magnetism fires once on release and lines an
 -- edge up with a neighbour. The two used to sit on one flag (Super+A), and
 -- there was no way to have shoving without sticking.
-bind{ mods = "super", key = "m", action = "toggle_magnetism" }
+bind{ mods = "super", key = "g", action = "toggle_magnetism" }
+-- Glue (driftwm mode, took over Super+M from magnetism): floating windows
+-- touching edge-to-edge form a cluster. While glue is on, resizing one of
+-- them drags/pushes the touching neighbours along so the group grows and
+-- shrinks together, instead of the dragged window resizing alone into (or
+-- away from) a static neighbour.
+bind{ mods = "super", key = "m", action = "toggle_glue" }
+-- Pin the focused window to the screen (again — unpin): it stays where it is
+-- on the glass while the canvas zooms and pans under it.
+bind{ mods = "super", key = "y", action = "toggle_pin" }
+-- The application dock: show/hide and the edit mode.
+bind{ mods = "super", key = "u", action = "dock_toggle" }
+bind{ mods = "super+shift", key = "u", action = "dock_edit" }
 -- Folding into a stack is off Super+Shift+S: the combination squeezed windows
 -- into one point, which is not what anyone expected of it. If you want it,
 -- bring the line below back.
@@ -558,7 +794,7 @@ bind{ mods = "ctrl+shift", key = "space", action = "layout_prev" }
 bind{ mods = "super+shift", key = "c", action = "reload_config" }
 
 -- ── Refreshing the compositor (Super+R) ──────────────────────────────────
--- A restart in place: the window session is saved to session.json, parallax
+-- A restart in place: parallax
 -- exits with code 42, and launch_native.sh brings it back up — rebuilding
 -- first if the sources are newer than the binary. That is how a fresh build is
 -- picked up without logging out of ly. The windows do close: the wayland
@@ -704,6 +940,13 @@ bind{ mods = "super+shift", key = "p", action = "tray_menu" }
 -- click does the quick thing (wi-fi radio, mute).
 bind{ mods = "super+shift", key = "i", action = "wifi_menu" }
 bind{ mods = "super+shift", key = "a", action = "audio_menu" }
+-- Power: click the battery in the bar or Win+Shift+O — power mode (through
+-- power-profiles-daemon), charge, screen brightness and keyboard backlight.
+bind{ mods = "super+shift", key = "o", action = "power_menu" }
+bind{ mods = "", key = "XF86MonBrightnessUp",   action = "brightness", step = 0.05 }
+bind{ mods = "", key = "XF86MonBrightnessDown", action = "brightness", step = -0.05 }
+bind{ mods = "", key = "XF86KbdBrightnessUp",   action = "kbd_backlight", step = 1 }
+bind{ mods = "", key = "XF86KbdBrightnessDown", action = "kbd_backlight", step = -1 }
 
 
 -- ── The application launcher ────────────────────────────────────────────────
@@ -712,9 +955,13 @@ bind{ mods = "super+shift", key = "a", action = "audio_menu" }
 bind{ mods = "super", key = "s", action = "spawn", cmd = "pkill -x fuzzel || fuzzel" }
 
 -- ── Screenshots and the clipboard ───────────────────────────────────────────
--- PrtScr: a shot of the WHOLE screen straight into the clipboard, no file is
--- written. grim gives the png on stdout, wl-copy picks it up from there.
-bind{ mods = "", key = "Print", action = "spawn", cmd = "grim - | wl-copy" }
+-- PrtScr: a snip like the Windows Snipping Tool. The screen dims and a mode
+-- bar appears on top: "Region" (drag it out; a click without dragging takes
+-- the whole screen), "Window" (click the highlighted window), "Full screen"
+-- and "×". The shot goes to ~/Pictures/Screenshots and to the clipboard.
+-- Esc or a right click cancels. (grim does not work here: parallax does not
+-- offer wlr-screencopy.)
+bind{ mods = "", key = "Print", action = "screenshot" }
 -- Super+C: the clipboard history as a list in fuzzel — images as well as text.
 -- What you pick goes back into the clipboard (cliphist decode | wl-copy), so
 -- it pastes with a plain Ctrl+V wherever you need it.
@@ -772,6 +1019,61 @@ monitor{ name = "DP-2", width = 2560, height = 1080, refresh = 200, x = 0, y = 0
 monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 
 -- ═══════════════════════════════════════════════════════════════════════════
+-- WINDOW RULES AND WIDGETS (window{}) — driftwm's model
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- A rule is applied the moment a window shows up, matched by app_id (exact, or
+-- a prefix when it ends with "*") and/or by a piece of the title:
+--
+--   window{ app_id = "conky", widget = true, x = 60, y = 120, w = 380, h = 520 }
+--   window{ app_id = "eww-*", widget = true }
+--   window{ app_id = "pavucontrol", float = true, w = 900, h = 600 }
+--
+--   app_id / title — what to match; a rule with neither matches nothing
+--   widget         — pin the window to the CANVAS: it cannot be dragged by
+--                    hand, gesture or bind, it lies BELOW ordinary windows and
+--                    it drops out of Super+Tab, of directional focus, of the
+--                    Super+F search and of the taskbar chips. This is what a
+--                    desktop widget is: a clock, a system monitor, a calendar.
+--                    Implies float = true — a pinned window cannot be tiled.
+--   float          — floating, but ordinary (same as toggle_floating at birth)
+--   x, y           — where to put it, in CANVAS coordinates (not screen ones)
+--   w, h           — size in logical pixels; one side alone keeps the other
+--
+-- The compositor draws no widgets of its own: the window belongs to a normal
+-- client (conky, eww, your own gtk toy), and the rule only decides how the
+-- compositor treats it. Placing one by hand is easier live than by guessing
+-- numbers, so there is a command for it:
+--
+--   plx ctl widget list                    — what is pinned and where
+--   plx ctl widget on|off [app_id]         — mark/unmark (default: focused)
+--   plx ctl widget move X Y [app_id]       — the only way to move a widget
+--
+-- window{ app_id = "conky", widget = true, x = 40, y = 80 }
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- DESKTOP ICONS
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- Shortcuts live right on the wallpaper, on the canvas, next to the workspace
+-- they belong to. There is nothing to configure here — they are edited with the
+-- mouse and stored in ~/.local/state/parallax/icons.json:
+--
+--   left click          — launch
+--   drag                — move (saved on release)
+--   right click on icon — properties: name, image, command, size; Delete removes
+--   right click on bare desktop — "New icon here"
+--
+-- The image is looked up as a file path first (png/svg), then as an icon name
+-- in the theme, then as an app_id through its .desktop file — so image =
+-- "firefox" just works. From a script or an installer:
+--
+--   plx ctl icon list
+--   plx ctl icon add firefox cmd=firefox image=firefox x=200 y=200 size=64
+--   plx ctl icon move firefox 600 300
+--   plx ctl icon rm firefox
+
+-- ═══════════════════════════════════════════════════════════════════════════
 -- TOUCHPAD GESTURES (gesture{}) — driftwm's model, brought over 30.08.2026
 -- ═══════════════════════════════════════════════════════════════════════════
 --
@@ -820,7 +1122,7 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 
 -- ── Over a window ──────────────────────────────────────────────────────────
 -- gesture{ mods = "alt", fingers = 3, kind = "swipe", where = "window", action = "resize-window" }
--- gesture{ mods = "alt+shift", fingers = 3, kind = "swipe", where = "window", action = "resize-window-snapped" }
+-- gesture{ mods = "alt+ctrl", fingers = 3, kind = "swipe", where = "window", action = "resize-window-snapped" }
 -- gesture{ mods = "alt", fingers = 3, kind = "pinch-in", where = "window", action = "toggle_fullscreen" }
 -- gesture{ mods = "alt", fingers = 3, kind = "pinch-out", where = "window", action = "toggle_fullscreen" }
 
@@ -885,6 +1187,23 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 --
 -- set{ touchpad_edge_motion = true, touchpad_edge_zone = 0.08,
 --      touchpad_edge_speed = 900.0, touchpad_edge_only_drag = false }
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- TOUCHPAD TAP AND CLICK (libinput)
+--
+-- libinput's own defaults are awkward on a laptop: tap-to-click is OFF and the
+-- right button is only a press in the bottom-right corner of the pad. These
+-- are the defaults parallax sets instead:
+--
+--   touchpad_tap            — tap = click (1 finger left, 2 right, 3 middle)
+--   touchpad_tap_drag       — tap and move right away to drag
+--   touchpad_clickfinger    — a physical press counts fingers (2 = right
+--                             click) instead of using corner areas
+--   touchpad_natural_scroll — content follows the fingers
+--   touchpad_dwt            — ignore the pad while typing
+--
+-- set{ touchpad_tap = true, touchpad_tap_drag = true, touchpad_clickfinger = true,
+--      touchpad_natural_scroll = false, touchpad_dwt = true }
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- MOUSE CHORDS (mouse{}) — hevel's model, brought over 05.09.2026
@@ -1015,3 +1334,18 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 -- that do not support wl_touch at all (old games under Xwayland, java
 -- clients): without this they do not react to a finger in any way.
 -- set{ touch_emulate_pointer = false }
+
+-- Gestures beyond pan and pinch. They work without the lines below; a
+-- touch{} line changes the action, action = "none" turns it off:
+--   edge-left / edge-right — from the edge inward: the neighbouring desk;
+--   edge-top — the status shelf, edge-bottom — the desk overview;
+--   tap-2 — two-finger tap (not on a window): right button;
+--   tap-3 — three-finger tap: window search;
+--   doubletap — on the empty canvas: zoom back to 1:1;
+--   longpress — on the empty canvas: right button (desk menu).
+-- Hold a finger on a window and drag — the window follows (touch_hold_drag);
+-- release in place — right button. touch_edge — edge strip width (0 = none).
+-- touch{ gesture = "tap-3", action = "spawn", cmd = "fuzzel" }
+-- touch{ gesture = "doubletap", action = "none" }
+-- set{ touch_edge = 24, touch_hold_drag = true }
+

@@ -32,31 +32,48 @@ use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use crate::Parallax;
 
-/// Завести место мода. `None` — если не завелась клавиатура: без неё место
-/// бессмысленно (в терминал на панели не напечатать), а молчаливая половина
-/// хуже честного отказа.
-pub fn завести(state: &mut Parallax) -> Option<Seat<Parallax>> {
-    let dh = state.display_handle.clone();
-    let mut место = state.seat_state.new_wl_seat(&dh, "plx-mine".to_string());
+/// Завести место мода — один раз, при старте parallax (`Parallax::new`).
+///
+/// **Не при включении режима**, как было до 07.10.2026. `wl_seat` — глобал, и
+/// GTK-клиенты (ghostty, Firefox) подключают только те места, что были на
+/// момент их запуска: глобал, объявленный позже, они получают и молча не
+/// `bind`-ят. А окна, ради которых режим включают, к Super+Alt+D уже открыты —
+/// панели в игре видны, а кликов и клавиш не получают вовсе. Замер на харнессе:
+/// ghostty, открытый до `mine on`, — 0 клавиш и 0 кнопок от мода; открытый
+/// после — набранное печатается. Поэтому место висит всю сессию, а режим его
+/// только берёт (`включить`) и отпускает (`убрать`).
+///
+/// `None` — если не завелась клавиатура: без неё место бессмысленно (в
+/// терминал на панели не напечатать), а молчаливая половина хуже честного
+/// отказа.
+pub fn завести(
+    seat_state: &mut smithay::input::SeatState<Parallax>,
+    dh: &smithay::reexports::wayland_server::DisplayHandle,
+    раскладка: smithay::input::keyboard::XkbConfig<'_>,
+) -> Option<Seat<Parallax>> {
+    let mut место = seat_state.new_wl_seat(dh, "plx-mine".to_string());
     // Раскладка та же, что у хозяина: клавиши приходят скан-кодами evdev, а
     // раскладку к ним применяет parallax.
-    let раскладка = state.lua_config.xkb_config();
     if место.add_keyboard(раскладка, 200, 25).is_err() {
         tracing::warn!("plx/mine: seat without a keyboard — refused");
         return None;
     }
     место.add_pointer();
-    tracing::info!("plx/mine: the mod has its own seat");
     Some(место)
 }
 
-/// Убрать место: снять фокус и отпустить глобал `wl_seat`.
+/// Режим выключен: снять с места мода фокус и указку. Само место остаётся
+/// (см. [`завести`]) — у него только клон.
 pub fn убрать(state: &mut Parallax, место: Seat<Parallax>) {
+    let serial = SERIAL_COUNTER.next_serial();
     if let Some(клавиатура) = место.get_keyboard() {
-        let serial = SERIAL_COUNTER.next_serial();
         клавиатура.set_focus(state, None, serial);
     }
-    drop(место);
+    if let Some(указатель) = место.get_pointer() {
+        let время = state.start_time.elapsed().as_millis() as u32;
+        указатель.motion(state, None, &MotionEvent { location: (0.0, 0.0).into(), serial, time: время });
+        указатель.frame(state);
+    }
 }
 
 /// Место мода (клон дешёвый — внутри Rc).
@@ -111,7 +128,7 @@ pub fn навести(state: &mut Parallax, окно: &Window, пкс_x: f64, п
     let serial = SERIAL_COUNTER.next_serial();
     let время = state.start_time.elapsed().as_millis() as u32;
 
-    if брать_фокус {
+    if брать_фокус && !super::икс_фокус_отнимет_игру(state, окно) {
         let прежний = место.get_keyboard().and_then(|к| к.current_focus());
         let цель = crate::focus::KeyboardFocusTarget::for_window(окно);
         if let (Some(клавиатура), Some(цель)) = (место.get_keyboard(), цель) {
@@ -146,6 +163,20 @@ pub fn увести(state: &mut Parallax) {
         &MotionEvent { location: (0.0, 0.0).into(), serial, time: время },
     );
     указатель.frame(state);
+}
+
+/// Прицел давно ушёл с панелей — снять клавиатуру места мода совсем.
+///
+/// Так у Hypr3D (`AimFocus`): фокус есть только у окна под прицелом. Бинды,
+/// метящие в окно, в это время не делают ничего (см. `focused_surface`), а
+/// клавиши мод и сам отдаёт игре, пока прицел не на панели.
+pub fn снять_фокус(state: &mut Parallax) {
+    let Some(место) = место(state) else { return };
+    let Some(клавиатура) = место.get_keyboard() else { return };
+    if клавиатура.current_focus().is_none() {
+        return;
+    }
+    клавиатура.set_focus(state, None, SERIAL_COUNTER.next_serial());
 }
 
 /// Кнопка мыши от мода. Панель под взглядом ещё и поднимается наверх — как по

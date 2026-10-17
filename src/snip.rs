@@ -18,6 +18,10 @@
 //! остаётся и старое поведение «снимок всего экрана», ради которого не пришлось
 //! заводить второй бинд.
 //!
+//! Сверху экрана — панель режимов, как у «Ножниц» Windows (26.09.2026):
+//! «Область», «Окно» (подсвечивается окно под курсором, клик снимает его
+//! видимую рамку), «Весь экран» (снимок сразу) и «×» — отмена.
+//!
 //! **Кадр снимается не здесь.** Пиксели живут в GlesRenderer, который
 //! принадлежит циклу отрисовки в udev.rs, — тем же приёмом, что и
 //! `screencopy::serve_pending`, запрос кладётся в [`Parallax::snip_ждёт`] и
@@ -35,6 +39,24 @@ use crate::тф;
 /// просто щёлкнул: снимаем монитор целиком.
 const МИНИМУМ: f64 = 8.0;
 
+/// Что снимаем — как в «Ножницах» Windows: панель режимов сверху экрана.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Режим {
+    /// Обвести прямоугольник мышью (клик без протяжки — весь экран).
+    Область,
+    /// Окно под курсором подсвечивается, клик снимает его видимую рамку.
+    Окно,
+    /// Весь монитор — сразу, по кнопке панели.
+    Экран,
+}
+
+/// Кнопка панели режимов.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Кнопка {
+    Режим(Режим),
+    Отмена,
+}
+
 /// Идущее выделение области.
 pub struct Выделение {
     /// Где нажали, в координатах ХОЛСТА. `None` — рамку ещё не начали тянуть
@@ -44,6 +66,56 @@ pub struct Выделение {
     /// по нему. Кадр берётся с одного выхода, и растянутая на два экрана рамка
     /// означала бы склейку двух снимков — этого сознательно не делаем.
     pub монитор: usize,
+    /// Текущий режим панели.
+    pub режим: Режим,
+    /// Кнопка панели, на которой нажали ЛКМ. Срабатывает она на отпускании и
+    /// только если курсор с неё не ушёл — как любая кнопка. Заодно отпускание
+    /// не утекает клиенту: выделение живо, пока кнопку не отпустили.
+    pub нажата_кнопка: Option<Кнопка>,
+}
+
+/// Масштаб шрифта панели и подписей.
+pub const МАСШТАБ: i32 = 2;
+
+/// Кнопки панели режимов в экранных пикселях монитора шириной `ширина` и
+/// высотой `высота`, слева направо. Одна функция на отрисовку (udev.rs) и на
+/// хит-тест (`snip_click`) — иначе кнопка нажималась бы не там, где нарисована.
+pub fn панель(ширина: i32, высота: i32) -> Vec<(Rectangle<i32, Physical>, Кнопка, &'static str)> {
+    const ПОЛЕ_X: i32 = 18;
+    const ПОЛЕ_Y: i32 = 10;
+    const ЗАЗОР: i32 = 6;
+    let кнопки: [(Кнопка, &'static str); 4] = [
+        (Кнопка::Режим(Режим::Область), crate::т!("Область", "Region")),
+        (Кнопка::Режим(Режим::Окно), crate::т!("Окно", "Window")),
+        (Кнопка::Режим(Режим::Экран), crate::т!("Весь экран", "Full screen")),
+        (Кнопка::Отмена, "×"),
+    ];
+    let в = crate::text::height(МАСШТАБ) + ПОЛЕ_Y * 2;
+    let ширины: Vec<i32> = кнопки.iter()
+        .map(|(_, т)| crate::text::width_of(т, crate::text::Weight::Semi, МАСШТАБ) + ПОЛЕ_X * 2)
+        .collect();
+    let всего: i32 = ширины.iter().sum::<i32>() + ЗАЗОР * (кнопки.len() as i32 - 1);
+    let mut x = (ширина - всего) / 2;
+    let y = (высота / 24).max(12);
+    кнопки.iter().zip(ширины).map(|(&(к, т), ш)| {
+        let r = Rectangle::new((x, y).into(), (ш, в).into());
+        x += ш + ЗАЗОР;
+        (r, к, т)
+    }).collect()
+}
+
+/// Рамка всей панели (подложка под кнопками).
+pub fn рамка_панели(ширина: i32, высота: i32) -> Option<Rectangle<i32, Physical>> {
+    const ПОЛЕ: i32 = 6;
+    let кнопки = панель(ширина, высота);
+    let (первая, последняя) = (кнопки.first()?.0, кнопки.last()?.0);
+    Some(Rectangle::new(
+        (первая.loc.x - ПОЛЕ, первая.loc.y - ПОЛЕ).into(),
+        (
+            последняя.loc.x + последняя.size.w - первая.loc.x + ПОЛЕ * 2,
+            первая.size.h + ПОЛЕ * 2,
+        ).into(),
+    ))
 }
 
 /// Готовый запрос на кадр: ждёт ближайшей отрисовки нужного выхода.
@@ -69,14 +141,106 @@ impl Parallax {
             self.request_redraw();
             return;
         }
-        self.snip = Some(Выделение { начало: None, монитор: self.курсор_монитор });
+        self.snip = Some(Выделение {
+            начало: None,
+            монитор: self.курсор_монитор,
+            режим: Режим::Область,
+            нажата_кнопка: None,
+        });
         tracing::info!("plx/snip: region selection, monitor {}", self.курсор_монитор + 1);
         self.request_redraw();
     }
 
+    /// Камера и размер экрана монитора `номер`: у активного живая копия вида
+    /// лежит в `viewport`, у остальных — в самом мониторе (monitors.rs). Без
+    /// таблицы мониторов (winit/headless) — первый выход и живой вид.
+    fn snip_вид(&self, номер: usize) -> Option<(Output, f64, f64, f64)> {
+        let (output, вид) = match self.мониторы.get(номер) {
+            Some(м) if номер != self.активный => (м.output.clone(), м.viewport.clone()),
+            Some(м) => (м.output.clone(), self.viewport.clone()),
+            None => (self.space.outputs().next()?.clone(), self.viewport.clone()),
+        };
+        Some((output, вид.cam_x, вид.cam_y, вид.zoom.max(0.01)))
+    }
+
+    /// Холст → экранные пиксели монитора `номер`.
+    pub fn snip_в_экран(&self, номер: usize, p: Point<f64, Logical>) -> Option<(f64, f64)> {
+        let (_, cx, cy, zoom) = self.snip_вид(номер)?;
+        Some(((p.x - cx) * zoom, (p.y - cy) * zoom))
+    }
+
+    /// Размер экрана монитора `номер` в физических пикселях.
+    fn snip_экран(&self, номер: usize) -> Option<(Output, Size<i32, Physical>)> {
+        let (output, ..) = self.snip_вид(номер)?;
+        let mode = output.current_mode()?;
+        Some((output, mode.size))
+    }
+
+    /// Кнопка панели под курсором (панель живёт на мониторе выделения).
+    pub fn snip_кнопка_под_курсором(&self) -> Option<Кнопка> {
+        let в = self.snip.as_ref()?;
+        if в.монитор != self.курсор_монитор {
+            return None;
+        }
+        let (_, экран) = self.snip_экран(в.монитор)?;
+        let (x, y) = self.snip_в_экран(в.монитор, self.pointer_location)?;
+        let точка = Point::<i32, Physical>::from((x.floor() as i32, y.floor() as i32));
+        панель(экран.w, экран.h).into_iter()
+            .find(|(r, _, _)| r.contains(точка))
+            .map(|(_, к, _)| к)
+    }
+
+    /// Режим «Окно»: видимая рамка окна под курсором в экранных пикселях
+    /// монитора выделения — то, что уйдёт в снимок и что подсвечивается.
+    ///
+    /// Рамка ВИДИМАЯ (`xwin::видимый_размер`), а не то, что нарисовал клиент:
+    /// упрямое окно (GTK, Electron) рисует буфер больше слота и режется
+    /// рендером, и снимок по полному размеру прихватил бы кусок соседа.
+    pub fn snip_окно(&self) -> Option<Rectangle<i32, Physical>> {
+        let в = self.snip.as_ref()?;
+        if в.режим != Режим::Окно || в.монитор != self.курсор_монитор {
+            return None;
+        }
+        if self.snip_кнопка_под_курсором().is_some() {
+            return None;
+        }
+        let (окно, _) = self.окно_под(self.pointer_location)?;
+        let g = self.space.element_geometry(&окно)?;
+        let размер = if self.is_fullscreen(&окно) {
+            g.size
+        } else {
+            crate::xwin::видимый_размер(&окно, g.size)
+        };
+        let (_, экран) = self.snip_экран(в.монитор)?;
+        let (x0, y0) = self.snip_в_экран(в.монитор, g.loc.to_f64())?;
+        let (_, _, _, zoom) = self.snip_вид(в.монитор)?;
+        let рамка = Rectangle::<i32, Physical>::new(
+            (x0.round() as i32, y0.round() as i32).into(),
+            (
+                (размер.w as f64 * zoom).round().max(1.0) as i32,
+                (размер.h as f64 * zoom).round().max(1.0) as i32,
+            ).into(),
+        );
+        рамка.intersection(Rectangle::from_size(экран))
+            .filter(|r| r.size.w > 0 && r.size.h > 0)
+    }
+
+    /// Курсор сдвинулся. Пока рамку не начали тянуть, панель и затемнение
+    /// переезжают на монитор под курсором — снимать будем там, куда смотрят.
+    pub fn snip_движение(&mut self) {
+        let монитор = self.курсор_монитор;
+        if let Some(в) = self.snip.as_mut() {
+            if в.начало.is_none() && в.нажата_кнопка.is_none() {
+                в.монитор = монитор;
+            }
+        }
+    }
+
     /// Кнопка мыши во время выделения. `true` — клик съеден.
     ///
-    /// ЛКМ вниз ставит угол, ЛКМ вверх заканчивает, ПКМ отменяет.
+    /// ЛКМ по кнопке панели меняет режим (срабатывает на отпускании). Дальше
+    /// по режиму: «Область» — нажали и тянем рамку, «Окно» — клик по окну,
+    /// «Весь экран» — клик где угодно. ПКМ отменяет.
     pub fn snip_click(&mut self, левая: bool, нажата: bool) -> bool {
         if self.snip.is_none() {
             return false;
@@ -91,76 +255,72 @@ impl Parallax {
             }
             return true;
         }
+        let кнопка = self.snip_кнопка_под_курсором();
         if нажата {
             let точка = self.pointer_location;
+            let монитор = self.курсор_монитор;
             if let Some(в) = self.snip.as_mut() {
-                в.начало = Some(точка);
-                в.монитор = self.курсор_монитор;
+                if кнопка.is_some() {
+                    в.нажата_кнопка = кнопка;
+                } else if в.режим == Режим::Область {
+                    в.начало = Some(точка);
+                    в.монитор = монитор;
+                }
             }
             self.request_redraw();
             return true;
         }
-        self.snip_finish();
-        true
-    }
 
-    /// Отпустили кнопку: превращаем рамку в запрос кадра.
-    fn snip_finish(&mut self) {
-        let Some(выделение) = self.snip.take() else { return };
-        self.request_redraw();
-        let Some(монитор) = self.мониторы.get(выделение.монитор) else {
-            // Один выход без таблицы мониторов (winit/headless) — снимаем его
-            // целиком: рамку не по чему пересчитывать.
-            let Some(output) = self.space.outputs().next().cloned() else { return };
-            let Some(mode) = output.current_mode() else { return };
-            self.snip_ждёт = Some(Запрос {
-                output,
-                область: Rectangle::from_size((mode.size.w, mode.size.h).into()),
-            });
-            return;
+        // Отпускание.
+        let (режим, нажатая) = match self.snip.as_mut() {
+            Some(в) => (в.режим, в.нажата_кнопка.take()),
+            None => return true,
         };
-        let output = монитор.output.clone();
-        let дом = монитор.дом;
-        let размер = монитор.размер;
-        let Some(mode) = output.current_mode() else { return };
-        // Вид ЭТОГО монитора: у активного живая копия лежит в `viewport`, у
-        // остальных — в самом мониторе (см. monitors.rs::сохранить_вид).
-        let вид = if выделение.монитор == self.активный {
-            self.viewport.clone()
-        } else {
-            монитор.viewport.clone()
-        };
-        let zoom = вид.zoom.max(0.01);
-
-        // Холст → экранные пиксели этого выхода.
-        let в_экран = |p: Point<f64, Logical>| -> (f64, f64) {
-            ((p.x - вид.cam_x) * zoom, (p.y - вид.cam_y) * zoom)
-        };
-        let полный = Rectangle::from_size(Size::<i32, Physical>::from((mode.size.w, mode.size.h)));
-        let область = match выделение.начало {
-            Some(начало) => {
-                let (x0, y0) = в_экран(начало);
-                let (x1, y1) = в_экран(self.pointer_location);
-                let (w, h) = ((x1 - x0).abs(), (y1 - y0).abs());
-                if w < МИНИМУМ || h < МИНИМУМ {
-                    // Клик без протяжки — весь монитор.
-                    полный
-                } else {
-                    let рамка = Rectangle::<i32, Physical>::new(
-                        (x0.min(x1).round() as i32, y0.min(y1).round() as i32).into(),
-                        (w.round().max(1.0) as i32, h.round().max(1.0) as i32).into(),
-                    );
-                    // Рамку могли увести за край экрана (курсор у parallax ходит по
-                    // холсту, а не по монитору) — режем по выходу.
-                    match рамка.intersection(полный) {
-                        Some(r) if r.size.w > 0 && r.size.h > 0 => r,
-                        _ => полный,
+        if let Some(нажатая) = нажатая {
+            // Кнопка срабатывает, только если с неё не ушли.
+            if кнопка == Some(нажатая) {
+                match нажатая {
+                    Кнопка::Отмена => {
+                        self.snip = None;
+                        tracing::info!("plx/snip: cancelled (panel)");
+                    }
+                    Кнопка::Режим(Режим::Экран) => self.snip_снять(None),
+                    Кнопка::Режим(новый) => {
+                        if let Some(в) = self.snip.as_mut() {
+                            в.режим = новый;
+                            в.начало = None;
+                        }
+                        tracing::info!("plx/snip: mode {:?}", новый);
                     }
                 }
             }
-            None => полный,
-        };
-        let _ = (дом, размер);
+            self.request_redraw();
+            return true;
+        }
+        match режим {
+            Режим::Область => self.snip_finish(),
+            Режим::Экран => self.snip_снять(None),
+            Режим::Окно => match self.snip_окно() {
+                Some(рамка) => self.snip_снять(Some(рамка)),
+                // Мимо окон — ничего не снимаем и ждём клика по окну, как
+                // «Ножницы» в режиме окна.
+                None => self.request_redraw(),
+            },
+        }
+        true
+    }
+
+    /// Закончить выделение и попросить кадр: `область` в экранных пикселях
+    /// монитора выделения, `None` — весь монитор.
+    fn snip_снять(&mut self, область: Option<Rectangle<i32, Physical>>) {
+        let Some(выделение) = self.snip.take() else { return };
+        self.request_redraw();
+        let Some((output, экран)) = self.snip_экран(выделение.монитор) else { return };
+        let полный = Rectangle::from_size(экран);
+        let область = область
+            .and_then(|r| r.intersection(полный))
+            .filter(|r| r.size.w > 0 && r.size.h > 0)
+            .unwrap_or(полный);
         tracing::info!(
             "plx/snip: capturing {}×{} from {} (position {},{})",
             область.size.w, область.size.h, output.name(), область.loc.x, область.loc.y,
@@ -169,6 +329,25 @@ impl Parallax {
         // Кадр снимается ПОСЛЕ отрисовки, а отрисовку надо ещё попросить:
         // на неподвижном экране parallax кадров не рисует вовсе.
         self.request_redraw();
+    }
+
+    /// Отпустили кнопку в режиме «Область»: превращаем рамку в запрос кадра.
+    fn snip_finish(&mut self) {
+        let Some(в) = self.snip.as_ref() else { return };
+        let монитор = в.монитор;
+        let рамка = в.начало.and_then(|начало| {
+            let (x0, y0) = self.snip_в_экран(монитор, начало)?;
+            let (x1, y1) = self.snip_в_экран(монитор, self.pointer_location)?;
+            let (w, h) = ((x1 - x0).abs(), (y1 - y0).abs());
+            // Клик без протяжки — весь монитор.
+            (w >= МИНИМУМ && h >= МИНИМУМ).then(|| Rectangle::<i32, Physical>::new(
+                (x0.min(x1).round() as i32, y0.min(y1).round() as i32).into(),
+                (w.round().max(1.0) as i32, h.round().max(1.0) as i32).into(),
+            ))
+        });
+        // Рамку могли увести за край экрана (курсор у parallax ходит по
+        // холсту, а не по монитору) — `snip_снять` режет её по выходу.
+        self.snip_снять(рамка);
     }
 
     /// Escape во время выделения.

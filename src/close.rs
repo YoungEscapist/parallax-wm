@@ -50,11 +50,20 @@ pub struct Уход {
     pub контекст: smithay::backend::renderer::ContextId<GlesTexture>,
     /// Где окно стояло на ХОЛСТЕ (не на экране): камера за время ухода
     /// продолжает ездить, и привязка к экрану уводила бы картинку с места.
-    pub rect: Rectangle<i32, Logical>,
+    ///
+    /// Это рамка, в которой окно было НАРИСОВАНО в последнем кадре (см.
+    /// `udev::ВидОкна`), а не геометрия клиента: у неподатливого клиента в
+    /// тайлинге, на живом ресайзе и на пружине размера они расходятся, и
+    /// снимок по геометрии на первом же кадре закрытия прыгал в размере.
+    pub rect: Rectangle<f64, Logical>,
     /// Постоянный Id: damage tracker ведёт историю по нему, и новый Id на
     /// каждый кадр означал бы полную перерисовку экрана (та же грабля, что в
     /// decor.rs и build_wallpaper_backdrop).
     pub id: Id,
+    /// Id матового стекла под снимком — есть, только если окно было
+    /// прозрачным со стеклом (см. `blur::Подложка`). Без него прозрачный
+    /// терминал на первом кадре ухода терял размытие и резко «прояснялся».
+    pub стекло: Option<Id>,
     start: Instant,
     duration: Duration,
 }
@@ -64,8 +73,9 @@ impl Уход {
         self.start.elapsed() >= self.duration
     }
 
-    /// Доля пройденного пути по спокойной кривой.
-    fn t(&self) -> f64 {
+    /// Доля пройденного пути по спокойной кривой. Она же — доля растворения
+    /// при `set{ dissolve }` (см. udev::build_closing_elements).
+    pub fn t(&self) -> f64 {
         let elapsed = self.start.elapsed().as_secs_f64();
         crate::anim::ease_calm(elapsed / self.duration.as_secs_f64().max(1e-6))
     }
@@ -87,6 +97,8 @@ pub fn снять(
     renderer: &mut GlesRenderer,
     window: &Window,
     rect: Rectangle<i32, Logical>,
+    холст: Rectangle<f64, Logical>,
+    стекло: bool,
     duration: Duration,
 ) -> Option<Уход> {
     if rect.size.w <= 0 || rect.size.h <= 0 {
@@ -145,8 +157,9 @@ pub fn снять(
     Some(Уход {
         контекст: renderer.context_id(),
         текстура,
-        rect,
+        rect: холст,
         id: Id::new(),
+        стекло: стекло.then(Id::new),
         start: Instant::now(),
         duration,
     })

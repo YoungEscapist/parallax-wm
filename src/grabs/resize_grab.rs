@@ -58,6 +58,161 @@ pub struct ResizeSurfaceGrab {
     /// То же для доли высоты строки схваченного окна (вертикальный ресайз в
     /// Columns): доля = base + total_delta_y/avail_h.
     row_resize_base: Option<f64>,
+    /// Склейка driftwm (Super+M, is_glue_enabled, см. cluster.rs): плавающие
+    /// окна, касавшиеся краями резайзимого окна на старте хвата, толкаются
+    /// вслед за растущим/уменьшающимся краем. Пусто, если склейка выключена,
+    /// окно тайловое, или в "созвездии" (group_initial) уже кто-то есть —
+    /// два способа тащить соседей друг другу не мешают только порознь.
+    glue: crate::cluster::GlueResizeSnapshot,
+    /// Соседи по прилипанию к краям экрана (как в KDE): окна, прилипшие
+    /// впритык к краю, за который тянут, и их геометрия на старте. Тянешь
+    /// границу между двумя половинами — вторая ужимается или растёт следом.
+    /// Снимается на первом ходу (в `start` нет доступа к состоянию).
+    край_соседи: Option<Vec<(Window, Rectangle<i32, Logical>, ResizeEdge)>>,
+}
+
+/// Ширина невидимой полосы снаружи окна (экранные px), за которую его тянут
+/// левой кнопкой без Super. Половина обычного зазора тайлинга: между двумя
+/// плитками полосы соседей встречаются посередине и не спорят.
+pub const КРОМКА_ЗОНА: f64 = 8.0;
+
+/// Отрезок кромки у угла (экранные px), где тянется угол, а не сторона.
+pub const КРОМКА_УГОЛ: f64 = 28.0;
+
+/// Какой край окна `рамка` лежит под точкой `pos`, если она в полосе `зона`
+/// СНАРУЖИ рамки. Внутри рамки и дальше полосы — `None`.
+pub fn край_кромки(
+    рамка: Rectangle<f64, Logical>,
+    pos: Point<f64, Logical>,
+    зона: f64,
+    угол: f64,
+) -> Option<ResizeEdge> {
+    let (x0, y0) = (рамка.loc.x, рамка.loc.y);
+    let (x1, y1) = (x0 + рамка.size.w, y0 + рамка.size.h);
+    if pos.x < x0 - зона || pos.x >= x1 + зона || pos.y < y0 - зона || pos.y >= y1 + зона {
+        return None;
+    }
+    let (лево, право, верх, низ) = (pos.x < x0, pos.x >= x1, pos.y < y0, pos.y >= y1);
+    let mut край = ResizeEdge::empty();
+    край.set(ResizeEdge::LEFT, лево);
+    край.set(ResizeEdge::RIGHT, право);
+    край.set(ResizeEdge::TOP, верх);
+    край.set(ResizeEdge::BOTTOM, низ);
+    if край.is_empty() {
+        return None;
+    }
+    // У угла сторона тянется вместе с соседней — но не больше трети стороны,
+    // иначе у узкого окна от «просто стороны» ничего не останется.
+    let (ух, уу) = (угол.min(рамка.size.w / 3.0), угол.min(рамка.size.h / 3.0));
+    if !верх && !низ {
+        край.set(ResizeEdge::TOP, pos.y < y0 + уу);
+        край.set(ResizeEdge::BOTTOM, pos.y >= y1 - уу);
+    }
+    if !лево && !право {
+        край.set(ResizeEdge::LEFT, pos.x < x0 + ух);
+        край.set(ResizeEdge::RIGHT, pos.x >= x1 - ух);
+    }
+    Some(край)
+}
+
+/// Стрелка ресайза для края.
+pub fn значок_кромки(край: ResizeEdge) -> smithay::input::pointer::CursorIcon {
+    use smithay::input::pointer::CursorIcon::*;
+    match край {
+        ResizeEdge::TOP_LEFT => NwResize,
+        ResizeEdge::TOP_RIGHT => NeResize,
+        ResizeEdge::BOTTOM_LEFT => SwResize,
+        ResizeEdge::BOTTOM_RIGHT => SeResize,
+        ResizeEdge::TOP => NResize,
+        ResizeEdge::BOTTOM => SResize,
+        ResizeEdge::LEFT => WResize,
+        _ => EResize,
+    }
+}
+
+/// Меньше этого сосед по прилипанию не ужимается: дальше тянущее окно
+/// упирается, а не выдавливает соседа в полоску.
+const МИН_СОСЕДА: i32 = 120;
+
+/// Какими из тянущихся краёв `edges` окно `хват` примыкает к `сосед`.
+fn примыкает(
+    хват: Rectangle<i32, Logical>,
+    сосед: Rectangle<i32, Logical>,
+    edges: ResizeEdge,
+    допуск: i32,
+) -> ResizeEdge {
+    let по_вертикали = хват.loc.y < сосед.loc.y + сосед.size.h && сосед.loc.y < хват.loc.y + хват.size.h;
+    let по_горизонтали = хват.loc.x < сосед.loc.x + сосед.size.w && сосед.loc.x < хват.loc.x + хват.size.w;
+    let mut стороны = ResizeEdge::empty();
+    if по_вертикали {
+        if edges.contains(ResizeEdge::RIGHT) && (сосед.loc.x - (хват.loc.x + хват.size.w)).abs() <= допуск {
+            стороны |= ResizeEdge::RIGHT;
+        }
+        if edges.contains(ResizeEdge::LEFT) && (сосед.loc.x + сосед.size.w - хват.loc.x).abs() <= допуск {
+            стороны |= ResizeEdge::LEFT;
+        }
+    }
+    if по_горизонтали {
+        if edges.contains(ResizeEdge::BOTTOM) && (сосед.loc.y - (хват.loc.y + хват.size.h)).abs() <= допуск {
+            стороны |= ResizeEdge::BOTTOM;
+        }
+        if edges.contains(ResizeEdge::TOP) && (сосед.loc.y + сосед.size.h - хват.loc.y).abs() <= допуск {
+            стороны |= ResizeEdge::TOP;
+        }
+    }
+    стороны
+}
+
+/// Геометрия соседа, когда тянущее окно выросло на (`dw`, `dh`): сосед
+/// отдаёт ровно столько же, зазор между окнами не меняется.
+fn подвинуть_соседа(
+    сосед: Rectangle<i32, Logical>,
+    стороны: ResizeEdge,
+    dw: i32,
+    dh: i32,
+) -> Rectangle<i32, Logical> {
+    let mut r = сосед;
+    if стороны.intersects(ResizeEdge::LEFT | ResizeEdge::RIGHT) {
+        r.size.w = (сосед.size.w - dw).max(1);
+        if стороны.contains(ResizeEdge::RIGHT) {
+            r.loc.x = сосед.loc.x + сосед.size.w - r.size.w;
+        }
+    }
+    if стороны.intersects(ResizeEdge::TOP | ResizeEdge::BOTTOM) {
+        r.size.h = (сосед.size.h - dh).max(1);
+        if стороны.contains(ResizeEdge::BOTTOM) {
+            r.loc.y = сосед.loc.y + сосед.size.h - r.size.h;
+        }
+    }
+    r
+}
+
+/// Прилипшие к краям окна текущего стола, примыкающие к тянущемуся краю
+/// `window`. Пусто, если само окно не прилипшее или раскладка не тайловая.
+fn прилипшие_соседи(
+    data: &Parallax,
+    window: &Window,
+    edges: ResizeEdge,
+    rect: Rectangle<i32, Logical>,
+) -> Vec<(Window, Rectangle<i32, Logical>, ResizeEdge)> {
+    if data.tile_config.layout == Layout::Float || data.overview_active
+        || !data.до_прилипания.iter().any(|(w, _)| w == window)
+    {
+        return Vec::new();
+    }
+    let tags = data.viewport.current_tags();
+    let допуск = crate::tiling::GAP_INNER() + ADJACENCY_TOLERANCE;
+    data.до_прилипания.iter()
+        .map(|(w, _)| w)
+        .filter(|w| *w != window)
+        .filter(|w| data.tagged_windows.iter().any(|tw| &tw.window == *w && tw.floating && tw.tags & tags != 0))
+        .filter_map(|w| {
+            let g = data.space.element_geometry(w)?;
+            let r = Rectangle::new(g.loc, crate::xwin::видимый_размер(w, g.size));
+            let стороны = примыкает(rect, r, edges, допуск);
+            (!стороны.is_empty()).then(|| (w.clone(), r, стороны))
+        })
+        .collect()
 }
 
 impl ResizeSurfaceGrab {
@@ -67,6 +222,7 @@ impl ResizeSurfaceGrab {
         edges: ResizeEdge,
         initial_window_rect: Rectangle<i32, Logical>,
         group_initial: Vec<(Window, Rectangle<i32, Logical>)>,
+        glue: crate::cluster::GlueResizeSnapshot,
     ) -> Self {
         // У X11-окна поверхности может ещё не быть — ResizeSurfaceState живёт
         // в её данных, но для X11 он и не нужен: позицию при ресайзе от
@@ -90,20 +246,15 @@ impl ResizeSurfaceGrab {
             tile_last_delta: Point::from((0.0, 0.0)),
             col_resize_base: None,
             row_resize_base: None,
+            glue,
+            край_соседи: None,
         }
     }
-}
 
-impl PointerGrab<Parallax> for ResizeSurfaceGrab {
-    fn motion(
-        &mut self,
-        data: &mut Parallax,
-        handle: &mut PointerInnerHandle<'_, Parallax>,
-        _focus: Option<(WlSurface, Point<f64, Logical>)>,
-        event: &MotionEvent,
-    ) {
-        handle.motion(data, None, event);
-
+    /// Шаг ресайза к точке курсора `location` (canvas). Общий для Win+ПКМ
+    /// (из `motion`) и жеста Super+3 пальца, который ведёт grab сам, мимо
+    /// указателя — так жест ресайзит ровно как мышь во всех раскладках.
+    pub fn resize_to(&mut self, data: &mut Parallax, location: Point<f64, Logical>) {
         // Окно в тайлинге? В обзоре — ровно та же проверка: ресайз там обязан
         // работать «как будто обзора нет», то есть тянуть деления раскладки, а
         // не менять размер окна свободно.
@@ -114,7 +265,7 @@ impl PointerGrab<Parallax> for ResizeSurfaceGrab {
             });
 
         if is_tiled {
-            let delta = event.location - self.start_data.location;
+            let delta = location - self.start_data.location;
             if data.tile_config.layout == Layout::Tile {
                 // Tile: тянем деления BSP-дерева (Hyprland resizeTarget,
                 // smart_resizing). Дереву отдаём ИНКРЕМЕНТ с прошлого события —
@@ -169,7 +320,7 @@ impl PointerGrab<Parallax> for ResizeSurfaceGrab {
         }
 
         // Floating: обычный resize
-        let mut delta = event.location - self.start_data.location;
+        let mut delta = location - self.start_data.location;
         let mut new_w = self.initial_rect.size.w;
         let mut new_h = self.initial_rect.size.h;
 
@@ -199,8 +350,25 @@ impl PointerGrab<Parallax> for ResizeSurfaceGrab {
         // тянется там ровно так же, как вне обзора (у остальных ресайз идёт
         // тайловой веткой выше).
         let (_, max_size) = crate::xwin::size_constraints(&self.window);
-        let max_w = if max_size.w <= 0 { i32::MAX } else { max_size.w };
-        let max_h = if max_size.h <= 0 { i32::MAX } else { max_size.h };
+        let mut max_w = if max_size.w <= 0 { i32::MAX } else { max_size.w };
+        let mut max_h = if max_size.h <= 0 { i32::MAX } else { max_size.h };
+        // Соседи по прилипанию к краям: окно растёт только за их счёт, и не
+        // дальше, чем сосед может ужаться.
+        if self.край_соседи.is_none() {
+            let соседи = прилипшие_соседи(data, &self.window, self.edges, self.initial_rect);
+            for (w, _, _) in &соседи {
+                data.freeze_window_anim(w);
+            }
+            self.край_соседи = Some(соседи);
+        }
+        for (_, r, стороны) in self.край_соседи.iter().flatten() {
+            if стороны.intersects(ResizeEdge::LEFT | ResizeEdge::RIGHT) {
+                max_w = max_w.min(self.initial_rect.size.w + (r.size.w - МИН_СОСЕДА).max(0));
+            }
+            if стороны.intersects(ResizeEdge::TOP | ResizeEdge::BOTTOM) {
+                max_h = max_h.min(self.initial_rect.size.h + (r.size.h - МИН_СОСЕДА).max(0));
+            }
+        }
         self.last_window_size = Size::from((
             new_w.clamp(1, max_w),
             new_h.clamp(1, max_h),
@@ -209,12 +377,16 @@ impl PointerGrab<Parallax> for ResizeSurfaceGrab {
         crate::xwin::set_resizing(&self.window, true);
         crate::xwin::set_size(&self.window, Some(self.last_window_size), crate::xwin::Tiled::Keep);
         crate::xwin::configure(&self.window);
+        data.отметить_живой_размер(&self.window);
 
-        // Тянем за левый/верхний край → окно должно ещё и ехать. У wayland-окна
-        // это делает handle_commit по факту применения нового размера клиентом;
-        // X11-клиент нового размера не «подтверждает» — двигаем сами и сразу,
-        // иначе окно растёт только вправо/вниз.
-        if self.window.is_x11() {
+        // Тянем за левый/верхний край → окно должно ещё и ехать. Двигаем САМИ
+        // и СРАЗУ — и X11 (он нового размера не «подтверждает»), и wayland.
+        // У wayland это раньше делал handle_commit по факту применения размера
+        // клиентом, и левый край прыгал вслед за курсором по коммиту на ступень.
+        // Теперь кадр рисует окно в запрошенном размере (растяжка или обрезка,
+        // см. `живая_растяжка`), значит и место считается от запрошенного —
+        // противоположный угол стоит, как прибитый.
+        {
             let mut loc = self.initial_rect.loc;
             if self.edges.intersects(ResizeEdge::LEFT) {
                 loc.x += self.initial_rect.size.w - self.last_window_size.w;
@@ -223,6 +395,44 @@ impl PointerGrab<Parallax> for ResizeSurfaceGrab {
                 loc.y += self.initial_rect.size.h - self.last_window_size.h;
             }
             data.space.map_element(self.window.clone(), loc, false);
+        }
+
+        // Прилипшие соседи отдают или забирают ровно то, на что изменилось
+        // это окно: граница между половинами экрана едет одна на двоих.
+        if self.край_соседи.as_ref().is_some_and(|с| !с.is_empty()) {
+            let dw = self.last_window_size.w - self.initial_rect.size.w;
+            let dh = self.last_window_size.h - self.initial_rect.size.h;
+            for (сосед, было, стороны) in self.край_соседи.iter().flatten() {
+                let r = подвинуть_соседа(*было, *стороны, dw, dh);
+                crate::xwin::set_size(сосед, Some(r.size), crate::xwin::Tiled::Keep);
+                crate::xwin::configure(сосед);
+                data.отметить_живой_размер(сосед);
+                data.space.map_element(сосед.clone(), r.loc, false);
+                if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| &tw.window == сосед) {
+                    tw.float_position = r.loc;
+                    tw.position = r.loc;
+                    tw.float_size = Some(r.size);
+                    tw.float_position_set = true;
+                }
+            }
+            data.request_redraw();
+        }
+
+        // Склейка driftwm (Super+M): соседи, касавшиеся резайзимого окна на
+        // старте хвата, толкаются вслед за растущим краем — не масштаб, а
+        // сдвиг позиции, ровно как в driftwm (см. cluster.rs).
+        if !self.glue.is_empty() {
+            let width_delta = self.last_window_size.w - self.initial_rect.size.w;
+            let height_delta = self.last_window_size.h - self.initial_rect.size.h;
+            for (member, new_pos) in self.glue.compute_member_positions(width_delta, height_delta) {
+                data.space.map_element(member.clone(), new_pos, false);
+                if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| tw.window == member) {
+                    tw.float_position = new_pos;
+                    tw.position = new_pos;
+                    tw.float_position_set = true;
+                }
+            }
+            data.request_redraw();
         }
 
         // "Созвездие": остальные окна группы масштабируются ЖИВО вместе с
@@ -248,11 +458,103 @@ impl PointerGrab<Parallax> for ResizeSurfaceGrab {
                 let new_y = (anchor_y as f64 + (geo.loc.y - anchor_y) as f64 * scale_y).round() as i32;
                 crate::xwin::set_size(&member, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
                 crate::xwin::configure(&member);
+                data.отметить_живой_размер(&member);
                 let new_loc: Point<i32, Logical> = (new_x, new_y).into();
                 data.space.map_element(member.clone(), new_loc, false);
             }
             data.request_redraw();
         }
+    }
+
+    /// Конец ресайза: отпустили ПКМ или пальцы.
+    pub fn finish(&mut self, data: &mut Parallax) {
+        // Только для floating (и обзора) — финализируем resize.
+        // В tiling/columns: сбрасываем ResizeSurfaceState (commit-хендлер
+        // не должен корректировать позицию — ей управляет layout).
+        let is_tiled = data.tile_config.layout != Layout::Float
+            && data.tagged_windows.iter().any(|tw| {
+                !tw.floating
+                    && tw.window == self.window
+            });
+
+        if is_tiled {
+            if let Some(surface) = crate::xwin::surface(&self.window) {
+                ResizeSurfaceState::with(&surface, |state| {
+                    *state = ResizeSurfaceState::Idle;
+                });
+            }
+        } else {
+            crate::xwin::set_resizing(&self.window, false);
+            crate::xwin::set_size(&self.window, Some(self.last_window_size), crate::xwin::Tiled::Keep);
+            crate::xwin::configure(&self.window);
+
+            // Сохраняем float_size
+            if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
+                tw.window == self.window
+            }) {
+                tw.float_size = Some(self.last_window_size);
+            }
+            // В обзоре ресайз должен пережить выход — правим и снимок
+            // до-обзорной геометрии (иначе он вернёт прежний размер).
+            if data.overview_active {
+                data.overview_note_resize(&self.window, self.last_window_size);
+            }
+
+            if let Some(surface) = crate::xwin::surface(&self.window) {
+                ResizeSurfaceState::with(&surface, |state| {
+                    *state = ResizeSurfaceState::WaitingForLastCommit {
+                        edges: self.edges,
+                        initial_rect: self.initial_rect,
+                    };
+                });
+            }
+
+            // "Созвездие" (Super+G): остальные окна группы масштабируются
+            // вокруг общего неподвижного угла на тот же коэффициент.
+            if !self.group_initial.is_empty() {
+                let scale_x = self.last_window_size.w as f64 / self.initial_rect.size.w.max(1) as f64;
+                let scale_y = self.last_window_size.h as f64 / self.initial_rect.size.h.max(1) as f64;
+                let anchor_x = if self.edges.intersects(ResizeEdge::LEFT) {
+                    self.initial_rect.loc.x + self.initial_rect.size.w
+                } else {
+                    self.initial_rect.loc.x
+                };
+                let anchor_y = if self.edges.intersects(ResizeEdge::TOP) {
+                    self.initial_rect.loc.y + self.initial_rect.size.h
+                } else {
+                    self.initial_rect.loc.y
+                };
+                for (member, geo) in self.group_initial.clone() {
+                    let new_w = ((geo.size.w as f64) * scale_x).round().max(1.0) as i32;
+                    let new_h = ((geo.size.h as f64) * scale_y).round().max(1.0) as i32;
+                    let new_x = (anchor_x as f64 + (geo.loc.x - anchor_x) as f64 * scale_x).round() as i32;
+                    let new_y = (anchor_y as f64 + (geo.loc.y - anchor_y) as f64 * scale_y).round() as i32;
+                    crate::xwin::set_size(&member, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
+                    crate::xwin::configure(&member);
+                    data.animate_window_to_dur(&member, (new_x, new_y).into(), crate::anim::дуг::сборка_тайлинга());
+                    if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
+                        tw.window == member
+                    }) {
+                        tw.float_size = Some((new_w, new_h).into());
+                        tw.float_position = (new_x, new_y).into();
+                    }
+                }
+                data.request_plane_reset();
+            }
+        }
+    }
+}
+
+impl PointerGrab<Parallax> for ResizeSurfaceGrab {
+    fn motion(
+        &mut self,
+        data: &mut Parallax,
+        handle: &mut PointerInnerHandle<'_, Parallax>,
+        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &MotionEvent,
+    ) {
+        handle.motion(data, None, event);
+        self.resize_to(data, event.location);
     }
 
     fn relative_motion(
@@ -271,85 +573,22 @@ impl PointerGrab<Parallax> for ResizeSurfaceGrab {
         handle: &mut PointerInnerHandle<'_, Parallax>,
         event: &ButtonEvent,
     ) {
+        // Вторая кнопка при Super — поворот (см. tilt_grab.rs): ресайз
+        // доводится до того размера, что успел набраться.
+        if event.button == 0x110 && event.state == smithay::backend::input::ButtonState::Pressed
+            && data.seat.get_keyboard().is_some_and(|k| k.modifier_state().logo)
+        {
+            handle.unset_grab(self, data, event.serial, event.time, false);
+            self.finish(data);
+            data.поворот_ждёт = Some(self.window.clone());
+            return;
+        }
         handle.button(data, event);
-        const BTN_RIGHT: u32 = 0x111;
-        if !handle.current_pressed().contains(&BTN_RIGHT) {
+        // Хват держит та кнопка, что его начала: ПКМ при Super+ПКМ и у жеста,
+        // ЛКМ при ресайзе за кромку.
+        if !handle.current_pressed().contains(&self.start_data.button) {
             handle.unset_grab(self, data, event.serial, event.time, true);
-
-            // Только для floating (и обзора) — финализируем resize.
-            // В tiling/columns: сбрасываем ResizeSurfaceState (commit-хендлер
-            // не должен корректировать позицию — ей управляет layout).
-            let is_tiled = data.tile_config.layout != Layout::Float
-                && data.tagged_windows.iter().any(|tw| {
-                    !tw.floating
-                        && tw.window == self.window
-                });
-
-            if is_tiled {
-                if let Some(surface) = crate::xwin::surface(&self.window) {
-                    ResizeSurfaceState::with(&surface, |state| {
-                        *state = ResizeSurfaceState::Idle;
-                    });
-                }
-            } else {
-                crate::xwin::set_resizing(&self.window, false);
-                crate::xwin::set_size(&self.window, Some(self.last_window_size), crate::xwin::Tiled::Keep);
-                crate::xwin::configure(&self.window);
-
-                // Сохраняем float_size
-                if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                    tw.window == self.window
-                }) {
-                    tw.float_size = Some(self.last_window_size);
-                }
-                // В обзоре ресайз должен пережить выход — правим и снимок
-                // до-обзорной геометрии (иначе он вернёт прежний размер).
-                if data.overview_active {
-                    data.overview_note_resize(&self.window, self.last_window_size);
-                }
-
-                if let Some(surface) = crate::xwin::surface(&self.window) {
-                    ResizeSurfaceState::with(&surface, |state| {
-                        *state = ResizeSurfaceState::WaitingForLastCommit {
-                            edges: self.edges,
-                            initial_rect: self.initial_rect,
-                        };
-                    });
-                }
-
-                // "Созвездие" (Super+G): остальные окна группы масштабируются
-                // вокруг общего неподвижного угла на тот же коэффициент.
-                if !self.group_initial.is_empty() {
-                    let scale_x = self.last_window_size.w as f64 / self.initial_rect.size.w.max(1) as f64;
-                    let scale_y = self.last_window_size.h as f64 / self.initial_rect.size.h.max(1) as f64;
-                    let anchor_x = if self.edges.intersects(ResizeEdge::LEFT) {
-                        self.initial_rect.loc.x + self.initial_rect.size.w
-                    } else {
-                        self.initial_rect.loc.x
-                    };
-                    let anchor_y = if self.edges.intersects(ResizeEdge::TOP) {
-                        self.initial_rect.loc.y + self.initial_rect.size.h
-                    } else {
-                        self.initial_rect.loc.y
-                    };
-                    for (member, geo) in self.group_initial.clone() {
-                        let new_w = ((geo.size.w as f64) * scale_x).round().max(1.0) as i32;
-                        let new_h = ((geo.size.h as f64) * scale_y).round().max(1.0) as i32;
-                        let new_x = (anchor_x as f64 + (geo.loc.x - anchor_x) as f64 * scale_x).round() as i32;
-                        let new_y = (anchor_y as f64 + (geo.loc.y - anchor_y) as f64 * scale_y).round() as i32;
-                        crate::xwin::set_size(&member, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
-                        crate::xwin::configure(&member);
-                        data.animate_window_to_dur(&member, (new_x, new_y).into(), crate::anim::дуг::сборка_тайлинга());
-                        if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| {
-                            tw.window == member
-                        }) {
-                            tw.float_size = Some((new_w, new_h).into());
-                            tw.float_position = (new_x, new_y).into();
-                        }
-                    }
-                    data.request_plane_reset();
-                }
-            }
+            self.finish(data);
         }
     }
 
@@ -386,7 +625,9 @@ impl PointerGrab<Parallax> for ResizeSurfaceGrab {
     fn start_data(&self) -> &PointerGrabStartData<Parallax> {
         &self.start_data
     }
-    fn unset(&mut self, _data: &mut Parallax) {}
+    fn unset(&mut self, data: &mut Parallax) {
+        data.кромка_курсор = None;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -520,13 +761,20 @@ pub fn handle_commit(space: &mut Space<Window>, surface: &WlSurface, elastic: bo
     let mut window_loc = space.element_location(&window)?;
     let geometry = window.geometry();
 
+    // Пока жест идёт, место считается от ЗАПРОШЕННОГО размера — ровно так же,
+    // как его ставит motion (см. там): кадр рисует окно в запрошенном размере,
+    // и коммит клиента с отстающим буфером не должен дёргать угол назад. На
+    // последнем коммите — по факту: там клиент уже сказал своё последнее слово.
+    let запрошенный = crate::xwin::requested_size(&window).filter(|s| s.w > 0 && s.h > 0);
     let new_loc: Point<Option<i32>, Logical> = ResizeSurfaceState::with(surface, |state| {
+        let идёт = matches!(state, ResizeSurfaceState::Resizing { .. });
+        let size = if идёт { запрошенный.unwrap_or(geometry.size) } else { geometry.size };
         state.commit().and_then(|(edges, initial_rect)| {
             edges.intersects(ResizeEdge::TOP_LEFT).then(|| {
                 let new_x = edges.intersects(ResizeEdge::LEFT)
-                    .then_some(initial_rect.loc.x + (initial_rect.size.w - geometry.size.w));
+                    .then_some(initial_rect.loc.x + (initial_rect.size.w - size.w));
                 let new_y = edges.intersects(ResizeEdge::TOP)
-                    .then_some(initial_rect.loc.y + (initial_rect.size.h - geometry.size.h));
+                    .then_some(initial_rect.loc.y + (initial_rect.size.h - size.h));
                 (new_x, new_y).into()
             })
         }).unwrap_or_default()
@@ -548,4 +796,64 @@ pub fn handle_commit(space: &mut Space<Window>, surface: &WlSurface, elastic: bo
     }
 
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    /// Две половины экрана с зазором: тянем правый край левой — правая
+    /// отдаёт ширину и уезжает, зазор и правый край экрана на месте.
+    #[test]
+    fn половины_делят_одну_границу() {
+        let (лев, прав) = (r(10, 10, 940, 1060), r(960, 10, 950, 1060));
+        let стороны = примыкает(лев, прав, ResizeEdge::RIGHT, 30);
+        assert_eq!(стороны, ResizeEdge::RIGHT);
+        let стал = подвинуть_соседа(прав, стороны, 200, 0);
+        assert_eq!(стал, r(1160, 10, 750, 1060));
+        // С другой стороны: левый край правой половины тянет левую.
+        let стороны = примыкает(прав, лев, ResizeEdge::LEFT, 30);
+        assert_eq!(стороны, ResizeEdge::LEFT);
+        assert_eq!(подвинуть_соседа(лев, стороны, -100, 0), r(10, 10, 1040, 1060));
+    }
+
+    /// Кромка — только полоса снаружи рамки; у угла сторона становится углом.
+    #[test]
+    fn кромка_снаружи_и_углы() {
+        let рамка = Rectangle::new((100.0, 100.0).into(), (400.0, 300.0).into());
+        let край = |x: f64, y: f64| край_кромки(рамка, (x, y).into(), 8.0, 28.0);
+        assert_eq!(край(300.0, 250.0), None, "внутри окна кромки нет");
+        assert_eq!(край(90.0, 250.0), None, "дальше полосы");
+        assert_eq!(край(96.0, 250.0), Some(ResizeEdge::LEFT));
+        assert_eq!(край(503.0, 250.0), Some(ResizeEdge::RIGHT));
+        assert_eq!(край(300.0, 95.0), Some(ResizeEdge::TOP));
+        assert_eq!(край(300.0, 404.0), Some(ResizeEdge::BOTTOM));
+        assert_eq!(край(96.0, 96.0), Some(ResizeEdge::TOP_LEFT));
+        assert_eq!(край(503.0, 390.0), Some(ResizeEdge::BOTTOM_RIGHT), "сторона у угла");
+        assert_eq!(край(110.0, 404.0), Some(ResizeEdge::BOTTOM_LEFT));
+    }
+
+    /// Край, за который не тянут, и окно по диагонали соседями не считаются.
+    #[test]
+    fn чужой_край_и_диагональ_не_соседи() {
+        let (лев, прав) = (r(10, 10, 940, 1060), r(960, 10, 950, 1060));
+        assert!(примыкает(лев, прав, ResizeEdge::BOTTOM | ResizeEdge::LEFT, 30).is_empty());
+        let (верх_лев, низ_прав) = (r(10, 10, 940, 520), r(960, 540, 950, 530));
+        assert!(примыкает(верх_лев, низ_прав, ResizeEdge::BOTTOM_RIGHT, 30).is_empty());
+    }
+
+    /// Четверть тянут за угол: сосед справа отдаёт ширину, сосед снизу — высоту.
+    #[test]
+    fn угол_четверти_двигает_обоих() {
+        let хват = r(10, 10, 940, 520);
+        let (справа, снизу) = (r(960, 10, 950, 520), r(10, 540, 940, 530));
+        let с = примыкает(хват, справа, ResizeEdge::BOTTOM_RIGHT, 30);
+        assert_eq!(подвинуть_соседа(справа, с, 50, 70), r(1010, 10, 900, 520));
+        let н = примыкает(хват, снизу, ResizeEdge::BOTTOM_RIGHT, 30);
+        assert_eq!(подвинуть_соседа(снизу, н, 50, 70), r(10, 610, 940, 460));
+    }
 }

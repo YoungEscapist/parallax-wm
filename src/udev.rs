@@ -105,20 +105,27 @@ smithay::backend::renderer::element::render_elements! {
     // Размытый фон под островом панели: та же текстура, но обрезанная
     // скруглением плашки тем же шейдером, что и углы окон (см. blur.rs).
     Blur = crate::rounded::Rounded<CropRenderElement<TextureRenderElement<GlesTexture>>>,
-    // Ореол вокруг окна (тень + свечение наружу): плитка в один пиксель,
-    // растянутая на окно с запасом, весь цвет которой считает тот же шейдер,
-    // что рисует само окно (см. build_halo_elements).
+    // Матовое стекло под прозрачным окном: размывает то, что в кадре уже
+    // нарисовано под ним (эффект по кадру, см. blur::Подложка).
+    Стекло = crate::rounded::Rounded<crate::blur::Подложка>,
+    // Ореол вокруг окна (тень): плитка в один пиксель, растянутая на окно с
+    // запасом, весь цвет которой считает тот же шейдер, что рисует само окно
+    // (см. build_halo_elements).
     Гало = crate::rounded::Rounded<MemoryRenderBufferRenderElement<GlesRenderer>>,
-    // Заливка света на холсте (см. свет.rs): картинка из памяти, обрезанная
-    // кадром. Обрезка не косметика — заливка заведомо крупнее экрана и своей
-    // геометрией повреждала бы соседний выход.
-    Свет = CropRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>,
+    // Весь кадр, пропущенный через пользовательский экранный шейдер
+    // (`set{ screen_shader = ... }`, см. экран.rs). Стоит в кадре ОДИН и
+    // заменяет собой всю сцену.
+    Экранный = crate::экран::Экранный,
     // Грань куба рабочих столов (см. куб.rs): живое окно стола, растянутое в
     // коробку своей проекции и развёрнутое шейдером в плоскость грани.
-    Грань = crate::куб::Грань<CropRenderElement<RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>>>,
+    Грань = crate::куб::Грань<CropRenderElement<RelocateRenderElement<RescaleRenderElement<CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>>>>,
     // Подложка грани — она же сама грань: однотонная плитка, растянутая на
     // всю грань и развёрнутая тем же шейдером.
     ГраньФон = crate::куб::Грань<CropRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>>,
+    // Обои, застилающие грань. Заменяют однотонную плитку везде, где обои
+    // вообще есть: окна у Ярика прозрачные, и на плитке сквозь них видно не
+    // обои, а её — грань выглядела «тёмной с затемнением» (жалоба 11.09.2026).
+    ГраньОбои = crate::куб::Грань<CropRenderElement<TextureRenderElement<GlesTexture>>>,
 }
 
 type GbmDrmCompositor = DrmCompositor<
@@ -159,6 +166,10 @@ pub struct Surface {
     /// Размытие фона под плашками. None — шейдер не собрался или блюр выключен
     /// (`set{ blur = ... }`, по умолчанию выключен — см. blur.rs).
     pub blur: Option<crate::blur::Блюр>,
+    /// Экранный шейдер (`set{ screen_shader = ... }`, см. экран.rs): офскрин
+    /// кадра и пользовательская программа поверх него. Пока ручка пуста —
+    /// пустая скорлупа без буферов.
+    pub экран: crate::экран::Экран,
     /// Сколько раз подряд `render_frame` вернул ошибку (см. `отказ_до`).
     pub отказов_подряд: u32,
     /// До какого момента не пытаться рисовать после отказа. `None` — можно.
@@ -198,6 +209,8 @@ pub struct RenderStats {
     blur_us: u64,
     blur_max_us: u64,
     blur_count: u32,
+    /// Самый крупный зум за интервал — для строки о медленных кадрах.
+    max_zoom: f64,
 }
 
 impl RenderStats {
@@ -208,6 +221,7 @@ impl RenderStats {
             max_ui: 0, max_windows: 0, max_decor: 0, max_bg: 0,
             sync_us: 0, sync_max_us: 0,
             blur_us: 0, blur_max_us: 0, blur_count: 0,
+            max_zoom: 0.0,
         }
     }
 
@@ -221,7 +235,8 @@ impl RenderStats {
         self.max_bg = self.max_bg.max(bg);
     }
 
-    fn record(&mut self, us: u64, elements: usize) {
+    fn record(&mut self, us: u64, elements: usize, zoom: f64) {
+        self.max_zoom = self.max_zoom.max(zoom);
         self.frames += 1;
         self.total_us += us;
         self.max_us = self.max_us.max(us);
@@ -249,6 +264,24 @@ impl RenderStats {
             return;
         }
         let secs = self.since.elapsed().as_secs_f64();
+        // Медленные кадры пишутся ВСЕГДА, а не только на debug: живой сеанс
+        // идёт на info, и жалобу «лагает» (зум, 11.10.2026) разбирать было не
+        // по чему — харнесс её не воспроизвёл, а в журнале не осталось ничего.
+        // Не чаще строки в секунду: `flush` и сам срабатывает раз в секунду.
+        let средний_мс = self.total_us as f64 / self.frames.max(1) as f64 / 1000.0;
+        let блюр_мс = self.blur_us as f64 / self.blur_count.max(1) as f64 / 1000.0;
+        if self.max_us > 50_000 || средний_мс + блюр_мс > 25.0 {
+            tracing::warn!(
+                "plx/render: slow frames: {:.0} fps, avg {:.1} ms, worst {:.1} ms, zoom up to {:.2}, \
+                 elements up to {} (ui {}, windows {}, decor {}, background {}), \
+                 gpu wait avg {:.2} ms / worst {:.2} ms, blur {} times avg {:.2} ms / worst {:.2} ms",
+                self.frames as f64 / secs, средний_мс, self.max_us as f64 / 1000.0, self.max_zoom,
+                self.max_elements, self.max_ui, self.max_windows, self.max_decor, self.max_bg,
+                self.sync_us as f64 / self.frames.max(1) as f64 / 1000.0,
+                self.sync_max_us as f64 / 1000.0,
+                self.blur_count, блюр_мс, self.blur_max_us as f64 / 1000.0,
+            );
+        }
         tracing::debug!(
             "plx/render: {:.0} кадр/с, средний {:.1} мс, худший {:.1} мс, \
              элементов до {} (интерфейс {}, окна {}, декор {}, фон {}), \
@@ -348,6 +381,12 @@ pub fn init_udev(
             SessionEvent::PauseSession => {
                 tracing::info!("plx/udev: session paused");
                 state.session_active = false;
+                // Кэш размытия держит текстуры ЭТОГО рендерера (см. blur_кэш).
+                // Переход на чужой VT — единственное место, после которого они
+                // могут оказаться от другого контекста; чистим, пересчитается
+                // первым же кадром.
+                state.blur_tex = None;
+                state.blur_кэш.clear();
                 // Отпускание кнопки, случившееся на чужом VT, до нас не
                 // доедет, а счётчик удержания запрещает переход курсора на
                 // соседний монитор (см. input.rs). Один потерянный Released —
@@ -396,7 +435,13 @@ pub fn init_udev(
     }).unwrap();
 
     // ── Libinput ─────────────────────────────────────────────────────────────
-    event_loop.handle().insert_source(libinput_backend, |event, _, state| {
+    event_loop.handle().insert_source(libinput_backend, |mut event, _, state| {
+        // Тап-клик и клик пальцами: у libinput они по умолчанию выключены
+        // (см. touchpad.rs, `НастройкиТачпада`). Настраивать можно только
+        // здесь — дальше событие обобщённое и libinput-устройства не видно.
+        if let smithay::backend::input::InputEvent::DeviceAdded { device } = &mut event {
+            crate::touchpad::настроить(device, &state.lua_config.тачпад);
+        }
         state.process_input_event(event);
     }).unwrap();
 
@@ -1064,6 +1109,7 @@ fn add_surface(
         last_elements: 0,
         rounded: crate::rounded::Шейдер::new(&mut device.gles),
         blur: crate::blur::Блюр::new(&mut device.gles),
+        экран: crate::экран::Экран::new(),
         отказов_подряд: 0,
         отказ_до: None,
         отказ_лог: None,
@@ -1074,6 +1120,9 @@ fn add_surface(
     if state.blur_shape.is_none() {
         state.blur_shape = crate::rounded::Шейдер::new(&mut device.gles);
         state.куб_шейдер = crate::куб::Шейдер::new(&mut device.gles);
+    }
+    if state.стекло.is_none() {
+        state.стекло = crate::blur::Стекло::new(&mut device.gles);
     }
     tracing::info!("plx/udev: output '{}' {}x{}@{}Hz",
         output_name, wl_mode.size.w, wl_mode.size.h, wl_mode.refresh/1000);
@@ -1477,42 +1526,123 @@ fn build_snip_elements(
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OutputRenderElements> {
+    use crate::snip::{Кнопка, Режим};
     let mut elements = Vec::new();
-    if !state.snip_идёт() {
-        return elements;
-    }
+    let Some(в) = state.snip.as_ref() else { return elements };
+    let (режим, монитор, начало, нажата) = (в.режим, в.монитор, в.начало, в.нажата_кнопка);
     let Some(mode) = output.current_mode() else { return elements };
     let (ширина, высота) = (mode.size.w, mode.size.h);
     let номер = state.монитор_по_выходу(output);
-    let свой = номер.is_none_or(|i| state.snip.as_ref().is_some_and(|в| в.монитор == i));
+    let свой = номер.is_none_or(|i| i == монитор);
 
-    // Рамка в экранных пикселях ЭТОГО выхода. Считается ровно тем же
-    // преобразованием, что и в `snip_finish`, — иначе снимок уехал бы
+    // Что подсвечено на ЭТОМ выходе, в его экранных пикселях. Считается ровно
+    // тем же преобразованием, что и в snip.rs, — иначе снимок уехал бы
     // относительно того, что человек обвёл.
-    let рамка = свой
-        .then(|| {
-            let начало = state.snip.as_ref()?.начало?;
-            let вид = match номер {
-                Some(i) if i != state.активный => state.мониторы.get(i)?.viewport.clone(),
-                _ => state.viewport.clone(),
-            };
-            let zoom = вид.zoom.max(0.01);
-            let в_экран = |p: Point<f64, Logical>| ((p.x - вид.cam_x) * zoom, (p.y - вид.cam_y) * zoom);
-            let (x0, y0) = в_экран(начало);
-            let (x1, y1) = в_экран(state.pointer_location);
-            let (x, y) = (x0.min(x1).round() as i32, y0.min(y1).round() as i32);
-            let (w, h) = ((x1 - x0).abs().round() as i32, (y1 - y0).abs().round() as i32);
-            (w > 0 && h > 0).then_some((x, y, w, h))
-        })
-        .flatten();
+    let рамка: Option<(i32, i32, i32, i32)> = if !свой {
+        None
+    } else {
+        match режим {
+            Режим::Область => начало.and_then(|начало| {
+                let (x0, y0) = state.snip_в_экран(монитор, начало)?;
+                let (x1, y1) = state.snip_в_экран(монитор, state.pointer_location)?;
+                let (x, y) = (x0.min(x1).round() as i32, y0.min(y1).round() as i32);
+                let (w, h) = ((x1 - x0).abs().round() as i32, (y1 - y0).abs().round() as i32);
+                (w > 0 && h > 0).then_some((x, y, w, h))
+            }),
+            Режим::Окно => state.snip_окно().map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h)),
+            Режим::Экран => Some((0, 0, ширина, высота)),
+        }
+    };
+    let под_курсором = if свой { state.snip_кнопка_под_курсором() } else { None };
 
     // Цвета ОБЫЧНЫЕ (straight): `pooled_solid` домножает на альфу сам.
     const ТЕНЬ: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
     const ЦВЕТ: [f32; 4] = [0.35, 0.75, 1.0, 0.9];
     const ТОЛЩИНА: i32 = 2;
+    const ТЕКСТ: [f32; 4] = [0.92, 0.96, 1.0, 1.0];
+    const МАСШТАБ: i32 = crate::snip::МАСШТАБ;
+
+    // СПИСОК КАДРА ИДЁТ ОТ ПЕРЕДНЕГО ПЛАНА К ЗАДНЕМУ: текст раньше своей
+    // плашки, панель и подписи раньше затемнения. До 26.09.2026 подпись
+    // клалась ПОСЛЕ затемнения — то есть под него — и читалась тускло.
+    let mut плашки: Vec<((i32, i32), (i32, i32), [f32; 4])> = Vec::new();
+
+    // ── Панель режимов («Ножницы») ───────────────────────────────────────────
+    if свой {
+        for (r, кнопка, подпись) in crate::snip::панель(ширина, высота) {
+            let тш = crate::text::width_of(подпись, crate::text::Weight::Semi, МАСШТАБ);
+            let тв = crate::text::height(МАСШТАБ);
+            draw_text_w(
+                state, renderer,
+                r.loc.x + (r.size.w - тш) / 2, r.loc.y + (r.size.h - тв) / 2,
+                подпись, crate::text::Weight::Semi, МАСШТАБ, ТЕКСТ, 0, &mut elements,
+            );
+            let выбрана = кнопка == Кнопка::Режим(режим);
+            let цвет = if нажата == Some(кнопка) {
+                [0.35, 0.75, 1.0, 0.55]
+            } else if выбрана {
+                [0.35, 0.75, 1.0, 0.35]
+            } else if под_курсором == Some(кнопка) {
+                [1.0, 1.0, 1.0, 0.12]
+            } else {
+                [0.0, 0.0, 0.0, 0.0]
+            };
+            if цвет[3] > 0.0 {
+                плашки.push(((r.loc.x, r.loc.y), (r.size.w, r.size.h), цвет));
+            }
+        }
+        if let Some(п) = crate::snip::рамка_панели(ширина, высота) {
+            плашки.push(((п.loc.x, п.loc.y), (п.size.w, п.size.h), [0.05, 0.07, 0.09, 0.88]));
+        }
+    }
+
+    // ── Подсказка или размер ─────────────────────────────────────────────────
+    let подсказка: Option<(String, Option<i32>, i32)> = match (рамка, режим) {
+        _ if !свой => None,
+        (Some((x, y, w, h)), Режим::Область | Режим::Окно) => {
+            let текст = format!("{}×{}", w, h);
+            let ш = crate::text::width_of(&текст, crate::text::Weight::Semi, МАСШТАБ);
+            let в = crate::text::height(МАСШТАБ);
+            // Над рамкой, а если она у верхнего края — внутри неё.
+            let сверху = y - в - 14;
+            Some((текст, Some(x + w / 2 - ш / 2), if сверху >= 0 { сверху } else { y + 6 }))
+        }
+        (_, р) => {
+            let низ = crate::snip::рамка_панели(ширина, высота)
+                .map(|п| п.loc.y + п.size.h)
+                .unwrap_or(высота / 12);
+            let текст = match р {
+                Режим::Область => т!("Обведите область · клик — весь экран · Esc — отмена", "Drag out a region · click — whole screen · Esc — cancel"),
+                Режим::Окно => т!("Щёлкните по окну · Esc — отмена", "Click a window · Esc — cancel"),
+                Режим::Экран => т!("Щёлкните, чтобы снять весь экран · Esc — отмена", "Click to capture the whole screen · Esc — cancel"),
+            };
+            Some((текст.to_string(), None, низ + 14))
+        }
+    };
+    if let Some((подпись, пx, пy)) = подсказка {
+        let ш = crate::text::width_of(&подпись, crate::text::Weight::Semi, МАСШТАБ);
+        let в = crate::text::height(МАСШТАБ);
+        let пx = пx.map(|x| x.clamp(4, (ширина - ш - 4).max(4))).unwrap_or((ширина - ш) / 2);
+        const ОТСТУП: i32 = 8;
+        draw_text_w(
+            state, renderer, пx, пy, &подпись,
+            crate::text::Weight::Semi, МАСШТАБ, ТЕКСТ, 0, &mut elements,
+        );
+        плашки.push((
+            (пx - ОТСТУП, пy - ОТСТУП / 2), (ш + ОТСТУП * 2, в + ОТСТУП),
+            [0.05, 0.07, 0.09, 0.75],
+        ));
+    }
 
     let pool = &mut state.snip_ids;
     let mut idx = 0usize;
+    for (loc, size, цвет) in плашки {
+        elements.push(pooled_solid(pool, &mut idx, loc, size, цвет));
+    }
+
+    // ── Рамка и затемнение вокруг неё ────────────────────────────────────────
+    // Весь экран в режиме «Экран» затемнять незачем: он и есть снимок, — только
+    // кайма по краю, как подсветка у «Ножниц».
     match рамка {
         None => {
             elements.push(pooled_solid(pool, &mut idx, (0, 0), (ширина, высота), ТЕНЬ));
@@ -1520,55 +1650,18 @@ fn build_snip_elements(
         Some((x, y, w, h)) => {
             let (x, y) = (x.clamp(0, ширина), y.clamp(0, высота));
             let (w, h) = (w.min(ширина - x), h.min(высота - y));
-            elements.push(pooled_solid(pool, &mut idx, (0, 0), (ширина, y), ТЕНЬ));
-            elements.push(pooled_solid(pool, &mut idx, (0, y + h), (ширина, высота - y - h), ТЕНЬ));
-            elements.push(pooled_solid(pool, &mut idx, (0, y), (x, h), ТЕНЬ));
-            elements.push(pooled_solid(pool, &mut idx, (x + w, y), (ширина - x - w, h), ТЕНЬ));
             // Рамка рисуется ВНУТРЬ выделения: снаружи она легла бы на
             // затемнение и визуально сдвинула границу на пару пикселей.
             elements.push(pooled_solid(pool, &mut idx, (x, y), (w, ТОЛЩИНА), ЦВЕТ));
             elements.push(pooled_solid(pool, &mut idx, (x, y + h - ТОЛЩИНА), (w, ТОЛЩИНА), ЦВЕТ));
             elements.push(pooled_solid(pool, &mut idx, (x, y), (ТОЛЩИНА, h), ЦВЕТ));
             elements.push(pooled_solid(pool, &mut idx, (x + w - ТОЛЩИНА, y), (ТОЛЩИНА, h), ЦВЕТ));
+            elements.push(pooled_solid(pool, &mut idx, (0, 0), (ширина, y), ТЕНЬ));
+            elements.push(pooled_solid(pool, &mut idx, (0, y + h), (ширина, высота - y - h), ТЕНЬ));
+            elements.push(pooled_solid(pool, &mut idx, (0, y), (x, h), ТЕНЬ));
+            elements.push(pooled_solid(pool, &mut idx, (x + w, y), (ширина - x - w, h), ТЕНЬ));
         }
     }
-
-    // Подпись: пока рамку не начали — что делать, дальше — размер выделения.
-    // Размер читают на лету, поэтому он висит над рамкой, а не в центре экрана.
-    const МАСШТАБ: i32 = 2;
-    let (подпись, пx, пy) = match рамка {
-        None if свой => (
-            т!("Обведите область · клик — весь экран · Esc — отмена", "Drag out a region · click — whole screen · Esc — cancel").to_string(),
-            None,
-            высота / 12,
-        ),
-        None => return elements,
-        Some((x, y, w, h)) => {
-            let текст = format!("{}×{}", w, h);
-            let ш = crate::text::width_of(&текст, crate::text::Weight::Semi, МАСШТАБ);
-            let в = crate::text::height(МАСШТАБ);
-            // Над рамкой, а если она у верхнего края — внутри неё.
-            let сверху = y - в - 14;
-            (текст, Some((x + w / 2 - ш / 2, ш)), if сверху >= 0 { сверху } else { y + 6 })
-        }
-    };
-    let ш = crate::text::width_of(&подпись, crate::text::Weight::Semi, МАСШТАБ);
-    let в = crate::text::height(МАСШТАБ);
-    let пx = пx.map(|(x, _)| x.clamp(4, (ширина - ш - 4).max(4))).unwrap_or((ширина - ш) / 2);
-    const ОТСТУП: i32 = 8;
-    {
-        let pool = &mut state.snip_ids;
-        let mut idx = 16usize;
-        elements.push(pooled_solid(
-            pool, &mut idx,
-            (пx - ОТСТУП, пy - ОТСТУП / 2), (ш + ОТСТУП * 2, в + ОТСТУП),
-            [0.05, 0.07, 0.09, 0.75],
-        ));
-    }
-    draw_text_w(
-        state, renderer, пx, пy, &подпись,
-        crate::text::Weight::Semi, МАСШТАБ, [0.92, 0.96, 1.0, 1.0], 0, &mut elements,
-    );
     elements
 }
 
@@ -2209,7 +2302,7 @@ fn build_parallax_elements(
 /// нарисовано вообще ничего. Углы окон им когда-то ЗАКРАШИВАЛИСЬ — отсюда
 /// чёрные куски поверх обоев; теперь их режет шейдер (`rounded.rs`), и цвет
 /// этот к скруглению отношения не имеет.
-const CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
+pub const CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
 // Радиус скругления окна в логических пикселях (до умножения на zoom) — ручки
 // `set{ rounding, rounding_tile }`. Умолчания те же, что были константами: во
 // Float окна мельче и разбросаны, в Tile — крупные и ровные, там заметнее
@@ -2374,6 +2467,60 @@ fn build_insert_hint(state: &mut Parallax) -> Vec<OutputRenderElements> {
     els
 }
 
+/// Подсказка прилипания плавающего окна к краю экрана (см. move_grab,
+/// `КрайПревью`): полупрозрачная плёнка с каймой там, куда окно встанет.
+/// Плёнка не появляется сразу на месте, а перетекает из окна (и между
+/// зонами) — пружиной прямо здесь, по времени между кадрами.
+fn build_edge_snap_hint(state: &mut Parallax) -> Vec<OutputRenderElements> {
+    let mut els = Vec::new();
+    if state.dragged_window.is_none() {
+        state.край_превью = None;
+        return els;
+    }
+    let Some(п) = state.край_превью.as_mut() else { return els };
+    let dt = п.шаг.elapsed().as_secs_f64().min(0.1);
+    п.шаг = std::time::Instant::now();
+    let k = 1.0 - (-dt * 18.0).exp();
+    let цель = п.цель.to_f64();
+    let к = |a: f64, b: f64| a + (b - a) * k;
+    п.текущее = Rectangle::new(
+        Point::from((к(п.текущее.loc.x, цель.loc.x), к(п.текущее.loc.y, цель.loc.y))),
+        Size::from((к(п.текущее.size.w, цель.size.w), к(п.текущее.size.h, цель.size.h))),
+    );
+    let r = п.текущее;
+    let доехала = (r.loc.x - цель.loc.x).abs() < 0.5
+        && (r.loc.y - цель.loc.y).abs() < 0.5
+        && (r.size.w - цель.size.w).abs() < 0.5
+        && (r.size.h - цель.size.h).abs() < 0.5;
+    if доехала {
+        п.текущее = цель;
+    }
+    const ЗАЛИВКА: [f32; 4] = [0.35, 0.6, 1.0, 0.22];
+    const КАЙМА: [f32; 4] = [0.6, 0.8, 1.0, 0.85];
+    let zoom = state.viewport.zoom;
+    let x = ((r.loc.x - state.viewport.cam_x) * zoom).round() as i32;
+    let y = ((r.loc.y - state.viewport.cam_y) * zoom).round() as i32;
+    let w = (r.size.w * zoom).round().max(1.0) as i32;
+    let h = (r.size.h * zoom).round().max(1.0) as i32;
+    let t = 2.min(w).min(h);
+    let pool = &mut state.hint_ids;
+    // Пул общий с подсказкой ленты: та живёт только в Columns у ТАЙЛОВОГО
+    // окна, эта — у плавающего; одновременно их не бывает, но индексы всё
+    // равно разносим, чтобы не делить слоты.
+    let mut idx = 8usize;
+    els.push(pooled_solid(pool, &mut idx, (x, y), (w, t), КАЙМА));
+    els.push(pooled_solid(pool, &mut idx, (x, y + h - t), (w, t), КАЙМА));
+    if h > 2 * t {
+        els.push(pooled_solid(pool, &mut idx, (x, y + t), (t, h - 2 * t), КАЙМА));
+        els.push(pooled_solid(pool, &mut idx, (x + w - t, y + t), (t, h - 2 * t), КАЙМА));
+    }
+    els.push(pooled_solid(pool, &mut idx, (x + t, y + t), ((w - 2 * t).max(1), (h - 2 * t).max(1)), ЗАЛИВКА));
+    if !доехала {
+        state.request_redraw();
+    }
+    els
+}
+
 /// Радиус скругления окон для текущей раскладки (логические px).
 fn corner_radius_logical(state: &Parallax) -> i32 {
     let r = if state.tile_config.layout == crate::tiling::Layout::Tile {
@@ -2406,6 +2553,11 @@ fn on_screen(screen: Size<i32, Logical>, r: (f64, f64, f64, f64), margin: f64) -
 }
 
 fn window_screen_rect(state: &Parallax, window: &Window) -> Option<(f64, f64, f64, f64)> {
+    // Закреплённое окно висит над холстом (см. pin.rs), и тени холста под
+    // ним нет: она легла бы под окна холста, то есть под НИЖНИЕ окна.
+    if state.закреплено(window) {
+        return None;
+    }
     let geo = state.space.element_geometry(window)?;
     let zoom = state.viewport.zoom;
     // Размер берём ВИДИМЫЙ, а не тот, что нарисовал клиент. Упрямое окно
@@ -2414,7 +2566,14 @@ fn window_screen_rect(state: &Parallax, window: &Window) -> Option<(f64, f64, f6
     // по факту клиента — и торчала из обрезанного окна во все стороны, выдавая
     // его настоящий размер. Замер 25.08.2026 в харнессе: окно 310x163 при
     // запрошенных 208x108 — тень на все 310x163.
-    let видимый = видимый_размер(window, geo.size);
+    let mut видимый = crate::xwin::видимый_размер(window, geo.size);
+    // Окно тянут рукой, и кадр рисует его растянутым до запрошенного (см.
+    // `anim::живая_растяжка`): тень обязана расти вместе, а не ждать клиента.
+    if let Some(t) = crate::xwin::requested_size(window) {
+        if state.живая_растяжка(window, Some(t), geo.size).is_some() && !state.is_fullscreen(window) {
+            видимый = t;
+        }
+    }
     Some((
         (geo.loc.x as f64 - state.viewport.cam_x) * zoom,
         (geo.loc.y as f64 - state.viewport.cam_y) * zoom,
@@ -2423,15 +2582,6 @@ fn window_screen_rect(state: &Parallax, window: &Window) -> Option<(f64, f64, f6
     ))
 }
 
-/// Какого размера окно ВИДНО на экране: меньшее из «что клиент нарисовал» и
-/// «что у него запросили». Одна точка правды для всех, кто рисует вокруг окна
-/// (тень, а дальше — всё, что захочет совпасть с его рамкой).
-fn видимый_размер(window: &Window, факт: Size<i32, Logical>) -> Size<i32, Logical> {
-    match crate::xwin::requested_size(window) {
-        Some(t) if t.w > 0 && t.h > 0 => Size::from((t.w.min(факт.w), t.h.min(факт.h))),
-        _ => факт,
-    }
-}
 
 /// Мягкая нейтральная тень-«гало» позади каждого окна.
 ///
@@ -2446,14 +2596,13 @@ fn build_shadow_elements(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
     скругление: Option<&crate::rounded::Шейдер>,
-    свет: Option<crate::свет::Источник>,
 ) -> Vec<OutputRenderElements> {
     // Есть шейдер — ореол считает он: одна плитка на окно вместо одиннадцати, и
-    // главное — та же форма и тот же свет, что у самого окна (см. rounded.rs,
-    // uniform `halo`). Плиточный путь ниже остаётся запасным: без шейдера окна
-    // и так с прямыми углами, но тень им нужна ровно так же.
+    // главное — та же форма, что у самого окна (см. rounded.rs, uniform `halo`).
+    // Плиточный путь ниже остаётся запасным: без шейдера окна и так с прямыми
+    // углами, но тень им нужна ровно так же.
     if let Some(ш) = скругление {
-        return build_halo_elements(state, renderer, ш, свет);
+        return build_halo_elements(state, renderer, ш);
     }
     let mut els = Vec::new();
     if state.tagged_windows.is_empty() {
@@ -2480,6 +2629,10 @@ fn build_shadow_elements(
     for window in windows {
         // Тень у полноэкранного окна рисовать негде и не нужно — см. выше.
         if state.is_fullscreen(&window) {
+            continue;
+        }
+        // Наклонённое окно — без тени (см. наклон.rs).
+        if state.наклон_окна(&window).is_some() {
             continue;
         }
         let Some((x0, y0raw, w, h)) = window_screen_rect(state, &window) else { continue };
@@ -2584,16 +2737,13 @@ fn build_shadow_elements(
 /// ВНУТРИ по краю уже шла кайма в цвет обоев, которая и про то, и про другое
 /// знала. Снаружи это читалось как две разные вещи на одной границе.
 ///
-/// Теперь граница одна. Прямоугольник и радиус — те же, что уходят в
-/// собственный элемент окна; цвет, направление света и его сила — тот же
-/// [`crate::rounded::Свечение`]; ручка `glow` гасит и кайму, и ореол разом.
-/// Шейдер считает по нему обе стороны: внутрь — кайму, наружу — тень со
-/// свечением. Тень при этом падает ОТ света, а не всегда вниз.
+/// Теперь граница одна: прямоугольник и радиус — те же, что уходят в
+/// собственный элемент окна. (Свечение в цвет обоев, которое здесь же шло
+/// наружу, вырезано 17.09.2026.) Растворяется тень вместе с окном.
 fn build_halo_elements(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
     шейдер: &crate::rounded::Шейдер,
-    свет: Option<crate::свет::Источник>,
 ) -> Vec<OutputRenderElements> {
     let mut els = Vec::new();
     if state.tagged_windows.is_empty() {
@@ -2606,9 +2756,6 @@ fn build_halo_elements(
     // ровно так же, как это делает плиточный путь.
     let spread = crate::decor::SPREAD as f64 * zoom;
     let drop = crate::decor::DROP as f64 * zoom;
-    let палитра = state.палитра_обоев;
-    let (glow, glow_width, sun) =
-        (state.lua_config.glow, state.lua_config.glow_width, state.lua_config.sun);
 
     let windows: Vec<Window> = state.tagged_windows.iter().map(|tw| tw.window.clone()).collect();
     let mut slot = 0usize;
@@ -2616,6 +2763,12 @@ fn build_halo_elements(
         // Тень у полноэкранного окна рисовать негде и не нужно (то же правило,
         // что у плиток).
         if state.is_fullscreen(&window) {
+            continue;
+        }
+        // У окна, развёрнутого в 3D (`flip3d`), тени нет: она плоский
+        // прямоугольник, приклеенный к экрану, и под повёрнутым окном выдала бы
+        // обман в первом же кадре — ровно тот же довод, что у теней при кубе.
+        if state.разворот_окна(&window).is_some() || state.наклон_окна(&window).is_some() {
             continue;
         }
         let Some((x0, y0, w, h)) = window_screen_rect(state, &window) else { continue };
@@ -2628,12 +2781,7 @@ fn build_halo_elements(
         if !on_screen(screen, (x0, y0, w, h), поле) {
             continue;
         }
-        let в_фокусе = state
-            .focused_surface()
-            .map(|s| crate::xwin::is_surface(&window, &s))
-            .unwrap_or(false);
-        let свечение = crate::rounded::Свечение::для_окна(палитра, glow, glow_width, zoom, в_фокусе)
-            .со_светом(палитра, sun, свет, (x0 + w * 0.5, y0 + h * 0.5));
+        let растворение = state.растворение_окна(&window);
         let радиус = (радиус_лог as f64 * zoom).min(w / 2.0).min(h / 2.0).max(0.0) as f32;
         let rect = [x0 as f32, y0 as f32, w as f32, h as f32];
         let форма = crate::rounded::Ореол {
@@ -2647,9 +2795,6 @@ fn build_halo_elements(
         // середина тени — ровно так же было и у плиточной раскладки.
         let ключ = [
             rect[0], rect[1], rect[2], rect[3], радиус,
-            свечение.цвет[0], свечение.цвет[1], свечение.цвет[2],
-            свечение.ширина, свечение.сила,
-            свечение.направление[0], свечение.направление[1], свечение.свет,
             форма.ширина, форма.сдвиг,
         ];
         let буфер = state.decor.гало(slot, &ключ).clone();
@@ -2664,9 +2809,14 @@ fn build_halo_elements(
             &буфер,
             None, None, Some(размер), Kind::Unspecified,
         ) {
-            Ok(el) => els.push(OutputRenderElements::Гало(crate::rounded::Rounded::ореол(
-                el, шейдер, rect, радиус, форма, свечение,
-            ))),
+            Ok(el) => {
+                let el = crate::rounded::Rounded::ореол(el, шейдер, rect, радиус, форма);
+                let el = match растворение {
+                    Some(р) => el.растворить(р),
+                    None => el,
+                };
+                els.push(OutputRenderElements::Гало(el));
+            }
             Err(e) => tracing::warn!("plx/udev: halo: {:?}", e),
         }
     }
@@ -2963,7 +3113,7 @@ fn build_bar_elements(
         for (i, r) in [Some(lay.left), lay.center, Some(lay.right)].into_iter().enumerate() {
             let Some(r) = r else { continue };
             let i = БЛЮР_ОСТРОВ + i;
-            if let Some(el) = build_blur_patch(state, renderer, r, BAR_RADIUS() as f32, 0.85, i) {
+            if let Some(el) = build_blur_patch(state, renderer, r, BAR_RADIUS() as f32, 0.85, i, None) {
                 els.push(el);
             }
         }
@@ -3109,6 +3259,10 @@ fn build_bar_elements(
         }
     }
     state.bar_ids = pool;
+    // Слоты пула дальше берут чипы и значки (полоска активного окна, тени
+    // всплывших значков) — СКВОЗНЫМ счётчиком после плашек. Раньше чип брал
+    // слот с `pool.len()`, и пул прирастал на каждом кадре.
+    let mut idx_значков = idx;
 
     // ── Текст и значки ───────────────────────────────────────────────────────
     // Текст ставится по вертикали от своей высоты, а не «на глаз»: у мелкой
@@ -3128,7 +3282,8 @@ fn build_bar_elements(
         match item.cell {
             bar::Cell::Window(i) => {
                 let Some(чип) = data.windows.get(i).cloned() else { continue };
-                draw_bar_window_chip(state, renderer, r, &чип, slot, &mut els);
+                let глубина = crate::anim::глубина_значка(state, item.cell);
+                draw_bar_window_chip(state, renderer, r, &чип, глубина, slot, &mut idx_значков, &mut els);
                 slot += 1;
             }
             bar::Cell::WindowsMore(n) => {
@@ -3140,7 +3295,7 @@ fn build_bar_elements(
                     title: String::new(),
                     focused: false,
                 };
-                draw_bar_window_chip(state, renderer, r, &чип, slot, &mut els);
+                draw_bar_window_chip(state, renderer, r, &чип, 0.0, slot, &mut idx_значков, &mut els);
                 slot += 1;
             }
             bar::Cell::Clock => {
@@ -3213,7 +3368,8 @@ fn build_bar_elements(
                 slot += 1;
             }
             bar::Cell::Tray(i) => {
-                draw_tray_icon(state, renderer, i, r, slot, &mut els);
+                let глубина = crate::anim::глубина_значка(state, item.cell);
+                draw_tray_icon(state, renderer, i, r, глубина, slot, &mut idx_значков, &mut els);
                 slot += 1;
             }
             _ => {}
@@ -3508,12 +3664,17 @@ fn build_bar_preview(
 /// Значок приходит готовым буфером из `Parallax::chip_icons` — он собирается на
 /// появлении окна, а не здесь: поиск по теме значков лезет в файловую систему,
 /// и делать это внутри кадра нельзя. Не нашлось — рисуем букву, как раньше.
+///
+/// `глубина` — насколько значок всплыл под курсором (`anim::глубина_значка`):
+/// он растёт к `bar::CHIP_ICON_UP`, приподнимается и отбрасывает тень.
 fn draw_bar_window_chip(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
     cell: bar::Rect,
     чип: &bar::WindowChip,
+    глубина: f64,
     slot: usize,
+    idx: &mut usize,
     out: &mut Vec<OutputRenderElements>,
 ) {
     const АКЦЕНТ: [f32; 4] = [0.55, 0.75, 1.0, 0.95];
@@ -3539,25 +3700,45 @@ fn draw_bar_window_chip(
     // же и съедала 4 px стороны под отступ, и подменяла собой фон цветного
     // значка. Сведений при этом не теряем — «какое окно активно» полоска
     // сообщает ровно так же, — а значок остаётся чистой картинкой.
+    // Тень ПЕРВОЙ: список собирается от заднего плана к переднему, и полоска
+    // активного окна обязана лечь поверх тени, а значок — поверх обеих.
+    тень_значка(state, x + сторона / 2, y + сторона, глубина, idx, out);
     if чип.focused {
         let mut pool = std::mem::take(&mut state.bar_ids);
-        let mut idx = pool.len();
         rounded_solid(
-            &mut pool, &mut idx,
+            &mut pool, idx,
             x + (сторона - ЧЕРТА_W) / 2, y + сторона + ЧЕРТА_ЗАЗОР,
             ЧЕРТА_W, ЧЕРТА_H, ЧЕРТА_H / 2, АКЦЕНТ, out,
         );
         state.bar_ids = pool;
     }
-    if let Some((buf, (iw, ih))) = state.chip_icons.get(&чип.app_id) {
-        // ОДИН В ОДИН, без пересчёта размера — ровно как значок трея рядом.
-        // Буфер уже растрирован в `bar::CHIP_ICON` (см. ensure_chip_icon), то
-        // есть поле внутри плашки заложено в сам значок. Раньше здесь стояло
-        // домасштабирование к тому же полю: GPU тянул готовый растр билинейно,
-        // и чипы выглядели мылом рядом с чистым треем.
-        let (dw, dh) = (*iw, *ih);
+    // Всплывший значок берётся из КРУПНОГО растра и ужимается до текущего
+    // размера: в покое (глубина 1) он ложится один в один, во время всплытия
+    // ужимается GPU — на движении этого не видно, а растянутый мелкий был бы
+    // мылом ровно тогда, когда на значок смотрят.
+    let крупный = (глубина > 0.001)
+        .then(|| state.chip_icons_up.get(&чип.app_id))
+        .flatten();
+    let лежащий = state.chip_icons.get(&чип.app_id);
+    if let Some((buf, (iw, ih))) = крупный.or(лежащий) {
+        // В покое — ОДИН В ОДИН, без пересчёта размера, ровно как значок трея
+        // рядом. Буфер уже растрирован в `bar::CHIP_ICON` (см.
+        // ensure_chip_icon). Раньше здесь стояло домасштабирование к тому же
+        // полю: GPU тянул готовый растр билинейно, и чипы выглядели мылом
+        // рядом с чистым треем.
+        let (dw, dh) = if крупный.is_some() {
+            let k = размер_всплытия(глубина) as f64 / bar::CHIP_ICON_UP as f64;
+            (((*iw as f64) * k).round() as i32, ((*ih as f64) * k).round() as i32)
+        } else if глубина > 0.001 {
+            // Крупного нет (значок нашёлся только в одном размере) — растим
+            // мелкий: мыло лучше, чем значок, не отозвавшийся на курсор.
+            let k = размер_всплытия(глубина) as f64 / сторона as f64;
+            (((*iw as f64) * k).round() as i32, ((*ih as f64) * k).round() as i32)
+        } else {
+            (*iw, *ih)
+        };
         let ix = x + (сторона - dw) / 2;
-        let iy = y + (сторона - dh) / 2;
+        let iy = y + (сторона - dh) / 2 - подъём_всплытия(глубина);
         match MemoryRenderBufferRenderElement::from_buffer(
             renderer,
             Point::<f64, Physical>::from((ix as f64, iy as f64)),
@@ -3578,8 +3759,51 @@ fn draw_bar_window_chip(
     let цвет = if чип.focused { БУКВА_АКТИВ } else { БУКВА };
     let w = crate::text::width_of(&чип.letter, bar::STRONG, bar::TEXT_SMALL);
     let tx = x + (сторона - w) / 2;
-    let ty = y + (сторона - crate::text::height(bar::TEXT_SMALL)) / 2;
+    // Букву растить нечем (строка растрируется в своём кегле), поэтому она
+    // только приподнимается.
+    let ty = y + (сторона - crate::text::height(bar::TEXT_SMALL)) / 2
+        - подъём_всплытия(глубина);
     draw_text_w(state, renderer, tx, ty, &чип.letter, bar::STRONG, bar::TEXT_SMALL, цвет, slot, out);
+}
+
+/// Сторона всплывшего значка панели при глубине `д` (0…~1.04 с перелётом).
+fn размер_всплытия(д: f64) -> i32 {
+    let к = (bar::CHIP_ICON_UP - DOT) as f64;
+    (DOT as f64 + к * д.max(0.0)).round() as i32
+}
+
+/// Насколько всплывший значок приподнят над своим местом, px.
+fn подъём_всплытия(д: f64) -> i32 {
+    (2.0 * д.max(0.0)).round() as i32
+}
+
+/// Тень под всплывшим значком панели: мягкое пятно у его подножия.
+///
+/// Глубину читает именно тень: значок поднялся и вырос, а пятно осталось на
+/// «полу» острова и расползлось. Две плашки — плотная узкая и широкая
+/// бледная — дают размытый край без прохода блюра (он на панели и так один
+/// на весь остров). `низ` — нижняя кромка значка В ПОКОЕ.
+fn тень_значка(
+    state: &mut Parallax,
+    центр_x: i32, низ: i32, д: f64,
+    idx: &mut usize,
+    out: &mut Vec<OutputRenderElements>,
+) {
+    if д <= 0.01 {
+        return;
+    }
+    let сила = д.min(1.0) as f32;
+    let ш = размер_всплытия(д) as f64;
+    let mut pool = std::mem::take(&mut state.bar_ids);
+    for (доля, h, альфа) in [(0.95, 5, 0.14), (0.62, 3, 0.30)] {
+        let w = ((ш * доля).round() as i32).max(4);
+        rounded_solid(
+            &mut pool, idx,
+            центр_x - w / 2, низ - h / 2 + 1,
+            w, h, h / 2, [0.0, 0.0, 0.0, альфа * сила], out,
+        );
+    }
+    state.bar_ids = pool;
 }
 
 /// Значок приложения в трее: готовая текстура из sni.rs.
@@ -3594,9 +3818,14 @@ fn draw_tray_icon(
     renderer: &mut GlesRenderer,
     index: usize,
     cell: bar::Rect,
+    глубина: f64,
     slot: usize,
+    idx: &mut usize,
     out: &mut Vec<OutputRenderElements>,
 ) {
+    // Тень всплывшего значка — до него, чтобы лечь под картинку.
+    let низ = cell.y + (cell.h + DOT) / 2;
+    тень_значка(state, cell.x + DOT / 2, низ, глубина, idx, out);
     let Some(apps) = state.tray_apps.as_ref() else { return };
     let Some(item) = apps.items.get(index) else { return };
     // Приглушённый значок у «неважных» предметов (Status = Passive): по
@@ -3607,8 +3836,16 @@ fn draw_tray_icon(
     // Размер берём У БУФЕРА, а не у `item.icon`: у значка, найденного в теме,
     // поле icon пустое — картинка живёт только в буфере.
     if let Some((buf, (iw, ih))) = apps.buffer(&item.key) {
+        // Крупного растра у трея нет (его собирает sni.rs под `DOT`), поэтому
+        // всплывший значок растит GPU. В покое — один в один, как и был.
+        let (iw, ih) = if глубина > 0.001 {
+            let k = размер_всплытия(глубина) as f64 / DOT as f64;
+            (((iw as f64) * k).round() as i32, ((ih as f64) * k).round() as i32)
+        } else {
+            (iw, ih)
+        };
         let x = cell.x + (DOT - iw) / 2;
-        let y = cell.y + (cell.h - ih) / 2;
+        let y = cell.y + (cell.h - ih) / 2 - подъём_всплытия(глубина);
         match MemoryRenderBufferRenderElement::from_buffer(
             renderer,
             Point::<f64, Physical>::from((x as f64, y as f64)),
@@ -3784,6 +4021,111 @@ fn wallpaper_placement(
     })
 }
 
+/// Ниже этого зума плитки режима cycle перестают мельчать: на птичьем глазе
+/// (зум 0.05) их иначе были бы сотни на кадр. Ниже предела обои едут чуть
+/// медленнее окон — на таком отдалении это читается как глубина, а не как ошибка.
+const ОБОИ_ЦИКЛ_МИН_ЗУМ: f64 = 0.25;
+
+/// На сколько пикселей кадра режим cycle отступает от его краёв (см.
+/// `build_wallpaper_cycle`).
+const ОБОИ_ЦИКЛ_ОТСТУП: f64 = 2.0;
+
+/// Режим «cycle»: где лечь плиткам обоев, в ФИЗИЧЕСКИХ пикселях экрана.
+///
+/// В отличие от [`wallpaper_placement`] картинка здесь лежит НА ХОЛСТЕ: плитка
+/// размером «накрыть экран» при зуме 1, масштабируется зумом и едет за камерой
+/// один в один, как окна. Холст покрыт целиком на любой камере.
+///
+/// **Соседние плитки отражены** (нечётные столбцы — по горизонтали, нечётные
+/// ряды — по вертикали). Именно это убирает шов, из-за которого плитку когда-то
+/// выкинули (`dawn-wallpaper-no-repeat`): у отражённой соседки край ровно тот
+/// же, что у этой, и стыка не видно ни на какой картинке.
+///
+/// Края считаются округлением ГРАНИЦ, а не размеров: так соседние плитки
+/// делят одну целую границу и чёрной нитки между ними не бывает.
+fn wallpaper_cycle_places(
+    камера: (f64, f64),
+    зум: f64,
+    масштаб: f64,
+    стол: f64,
+    картинка: (i32, i32),
+    экран: (i32, i32),
+) -> Vec<(МестоОбоев, Transform)> {
+    if картинка_негодна(картинка)
+        || экран.0 <= 0
+        || экран.1 <= 0
+        || !камера.0.is_finite()
+        || !камера.1.is_finite()
+        || !зум.is_finite()
+        || !масштаб.is_finite()
+        || масштаб <= 0.0
+        || !стол.is_finite()
+    {
+        return Vec::new();
+    }
+    let (эw, эh) = (экран.0 as f64, экран.1 as f64);
+    let з = зум.max(ОБОИ_ЦИКЛ_МИН_ЗУМ);
+    let покрытие = (эw / картинка.0 as f64).max(эh / картинка.1 as f64);
+    let (w, h) = (картинка.0 as f64 * покрытие * з, картинка.1 as f64 * покрытие * з);
+    // Где на экране лежит начало холста (угол плитки 0,0). Стол — тот же
+    // виртуальный ход, что и у одиночной копии: Super+N камеру не двигает.
+    let начало_x = -камера.0 * з * масштаб - стол * эw * ОБОИ_ШАГ_СТОЛА;
+    let начало_y = -камера.1 * з * масштаб;
+    let первый_i = ((-начало_x) / w).floor() as i64;
+    let первый_j = ((-начало_y) / h).floor() as i64;
+    let mut out = Vec::new();
+    let mut j = первый_j;
+    loop {
+        let y0 = (начало_y + j as f64 * h).round();
+        if y0 >= эh {
+            break;
+        }
+        let y1 = (начало_y + (j + 1) as f64 * h).round();
+        let mut i = первый_i;
+        loop {
+            let x0 = (начало_x + i as f64 * w).round();
+            if x0 >= эw {
+                break;
+            }
+            let x1 = (начало_x + (i + 1) as f64 * w).round();
+            let поворот = match (i.rem_euclid(2) == 1, j.rem_euclid(2) == 1) {
+                (false, false) => Transform::Normal,
+                (true, false) => Transform::Flipped,
+                (false, true) => Transform::Flipped180,
+                (true, true) => Transform::_180,
+            };
+            out.push((
+                МестоОбоев { x: x0, y: y0, w: (x1 - x0).max(1.0), h: (y1 - y0).max(1.0) },
+                поворот,
+            ));
+            i += 1;
+        }
+        j += 1;
+    }
+    out
+}
+
+/// Плитки режима cycle для этого монитора — общий расчёт кадра и блюра.
+fn wallpaper_cycle_for(
+    state: &Parallax,
+    output: &Output,
+    картинка: (i32, i32),
+    экран: (i32, i32),
+) -> Vec<(МестоОбоев, Transform)> {
+    let дом = state.монитор_дом();
+    wallpaper_cycle_places(
+        (
+            state.viewport.cam_x - дом.x as f64,
+            state.viewport.cam_y - дом.y as f64,
+        ),
+        state.viewport.zoom,
+        output.current_scale().fractional_scale(),
+        state.обои_фаза(),
+        картинка,
+        экран,
+    )
+}
+
 fn картинка_негодна(картинка: (i32, i32)) -> bool {
     картинка.0 <= 0 || картинка.1 <= 0
 }
@@ -3804,7 +4146,7 @@ fn wallpaper_screen_place(
     output: &Output,
     экран: Size<i32, Physical>,
 ) -> Vec<crate::blur::Плитка> {
-    if !state.lua_config.infinite_wallpaper {
+    if !state.lua_config.infinite_wallpaper && !state.обои_цикл {
         return Vec::new();
     }
     // Слой берём тот же, что и сам кадр (`build_wallpaper_backdrop`): свой у
@@ -3812,7 +4154,6 @@ fn wallpaper_screen_place(
     // `render_surface` уже перешёл на точку зрения рисуемого выхода
     // (`monitors::войти_в_монитор` подменяет и `layer_output`). Разъехаться
     // этим двум нельзя — блюр размывал бы не то, что нарисовано.
-    let _ = output;
     let Some(поверхность) = state.фоновая_поверхность() else {
         return Vec::new();
     };
@@ -3822,6 +4163,12 @@ fn wallpaper_screen_place(
     // Размер — по ПОВЕРХНОСТИ, ровно как в build_wallpaper_backdrop, и отсчёт
     // от ДОМА своего монитора: оба расчёта обязаны совпадать до пикселя.
     let размер = вид.dst;
+    if state.обои_цикл {
+        return wallpaper_cycle_for(state, output, (размер.w, размер.h), (экран.w, экран.h))
+            .into_iter()
+            .map(|(м, поворот)| crate::blur::Плитка { x: м.x, y: м.y, w: м.w, h: м.h, поворот })
+            .collect();
+    }
     let дом = state.монитор_дом();
     let Some(место) = wallpaper_placement(
         (
@@ -3839,6 +4186,7 @@ fn wallpaper_screen_place(
         y: место.y,
         w: место.w,
         h: место.h,
+        поворот: Transform::Normal,
     }]
 }
 
@@ -3869,6 +4217,12 @@ fn build_blur_patch(
     // заплату 15% РЕЗКИХ обоев смазали бы весь эффект.
     alpha: f32,
     слот: usize,
+    // Растворение ОКНА, под которым лежит заплата (`set{ dissolve }`): стекло
+    // обязано собираться теми же кляксами, что и само окно, — иначе при
+    // открытии прозрачного терминала сперва висел бы целый матовый
+    // прямоугольник, а окно собиралось бы поверх него. У плашек интерфейса —
+    // None.
+    растворение: Option<crate::rounded::Растворение>,
 ) -> Option<OutputRenderElements> {
     let текстура = state.blur_tex.clone()?;
     let шейдер = state.blur_shape.clone()?;
@@ -3907,9 +4261,11 @@ fn build_blur_patch(
         Kind::Unspecified,
     );
     let обрезанное = CropRenderElement::from_element(el, 1.0, прямоугольник)?;
-    Some(OutputRenderElements::Blur(crate::rounded::Rounded::from_rect(
-        обрезанное, &шейдер, прямоугольник, radius,
-    )))
+    let плашка = crate::rounded::Rounded::from_rect(обрезанное, &шейдер, прямоугольник, radius);
+    Some(OutputRenderElements::Blur(match растворение {
+        Some(р) => плашка.растворить(р),
+        None => плашка,
+    }))
 }
 
 // Номера заплат размытия. Один номер — одна плашка на экране; острова панели
@@ -3921,11 +4277,29 @@ const БЛЮР_ПРЕДПРОСМОТР: usize = 5;
 /// Карта окон: её карточка тоже стоит на матовом стекле (26.08.2026 — вместо
 /// обоев внутри карты, см. `build_minimap_elements`).
 const БЛЮР_КАРТА: usize = 6;
-/// С этого номера идут заплаты ПОД ОКНАМИ — по одной на прозрачное окно в
-/// кадре. Номер стабилен внутри кадра (порядок обхода окон детерминирован), а
-/// значит стабилен и `Id` заплаты: ровно то, чего требует damage tracking
-/// (см. `pooled_solid`).
-const БЛЮР_ОКНО: usize = 8;
+/// Панель приложений (см. dock.rs).
+const БЛЮР_ДОК: usize = 7;
+/// Окно «Параметры панели» (см. dock_settings.rs): бывает открыто вместе со
+/// списком «+», у которого своё стекло меню.
+const БЛЮР_ПАРАМЕТРЫ_ДОКА: usize = 8;
+// Номер 9 и дальше раньше занимали заплаты ПОД ОКНАМИ; с 05.10.2026 там
+// лежит стекло-эффект со своим Id на окне (`СтеклоОкна`), и пул ему не нужен.
+
+/// Постоянный Id стекла под окном (см. `blur::Подложка`), живёт в user_data
+/// самого окна.
+struct СтеклоОкна(Id);
+
+/// Как окно было нарисовано в последнем кадре: видимая рамка до масштабов
+/// (`рамка` — сколько буфера видно) и где она легла на ХОЛСТЕ со всеми
+/// масштабами (`холст`). Отсюда снимает картинку закрытие (см.
+/// `Parallax::начать_уход`): снимок по геометрии клиента расходился с тем,
+/// что было на экране, и окно на первом кадре закрытия меняло размер.
+#[derive(Clone, Copy, Debug)]
+pub struct ВидОкна {
+    pub рамка: Size<i32, Logical>,
+    pub холст: Rectangle<f64, Logical>,
+    pub когда: std::time::Instant,
+}
 
 /// «Матовое стекло» под плашку интерфейса: заплата размытого фона в её
 /// прямоугольнике.
@@ -3949,7 +4323,7 @@ fn стекло(
     if state.blur_tex.is_none() {
         return None;
     }
-    build_blur_patch(state, renderer, bar::Rect { x, y, w, h }, radius as f32, 0.85, слот)
+    build_blur_patch(state, renderer, bar::Rect { x, y, w, h }, radius as f32, 0.85, слот, None)
 }
 
 /// Текстура фоновой поверхности вместе с её ВИДОМ.
@@ -4032,6 +4406,133 @@ fn wallpaper_texture(
     None
 }
 
+/// Положить поверхности на ПЛОСКОСТЬ, развёрнутую в пространстве, — одним и
+/// тем же кодом для грани куба и для окна, разворачивающегося при открытии
+/// (`flip3d`).
+///
+/// `в_плоскость` переводит точку из тех координат, в которых пришли элементы
+/// (холст для грани, экран до зума для окна), в координаты плоскости с началом
+/// в её середине — так требует шейдер.
+///
+/// Каждая поверхность растягивается в КОРОБКУ своей проекции: проекция
+/// прямоугольника — трапеция, а у элемента кадра есть только прямоугольник
+/// `dst`, и за его пределами фрагментов не существует вовсе. Сам разворот
+/// делает шейдер обратным отображением (см. шапку куб.rs) — коробка нужна лишь
+/// затем, чтобы фрагменты были там, где встанет трапеция.
+fn положить_на_плоскость(
+    шейдер: &crate::куб::Шейдер,
+    плоскость: &crate::куб::Куб,
+    угол: f32,
+    кадр: Rectangle<i32, Physical>,
+    элементы: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    в_плоскость: &dyn Fn(i32, i32) -> (f32, f32),
+    обрезка: Option<Rectangle<i32, Physical>>,
+) -> Vec<OutputRenderElements> {
+    положить_на(
+        шейдер, плоскость, &плоскость.грань(угол), 1.0, кадр, элементы, в_плоскость, обрезка,
+    )
+}
+
+/// То же на ПРОИЗВОЛЬНОЙ плоскости `пл` (панель карусели) с общей яркостью.
+/// `камера` даёт проекцию; грань куба — частный случай, `камера.грань(угол)`.
+#[allow(clippy::too_many_arguments)]
+fn положить_на(
+    шейдер: &crate::куб::Шейдер,
+    камера: &crate::куб::Куб,
+    пл: &crate::куб::Плоскость,
+    яркость: f32,
+    кадр: Rectangle<i32, Physical>,
+    элементы: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    в_плоскость: &dyn Fn(i32, i32) -> (f32, f32),
+    обрезка: Option<Rectangle<i32, Physical>>,
+) -> Vec<OutputRenderElements> {
+    положить_на_скруглённо(шейдер, камера, пл, яркость, кадр, элементы, в_плоскость, обрезка, None)
+}
+
+/// То же со скруглёнными углами: `скругление` — видимая рамка окна в
+/// координатах плоскости и радиус дуги в тех же единицах. Нужно наклонённому
+/// окну (см. наклон.rs): его углы режет шейдер плоскости, а не шейдер
+/// скругления.
+#[allow(clippy::too_many_arguments)]
+fn положить_на_скруглённо(
+    шейдер: &crate::куб::Шейдер,
+    камера: &crate::куб::Куб,
+    пл: &crate::куб::Плоскость,
+    яркость: f32,
+    кадр: Rectangle<i32, Physical>,
+    элементы: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    в_плоскость: &dyn Fn(i32, i32) -> (f32, f32),
+    обрезка: Option<Rectangle<i32, Physical>>,
+    скругление: Option<((f32, f32, f32, f32), f32)>,
+) -> Vec<OutputRenderElements> {
+    let mut out = Vec::with_capacity(элементы.len());
+    // Обрезка — в ИСХОДНЫХ координатах (холст), до проекции: после неё
+    // прямоугольник становится трапецией, и резать его было бы уже нечем. Нужна
+    // ленте, где этаж шире экрана: колонка за краем кадра иначе торчала бы за
+    // ребро грани в пустоту (24.09.2026).
+    let обрезка = обрезка.unwrap_or_else(|| {
+        Rectangle::new((i32::MIN / 4, i32::MIN / 4).into(), (i32::MAX / 2, i32::MAX / 2).into())
+    });
+    for el in элементы {
+        // Рамка ЦЕЛОЙ поверхности, до обрезки: по ней шейдер считает
+        // координаты текстуры. Отдай ему обрезанную — и весь буфер сжимался
+        // в вырез (харнесс 26.09.2026: gtk3-widget-factory шириной 1457
+        // целиком в слоте 615 на грани обзора).
+        let целая = smithay::backend::renderer::element::Element::geometry(
+            &el,
+            smithay::utils::Scale::from(1.0),
+        );
+        let Some(el) = CropRenderElement::from_element(el, 1.0, обрезка) else { continue };
+        // Где эта ПОВЕРХНОСТЬ (не окно целиком — у окна их бывает много) лежит
+        // в исходных координатах, а значит и в плоскости. Трейт `Element`
+        // зовётся по полному пути: в этом файле он не в области видимости, а
+        // тащить его сюда ради одного вызова значит поменять разрешение имён у
+        // всего остального.
+        let г = smithay::backend::renderer::element::Element::geometry(
+            &el,
+            smithay::utils::Scale::from(1.0),
+        );
+        if г.size.w <= 0 || г.size.h <= 0 {
+            continue;
+        }
+        let (u0, v0) = в_плоскость(г.loc.x, г.loc.y);
+        let (u1, v1) = в_плоскость(г.loc.x + г.size.w, г.loc.y + г.size.h);
+        let Some(коробка) = камера.коробка_на(пл, (u0, v0, u1, v1)) else { continue };
+        if коробка.intersection(кадр).is_none() {
+            continue;
+        }
+        // Сначала масштаб по каждой оси отдельно (проекция сжимает плоскость
+        // неравномерно), потом сдвиг.
+        let sx = коробка.size.w as f64 / г.size.w as f64;
+        let sy = коробка.size.h as f64 / г.size.h as f64;
+        let ужатое = RescaleRenderElement::from_element(
+            el,
+            Point::<i32, Physical>::from((0, 0)),
+            smithay::utils::Scale::from((sx, sy)),
+        );
+        let сдвиг = Point::<i32, Physical>::from((
+            коробка.loc.x - (г.loc.x as f64 * sx).round() as i32,
+            коробка.loc.y - (г.loc.y as f64 * sy).round() as i32,
+        ));
+        let на_месте = RelocateRenderElement::from_element(ужатое, сдвиг, Relocate::Relative);
+        let Some(обрезанное) = CropRenderElement::from_element(на_месте, 1.0, кадр) else {
+            continue;
+        };
+        let (ц0x, ц0y) = в_плоскость(целая.loc.x, целая.loc.y);
+        let (ц1x, ц1y) = в_плоскость(целая.loc.x + целая.size.w, целая.loc.y + целая.size.h);
+        let mut uniforms = камера.uniforms_плоскости(пл, (ц0x, ц0y, ц1x, ц1y), яркость);
+        if let Some((рамка, радиус)) = скругление {
+            crate::куб::Куб::скруглить(&mut uniforms, рамка, радиус);
+        }
+        out.push(OutputRenderElements::Грань(crate::куб::Грань::на_плоскости(
+            обрезанное,
+            шейдер,
+            uniforms,
+        ).с_отсечением((u0, v0, u1, v1))));
+    }
+    out
+}
+
 /// Куб рабочих столов (см. куб.rs): столы на гранях призмы вместо плоской
 /// сетки обзора.
 ///
@@ -4074,6 +4575,7 @@ fn build_cube_elements(
         state.lua_config.cube_shade * сила,
     );
     куб.поворот = state.куб_угол as f32;
+    куб.наклон = state.куб_наклон as f32;
 
     // Грани обходим ОТ БЛИЖНЕЙ К ДАЛЬНЕЙ: список кадра идёт от переднего плана
     // к заднему, и передняя грань обязана перекрывать соседние по ребру.
@@ -4084,7 +4586,9 @@ fn build_cube_elements(
     });
 
     let кадр = Rectangle::<i32, Physical>::new((0, 0).into(), экран);
-    let mut out: Vec<OutputRenderElements> = Vec::new();
+    // Глубина, слой (0 — подложка грани, дальше номер окна в стопке) и сам
+    // элемент. Сортируется всё разом в конце, см. там же.
+    let mut слои: Vec<(f32, i32, OutputRenderElements)> = Vec::new();
     for грань in порядок {
         // Какой стол лежит на ЭТОЙ грани — вопрос к кольцу столов, а не к
         // номеру грани: столов может быть больше, чем граней, и слоты берут их
@@ -4098,22 +4602,24 @@ fn build_cube_elements(
         if рамка.size.w <= 0 || рамка.size.h <= 0 {
             continue;
         }
-        // Холст → плоскость грани: доля внутри рамки, растянутая на экран, с
-        // началом координат в ЦЕНТРЕ грани (так требует шейдер).
-        let кx = экран.w as f32 / рамка.size.w as f32;
-        let кy = экран.h as f32 / рамка.size.h as f32;
+        // Холст → плоскость грани: рамка ВПИСАНА в грань одним масштабом на обе
+        // оси, центр рамки — центр грани (так требует шейдер).
+        //
+        // Раньше оси тянулись каждая своим множителем, и рамка ровно в экран
+        // этого не замечала. Но стол с мозаикой (`overview_расклад`) выше и
+        // шире экрана, и его окна на грани сплющивались: замер харнесса
+        // 26.09.2026 — рамка 2600×2100 на грани 2560×1080, окна вдвое ниже
+        // своего роста. Жалоба Ярика: «окна в обзоре смещены или не того
+        // размера».
+        let к = (экран.w as f32 / рамка.size.w as f32).min(экран.h as f32 / рамка.size.h as f32);
+        let центр_x = рамка.loc.x as f32 + рамка.size.w as f32 * 0.5;
+        let центр_y = рамка.loc.y as f32 + рамка.size.h as f32 * 0.5;
         let в_грань = |p: Point<i32, Logical>| -> (f32, f32) {
-            (
-                (p.x - рамка.loc.x) as f32 * кx - экран.w as f32 * 0.5,
-                (p.y - рамка.loc.y) as f32 * кy - экран.h as f32 * 0.5,
-            )
+            ((p.x as f32 - центр_x) * к, (p.y as f32 - центр_y) * к)
         };
 
-        // Подложка грани — под окнами, поэтому кладётся в список ПОСЛЕ них.
-        let mut грани_элементы: Vec<OutputRenderElements> = Vec::new();
-
         // Окна стола: снизу вверх по стеку, а в список кадра — наоборот.
-        let окна: Vec<(Window, Rectangle<i32, Logical>)> = state
+        let mut окна: Vec<(Window, Rectangle<i32, Logical>)> = state
             .space
             .elements()
             .rev()
@@ -4125,8 +4631,37 @@ fn build_cube_elements(
             })
             .filter_map(|w| state.space.element_geometry(w).map(|g| (w.clone(), g)))
             .collect();
+        // Проворот вне обзора: стол, с которого ушли, на холсте уже не лежит —
+        // view_tag снял его окна в том же кадре, где начался поворот. По
+        // одному холсту его грань была бы пустыми обоями (снимок харнесса
+        // 25.09.2026: Float-стол крутился прочь без единого окна). Такие окна
+        // берём из их домов (`tw.position`, туда их записал refresh_tags) и
+        // кладём В НИЗ стопки: порядок в стеке у снятых окон уже не узнать.
+        if state.куб_переход && !state.overview_active {
+            for tw in state.tagged_windows.iter().filter(|tw| tw.tags & стол != 0) {
+                if state.space.element_location(&tw.window).is_some()
+                    || окна.iter().any(|(w, _)| w == &tw.window)
+                {
+                    continue;
+                }
+                let g = Rectangle::new(tw.position, tw.window.geometry().size);
+                окна.push((tw.window.clone(), g));
+            }
+        }
 
-        for (окно, geo) in окна {
+        // Слой стопки СНИЗУ ВВЕРХ: список идёт сверху вниз (`rev()` выше), а
+        // подъём считается от нижнего окна — оно ближе всех к грани.
+        let всего_окон = окна.len();
+        for (номер, (окно, geo)) in окна.into_iter().enumerate() {
+            let слой = всего_окон.saturating_sub(номер + 1);
+            // ОКНО ЖИВЁТ НЕ В ПЛОСКОСТИ ГРАНИ, А НАД НЕЙ. Куб при этом
+            // перестаёт быть «столами, нарисованными на коробке», и становится
+            // тем, чем он является в расширении GNOME: коробкой из обоев, над
+            // которой висят окна. Ближе к камере — значит крупнее грани и
+            // по-настоящему перекрывает соседей, включая окна соседних граней
+            // (порядок в кадре считается ниже, по глубине).
+            let куб_окна = куб.с_подъёмом(state.куб_подъём_пикселей(слой, экран.w as f32));
+            let глубина_окна = куб_окна.глубина(угол);
             // Начало дерева поверхностей — та же поправка на клиентские поля,
             // что и в обычной отрисовке: g.loc − window.geometry().loc.
             let корень = geo.loc - окно.geometry().loc;
@@ -4136,54 +4671,29 @@ fn build_cube_elements(
                 smithay::utils::Scale::from(1.0),
                 1.0,
             );
-            for el in элементы {
-                // Где эта ПОВЕРХНОСТЬ (не окно целиком — у окна их бывает
-                // много) лежит в холсте, а значит и в плоскости грани.
-                // Трейт `Element` зовётся по полному пути: в этом файле он не
-                // в области видимости, а тащить его сюда ради одного вызова
-                // значит поменять разрешение имён у всего остального.
-                let г = smithay::backend::renderer::element::Element::geometry(
-                    &el,
-                    smithay::utils::Scale::from(1.0),
-                );
-                if г.size.w <= 0 || г.size.h <= 0 {
-                    continue;
-                }
-                let (u0, v0) = в_грань(Point::from((г.loc.x, г.loc.y)));
-                let (u1, v1) = в_грань(Point::from((
-                    г.loc.x + г.size.w,
-                    г.loc.y + г.size.h,
-                )));
-                let Some(коробка) = куб.коробка(угол, (u0, v0, u1, v1)) else { continue };
-                if коробка.intersection(кадр).is_none() {
-                    continue;
-                }
-                // Элемент растягиваем в коробку: сначала масштаб по каждой оси
-                // отдельно (проекция сжимает грань неравномерно), потом сдвиг.
-                // Сам разворот делает шейдер — коробка нужна лишь затем, чтобы
-                // фрагменты вообще существовали там, где встанет трапеция.
-                let sx = коробка.size.w as f64 / г.size.w as f64;
-                let sy = коробка.size.h as f64 / г.size.h as f64;
-                let ужатое = RescaleRenderElement::from_element(
-                    el,
-                    Point::<i32, Physical>::from((0, 0)),
-                    smithay::utils::Scale::from((sx, sy)),
-                );
-                let сдвиг = Point::<i32, Physical>::from((
-                    коробка.loc.x - (г.loc.x as f64 * sx).round() as i32,
-                    коробка.loc.y - (г.loc.y as f64 * sy).round() as i32,
-                ));
-                let на_месте = RelocateRenderElement::from_element(ужатое, сдвиг, Relocate::Relative);
-                let Some(обрезанное) = CropRenderElement::from_element(на_месте, 1.0, кадр) else {
-                    continue;
-                };
-                грани_элементы.push(OutputRenderElements::Грань(crate::куб::Грань::new(
-                    обрезанное,
-                    &шейдер,
-                    &куб,
-                    угол,
-                    (u0, v0, u1, v1),
-                )));
+            // Поднятая плоскость ближе к камере — ужимаем её, чтобы анфас окна
+            // стояли ровно по раскладке стола (см. `Куб::сжатие_подъёма`).
+            let сжатие = куб.сжатие_подъёма(&куб_окна);
+            let в_плоскость = |x: i32, y: i32| {
+                let (a, b) = в_грань(Point::from((x, y)));
+                (a * сжатие, b * сжатие)
+            };
+            // Режем не только по рамке стола, но и по ВИДИМОЙ рамке окна.
+            // Упрямый клиент (GTK, Electron, Firefox со своим минимумом) рисует
+            // буфер больше запрошенного слота, и на столе его режет
+            // "нужен_кроп"; на грани этого не было, и окно вылезало поверх
+            // соседей в полный рост (харнесс 26.09.2026: gtk3-widget-factory
+            // 1457×780 в слоте 615×506).
+            let видимо = Rectangle::new(geo.loc, crate::xwin::видимый_размер(&окно, geo.size));
+            let Some(обрезка) = рамка.intersection(видимо) else { continue };
+            let рамка_физ = Rectangle::<i32, Physical>::new(
+                (обрезка.loc.x, обрезка.loc.y).into(),
+                (обрезка.size.w, обрезка.size.h).into(),
+            );
+            for эл in положить_на_плоскость(
+                &шейдер, &куб_окна, угол, кадр, элементы, &в_плоскость, Some(рамка_физ),
+            ) {
+                слои.push((глубина_окна, слой as i32 + 1, эл));
             }
         }
 
@@ -4197,18 +4707,293 @@ fn build_cube_elements(
         );
         if let Some(коробка) = куб.коробка(угол, вся) {
             if коробка.intersection(кадр).is_some() {
-                let свой = стол == state.viewport.current_tags();
-                if let Some(эл) = cube_face_backdrop(state, renderer, коробка, свой) {
-                    грани_элементы.push(OutputRenderElements::ГраньФон(crate::куб::Грань::new(
-                        эл, &шейдер, &куб, угол, вся,
+                // Грань — это СТОЛ, а стол начинается с обоев. Однотонная
+                // плитка остаётся запасным путём на случай, когда обоев нет
+                // вовсе (plx-wall не запущен, фонового слоя в карте выходов
+                // нет) — иначе куб стал бы набором висящих в пустоте окон.
+                let глубина_грани = куб.глубина(угол);
+                if let Some(эл) = cube_face_wallpaper(state, renderer, коробка, грань) {
+                    слои.push((глубина_грани, 0, OutputRenderElements::ГраньОбои(
+                        crate::куб::Грань::new(эл, &шейдер, &куб, угол, вся),
+                    )));
+                } else if let Some(эл) = cube_face_backdrop(state, renderer, коробка) {
+                    слои.push((глубина_грани, 0, OutputRenderElements::ГраньФон(
+                        crate::куб::Грань::new(эл, &шейдер, &куб, угол, вся),
                     )));
                 }
             }
         }
 
-        out.extend(грани_элементы);
     }
+
+    // КРЫШЕК НЕТ (30.09.2026, просьба Ярика «убери из куба потолок и пол»):
+    // наклонённый куб открыт сверху и снизу, и сквозь проём видно фон за
+    // ним. Геометрия крышек осталась в куб_math.rs (`Куб::крышка`) с тестами.
+
+    // ПОРЯДОК В КАДРЕ — ПО ГЛУБИНЕ, А НЕ ПО ГРАНЯМ. Пока окна лежали в
+    // плоскости своей грани, хватало обхода граней от ближней к дальней:
+    // внутри грани порядок был порядком стопки. Поднятое окно ломает это
+    // допущение — окно боковой грани бывает ближе к зрителю, чем подложка
+    // передней, — поэтому сортируется весь список разом.
+    //
+    // Глубина у всех считается в ОДНОЙ точке — центре плоскости (`u = 0`): по
+    // точке поверхности ближний край окна на грани, стоящей почти ребром,
+    // оказывался бы дальше подложки своей же грани, и грань закрыла бы лежащее
+    // на ней окно.
+    //
+    // Список кадра идёт от переднего плана к заднему, поэтому сортируем по
+    // ВОЗРАСТАНИЮ глубины, а при равной глубине (подъём выключен) — по
+    // убыванию слоя: верхнее окно стопки первым, подложка грани последней.
+    слои.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.1.cmp(&a.1))
+    });
+    let out: Vec<OutputRenderElements> = слои.into_iter().map(|(_, _, эл)| эл).collect();
     Some(out)
+}
+
+/// Карусель колонок (см. карусель.rs): каждая колонка этажа — панель на
+/// кольце, окна колонки ложатся на неё живыми поверхностями, как на грань куба.
+///
+/// `None` — карусели нет. Порядок кадра — по глубине панелей, внутри панели —
+/// по стопке окон.
+fn build_carousel_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Option<Vec<OutputRenderElements>> {
+    if !state.карусель_активна() {
+        return None;
+    }
+    if state.карусель_столов.is_some() {
+        return build_desk_carousel_elements(state, renderer, output);
+    }
+    let шейдер = state.куб_шейдер.clone()?;
+    let экран = output.current_mode()?.size;
+    let (камера, панели, колонки) =
+        state.карусель_разложить((экран.w as f64, экран.h as f64))?;
+    let кадр = Rectangle::<i32, Physical>::new((0, 0).into(), экран);
+    let высота_этажа = state.screen_size().h;
+
+    let mut слои: Vec<(f32, i32, OutputRenderElements)> = Vec::new();
+    for панель in &панели {
+        let Some((_, cols)) = колонки.get(панель.этаж) else { continue };
+        let Some(колонка) = cols.get(панель.колонка) else { continue };
+        // Рамка колонки на холсте во всю высоту этажа: окна режутся по ней, и
+        // соседняя колонка, заехавшая краем (ресайз посреди анимации), не
+        // вылезает на чужую панель.
+        let верх = (панель.центр.1 - высота_этажа as f64 * 0.5).round() as i32;
+        let рамка = Rectangle::<i32, Logical>::new(
+            (колонка.x0.floor() as i32, верх).into(),
+            ((колонка.x1 - колонка.x0).ceil() as i32, высота_этажа).into(),
+        );
+        let (цx, цy) = панель.центр;
+        let в_плоскость = |x: i32, y: i32| ((x as f64 - цx) as f32, (y as f64 - цy) as f32);
+        let всего = колонка.окна.len();
+        for (номер, окно) in колонка.окна.iter().enumerate() {
+            let Some(geo) = state.space.element_geometry(окно) else { continue };
+            let корень = geo.loc - окно.geometry().loc;
+            let элементы: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = окно.render_elements(
+                renderer,
+                Point::<i32, Physical>::from((корень.x, корень.y)),
+                smithay::utils::Scale::from(1.0),
+                1.0,
+            );
+            // Та же двойная обрезка, что на грани куба: по колонке и по
+            // ВИДИМОЙ рамке окна (упрямые клиенты рисуют буфер больше слота).
+            let видимо = Rectangle::new(geo.loc, crate::xwin::видимый_размер(окно, geo.size));
+            let Some(обрезка) = рамка.intersection(видимо) else { continue };
+            let обрезка = Rectangle::<i32, Physical>::new(
+                (обрезка.loc.x, обрезка.loc.y).into(),
+                (обрезка.size.w, обрезка.size.h).into(),
+            );
+            for эл in положить_на(
+                &шейдер, &камера, &панель.плоскость, панель.яркость, кадр, элементы,
+                &в_плоскость, Some(обрезка),
+            ) {
+                слои.push((панель.глубина, (всего - номер) as i32, эл));
+            }
+        }
+    }
+    // Как у куба: от переднего плана к заднему, при равной глубине — верхнее
+    // окно стопки первым.
+    слои.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
+    Some(слои.into_iter().map(|(_, _, эл)| эл).collect())
+}
+
+/// Карусель столов (см. карусель_столов.rs): каждый стол — панель из обоев,
+/// над которой лежат его окна, как на грани куба. Рамка стола — его ячейка
+/// сеточного обзора, вписанная в панель одним масштабом.
+fn build_desk_carousel_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Option<Vec<OutputRenderElements>> {
+    let шейдер = state.куб_шейдер.clone()?;
+    let экран = output.current_mode()?.size;
+    let (камера, панели, столы) =
+        state.карусель_столов_разложить((экран.w as f64, экран.h as f64))?;
+    let кадр = Rectangle::<i32, Physical>::new((0, 0).into(), экран);
+
+    let mut слои: Vec<(f32, i32, OutputRenderElements)> = Vec::new();
+    for панель in &панели {
+        let Some(&стол) = столы.get(панель.колонка) else { continue };
+        let вся = панель.rect;
+        // Подложка — обои стола. Id после граней куба и его крышки, по одному
+        // на стол (см. `куб_фон_ids`).
+        if let Some(коробка) = камера.коробка_на(&панель.плоскость, вся) {
+            if коробка.intersection(кадр).is_some() {
+                let uniforms = камера.uniforms_плоскости(&панель.плоскость, вся, панель.яркость);
+                let номер = 16 + панель.колонка as u32;
+                if let Some(эл) = cube_face_wallpaper(state, renderer, коробка, номер) {
+                    слои.push((панель.глубина, 0, OutputRenderElements::ГраньОбои(
+                        crate::куб::Грань::на_плоскости(эл, &шейдер, uniforms),
+                    )));
+                } else if let Some(эл) = cube_face_backdrop(state, renderer, коробка) {
+                    слои.push((панель.глубина, 0, OutputRenderElements::ГраньФон(
+                        crate::куб::Грань::на_плоскости(эл, &шейдер, uniforms),
+                    )));
+                }
+            }
+        }
+
+        // Окна — только на лицевой части карусели (просьба Ярика 05.10.2026):
+        // задние панели и боковые стены квадрата остаются одними обоями. Стол,
+        // на который идёт выход, — с окнами всегда: он доворачивается к
+        // зрителю, и окна не должны выскакивать на последних кадрах.
+        let на_выход = state
+            .карусель_столов
+            .as_ref()
+            .and_then(|к| к.выход)
+            .is_some_and(|(м, _)| м == стол);
+        if !панель.лицом && !на_выход {
+            continue;
+        }
+        let Some(рамка) = state.куб_рамка_стола(стол) else { continue };
+        if рамка.size.w <= 0 || рамка.size.h <= 0 {
+            continue;
+        }
+        let к = (экран.w as f32 / рамка.size.w as f32).min(экран.h as f32 / рамка.size.h as f32);
+        let центр_x = рамка.loc.x as f32 + рамка.size.w as f32 * 0.5;
+        let центр_y = рамка.loc.y as f32 + рамка.size.h as f32 * 0.5;
+        let в_плоскость = |x: i32, y: i32| ((x as f32 - центр_x) * к, (y as f32 - центр_y) * к);
+
+        // Окна стола снизу вверх по стеку; в кадр — верхние первыми.
+        let окна: Vec<(Window, Rectangle<i32, Logical>)> = state
+            .space
+            .elements()
+            .filter(|w| {
+                state
+                    .tagged_windows
+                    .iter()
+                    .any(|tw| &tw.window == *w && tw.tags & стол != 0)
+            })
+            .filter_map(|w| state.space.element_geometry(w).map(|g| (w.clone(), g)))
+            .collect();
+        for (номер, (окно, geo)) in окна.into_iter().enumerate() {
+            let корень = geo.loc - окно.geometry().loc;
+            let элементы: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = окно.render_elements(
+                renderer,
+                Point::<i32, Physical>::from((корень.x, корень.y)),
+                smithay::utils::Scale::from(1.0),
+                1.0,
+            );
+            // Двойная обрезка, как на грани куба: по рамке стола и по видимой
+            // рамке окна (упрямые клиенты рисуют буфер больше слота).
+            let видимо = Rectangle::new(geo.loc, crate::xwin::видимый_размер(&окно, geo.size));
+            let Some(обрезка) = рамка.intersection(видимо) else { continue };
+            let обрезка = Rectangle::<i32, Physical>::new(
+                (обрезка.loc.x, обрезка.loc.y).into(),
+                (обрезка.size.w, обрезка.size.h).into(),
+            );
+            // ОКНО НАД ПАНЕЛЬЮ, А НЕ В НЕЙ (01.10.2026, «отдельными от столов,
+            // как было раньше»): та же механика, что у куба с 18.09 —
+            // `cube_lift` плюс шаг стопки, — только вдоль нормали панели.
+            // Номер здесь — место в стопке снизу, поэтому верхнее окно и висит
+            // выше всех.
+            let подъём = state.карусель_столов_подъём(номер, экран.w as f32);
+            let (плоскость_окон, сжатие) =
+                crate::карусель_столов::поднять(&камера, &панель.плоскость, подъём);
+            let глубина_окна = камера.глубина_плоскости(&плоскость_окон);
+            let в_поднятую = |x: i32, y: i32| {
+                let (u, v) = в_плоскость(x, y);
+                (u * сжатие, v * сжатие)
+            };
+            for эл in положить_на(
+                &шейдер, &камера, &плоскость_окон, панель.яркость, кадр, элементы,
+                &в_поднятую, Some(обрезка),
+            ) {
+                слои.push((глубина_окна, номер as i32 + 1, эл));
+            }
+        }
+    }
+    // От переднего плана к заднему — по ГЛУБИНЕ ПЛОСКОСТИ, как у куба:
+    // поднятое окно боковой панели бывает ближе подложки передней. При равной
+    // глубине (подъём выключен) — верхнее окно первым, подложка последней.
+    слои.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
+    Some(слои.into_iter().map(|(_, _, эл)| эл).collect())
+}
+
+/// Обои, застилающие грань куба.
+///
+/// Грань — это СТОЛ, а стол начинается с обоев: под окнами лежат они, и всё,
+/// что у окна прозрачно, показывает именно их. Пока подложкой была однотонная
+/// плитка (`cube_face_backdrop`), прозрачные окна — у Ярика прозрачны все
+/// терминалы, см. tui-transparency — показывали на кубе не обои, а плитку,
+/// и грань читалась как «тёмный фон с затемнением» (жалоба 11.09.2026).
+///
+/// Обои берём ровно те же, что рисует `build_wallpaper_backdrop`, но без
+/// сдвига за камерой: грань показывает стол целиком, а не кусок бесконечного
+/// холста под текущим кадром.
+fn cube_face_wallpaper(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    коробка: Rectangle<i32, Physical>,
+    грань: u32,
+) -> Option<CropRenderElement<TextureRenderElement<GlesTexture>>> {
+    if коробка.size.w <= 0 || коробка.size.h <= 0 {
+        return None;
+    }
+    let поверхность = state.фоновая_поверхность()?;
+    let ctx = {
+        use smithay::backend::renderer::Renderer as _;
+        renderer.context_id()
+    };
+    let (текстура, вид) = wallpaper_texture_sized(&поверхность, renderer)?;
+    if вид.src.size.w <= 0.0 || вид.src.size.h <= 0.0 {
+        return None;
+    }
+    // Свой Id на грань — см. `Parallax::куб_фон_ids`.
+    let номер = грань as usize;
+    while state.куб_фон_ids.len() <= номер {
+        state.куб_фон_ids.push(Id::new());
+    }
+    let id = state.куб_фон_ids[номер].clone();
+    // Тот же снимок повреждений, что у обоев холста: кадр живых обоев меняется
+    // сам по себе, и без этого куб показывал бы застывшую картинку до первого
+    // поворота (та же грабля, что в build_wallpaper_backdrop).
+    let снимок = state.wallpaper_damage.snapshot();
+    let el = TextureRenderElement::from_texture_with_damage(
+        id,
+        ctx,
+        Point::<f64, Physical>::from((коробка.loc.x as f64, коробка.loc.y as f64)),
+        текстура,
+        1,
+        Transform::Normal,
+        Some(1.0),
+        Some(вид.src),
+        Some(Size::<i32, Logical>::from((коробка.size.w, коробка.size.h))),
+        None,
+        снимок,
+        Kind::Unspecified,
+    );
+    let экран = state.screen_size();
+    let кадр = Rectangle::<i32, Physical>::new(
+        (0, 0).into(),
+        Size::<i32, Physical>::from((экран.w, экран.h)),
+    );
+    CropRenderElement::from_element(el, 1.0, кадр)
 }
 
 /// Плитка-подложка грани, растянутая на её коробку.
@@ -4221,7 +5006,6 @@ fn cube_face_backdrop(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
     коробка: Rectangle<i32, Physical>,
-    свой: bool,
 ) -> Option<CropRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>> {
     use smithay::backend::allocator::Fourcc;
     use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
@@ -4244,8 +5028,12 @@ fn cube_face_backdrop(
         renderer,
         Point::<f64, Physical>::from((коробка.loc.x as f64, коробка.loc.y as f64)),
         буфер,
-        // Свой стол чуть светлее прочих: иначе на кубе не видно, откуда вышел.
-        Some(if свой { 1.0 } else { 0.75 }),
+        // Одинаково для всех граней. Прежде свой стол шёл с alpha = 1.0
+        // «чтобы было видно, откуда вышел», но выходило ровно наоборот: глухая
+        // плитка делала его САМЫМ ТЁМНЫМ, а чужие грани с 0.75 просвечивали
+        // обоями и казались живыми. Откуда вышел, видно и так — по тому, что
+        // эта грань стоит лицом (жалоба Ярика 11.09.2026).
+        Some(0.75),
         None,
         Some(Size::<i32, Logical>::from((коробка.size.w, коробка.size.h))),
         Kind::Unspecified,
@@ -4259,114 +5047,12 @@ fn cube_face_backdrop(
     CropRenderElement::from_element(el, 1.0, кадр)
 }
 
-/// Источник света на экране — общий для заливки сцены и для окон.
-///
-/// Считается ОДИН раз на кадр и уходит обоим потребителям: заливке
-/// (`build_light_element`) и каждому окну (см. `Свечение::со_светом`). Считать
-/// его в двух местах значило бы получить две разные точки после первого же
-/// расхождения в формуле — и свет на окнах поехал бы мимо света на холсте.
-///
-/// Место отсчитывается от ДОМА своего монитора, а не от нуля холста: дом
-/// второго монитора отстоит на `monitors::ШАГ_ДОМА`, и от нуля источник висел
-/// бы у него за краем света (та же поправка, что в `build_wallpaper_backdrop`).
-fn источник_света(state: &Parallax, output: &Output) -> Option<crate::свет::Источник> {
-    if state.lua_config.sun <= 0.0 {
-        return None;
-    }
-    let mode = output.current_mode()?;
-    let экран = mode.size;
-    let дом = state.монитор_дом();
-    Some(crate::свет::источник(
-        (
-            экран.w as f64 * state.lua_config.sun_x as f64,
-            экран.h as f64 * state.lua_config.sun_y as f64,
-        ),
-        экран.w as f64 * state.lua_config.sun_size as f64,
-        (
-            state.viewport.cam_x - дом.x as f64,
-            state.viewport.cam_y - дом.y as f64,
-        ),
-        state.viewport.zoom,
-        state.lua_config.sun_far as f64,
-        // Размах — ширина экрана: дальше этого источник не уходит ни при каком
-        // перелёте по холсту.
-        экран.w as f64,
-    ))
-}
-
-/// Заливка сцены: как освещён сам холст. Лежит ЗА окнами и ПОВЕРХ обоев
-/// (см. свет.rs).
-///
-/// Диска здесь нет — это мягкий градиент без ядра и без края; то, что видно
-/// как «откуда светит», складывается из него и из освещённых сторон окон.
-///
-/// Обрезка по кадру обязательна: заливка заведомо больше экрана, а элемент,
-/// торчащий за его пределы, повреждал бы соседний выход.
-fn build_light_element(
-    state: &mut Parallax,
-    renderer: &mut GlesRenderer,
-    output: &Output,
-    и: crate::свет::Источник,
-) -> Option<OutputRenderElements> {
-    let сила = state.lua_config.sun;
-    if сила <= 0.0 {
-        return None;
-    }
-    let mode = output.current_mode()?;
-    let экран = mode.size;
-    let сторона = и.охват * 2.0;
-    if сторона < 1.0 {
-        return None;
-    }
-    let (x, y) = (и.точка.0 - и.охват, и.точка.1 - и.охват);
-    let кадр = Rectangle::<i32, Physical>::new((0, 0).into(), экран);
-    // Заливка целиком за краем экрана — не строим элемент вовсе: Crop ниже всё
-    // равно вернул бы None, но буфер уже был бы посчитан.
-    let место_на_экране = Rectangle::<f64, Physical>::new(
-        (x, y).into(),
-        (сторона, сторона).into(),
-    );
-    if место_на_экране.intersection(кадр.to_f64()).is_none() {
-        return None;
-    }
-    let палитра = state.палитра_обоев;
-    let буфер = state.свет.буфер(палитра, сила)?;
-    let el = match MemoryRenderBufferRenderElement::from_buffer(
-        renderer,
-        Point::<f64, Physical>::from((x, y)),
-        буфер,
-        None,
-        // `src` — КАКОЙ КУСОК КАРТИНКИ берём, и передавать его обязательно.
-        // Грабля smithay (element/memory.rs:501): при `src = None` он берётся
-        // не из размера буфера, а из `size`, то есть из размера НА ЭКРАНЕ.
-        // Сторона заливки — тысячи пикселей, картинка — 256 текселей, и
-        // выборка уходила целиком за край текстуры: элемент строился, лежал
-        // в кадре, а на экране не было ничего.
-        Some(Rectangle::from_size(Size::<f64, Logical>::from((
-            crate::свет::СТОРОНА as f64,
-            crate::свет::СТОРОНА as f64,
-        )))),
-        Some(Size::<i32, Logical>::from((
-            сторона.round().max(1.0) as i32,
-            сторона.round().max(1.0) as i32,
-        ))),
-        Kind::Unspecified,
-    ) {
-        Ok(el) => el,
-        Err(e) => {
-            tracing::warn!("plx/udev: light: {:?}", e);
-            return None;
-        }
-    };
-    CropRenderElement::from_element(el, 1.0, кадр).map(OutputRenderElements::Свет)
-}
-
 fn build_wallpaper_backdrop(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Option<Vec<OutputRenderElements>> {
-    if !state.lua_config.infinite_wallpaper {
+    if !state.lua_config.infinite_wallpaper && !state.обои_цикл {
         return None;
     }
     let mode = output.current_mode()?;
@@ -4401,6 +5087,9 @@ fn build_wallpaper_backdrop(
     // кроме самой отрисовки.
     if state.обои_едут() {
         state.request_redraw();
+    }
+    if state.обои_цикл {
+        return build_wallpaper_cycle(state, output, ctx, текстура, &вид, экран);
     }
     let место = wallpaper_placement(
         (
@@ -4455,6 +5144,95 @@ fn build_wallpaper_backdrop(
     Some(vec![OutputRenderElements::Wallpaper(обрезанное)])
 }
 
+/// Кадр режима cycle: плитки из [`wallpaper_cycle_places`], каждая своим
+/// элементом со своим постоянным Id (`Parallax::обои_цикл_ids`, по номеру в
+/// кадре) и своим зеркалом.
+fn build_wallpaper_cycle(
+    state: &mut Parallax,
+    output: &Output,
+    ctx: smithay::backend::renderer::ContextId<GlesTexture>,
+    текстура: GlesTexture,
+    вид: &smithay::backend::renderer::utils::SurfaceView,
+    экран: (i32, i32),
+) -> Option<Vec<OutputRenderElements>> {
+    let места = wallpaper_cycle_for(state, output, (вид.dst.w, вид.dst.h), экран);
+    if места.is_empty() {
+        return None;
+    }
+    while state.обои_цикл_ids.len() < места.len() {
+        state.обои_цикл_ids.push(Id::new());
+    }
+    let снимок = state.wallpaper_damage.snapshot();
+    let кадр = Rectangle::<i32, Physical>::new((0, 0).into(), (экран.0, экран.1).into());
+    // Отступ в пару пикселей от края кадра: у роликов по краю часто идёт
+    // тёмная кромка кодировщика, и на стыке отражённых плиток она складывалась
+    // в видимую нитку (замер 08.10.2026: −4 уровня яркости на 1–2 px).
+    let отступ = ОБОИ_ЦИКЛ_ОТСТУП.min(вид.src.size.w / 8.0).min(вид.src.size.h / 8.0);
+    let s0 = Rectangle::<f64, Logical>::new(
+        (вид.src.loc.x + отступ, вид.src.loc.y + отступ).into(),
+        (вид.src.size.w - 2.0 * отступ, вид.src.size.h - 2.0 * отступ).into(),
+    );
+    let mut out = Vec::with_capacity(места.len());
+    for (n, (место, поворот)) in места.into_iter().enumerate() {
+        // Видимую часть плитки отсекаем САМИ: smithay, отсекая элемент с
+        // отражённой текстурой, берёт из кадра не ту половину.
+        let x0 = место.x.max(0.0);
+        let y0 = место.y.max(0.0);
+        let x1 = (место.x + место.w).min(экран.0 as f64);
+        let y1 = (место.y + место.h).min(экран.1 as f64);
+        if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
+            continue;
+        }
+        let (по_x, по_y) = match поворот {
+            Transform::Flipped => (true, false),
+            Transform::Flipped180 => (false, true),
+            Transform::_180 => (true, true),
+            _ => (false, false),
+        };
+        // Видимая доля плитки по осям, а из неё — кусок ИСХОДНОГО кадра (в
+        // координатах буфера), который ляжет в видимую часть. По отражённой
+        // оси доля берётся с другого конца.
+        let (a_x, b_x) = ((x0 - место.x) / место.w, (x1 - место.x) / место.w);
+        let (a_y, b_y) = ((y0 - место.y) / место.h, (y1 - место.y) / место.h);
+        let (a_x, b_x) = if по_x { (1.0 - b_x, 1.0 - a_x) } else { (a_x, b_x) };
+        let (a_y, b_y) = if по_y { (1.0 - b_y, 1.0 - a_y) } else { (a_y, b_y) };
+        let буф_x = s0.loc.x + a_x * s0.size.w;
+        let буф_y = s0.loc.y + a_y * s0.size.h;
+        let буф_w = (b_x - a_x) * s0.size.w;
+        let буф_h = (b_y - a_y) * s0.size.h;
+        // Размер элемента на экране — целый, и smithay считает от него.
+        let (ew, eh) = ((x1 - x0).round().max(1.0), (y1 - y0).round().max(1.0));
+        // ГРАБЛЯ smithay: `TextureRenderElement` переводит `src` в буфер,
+        // отражая его относительно РАЗМЕРА ЭЛЕМЕНТА на экране, а не размера
+        // текстуры (`to_buffer(.., &logical_size)`). У плитки не в размер кадра
+        // отражённая ось уезжала за текстуру: такие плитки пропадали или
+        // показывали не ту половину (замер 08.10.2026, тестовая картинка с
+        // метками по углам). Поэтому подаём крой, который после ЕГО отражения
+        // станет нужным куском буфера: x = ew − буф_x − буф_w.
+        let src_x = if по_x { ew - буф_x - буф_w } else { буф_x };
+        let src_y = if по_y { eh - буф_y - буф_h } else { буф_y };
+        let src = Rectangle::<f64, Logical>::new((src_x, src_y).into(), (буф_w, буф_h).into());
+        let el = TextureRenderElement::from_texture_with_damage(
+            state.обои_цикл_ids[n].clone(),
+            ctx.clone(),
+            Point::<f64, Physical>::from((x0, y0)),
+            текстура.clone(),
+            1,
+            поворот,
+            Some(1.0),
+            Some(src),
+            Some(Size::<i32, Logical>::from((ew as i32, eh as i32))),
+            None,
+            снимок.clone(),
+            Kind::Unspecified,
+        );
+        if let Some(обрезанное) = CropRenderElement::from_element(el, 1.0, кадр) {
+            out.push(OutputRenderElements::Wallpaper(обрезанное));
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// Дать что-нибудь сделать с ГЛАВНЫМ рендерером вне пути отрисовки.
 ///
 /// Нужно ровно там, где картинку надо получить не в кадр, а в текстуру:
@@ -4471,6 +5249,11 @@ pub fn with_primary_renderer<R>(
     f: impl FnOnce(&mut Parallax, &mut GlesRenderer) -> R,
 ) -> Option<R> {
     let mut devices = std::mem::take(&mut state.udev_devices);
+    if devices.is_empty() {
+        // headless-харнесс: устройств нет, рендерер свой (см. headless.rs).
+        state.udev_devices = devices;
+        return unsafe { crate::headless::рендерер() }.map(|r| f(state, r));
+    }
     let итог = devices.values_mut().next().map(|device| {
         let gles = &mut device.gles as *mut GlesRenderer;
         unsafe { f(state, &mut *gles) }
@@ -4489,15 +5272,32 @@ fn build_closing_elements(state: &mut Parallax, screen: Size<i32, Physical>) -> 
     let zoom = state.viewport.zoom.max(0.01);
     let cam = (state.viewport.cam_x, state.viewport.cam_y);
     let кадр = Rectangle::<i32, Physical>::new((0, 0).into(), screen);
+    // Растворение (`set{ dissolve }`): снимок не гаснет и не сжимается, а
+    // рассыпается кляксами — тем же шейдером, что рисует окна.
+    let шейдер = if state.растворение_включено() { state.blur_shape.clone() } else { None };
+    let радиус_лог = corner_radius_logical(state);
     let mut out = Vec::new();
     for уход in &state.закрытия {
-        let (alpha, k) = уход.alpha_scale();
+        let растворение = шейдер.as_ref().and_then(|_| {
+            crate::rounded::Растворение::по_ручке(
+                state.lua_config.dissolve, zoom, уход.t(), state.lua_config.dissolve_mosaic,
+            )
+        });
+        // Разворот главнее растворения (см. `разворот_включён`): пока окно
+        // крутится, оно ещё и гаснет — то есть живёт по прежним правилам
+        // снимка, а не по правилам растворения, которое гасить не даёт.
+        let разворот = state.разворот_закрытия(уход.t());
+        let (alpha, k) = if шейдер.is_some() && разворот.is_none() {
+            (1.0, 1.0)
+        } else {
+            уход.alpha_scale()
+        };
         // Сжимаем к ЦЕНТРУ окна: угол как точка опоры читался бы как «окно
         // уползло», а не «погасло».
-        let w = уход.rect.size.w as f64 * k;
-        let h = уход.rect.size.h as f64 * k;
-        let cx = уход.rect.loc.x as f64 + уход.rect.size.w as f64 / 2.0;
-        let cy = уход.rect.loc.y as f64 + уход.rect.size.h as f64 / 2.0;
+        let w = уход.rect.size.w * k;
+        let h = уход.rect.size.h * k;
+        let cx = уход.rect.loc.x + уход.rect.size.w / 2.0;
+        let cy = уход.rect.loc.y + уход.rect.size.h / 2.0;
         let loc = Point::<f64, Physical>::from((
             (cx - w / 2.0 - cam.0) * zoom,
             (cy - h / 2.0 - cam.1) * zoom,
@@ -4519,8 +5319,82 @@ fn build_closing_elements(state: &mut Parallax, screen: Size<i32, Physical>) -> 
             None,
             Kind::Unspecified,
         );
-        if let Some(обрезанное) = CropRenderElement::from_element(el, 1.0, кадр) {
-            out.push(OutputRenderElements::Wallpaper(обрезанное));
+        let Some(обрезанное) = CropRenderElement::from_element(el, 1.0, кадр) else { continue };
+        // ── 3D-разворот на закрытии (`flip3d`) ───────────────────────────────
+        // Окно уходит тем же движением, которым пришло, только наоборот:
+        // поворачивается вокруг своей вертикальной оси и гаснет. Тип элемента
+        // здесь тот же, что у обоев на грани куба (текстура в кропе под
+        // шейдером куба), — отдельного варианта кадра ради одного имени не
+        // заводим.
+        if let (Some(угол), Some(шейдер_куба)) = (разворот, state.куб_шейдер.clone())
+        {
+            let ось = (
+                (loc.x + размер.w as f64 * 0.5) as f32,
+                (loc.y + размер.h as f64 * 0.5) as f32,
+            );
+            let плоскость = crate::куб::Куб::плоскость(
+                screen.w as f32,
+                state.lua_config.cube_focal,
+                ось,
+            );
+            let rect = (
+                -(размер.w as f32) * 0.5,
+                -(размер.h as f32) * 0.5,
+                размер.w as f32 * 0.5,
+                размер.h as f32 * 0.5,
+            );
+            if let Some(коробка) = плоскость.коробка(угол, rect) {
+                if коробка.intersection(кадр).is_some() {
+                    // Снимок — одна текстура, и растягивать её в коробку
+                    // проекции незачем обёрткой: место и размер у неё свои.
+                    let развёрнутый = TextureRenderElement::from_static_texture(
+                        уход.id.clone(),
+                        уход.контекст.clone(),
+                        Point::<f64, Physical>::from((коробка.loc.x as f64, коробка.loc.y as f64)),
+                        уход.текстура.clone(),
+                        1,
+                        Transform::Normal,
+                        Some(alpha),
+                        None,
+                        Some(Size::<i32, Logical>::from((коробка.size.w, коробка.size.h))),
+                        None,
+                        Kind::Unspecified,
+                    );
+                    if let Some(обрез) = CropRenderElement::from_element(развёрнутый, 1.0, кадр) {
+                        out.push(OutputRenderElements::ГраньОбои(crate::куб::Грань::new(
+                            обрез, &шейдер_куба, &плоскость, угол, rect,
+                        )));
+                        continue;
+                    }
+                }
+            }
+        }
+        match (шейдер.as_ref(), растворение) {
+            (Some(ш), Some(р)) => {
+                let (w, h) = (размер.w as f32, размер.h as f32);
+                let радиус = (радиус_лог as f64 * zoom).min(w as f64 / 2.0).min(h as f64 / 2.0).max(0.0) as f32;
+                let rect = [loc.x as f32, loc.y as f32, w, h];
+                // Тип тот же, что у размытой плашки (`Blur`): текстура в
+                // кропе под шейдером скругления — отдельный вариант кадра
+                // ради одного имени не заводим.
+                out.push(OutputRenderElements::Blur(
+                    crate::rounded::Rounded::new(обрезанное, ш, rect, радиус, false).растворить(р),
+                ));
+                // Стекло прозрачного окна уходит вместе с ним, теми же
+                // кляксами (как и при открытии), а не пропадает разом.
+                if let (Some(id), Some(стекло)) = (уход.стекло.clone(), state.стекло.as_ref()) {
+                    let кусок = Rectangle::<i32, Physical>::new(
+                        (loc.x.round() as i32, loc.y.round() as i32).into(),
+                        (размер.w, размер.h).into(),
+                    );
+                    if let Some(подложка) = стекло.подложка(id, кусок, screen) {
+                        out.push(OutputRenderElements::Стекло(
+                            crate::rounded::Rounded::new(подложка, ш, rect, радиус, true).растворить(р),
+                        ));
+                    }
+                }
+            }
+            _ => out.push(OutputRenderElements::Wallpaper(обрезанное)),
         }
     }
     out
@@ -4664,6 +5538,24 @@ fn flags_кадра() -> FrameFlags {
 /// бы. Снаружи это и есть «мигает маска скругления на баре»: моргает не маска,
 /// а то, что под ней. Держим прошлую размытую картинку — она отстаёт на кадр,
 /// чего под панелью не видно.
+/// Входные данные размытого фона — всё, от чего зависит его результат.
+///
+/// Свёртку считать заново незачем, пока ключ тот же: картинка обоев та же
+/// (`коммит` — отметка последнего кадра фонового слоя), и на экран попадает
+/// тот же её кусок (камера, зум, размер выхода). См. `Parallax::blur_кэш`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct БлюрКлюч {
+    /// Когда фоновый слой прислал свой последний кадр (см. `фон_коммит`).
+    коммит: Option<std::time::Instant>,
+    /// Камера и зум в сотых долях: свёртка идёт по картинке, ужатой в
+    /// `blur::УЖАТИЕ` раз, и доли пикселя на ней не видны вовсе.
+    камера: (i64, i64),
+    зум: i64,
+    экран: (i32, i32),
+    /// Режим cycle раскладывает обои иначе — смена режима обязана пересчитать.
+    цикл: bool,
+}
+
 pub fn пересчитать_блюр(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
@@ -4672,6 +5564,35 @@ pub fn пересчитать_блюр(
 ) {
     match (state.lua_config.blur, блюр, output.current_mode()) {
         (true, Some(блюр), Some(mode)) => {
+            // ── Под полноэкранным окном не размываем вовсе ──────────────────
+            // Обоев на экране нет (их кроет игра или плеер), панель уехала, и
+            // единственное, что может лечь поверх, — меню; ему достаётся
+            // прошлая текстура, то есть та же размытая картинка обоев, какую
+            // оно показывало бы и так. Экономия — три офскрин-прохода на
+            // КАЖДОМ кадре игры (см. `fullscreen_boost`).
+            if state.lua_config.fullscreen_boost && state.wallpaper_hidden() {
+                return;
+            }
+
+            // ── Кэш: та же картинка и тот же кусок — та же текстура ─────────
+            let ключ = БлюрКлюч {
+                коммит: state.фон_коммит,
+                камера: (
+                    (state.viewport.cam_x * 100.0).round() as i64,
+                    (state.viewport.cam_y * 100.0).round() as i64,
+                ),
+                зум: (state.viewport.zoom * 100.0).round() as i64,
+                цикл: state.обои_цикл,
+                экран: (mode.size.w, mode.size.h),
+            };
+            let имя = output.name();
+            if let Some((прежний, текстура)) = state.blur_кэш.get(&имя) {
+                if *прежний == ключ {
+                    state.blur_tex = Some(текстура.clone());
+                    return;
+                }
+            }
+
             // Раскладка обоев — ТА ЖЕ, что и в кадре (`build_wallpaper_backdrop`).
             // Без неё размытие сэмплировалось бы так, будто камера в нуле, —
             // см. заметку у `blur::Блюр::размыть`.
@@ -4681,7 +5602,17 @@ pub fn пересчитать_блюр(
                     match блюр.размыть(
                         renderer, &исходник, &плитки, mode.size, crate::blur::РАДИУС,
                     ) {
-                        Some(новая) => state.blur_tex = Some(новая),
+                        Some(новая) => {
+                            state.blur_кэш.insert(имя, (ключ, новая.clone()));
+                            state.blur_tex = Some(новая);
+                            // Картинка в ТОЙ ЖЕ текстуре сменилась (новые обои,
+                            // сдвиг камеры), а заплаты плашек — статичные
+                            // текстуры с постоянным счётчиком коммитов: damage
+                            // tracker о смене не узнаёт и держит старое стекло
+                            // («сменил обои — блюр панели прежний»). Новые Id =
+                            // заплаты перерисовываются целиком.
+                            state.blur_ids.clear();
+                        }
                         None => почему_нет_блюра("the convolution failed"),
                     }
                 }
@@ -4702,6 +5633,10 @@ pub fn пересчитать_блюр(
                 вкл, шейдер.is_some(), режим.is_some(),
             ));
             state.blur_tex = None;
+            // Текстуры кэша живут в ТОМ ЖЕ рендерере, что и сброшенная: если
+            // блюр выключили или выход остался без режима (смена VT, отключение
+            // монитора), держать их нельзя — вернутся уже чужими.
+            state.blur_кэш.clear();
         }
     }
 }
@@ -4867,10 +5802,6 @@ pub fn собрать_элементы(
     let mut elements: Vec<OutputRenderElements> =
         Vec::with_capacity(ёмкость.max(64));
 
-    // Источник света на холсте — один на кадр (см. `источник_света`): его
-    // берут и окна ниже, и заливка сцены в самом конце списка.
-    let свет = источник_света(state, output);
-
     // ── Cursor (front layer) ─────────────────────────────────────────────────
     // Только для диагностики ниже: сами ветки курсора считают свою точку
     // каждая по своему хотспоту (см. match по cursor_status).
@@ -4928,6 +5859,9 @@ pub fn собрать_элементы(
         CursorImageStatus::Named(smithay::input::pointer::CursorIcon::Grabbing)
     } else if state.minimap_hit().is_some() || state.preview_hit().is_some() {
         CursorImageStatus::Named(smithay::input::pointer::CursorIcon::Default)
+    } else if let Some(значок) = state.курсор_кромки() {
+        // Кромка окна: стрелка показывает, за какой край возьмётся ЛКМ.
+        CursorImageStatus::Named(значок)
     } else {
         state.cursor_status.clone()
     };
@@ -5135,8 +6069,12 @@ pub fn собрать_элементы(
     if свой_монитор {
         elements.extend(build_bluetooth_elements(state, renderer, output));
         elements.extend(build_search_elements(state, renderer, output));
+        elements.extend(build_desktop_menu_elements(state, renderer, output));
         elements.extend(build_wifi_elements(state, renderer, output));
+        elements.extend(build_dock_picker_elements(state, renderer, output));
+        elements.extend(build_dock_settings_elements(state, renderer, output));
         elements.extend(build_audio_elements(state, renderer, output));
+        elements.extend(build_power_elements(state, renderer, output));
         elements.extend(build_tray_elements(state, renderer, output));
         elements.extend(build_share_panel_elements(state, renderer, output));
     }
@@ -5216,6 +6154,7 @@ pub fn собрать_элементы(
     // ── Полоски вкладок и подсказка вставки (только Columns/niri) ────────────
     elements.extend(build_tab_indicators(state));
     elements.extend(build_insert_hint(state));
+    elements.extend(build_edge_snap_hint(state));
 
     // ── Мультивыделение (rubber-band + подсветка "созвездий") ───────────────
     elements.extend(build_ghost_elements(state));
@@ -5237,6 +6176,16 @@ pub fn собрать_элементы(
 
     // ── Top-слой (wlr-layer-shell): поверх окон, под UI -----------------------
     elements.extend(build_layer_elements(state, renderer, output, &[WlrLayer::Top]));
+
+    // ── Панель приложений (см. dock.rs): над окнами, как и панель столов ────
+    // Раньше закреплённых окон: список идёт от переднего плана к заднему, а
+    // панель — интерфейс и обязана лежать поверх любого окна.
+    if свой_монитор {
+        elements.extend(build_dock_elements(state, renderer));
+    }
+
+    // ── Закреплённые окна (Super+Y, см. pin.rs): над холстом, под слоями ─────
+    elements.extend(build_pinned_elements(state, renderer, output, скругление));
 
     // Граница групп для посекундной сводки: всё, что добавлено выше, —
     // интерфейс (курсор, полки, меню, маски углов, индикаторы).
@@ -5266,13 +6215,25 @@ pub fn собрать_элементы(
     // вторая их копия плашмя поверх куба — ровно то, чего быть не должно.
     // Отсюда `None` против пустого вектора: пустой значит «куб есть, но все
     // грани мимо кадра», и холст всё равно остаётся скрытым.
-    let куб = build_cube_elements(state, renderer, output);
+    // Карусель ленты — тот же уклад, что у куба: окна на холсте не рисуются,
+    // их поверхности уже разложены по панелям.
+    let куб = build_cube_elements(state, renderer, output)
+        .or_else(|| build_carousel_elements(state, renderer, output));
     let куб_рисуется = куб.is_some();
     if let Some(грани) = куб {
         elements.extend(грани);
     }
     if !куб_рисуется {
         let zoom = state.viewport.zoom.max(0.01);
+        // Экран целиком — рамка отсечения для 3D-разворота окон (`flip3d`):
+        // повёрнутое окно выходит за свой прямоугольник, и коробка его проекции
+        // режется по кадру, а не по окну.
+        let экран_физ = output.current_mode().map(|m| m.size).unwrap_or_else(|| {
+            let s = state.screen_size();
+            Size::<i32, Physical>::from((s.w, s.h))
+        });
+        let кадр_экрана = Rectangle::<i32, Physical>::new((0, 0).into(), экран_физ);
+        let ширина_экрана = экран_физ.w as f32;
         let cam = Point::<f64, Logical>::from((state.viewport.cam_x, state.viewport.cam_y));
         let vis = state.visible_canvas_size();
         let видимое = Rectangle::<f64, Logical>::new(cam, vis);
@@ -5299,14 +6260,12 @@ pub fn собрать_элементы(
         // баг и не воспроизводился ни в терминале, ни в firefox под Xwayland.
         let окна: Vec<(Window, Point<i32, Logical>)> = state.space.elements()
             .rev()
+            .filter(|w| !state.закреплено(w))
             .filter_map(|w| state.space.element_geometry(w).map(|g| (w.clone(), g)))
             .filter(|(_, g)| видимое.overlaps(g.to_f64()))
             .map(|(w, g)| { let loc = g.loc - w.geometry().loc; (w, loc) })
             .collect();
         let радиус_лог = corner_radius_logical(state);
-        // Сколько заплат размытия под окнами уже выдано в этом кадре — по ней
-        // берётся номер слота в пуле `blur_ids` (см. БЛЮР_ОКНО).
-        let mut окон_с_блюром = 0usize;
         for (window, loc) in окна {
             let экран = Point::<f64, Logical>::from((loc.x as f64 - cam.x, loc.y as f64 - cam.y));
             let phys: Point<i32, Physical> = (экран.x.round() as i32, экран.y.round() as i32).into();
@@ -5330,6 +6289,110 @@ pub fn собрать_элементы(
             // стороны — маленькое окно выходит «таблеткой», а не мигает.
             let geo = window.geometry();
 
+            // ── 3D-РАЗВОРОТ ОТКРЫВАЮЩЕГОСЯ ОКНА (`flip3d`) ──────────────────
+            //
+            // Окно въезжает повёрнутым вокруг своей вертикальной оси и
+            // доворачивается лицом к зрителю — анимация из Compiz, сделанная
+            // тем же шейдером, что кладёт столы на грани куба: развёрнутое окно
+            // это и есть грань, у которой радиус равен нулю (см.
+            // `Куб::плоскость`).
+            //
+            // Путь отрисовки здесь СВОЙ, в обход скругления, тени и заплаты
+            // размытия: шейдер разворота и шейдер скругления — две программы на
+            // одно и то же место кадра, и вторая затёрла бы первую
+            // (`override_default_tex_program` живёт до конца отрисовки
+            // элемента). Углы на эти доли секунды остаются прямыми; в последнем
+            // кадре угол равен нулю, окно возвращается на обычный путь и
+            // совпадает с собой пиксель в пиксель.
+            if let (Some((угол, альфа)), Some(шейдер)) =
+                (state.разворот_окна(&window), state.куб_шейдер.clone())
+            {
+                // Ось разворота — середина окна НА ЭКРАНЕ, то есть там же, где
+                // его середину считает обычный путь (`в_кадре` ниже).
+                let центр_канвы = (
+                    phys.x as f64 + geo.loc.x as f64 + geo.size.w as f64 * 0.5,
+                    phys.y as f64 + geo.loc.y as f64 + geo.size.h as f64 * 0.5,
+                );
+                let ось = (
+                    ((phys.x as f64 * zoom).round()
+                        + (geo.loc.x as f64 + geo.size.w as f64 * 0.5) * zoom) as f32,
+                    ((phys.y as f64 * zoom).round()
+                        + (geo.loc.y as f64 + geo.size.h as f64 * 0.5) * zoom) as f32,
+                );
+                let плоскость = crate::куб::Куб::плоскость(
+                    ширина_экрана,
+                    state.lua_config.cube_focal,
+                    ось,
+                );
+                // Холст → плоскость окна: середина окна в ноль, зум холста
+                // учтён здесь же (элементы приходят без него).
+                let в_плоскость = |x: i32, y: i32| -> (f32, f32) {
+                    (
+                        ((x as f64 - центр_канвы.0) * zoom) as f32,
+                        ((y as f64 - центр_канвы.1) * zoom) as f32,
+                    )
+                };
+                let элементы: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = window
+                    .render_elements(renderer, phys, smithay::utils::Scale::from(1.0), альфа);
+                elements.extend(положить_на_плоскость(
+                    &шейдер, &плоскость, угол, кадр_экрана, элементы, &в_плоскость, None,
+                ));
+                continue;
+            }
+
+            // ── НАКЛОНЁННОЕ / ПОВЁРНУТОЕ ОКНО (см. наклон.rs) ─────────────────
+            //
+            // Тот же путь, что у разворота выше, только плоскость повёрнута по
+            // всем трём осям и стоит так сколько угодно, а не 280 мс, — поэтому
+            // углы здесь скругляет шейдер плоскости. Видимая рамка окна (по
+            // которой режет и обычный путь, см. «нужен_кроп») становится
+            // рамкой скругления и отсечения: невидимые поля клиентских рамок
+            // наклон не показывает.
+            if let (Some(н), Some(шейдер)) = (state.наклон_окна(&window), state.куб_шейдер.clone()) {
+                let видимо = crate::xwin::видимый_размер(&window, geo.size);
+                let центр_канвы = (
+                    phys.x as f64 + geo.loc.x as f64 + geo.size.w as f64 * 0.5,
+                    phys.y as f64 + geo.loc.y as f64 + geo.size.h as f64 * 0.5,
+                );
+                let ось = (
+                    ((phys.x as f64 * zoom).round()
+                        + (geo.loc.x as f64 + geo.size.w as f64 * 0.5) * zoom) as f32,
+                    ((phys.y as f64 * zoom).round()
+                        + (geo.loc.y as f64 + geo.size.h as f64 * 0.5) * zoom) as f32,
+                );
+                let камера = crate::куб::Куб::плоскость(
+                    ширина_экрана,
+                    state.lua_config.cube_focal,
+                    ось,
+                );
+                let пл = crate::куб::Куб::плоскость_окна(н.рыскание, н.тангаж, н.крен);
+                let в_плоскость = |x: i32, y: i32| -> (f32, f32) {
+                    (
+                        ((x as f64 - центр_канвы.0) * zoom) as f32,
+                        ((y as f64 - центр_канвы.1) * zoom) as f32,
+                    )
+                };
+                // Видимая рамка в координатах плоскости. Обрезка — в тех же
+                // координатах, в каких пришли элементы (экран до зума).
+                let (r0x, r0y) = в_плоскость(phys.x + geo.loc.x, phys.y + geo.loc.y);
+                let (r1x, r1y) = в_плоскость(
+                    phys.x + geo.loc.x + видимо.w,
+                    phys.y + geo.loc.y + видимо.h,
+                );
+                let радиус = (радиус_лог as f64 * zoom) as f32;
+                let обрезка = Rectangle::<i32, Physical>::new(
+                    (phys.x + geo.loc.x, phys.y + geo.loc.y).into(),
+                    (видимо.w, видимо.h).into(),
+                );
+                let элементы: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = window
+                    .render_elements(renderer, phys, smithay::utils::Scale::from(1.0), 1.0);
+                elements.extend(положить_на_скруглённо(
+                    &шейдер, &камера, &пл, 1.0, кадр_экрана, элементы, &в_плоскость,
+                    Some(обрезка), Some(((r0x, r0y, r1x, r1y), радиус)),
+                ));
+                continue;
+            }
+
             // ── Всплытие только что открывшегося окна ────────────────────────
             //
             // Окно уже стоит в своём настоящем размере и на своём месте
@@ -5345,13 +6408,40 @@ pub fn собрать_элементы(
             // (`canvas::двойное_остриё`). При k = 1 остриё равно нулю — ровно
             // то, что стояло здесь раньше.
             let (рост, проявление) = state.открытие_окна(&window).unwrap_or((1.0, 1.0));
+            // Пиксельное растворение вместо роста и проявления (`set{ dissolve }`):
+            // если оно идёт, `открытие_окна` выше уже вернуло «как есть».
+            let растворение = state.растворение_окна(&window);
             // ...и ВТОРАЯ анимация картинки: смена размера в тайлинге
             // (`anim::SizeAnim`). Она растягивает окно ПО КАЖДОЙ ОСИ отдельно —
             // слот меняет ширину и высоту независимо, — поэтому дальше весь
             // расчёт идёт парой чисел, а не одним масштабом.
-            let (растx, расty) = state.размер_окна(&window, geo.size).unwrap_or((1.0, 1.0));
-            let движется = рост < 1.0 || (растx - 1.0).abs() > 1e-6 || (расty - 1.0).abs() > 1e-6;
-            // Цепочка из трёх масштабов складывается в ОДНУ обёртку Rescale
+            //
+            // Кадр, который у окна ЗАПРОСИЛИ, против того, что клиент реально
+            // нарисовал, — разбор ниже, у «нужен_кроп». Считается здесь, до
+            // масштабов: живой ресайз рукой растягивает по нему картинку.
+            let (целевой, факт) = match window.underlying_surface() {
+                WindowSurface::Wayland(_) => (crate::xwin::requested_size(&window), geo.size),
+                WindowSurface::X11(s) => (
+                    Some(geo.size),
+                    s.wl_surface()
+                        .and_then(|wl| crate::xwin::surface_buffer_size(&wl))
+                        .unwrap_or(geo.size),
+                ),
+            };
+            // Пружина раскладки главнее: пока она едет, картинку ведёт она. Иначе
+            // — растяжка живого ресайза (см. `anim::живая_растяжка`): край окна
+            // идёт за рукой, не дожидаясь буфера от клиента.
+            let пружина = state.размер_окна(&window, geo.size);
+            let живая = if пружина.is_none() && !state.is_fullscreen(&window) {
+                state.живая_растяжка(&window, целевой, факт)
+            } else {
+                None
+            };
+            let (растx, расty) = пружина.or(живая).unwrap_or((1.0, 1.0));
+            let движется = рост < 1.0
+                || (растx - 1.0).abs() > 1e-6
+                || (расty - 1.0).abs() > 1e-6;
+            // Цепочка из двух масштабов складывается в ОДНУ обёртку Rescale
             // (`canvas::остриё_цепочки`). Двух вложенных здесь быть не может:
             // тип элемента кадра (`OutputRenderElements::Layer`/`Rounded`) —
             // это ровно один Rescale вокруг поверхности, и второй внутри
@@ -5374,18 +6464,10 @@ pub fn собрать_элементы(
                     угол.0 + geo.size.w as f64 * 0.5,
                     угол.1 + geo.size.h as f64 * 0.5,
                 );
-                // Масштаб, вплотную подошедший к единице, — это чистый СДВИГ,
-                // которого Rescale не умеет; отодвигаем на пару процентов (на
-                // кадр-другой быстрого движения глазу не видно), лишь бы не
-                // делить на ноль. Случай законный: окно открылось или сменило
-                // размер на приближенном холсте.
-                let отодвинуть = |s: f64| {
-                    if (1.0 - s).abs() >= 0.02 { s }
-                    else if s < 1.0 { 0.98 } else { 1.02 }
-                };
                 let ось = |r: f64, p: f64, c: f64| -> (f64, f64) {
-                    let s = отодвинуть(r * рост * zoom);
+                    let s = r * рост * zoom;
                     let t = zoom * (p * (1.0 - r) * рост + c * (1.0 - рост));
+                    let (s, t) = crate::canvas::отодвинуть_от_единицы(s, t, p);
                     (s, crate::canvas::остриё_цепочки(s, t).unwrap_or(0.0))
                 };
                 let (sx, ax) = ось(растx, угол.0, центр.0);
@@ -5439,15 +6521,8 @@ pub fn собрать_элементы(
             // расхождение не видно ни в чём, кроме размера самого буфера, —
             // по нему и сравниваем. Отсюда и «лимит никуда не ушёл»: половина
             // окон Ярика — X11, и для них обрезки не включалось НИКОГДА.
-            let (целевой, факт) = match window.underlying_surface() {
-                WindowSurface::Wayland(_) => (crate::xwin::requested_size(&window), geo.size),
-                WindowSurface::X11(s) => (
-                    Some(geo.size),
-                    s.wl_surface()
-                        .and_then(|wl| crate::xwin::surface_buffer_size(&wl))
-                        .unwrap_or(geo.size),
-                ),
-            };
+            //
+            // Сам расчёт пары (`целевой`, `факт`) стоит выше, до масштабов.
             let нужен_кроп = !state.is_fullscreen(&window)
                 && целевой.is_some_and(|t| {
                     t.w > 0 && t.h > 0 && (t.w < факт.w || t.h < факт.h)
@@ -5460,6 +6535,38 @@ pub fn собрать_элементы(
                     crate::xwin::app_id(&window).unwrap_or_default(),
                     целевой.unwrap(), факт,
                 );
+            }
+            // Рамка окна ДО масштабов — то, что из буфера остаётся видно. С
+            // обрезкой это меньшее из запроса и факта по каждой оси; с живой
+            // растяжкой — факт (растянет его уже `масштаб`). Раньше при обрезке
+            // бралась запрошенная рамка целиком, и ось, по которой окно в тот же
+            // миг РОСЛО, давала маску и размытие шире самого окна.
+            let рамка = match целевой {
+                Some(t) if (нужен_кроп || живая.is_some()) && t.w > 0 && t.h > 0 => {
+                    Size::<i32, Logical>::from((t.w.min(факт.w), t.h.min(факт.h)))
+                }
+                _ => geo.size,
+            };
+
+            // Запомнить, КАК окно легло в этот кадр, — для снимка закрытия
+            // (см. `ВидОкна`). Обзор не в счёт: там миниатюры, а закрывают
+            // окно почти всегда с рабочего стола.
+            if !state.overview_active {
+                let (x0, y0) = в_кадре(geo.loc.x as f64, geo.loc.y as f64);
+                let вид = ВидОкна {
+                    рамка,
+                    холст: Rectangle::<f64, Logical>::new(
+                        (x0 / zoom + cam.x, y0 / zoom + cam.y).into(),
+                        (
+                            рамка.w as f64 * масштаб.0 / zoom,
+                            рамка.h as f64 * масштаб.1 / zoom,
+                        ).into(),
+                    ),
+                    когда: std::time::Instant::now(),
+                };
+                let ячейка = window.user_data()
+                    .get_or_insert(|| std::cell::RefCell::new(вид));
+                *ячейка.borrow_mut() = вид;
             }
 
             // Считает (шейдер, прямоугольник, радиус, hard_clip) под заданный
@@ -5480,47 +6587,16 @@ pub fn собрать_элементы(
                     // Порог «мельче двух радиусов не скругляем» — только для
                     // обычного (не режущего) случая: жёсткая обрезка обязана
                     // сработать, даже если дуга по углам вышла бы нулевой.
-                    if r < 0.5 && !hard {
+                    // Растворяющемуся окну шейдер нужен при любом радиусе.
+                    if r < 0.5 && !hard && растворение.is_none() {
                         return None;
                     }
                     Some((ш.clone(), [x0 as f32, y0 as f32, w as f32, h as f32], r.max(0.0) as f32, hard))
                 })
             };
             let скруглить = скругление_для(
-                if нужен_кроп { целевой.unwrap() } else { geo.size },
+                рамка,
                 нужен_кроп,
-            );
-
-            // Свечение краёв в цвет обоев. Считается один раз на окно: цвет и
-            // сила у всех его поверхностей общие, как и рамка скругления.
-            //
-            // «В фокусе» сравниваем по КОРНЕВОЙ поверхности окна: фокус может
-            // держать его попап (открытое меню), и окно от этого перестать
-            // быть тем, с которым работают, не должно.
-            let в_фокусе = state
-                .focused_surface()
-                .map(|s| crate::xwin::is_surface(&window, &s))
-                .unwrap_or(false);
-            let свечение = crate::rounded::Свечение::для_окна(
-                state.палитра_обоев,
-                state.lua_config.glow,
-                state.lua_config.glow_width,
-                масштаб_1,
-                в_фокусе,
-            )
-            // ...и свет от источника на холсте: сторона окна, обращённая к
-            // нему, светлее, обратная уходит в тень. Центр окна считаем тем же
-            // преобразованием, что и рамка скругления выше (phys + geo.loc,
-            // всё умноженное на зум), — иначе свет падал бы не на то место,
-            // где окно нарисовано.
-            .со_светом(
-                state.палитра_обоев,
-                state.lua_config.sun,
-                свет,
-                в_кадре(
-                    geo.loc.x as f64 + geo.size.w as f64 * 0.5,
-                    geo.loc.y as f64 + geo.size.h as f64 * 0.5,
-                ),
             );
 
             // Список элементов окна. Без обрезки — как раньше, один вызов.
@@ -5580,9 +6656,13 @@ pub fn собрать_элементы(
                 let el = RescaleRenderElement::from_element(el, остриё, масштаб);
                 let маска = if обрезать || !нужен_кроп { &скруглить } else { &скруглить_попап };
                 match маска {
-                    Some((ш, rect, r, hard)) => OutputRenderElements::Rounded(
-                        crate::rounded::Rounded::new(el, ш, *rect, *r, *hard, свечение),
-                    ),
+                    Some((ш, rect, r, hard)) => {
+                        let el = crate::rounded::Rounded::new(el, ш, *rect, *r, *hard);
+                        OutputRenderElements::Rounded(match растворение {
+                            Some(р) => el.растворить(р),
+                            None => el,
+                        })
+                    }
                     None => OutputRenderElements::Layer(el),
                 }
             }));
@@ -5599,12 +6679,17 @@ pub fn собрать_элементы(
             //
             // В обзоре не рисуем: там окна ужаты в миниатюры, заплата под
             // каждой ничего не добавляет, а стоит по текстуре на окно.
+            //
+            // С 05.10.2026 это НЕ кусок общей текстуры размытых обоев, а
+            // эффект по кадру (`blur::Подложка`): размывается то, что к этому
+            // месту в кадре реально нарисовано под окном, — и окна ниже, и
+            // свежие обои после их смены.
             if state.lua_config.blur
-                && state.blur_tex.is_some()
+                && state.стекло.is_some()
                 && !state.overview_active
                 && crate::xwin::has_transparency(&window)
             {
-                let размер = if нужен_кроп { целевой.unwrap() } else { geo.size };
+                let размер = рамка;
                 let (x0, y0) = в_кадре(geo.loc.x as f64, geo.loc.y as f64);
                 let w = размер.w as f64 * масштаб.0;
                 let h = размер.h as f64 * масштаб.1;
@@ -5614,17 +6699,31 @@ pub fn собрать_элементы(
                     } else {
                         (радиус_лог as f64 * масштаб_1).min(w / 2.0).min(h / 2.0).max(0.0)
                     };
-                    let слот = БЛЮР_ОКНО + окон_с_блюром;
-                    окон_с_блюром += 1;
-                    if let Some(el) = build_blur_patch(
-                        state, renderer,
-                        bar::Rect {
-                            x: x0.round() as i32, y: y0.round() as i32,
-                            w: w.round() as i32, h: h.round() as i32,
-                        },
-                        r as f32, 1.0, слот,
-                    ) {
-                        elements.push(el);
+                    // Id — за ОКНОМ, а не за номером в кадре: в кэше эффекта
+                    // (по Id) лежит размытый снимок того, что под этим окном,
+                    // и при смене порядка окон он не должен достаться соседу.
+                    let id = window.user_data()
+                        .get_or_insert(|| СтеклоОкна(Id::new()))
+                        .0.clone();
+                    let экран_кадра = output.current_mode().map(|m| m.size);
+                    let rect = Rectangle::<i32, Physical>::new(
+                        (x0.round() as i32, y0.round() as i32).into(),
+                        (w.round() as i32, h.round() as i32).into(),
+                    );
+                    if let (Some(стекло), Some(ш), Some(экран_кадра)) =
+                        (state.стекло.as_ref(), state.blur_shape.as_ref(), экран_кадра)
+                    {
+                        if let Some(подложка) = стекло.подложка(id, rect, экран_кадра) {
+                            let маска = crate::rounded::Rounded::new(
+                                подложка, ш,
+                                [x0 as f32, y0 as f32, w as f32, h as f32],
+                                r as f32, true,
+                            );
+                            elements.push(OutputRenderElements::Стекло(match растворение {
+                                Some(р) => маска.растворить(р),
+                                None => маска,
+                            }));
+                        }
                     }
                 }
             }
@@ -5647,68 +6746,95 @@ pub fn собрать_элементы(
     // Граница групп: всё, что добавлено между этой строкой и предыдущей, — окна.
     let счёт_окна = elements.len() - счёт_интерфейс;
 
-    // ── Bottom-слой (wlr-layer-shell): под окнами, над фоном ──────────────────
-    elements.extend(build_layer_elements(state, renderer, output, &[WlrLayer::Bottom]));
+    // ── Ниже — только то, что кроет собой полноэкранное окно ────────────────
+    // Ярлыки, виджеты, bottom-слой, тени, фоны обзора и сами обои (плитками
+    // или фоновым слоем) лежат ПОД окнами. Когда одно окно занимает экран
+    // целиком (игра, плеер, F11), ни один их пиксель на монитор не попадает —
+    // а собираются они на каждом кадре: импорт текстур, плитки бесконечных
+    // обоев, по одиннадцать элементов тени на окно. Пропускаем их целиком
+    // (`fullscreen_boost`); в обзоре и при зуме `wallpaper_hidden` уже false,
+    // так что видно всё как раньше.
+    // Считается ВНУТРИ (см. присваивание ниже): при пропуске декора нет вовсе.
+    let mut счёт_декор = 0usize;
+    if !(state.lua_config.fullscreen_boost && state.wallpaper_hidden()) {
+        // ── Иконки рабочего стола ────────────────────────────────────────────────
+        // Ниже окон и выше всего, что считается фоном: и bottom-слоя (там живут
+        // обои plx-wall), и собственных обоев компоновщика. Ярлык, уехавший под
+        // обои, человек не увидел бы вовсе, а поверх окон он мешал бы работе.
+        elements.extend(build_desktop_icons(state, renderer, output));
+        // Встроенные виджеты — сразу под иконками: ярлык, брошенный на плашку
+        // часов, должен остаться виден и кликабелен (хит-тест тоже иконки первыми).
+        elements.extend(build_desktop_widgets(state, renderer, output));
 
-    // ── Тени окон (полупрозрачные, скруглённые), сразу ПОЗАДИ окон ──────────
-    // В обзоре тоже рисуем: раньше их там отключали из-за цены (225 элементов
-    // на окно), но после перехода на плитки это 11 элементов, и в обзоре тень
-    // как раз нужна — она отделяет окна от фона стола.
-    // При кубе теней и рамок столов нет: и то и другое — прямоугольники,
-    // приклеенные к холсту, а холст в этот момент не показывается. Плоская
-    // рамка поверх повёрнутой грани выдала бы обман сразу.
-    if !куб_рисуется {
-        elements.extend(build_shadow_elements(state, renderer, скругление, свет));
+        // ── Bottom-слой (wlr-layer-shell): под окнами, над фоном ──────────────────
+        elements.extend(build_layer_elements(state, renderer, output, &[WlrLayer::Bottom]));
 
-        // Focus Aura (голубое свечение) УБРАНА — её принимали за "голубую тень".
-        // Глубину теперь даёт нейтральная мягкая build_shadow_elements выше.
+        // ── Тени окон (полупрозрачные, скруглённые), сразу ПОЗАДИ окон ──────────
+        // В обзоре тоже рисуем: раньше их там отключали из-за цены (225 элементов
+        // на окно), но после перехода на плитки это 11 элементов, и в обзоре тень
+        // как раз нужна — она отделяет окна от фона стола.
+        // При кубе теней и рамок столов нет: и то и другое — прямоугольники,
+        // приклеенные к холсту, а холст в этот момент не показывается. Плоская
+        // рамка поверх повёрнутой грани выдала бы обман сразу.
+        if !куб_рисуется {
+            elements.extend(build_shadow_elements(state, renderer, скругление));
 
-        // ── Фон рабочих столов в обзоре (только при тапе Super), позади окон ────
-        elements.extend(build_overview_bg_elements(state));
-    }
+            // Focus Aura (голубое свечение) УБРАНА — её принимали за "голубую тень".
+            // Глубину теперь даёт нейтральная мягкая build_shadow_elements выше.
 
-    // Граница групп: bottom-слой, тени и фоны обзора — декор.
-    let счёт_декор = elements.len() - счёт_интерфейс - счёт_окна;
+            // ── Фон рабочих столов в обзоре (только при тапе Super), позади окон ────
+            elements.extend(build_overview_bg_elements(state));
+        }
 
-    // ── Свет на холсте ─────────────────────────────────────────────────────
-    //
-    // Здесь, а не ниже с обоями: список идёт ОТ ПЕРЕДНЕГО ПЛАНА К ЗАДНЕМУ, и
-    // заливке место сразу за окнами и декором, но перед обоями — она светит
-    // ПОВЕРХ картинки и ПОД окнами, как свет в комнате.
-    if let Some(и) = свет {
-        elements.extend(build_light_element(state, renderer, output, и));
-    }
 
-    // ── Background-слой (wlr-layer-shell) и за ним параллакс ───────────────────
-    //
-    // Порядок важен: список идёт ОТ ПЕРЕДНЕГО ПЛАНА К ЗАДНЕМУ, и раньше
-    // параллакс добавлялся ПЕРЕД фоновым слоем — то есть его точки лежали
-    // ПОВЕРХ обоев и просвечивали сквозь любую картинку. Теперь обои идут
-    // первыми, а сетка точек — за ними: без обоев она видна как прежде, с
-    // обоями честно скрыта под ними.
-    // Обои: сперва пробуем положить их НА ХОЛСТ плитками (бесконечные обои,
-    // едут с камерой). Не вышло — рисуем фоновый слой как раньше, приклеенным
-    // к экрану. Отказ обязан быть мягким: без обоев экран чёрный.
-    let плитками = match build_wallpaper_backdrop(state, renderer, output) {
-        Some(плитки) => {
-            elements.extend(плитки);
+        // Граница групп: bottom-слой, тени и фоны обзора — декор.
+        счёт_декор = elements.len() - счёт_интерфейс - счёт_окна;
+
+        // ── Background-слой (wlr-layer-shell) и за ним параллакс ───────────────────
+        //
+        // Порядок важен: список идёт ОТ ПЕРЕДНЕГО ПЛАНА К ЗАДНЕМУ, и раньше
+        // параллакс добавлялся ПЕРЕД фоновым слоем — то есть его точки лежали
+        // ПОВЕРХ обоев и просвечивали сквозь любую картинку. Теперь обои идут
+        // первыми, а сетка точек — за ними: без обоев она видна как прежде, с
+        // обоями честно скрыта под ними.
+        // Обои: сперва пробуем положить их НА ХОЛСТ плитками (бесконечные обои,
+        // едут с камерой). Не вышло — рисуем фоновый слой как раньше, приклеенным
+        // к экрану. Отказ обязан быть мягким: без обоев экран чёрный.
+        //
+        // КУБ: за его пределами обоев НЕТ — там фон композитора по умолчанию
+        // (серый CLEAR_COLOR и сетка параллакса), как без plx-wall вовсе
+        // (просьба Ярика 24.09.2026). Обои остаются только на гранях: иначе
+        // куб из обоев тонет в тех же обоях за ним. Текстуру граням это не
+        // отнимает — cube_face_wallpaper берёт её у поверхности напрямую.
+        // Карусель — не коробка из обоев, а окна в воздухе: за ней остаются
+        // обычные обои стола, иначе прозрачные окна висели бы над серым.
+        let плитками = if куб_рисуется && state.карусель.is_none() {
+            if let Some(mode) = output.current_mode() {
+                elements.extend(build_parallax_elements(state, renderer, mode));
+            }
             true
+        } else { match build_wallpaper_backdrop(state, renderer, output) {
+            Some(плитки) => {
+                elements.extend(плитки);
+                true
+            }
+            None => {
+                elements.extend(
+                    build_layer_elements(state, renderer, output, &[WlrLayer::Background]),
+                );
+                false
+            }
+        } };
+        if let Some(mode) = output.current_mode() {
+            // Под обоями во весь экран сетку не строим — её всё равно не видно.
+            // Плитки кроют холст по определению, а вот `background_covers_output`
+            // спрашивает СВОЮ карту слоёв: у монитора, которому plx-wall поверхность не
+            // вешал, она пуста, и сетка строилась бы под чужими обоями впустую.
+            if !плитками && !background_covers_output(state, output, state.screen_size()) {
+                elements.extend(build_parallax_elements(state, renderer, mode));
+            }
         }
-        None => {
-            elements.extend(
-                build_layer_elements(state, renderer, output, &[WlrLayer::Background]),
-            );
-            false
-        }
-    };
-    if let Some(mode) = output.current_mode() {
-        // Под обоями во весь экран сетку не строим — её всё равно не видно.
-        // Плитки кроют холст по определению, а вот `background_covers_output`
-        // спрашивает СВОЮ карту слоёв: у монитора, которому plx-wall поверхность не
-        // вешал, она пуста, и сетка строилась бы под чужими обоями впустую.
-        if !плитками && !background_covers_output(state, output, state.screen_size()) {
-            elements.extend(build_parallax_elements(state, renderer, mode));
-        }
+
     }
 
     // ── Пелена входа: поверх ВСЕГО, включая курсор ──────────────────────────
@@ -5840,6 +6966,15 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
     // всей работы размытия уходило в кадр, который никто не собирал. Сводка
     // это скрывала — таймер начинается ниже, и блюр в `средний ... мс` не
     // попадал (0.3 мс на кадр в логе против 33% ядра у процесса).
+    // ── Облегчение под полноэкранным окном ───────────────────────────────────
+    // Экран занят целиком одним окном (игра, плеер, браузер в F11): обоев,
+    // панели, теней и ярлыков на нём не видно ни пикселя. Всё, что считается
+    // ради них, — это работа в никуда, причём на КАЖДОМ кадре игры (у Ярика
+    // монитор 200 Гц). Признак — тот же `wallpaper_hidden`, по которому обои
+    // уже сейчас перестают получать кадровые callback'и; в обзоре и при зуме
+    // он false, так что красота нигде не теряется.
+    let облегчить = state.lua_config.fullscreen_boost && state.wallpaper_hidden();
+
     let blur_started = std::time::Instant::now();
     пересчитать_блюр(state, renderer, surface.blur.as_mut(), &surface.output);
     state.render_stats.record_blur(blur_started.elapsed().as_micros() as u64);
@@ -5868,7 +7003,7 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
     // Ёмкость берём по прошлому кадру: список набирается двумя десятками
     // `extend` и на 300 элементах успевал переехать в новую память с десяток
     // раз за кадр, то есть 190 раз в секунду.
-    let (elements, cursor_elements) = собрать_элементы(
+    let (mut elements, cursor_elements) = собрать_элементы(
         state,
         renderer,
         &surface.output,
@@ -5878,8 +7013,70 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
     let element_count = elements.len();
     surface.last_elements = element_count;
     let output_name = surface.output.name();
+
+    // ── Экранный шейдер ──────────────────────────────────────────────────────
+    // Пока ручка `screen_shader` пуста, здесь не происходит ровно ничего и кадр
+    // идёт на монитор как раньше. Задана — сцена уезжает в свой офскрин, а на
+    // плоскость отдаётся ОДИН элемент: этот кадр, нарисованный пользовательской
+    // программой (см. экран.rs).
+    // В сборке без фичи `shaders` ручки нет: путь пустой, и `кадр` выходит
+    // первой же строкой, ничего не выделяя.
+    //
+    // Под полноэкранным окном экранный шейдер ВЫКЛЮЧАЕТСЯ (`fullscreen_boost`),
+    // и это самая дорогая из всех экономий. Дело не только в двух лишних
+    // проходах по 2560×1080: пока сцена уезжает в офскрин, на плоскость монитора
+    // уходит ОДИН наш элемент — то есть буфер игры физически не может попасть на
+    // primary plane напрямую (см. flags_кадра: ALLOW_SCANOUT). Выключив шейдер,
+    // мы возвращаем Dota прямой вывод: композитор в такие кадры не рисует вовсе.
+    // Показать дымку поверх игры всё равно некому — экран занят ею целиком.
+    let путь: &str = if cfg!(feature = "shaders") {
+        state.lua_config.screen_shader.as_str()
+    } else {
+        ""
+    };
+    // Под полноэкранным окном шейдер не зовём ВОВСЕ (`fullscreen_boost`) — не
+    // через пустой путь: пустой путь гасит `Экран` целиком (см. `выключить`), и
+    // на каждом выходе из игры программа собиралась бы заново. Здесь же объект
+    // остаётся как есть, с готовой программой и офскрином, и кадр просто идёт
+    // мимо него.
+    //
+    // КУРСОР ЧЕРЕЗ ШЕЙДЕР НЕ ИДЁТ, и это не косметика. Стрелка живёт на своём
+    // аппаратном слое (см. flags_кадра), то есть её движение обычно не стоит
+    // ничего: меняется позиция слоя, сцена не пересобирается. Стоит запечь её
+    // в офскрин шейдера — и слой становится невозможен: на плоскость уходит
+    // один наш элемент, внутри которого нарисован в том числе курсор. Значит
+    // КАЖДОЕ движение мыши на рабочем столе — полная пересборка сцены плюс два
+    // полноэкранных прохода (дымка и свечение), и на мониторе 200 Гц это
+    // двести таких кадров в секунду. Пропускаем через программу сцену БЕЗ
+    // курсора, а стрелку кладём сверху отдельными элементами — она и должна
+    // быть резкой, а не в дымке.
+    let через_шейдер = if облегчить {
+        None
+    } else {
+        surface.экран.кадр(
+            renderer, &surface.output, путь, &elements[cursor_elements..], CLEAR_COLOR,
+        )
+    };
+    // Что уходит на плоскости монитора: либо вся сцена, либо курсор поверх
+    // ОДНОГО элемента — её же кадра, пропущенного через пользовательскую
+    // программу. `elements` ниже нужен как есть (захват экрана обязан
+    // показывать сцену), поэтому здесь ссылка либо новый короткий список.
+    //
+    // Курсор ПЕРЕЕЗЖАЕТ из сцены в этот короткий список (`drain`), а не
+    // копируется: элементы кадра клонировать нельзя, у них нет `Clone`.
+    // Обратно он встаёт сразу после `render_frame` — захват экрана и снимок
+    // ниже обязаны видеть кадр целиком, вместе со стрелкой.
+    let mut поверх: Vec<OutputRenderElements> = Vec::new();
+    let на_монитор: &[OutputRenderElements] = match через_шейдер {
+        Some(эл) => {
+            поверх = elements.drain(..cursor_elements).collect();
+            поверх.push(OutputRenderElements::Экранный(эл));
+            &поверх
+        }
+        None => &elements,
+    };
     match surface.compositor.render_frame(
-        renderer, &elements, CLEAR_COLOR, flags_кадра()
+        renderer, на_монитор, CLEAR_COLOR, flags_кадра()
     ) {
         Ok(res) => {
             // Кадр выделился — память вернулась, откат снимаем.
@@ -5986,7 +7183,7 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
                     output_name, e, surface.отказов_подряд, пауза,
                 );
             }
-            state.render_stats.record(render_started.elapsed().as_micros() as u64, element_count);
+            state.render_stats.record(render_started.elapsed().as_micros() as u64, element_count, state.viewport.zoom);
             // Дальше по функции идут захват экрана и РАССЫЛКА FRAME CALLBACK.
             // Ни то, ни другое делать нельзя: кадра нет, а callback'и вернутся
             // коммитами клиентов и закрутят тот самый цикл (см. ОТКАЗ_ПАУЗА_МС).
@@ -5996,7 +7193,15 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
         }
     }
 
-    state.render_stats.record(render_started.elapsed().as_micros() as u64, element_count);
+    state.render_stats.record(render_started.elapsed().as_micros() as u64, element_count, state.viewport.zoom);
+
+    // Курсор — обратно в начало сцены (см. `поверх` выше): захват экрана,
+    // снимок области и кадры гостям собираются из `elements` и отрезают
+    // курсорный блок по `cursor_elements`, то есть ждут его именно там.
+    if !поверх.is_empty() {
+        поверх.pop(); // элемент экранного шейдера в сцену не возвращается
+        elements.splice(0..0, поверх.drain(..));
+    }
 
     // ── Захват экрана ────────────────────────────────────────────────────────
     // Строго ПОСЛЕ render_frame и теми же элементами: демонстрация экрана
@@ -6055,9 +7260,14 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
     };
 
     let elapsed = state.start_time.elapsed();
+    // Закреплённые окна на экране всегда, где бы ни стояло их место на холсте.
+    let закреплённые: Vec<Window> = state.tagged_windows.iter()
+        .filter(|tw| tw.закреплено.is_some())
+        .map(|tw| tw.window.clone())
+        .collect();
     let space = &state.space;
     space.elements().for_each(|window| {
-        let awake = space.element_geometry(window)
+        let awake = закреплённые.contains(window) || space.element_geometry(window)
             .map(|g| eco_rect.overlaps(g))
             .unwrap_or(true);
         if awake {
@@ -6093,6 +7303,31 @@ fn рисовать_поверхность(surface: &mut Surface, renderer: &mut
                 |_, _| Some(surface.output.clone()),
             );
         }
+    }
+    отдать_кадр_курсору(state, &surface.output, elapsed, Some(Duration::from_millis(16)));
+}
+
+/// Frame callback поверхности курсора, которую прислал клиент.
+///
+/// Xwayland меняет форму курсора НЕ сразу: новую картинку он кладёт только
+/// после `done` на прошлую (xwl_cursor ждёт frame callback, а до него лишь
+/// помечает «надо обновить»). Колбэки курсору parallax не слал вовсе — и
+/// каждое X11-приложение (Steam, Dota 2, Discord под X11) меняло курсор ровно
+/// один раз, на входе мыши в окно, а дальше оставалось с той формой, что
+/// досталась первой: текстовый курсор над ссылкой, стрелка над полем ввода.
+/// Замер 27.09.2026 на харнессе: `wl_surface@16.frame(12)` от Xwayland без
+/// единого `wl_callback@12.done`, и ни одного `set_cursor` после первого, хотя
+/// motion по зонам окна с разными курсорами до X доезжал.
+pub fn отдать_кадр_курсору(
+    state: &Parallax,
+    output: &Output,
+    время: Duration,
+    throttle: Option<Duration>,
+) {
+    if let CursorImageStatus::Surface(ref поверхность) = state.cursor_status {
+        smithay::desktop::utils::send_frames_surface_tree(
+            поверхность, output, время, throttle, |_, _| Some(output.clone()),
+        );
     }
 }
 
@@ -6696,11 +7931,13 @@ struct MenuRow {
     dot: u8,
     /// Уровень сигнала 0..100 — рисуется столбиками у правого края.
     strength: Option<u8>,
+    /// Ползунок 0..1 на правых двух третях строки (яркость в меню питания).
+    ползунок: Option<f32>,
 }
 
 impl MenuRow {
     fn head(text: &str) -> Self {
-        Self { header: true, left: text.to_string(), right: String::new(), dot: 0, strength: None }
+        Self { header: true, left: text.to_string(), right: String::new(), dot: 0, strength: None, ползунок: None }
     }
 }
 
@@ -6804,6 +8041,20 @@ fn build_list_menu(
         if row.dot > 0 {
             let c = if row.dot >= 2 { ACCENT } else { DIM };
             rounded_solid(&mut pool, &mut idx, x + 22, ry + 12, 10, 10, 5, c, &mut els);
+        }
+        // Ползунок яркости: дорожка и заполнение. Геометрия та же, что у
+        // клика (`питание::ПОЛЗУНОК_С`), иначе рука попадала бы мимо.
+        if let Some(доля) = row.ползунок {
+            let x0 = rect.x + (rect.w as f64 * crate::питание::ПОЛЗУНОК_С) as i32;
+            let x1 = rect.x + (rect.w as f64 * 0.96) as i32;
+            let w = (x1 - x0).max(1);
+            let yy = ry + (MENU_ROW_H - 4) / 2 - 3;
+            rounded_solid(&mut pool, &mut idx, x0, yy, w, 6, 3, [0.5, 0.5, 0.55, 0.30], &mut els);
+            let заполнено = ((w as f32) * доля.clamp(0.0, 1.0)).round() as i32;
+            if заполнено > 0 {
+                rounded_solid(&mut pool, &mut idx, x0, yy, заполнено.max(6), 6, 3, ACCENT, &mut els);
+            }
+            rounded_solid(&mut pool, &mut idx, x0 + заполнено - 7, yy - 4, 14, 14, 7, WHITE, &mut els);
         }
         // Уровень сигнала — четыре столбика у правого края: цифра рядом есть,
         // но глазом ряд читается быстрее.
@@ -7021,6 +8272,651 @@ fn build_share_panel_elements(
     els
 }
 
+/// Панель приложений (см. dock.rs): плашка, значки, точки запущенных,
+/// перетаскиваемый значок, подсказка с именем и контекстное меню.
+///
+/// Приклеена к экрану, как панель столов. Геометрия — `dock::раскладка`, та
+/// же, по которой ловит клики `Parallax::dock_button`.
+fn build_dock_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+) -> Vec<OutputRenderElements> {
+    const АКЦЕНТ: [f32; 4] = [0.55, 0.78, 1.0, 1.0];
+    const ТОЧКА: [f32; 4] = [0.85, 0.88, 0.95, 0.85];
+    const НАВЕДЕНИЕ: [f32; 4] = [1.0, 1.0, 1.0, 0.10];
+    const МЕНЮ_ФОН: [f32; 4] = [0.035, 0.035, 0.05, 0.96];
+    const МЕНЮ_ВЫБОР: [f32; 4] = [0.130, 0.230, 0.330, 0.88];
+    const БЕЛЫЙ: [f32; 4] = [0.95, 0.95, 0.97, 0.98];
+
+    let mut els: Vec<OutputRenderElements> = Vec::new();
+    if !state.dock_visible() {
+        state.dock.меню = None;
+        return els;
+    }
+    let (л, пункты) = state.dock_layout();
+    let сторона = state.dock.cfg.size;
+    let перетаскивание = state.dock_drag_view();
+    let hover = state.dock.hover;
+    let правка = state.dock.правка;
+
+    let mut idx = 0usize;
+    let mut slot = 0usize;
+    let ф = л.фон;
+
+    // Пустое место панели тащат к другому краю — показываем, куда она встанет
+    // (сама панель пока стоит на месте).
+    if let Some((usize::MAX, (px, py), true)) = перетаскивание {
+        let экран = state.screen_size();
+        let mut cfg = state.dock.cfg.clone();
+        let (fx, fy) = (px / экран.w.max(1) as f64, py / экран.h.max(1) as f64);
+        cfg.position = [
+            (fy, crate::dock::Край::Верх),
+            (1.0 - fy, crate::dock::Край::Низ),
+            (fx, crate::dock::Край::Лево),
+            (1.0 - fx, crate::dock::Край::Право),
+        ]
+        .iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, к)| *к)
+        .unwrap_or(cfg.position);
+        let закреплённых = пункты.iter().filter(|п| п.закреплён).count();
+        let цель = crate::dock::раскладка(&cfg, экран, пункты.len(), закреплённых).фон;
+        let mut pool = std::mem::take(&mut state.dock_ids);
+        rounded_solid(&mut pool, &mut idx, цель.x, цель.y, цель.w, цель.h, 16, [0.55, 0.78, 1.0, 0.18], &mut els);
+        state.dock_ids = pool;
+    }
+
+    // Плашка: стекло + полупрозрачная заливка цветом панели столов.
+    // Во всю ширину и вплотную к краю — полоса, как в Windows: скругления
+    // у экрана были бы щелями, сквозь которые видно обои.
+    let радиус = if state.dock.cfg.full_width && state.dock.cfg.margin == 0 {
+        0
+    } else {
+        18.min(ф.h / 2).min(ф.w / 2)
+    };
+    // Непрозрачность из параметров: при исходных 55% всё как было — над
+    // стеклом альфа не выше 0.55, без стекла глухой цвет панели столов.
+    let доля = state.dock.cfg.opacity as f32 / 100.0;
+    let фон_цвет = match стекло(state, renderer, ф.x, ф.y, ф.w, ф.h, радиус, БЛЮР_ДОК) {
+        Some(el) => {
+            els.push(el);
+            let mut c = BAR_BG();
+            c[3] = c[3].min(доля);
+            c
+        }
+        None => {
+            let mut c = BAR_BG();
+            let исходная = crate::dock::ПРОЗРАЧНОСТЬ_ИСХОДНАЯ as f32 / 100.0;
+            c[3] = (c[3] * доля / исходная).clamp(0.0, 1.0);
+            c
+        }
+    };
+    {
+        let mut pool = std::mem::take(&mut state.dock_ids);
+        rounded_solid(&mut pool, &mut idx, ф.x, ф.y, ф.w, ф.h, радиус, фон_цвет, &mut els);
+        if let Some(р) = л.раздел {
+            rounded_solid(&mut pool, &mut idx, р.x, р.y, р.w, р.h, 1, [1.0, 1.0, 1.0, 0.22], &mut els);
+        }
+        state.dock_ids = pool;
+    }
+
+    // Куда встанет тащимый значок — между какими соседями открыть щель.
+    let тащим = match перетаскивание {
+        Some((i, _, false)) => Some(i),
+        _ => None,
+    };
+    let слот_броска = тащим.and_then(|_| {
+        let (px, py) = перетаскивание.map(|(_, p, _)| p).unwrap_or_default();
+        state.dock_drop_slot(px, py)
+    });
+    let шаг = сторона + 2 * crate::dock::ПОЛЕ;
+
+    for (i, п) in пункты.iter().enumerate() {
+        if Some(i) == тащим {
+            continue;
+        }
+        let mut к = л.клетки[i];
+        // Щель под бросаемый значок: закреплённые правее слота едут на шаг.
+        if let (Some(t), Some(s)) = (тащим, слот_броска) {
+            if п.закреплён {
+                let позиция = if i > t { i - 1 } else { i };
+                let сдвиг = if позиция >= s { шаг } else { 0 } - if i > t { шаг } else { 0 };
+                if л.вертикальная { к.y += сдвиг } else { к.x += сдвиг }
+            }
+        }
+        let наведён = hover == Some(i) && тащим.is_none();
+        if наведён {
+            let mut pool = std::mem::take(&mut state.dock_ids);
+            rounded_solid(&mut pool, &mut idx, к.x + 2, к.y + 2, к.w - 4, к.h - 4, 12, НАВЕДЕНИЕ, &mut els);
+            state.dock_ids = pool;
+        }
+        // Всплытие наведённого значка: чуть крупнее и приподнят от края.
+        let рост = if наведён { 1.12 } else { 1.0 };
+        let s_px = (сторона as f64 * рост).round() as i32;
+        let подъём = if наведён { 4 } else { 0 };
+        let (dx, dy) = match state.dock.cfg.position {
+            crate::dock::Край::Низ => (0, -подъём),
+            crate::dock::Край::Верх => (0, подъём),
+            crate::dock::Край::Лево => (подъём, 0),
+            crate::dock::Край::Право => (-подъём, 0),
+        };
+        let ix = к.x + (к.w - s_px) / 2 + dx;
+        let iy = к.y + (к.h - s_px) / 2 + dy;
+        let значок = state.dock_icon(п, if наведён { s_px } else { сторона });
+        match значок {
+            Some((buf, _)) => {
+                if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
+                    renderer, Point::<f64, Physical>::from((ix as f64, iy as f64)), &buf,
+                    None, None, Some(Size::<i32, Logical>::from((s_px, s_px))), Kind::Unspecified,
+                ) {
+                    els.push(OutputRenderElements::Memory(el));
+                }
+            }
+            None => {
+                // Значка нет — плашка с первой буквой имени.
+                let mut pool = std::mem::take(&mut state.dock_ids);
+                rounded_solid(&mut pool, &mut idx, ix, iy, s_px, s_px, s_px / 4, [0.30, 0.40, 0.60, 0.85], &mut els);
+                state.dock_ids = pool;
+                let буква: String = п.имя.chars().find(|c| c.is_alphanumeric())
+                    .map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
+                let масштаб = (s_px / 22).max(1);
+                let w = crate::text::width_of(&буква, crate::text::Weight::Semi, масштаб);
+                let h = crate::text::height(масштаб);
+                draw_text_w(state, renderer, ix + (s_px - w) / 2, iy + (s_px - h) / 2, &буква,
+                    crate::text::Weight::Semi, масштаб, БЕЛЫЙ, slot, &mut els);
+                slot += 1;
+            }
+        }
+        // Режим правки: крестик в углу закреплённого значка.
+        if правка && п.закреплён && !state.dock.cfg.locked {
+            let mut pool = std::mem::take(&mut state.dock_ids);
+            rounded_solid(&mut pool, &mut idx, к.x + к.w - 16, к.y + 1, 15, 15, 7, [0.85, 0.25, 0.25, 0.95], &mut els);
+            state.dock_ids = pool;
+            draw_text(state, renderer, к.x + к.w - 12, к.y + 1, "x", 1, БЕЛЫЙ, slot, &mut els);
+            slot += 1;
+        }
+        // Точки запущенных окон — у внешнего края клетки, до трёх штук.
+        let n = п.окна.len().min(3) as i32;
+        if n > 0 {
+            let цвет = if п.в_фокусе { АКЦЕНТ } else { ТОЧКА };
+            let (d, зазор) = (if п.в_фокусе { 5 } else { 4 }, 3);
+            let длина = n * d + (n - 1) * зазор;
+            let mut pool = std::mem::take(&mut state.dock_ids);
+            for k in 0..n {
+                let (x, y) = match state.dock.cfg.position {
+                    crate::dock::Край::Низ => (к.x + (к.w - длина) / 2 + k * (d + зазор), ф.y + ф.h - d - 3),
+                    crate::dock::Край::Верх => (к.x + (к.w - длина) / 2 + k * (d + зазор), ф.y + 3),
+                    crate::dock::Край::Лево => (ф.x + 3, к.y + (к.h - длина) / 2 + k * (d + зазор)),
+                    crate::dock::Край::Право => (ф.x + ф.w - d - 3, к.y + (к.h - длина) / 2 + k * (d + зазор)),
+                };
+                rounded_solid(&mut pool, &mut idx, x, y, d, d, d / 2, цвет, &mut els);
+            }
+            state.dock_ids = pool;
+        }
+    }
+
+    // «+» — добавить приложение.
+    {
+        let к = л.плюс;
+        let mut pool = std::mem::take(&mut state.dock_ids);
+        let d = (сторона * 2 / 3).max(16);
+        rounded_solid(&mut pool, &mut idx, к.x + (к.w - d) / 2, к.y + (к.h - d) / 2, d, d, d / 2,
+            [1.0, 1.0, 1.0, if hover.is_none() { 0.10 } else { 0.14 }], &mut els);
+        let t = (d / 10).max(2);
+        let len = d / 2;
+        let (cx, cy) = (к.x + к.w / 2, к.y + к.h / 2);
+        rounded_solid(&mut pool, &mut idx, cx - len / 2, cy - t / 2, len, t, t / 2, БЕЛЫЙ, &mut els);
+        rounded_solid(&mut pool, &mut idx, cx - t / 2, cy - len / 2, t, len, t / 2, БЕЛЫЙ, &mut els);
+        state.dock_ids = pool;
+    }
+
+    // Тащимый значок — под курсором, полупрозрачный; вдали от панели (там,
+    // где его бросок уберёт значок) — ещё бледнее.
+    if let Some((i, (px, py), false)) = перетаскивание {
+        if let Some(п) = пункты.get(i).cloned() {
+            let уберут = п.закреплён && state.dock_drop_slot(px, py).is_none();
+            let альфа = if уберут { 0.35 } else { 0.85 };
+            if let Some((buf, _)) = state.dock_icon(&п, сторона) {
+                if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    Point::<f64, Physical>::from((px - сторона as f64 / 2.0, py - сторона as f64 / 2.0)),
+                    &buf, Some(альфа), None, Some(Size::<i32, Logical>::from((сторона, сторона))),
+                    Kind::Unspecified,
+                ) {
+                    els.push(OutputRenderElements::Memory(el));
+                }
+            }
+            if уберут {
+                let надпись = crate::т!("убрать с панели", "remove from dock");
+                let w = crate::text::width(надпись, 1);
+                draw_text(state, renderer, px as i32 - w / 2, py as i32 + сторона / 2 + 4, надпись, 1,
+                    [1.0, 0.6, 0.6, 0.95], slot, &mut els);
+                slot += 1;
+            }
+        }
+    }
+
+    // Подсказка с именем у наведённого значка — с внутренней стороны панели.
+    if let (Some(i), None, None) = (hover, тащим, state.dock.меню.as_ref()) {
+        if let Some(п) = пункты.get(i) {
+            let к = л.клетки[i];
+            let текст: String = п.имя.chars().take(40).collect();
+            let tw = crate::text::width(&текст, 1) + 16;
+            let th = crate::text::height(1) + 10;
+            let (x, y) = match state.dock.cfg.position {
+                crate::dock::Край::Низ => (к.x + к.w / 2 - tw / 2, ф.y - th - 8),
+                crate::dock::Край::Верх => (к.x + к.w / 2 - tw / 2, ф.y + ф.h + 8),
+                crate::dock::Край::Лево => (ф.x + ф.w + 8, к.y + (к.h - th) / 2),
+                crate::dock::Край::Право => (ф.x - tw - 8, к.y + (к.h - th) / 2),
+            };
+            let mut pool = std::mem::take(&mut state.dock_ids);
+            rounded_solid(&mut pool, &mut idx, x, y, tw, th, 8, МЕНЮ_ФОН, &mut els);
+            state.dock_ids = pool;
+            draw_text(state, renderer, x + 8, y + 5, &текст, 1, БЕЛЫЙ, slot, &mut els);
+            slot += 1;
+        }
+    }
+
+    // Контекстное меню.
+    if let Some(м) = state.dock.меню.as_ref() {
+        const СТРОКА: i32 = 30;
+        let пункты_меню: Vec<String> = м.пункты.iter().map(|(t, _)| t.clone()).collect();
+        let sel = м.sel;
+        let (ax, ay) = м.у;
+        let w = пункты_меню.iter().map(|t| crate::text::width(t, 1)).max().unwrap_or(100) + 40;
+        let h = пункты_меню.len() as i32 * СТРОКА + 12;
+        let экран = state.screen_size();
+        // Раскрываем внутрь экрана от точки, со стороны от панели.
+        let (mut x, mut y) = match state.dock.cfg.position {
+            crate::dock::Край::Низ => (ax - w / 2, ф.y - h - 10),
+            crate::dock::Край::Верх => (ax - w / 2, ф.y + ф.h + 10),
+            crate::dock::Край::Лево => (ф.x + ф.w + 10, ay - h / 2),
+            crate::dock::Край::Право => (ф.x - w - 10, ay - h / 2),
+        };
+        x = x.clamp(6, (экран.w - w - 6).max(6));
+        y = y.clamp(6, (экран.h - h - 6).max(6));
+        let hover_row = {
+            let p = state.pointer_screen_physical();
+            (p.x >= x as f64 && p.x < (x + w) as f64 && p.y >= (y + 6) as f64)
+                .then(|| ((p.y - (y + 6) as f64) / СТРОКА as f64) as usize)
+                .filter(|r| *r < пункты_меню.len())
+        };
+        let mut rows = Vec::new();
+        let mut pool = std::mem::take(&mut state.dock_ids);
+        rounded_solid(&mut pool, &mut idx, x, y, w, h, 12, МЕНЮ_ФОН, &mut els);
+        for (r, _) in пункты_меню.iter().enumerate() {
+            let ry = y + 6 + r as i32 * СТРОКА;
+            let rect = bar::Rect { x: x + 6, y: ry, w: w - 12, h: СТРОКА - 2 };
+            if hover_row.unwrap_or(sel) == r {
+                rounded_solid(&mut pool, &mut idx, rect.x, rect.y, rect.w, rect.h, 8, МЕНЮ_ВЫБОР, &mut els);
+            }
+            rows.push(rect);
+        }
+        state.dock_ids = pool;
+        for (r, t) in пункты_меню.iter().enumerate() {
+            let ry = y + 6 + r as i32 * СТРОКА;
+            draw_text(state, renderer, x + 18, ry + (СТРОКА - crate::text::height(1)) / 2 - 1, t, 1, БЕЛЫЙ, slot, &mut els);
+            slot += 1;
+        }
+        if let Some(м) = state.dock.меню.as_mut() {
+            м.rows = rows;
+        }
+    }
+
+    els.reverse();
+    els
+}
+
+/// Список всех приложений («+» на панели) с поиском по имени.
+fn build_dock_picker_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    const DIM: [f32; 4] = [0.62, 0.62, 0.70, 0.75];
+    if !state.dock_picker_open() {
+        return Vec::new();
+    }
+    let список = state.dock_picker_list();
+    let (запрос, sel) = state.dock.выбор.as_ref().map(|в| (в.запрос.clone(), в.sel)).unwrap_or_default();
+    let на_панели: Vec<String> = state.dock.cfg.apps.iter().map(|a| a.id.clone()).collect();
+    let rows: Vec<MenuRow> = список
+        .iter()
+        .map(|я| MenuRow {
+            header: false,
+            left: я.name.clone(),
+            right: if на_панели.contains(&я.id) {
+                crate::т!("уже на панели", "already in the dock").to_string()
+            } else {
+                я.id.clone()
+            },
+            dot: if на_панели.contains(&я.id) { 2 } else { 0 },
+            strength: None,
+            ползунок: None,
+        })
+        .collect();
+    let title = crate::тф!("ДОБАВИТЬ НА ПАНЕЛЬ — {}_", "ADD TO THE DOCK — {}_", запрос);
+    let foot = crate::т!(
+        "печатайте для поиска   Enter добавить   Esc закрыть",
+        "type to search   Enter add   Esc close",
+    );
+    let (els, hits) = build_list_menu(state, renderer, output, &title, &rows, sel.min(rows.len().saturating_sub(1)), (foot, DIM));
+    if let Some(в) = state.dock.выбор.as_mut() {
+        в.rows = hits.into_iter().enumerate().map(|(i, r)| (r, i)).collect();
+    }
+    els
+}
+
+/// Окно «Параметры панели» (см. dock_settings.rs): разделы, флажки-тумблеры,
+/// выбор сегментами, ползунки и список закреплённых приложений.
+///
+/// Прямоугольники кликов складываются в `Окно::цели` в том же порядке, в
+/// каком их ищет хит-тест: сначала мелкие (сегмент, дорожка, кнопка строки),
+/// затем сама строка.
+fn build_dock_settings_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    use crate::dock_settings::{Контрол, Параметр, Строка, Цель, ДелоСПриложением};
+    const BG: [f32; 4] = [0.030, 0.030, 0.045, 0.96];
+    const SEL_BG: [f32; 4] = [0.130, 0.230, 0.330, 0.88];
+    const HOVER_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.05];
+    const FIELD_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
+    const SEG_ON: [f32; 4] = [0.20, 0.45, 0.70, 0.90];
+    const WHITE: [f32; 4] = [0.95, 0.95, 0.97, 0.98];
+    const LABEL: [f32; 4] = [0.86, 0.86, 0.90, 0.95];
+    const DIM: [f32; 4] = [0.62, 0.62, 0.70, 0.80];
+    const OFF: [f32; 4] = [0.62, 0.62, 0.70, 0.35];
+    const HEAD: [f32; 4] = [0.45, 0.70, 0.95, 0.90];
+    const ACCENT: [f32; 4] = [0.35, 0.75, 0.95, 0.95];
+    const W: i32 = 820;
+    const ROW: i32 = 40;
+    const HEAD_H: i32 = 66;
+    const FOOT_H: i32 = 66;
+    /// Номера текстовых буферов — свои, подальше от меню: одна и та же
+    /// строка в двух плашках кадра с одним номером делила бы буфер.
+    const SLOT0: usize = 600;
+
+    let mut els = Vec::new();
+    if !state.dock_settings_is_open() {
+        return els;
+    }
+    let Some(mode) = output.current_mode() else { return els };
+    let строки = state.dock_settings_rows();
+    let Some(о) = state.dock.параметры.as_ref() else { return els };
+    let фокус = о.фокус;
+    let следить = о.следить;
+    let тащим = о.тащим;
+    let mut прокрутка = о.прокрутка;
+
+    // Окно не заходит ни на панель столов, ни на сам док: правки должны
+    // быть видны на панели сразу, иначе ползунок двигают вслепую.
+    let mut обл = bar::Rect { x: 0, y: 0, w: mode.size.w, h: mode.size.h };
+    let сверху = BAR_TOP() + BAR_H() + 10;
+    обл.y += сверху;
+    обл.h -= сверху + 10;
+    if state.dock_enabled() {
+        let (край, толщина) = crate::dock::резерв(&state.dock.cfg);
+        match край {
+            crate::dock::Край::Низ => обл.h -= толщина,
+            crate::dock::Край::Верх => {
+                обл.y += толщина;
+                обл.h -= толщина;
+            }
+            crate::dock::Край::Лево => {
+                обл.x += толщина;
+                обл.w -= толщина;
+            }
+            crate::dock::Край::Право => обл.w -= толщина,
+        }
+    }
+    let видимых = (((обл.h - HEAD_H - FOOT_H) / ROW).max(4) as usize).min(строки.len().max(1));
+    if следить {
+        if let Some(i) = строки.iter().position(|с| matches!(с, Строка::Пункт { п, .. } if *п == фокус)) {
+            // Заголовок раздела над первой строкой — тоже в кадр.
+            if i < прокрутка + 1 {
+                прокрутка = i.saturating_sub(1);
+            } else if i >= прокрутка + видимых {
+                прокрутка = i + 1 - видимых;
+            }
+        }
+    }
+    прокрутка = прокрутка.min(строки.len().saturating_sub(видимых));
+    let h = HEAD_H + видимых as i32 * ROW + FOOT_H;
+    let x = обл.x + (обл.w - W) / 2;
+    let y = обл.y + ((обл.h - h) / 2).max(0);
+    let правый = x + W - 28;
+    let указатель = state.pointer_screen_physical();
+    let th = crate::text::height(1);
+
+    let mut idx = 0usize;
+    let mut слоты = SLOT0;
+    let mut цели: Vec<(bar::Rect, Цель)> = Vec::new();
+    // Тексты рисуем вторым проходом, поверх всех подложек.
+    let mut тексты: Vec<(i32, i32, String, [f32; 4], bool)> = Vec::new();
+    let mut pool = std::mem::take(&mut state.dock_settings_ids);
+
+    let фон = match стекло(state, renderer, x, y, W, h, 16, БЛЮР_ПАРАМЕТРЫ_ДОКА) {
+        Some(el) => {
+            els.push(el);
+            MENU_BG_СТЕКЛО
+        }
+        None => BG,
+    };
+    rounded_solid(&mut pool, &mut idx, x, y, W, h, 16, фон, &mut els);
+    тексты.push((x + 24, y + 18, crate::т!("Параметры панели приложений", "Dock settings").to_string(), WHITE, true));
+
+    for (k, с) in строки.iter().enumerate().skip(прокрутка).take(видимых) {
+        let ry = y + HEAD_H + (k - прокрутка) as i32 * ROW;
+        let ty = ry + (ROW - th) / 2 - 1;
+        let (п, подпись, к) = match с {
+            Строка::Раздел(t) => {
+                тексты.push((x + 24, ty + 4, t.to_string(), HEAD, true));
+                continue;
+            }
+            Строка::Пункт { п, подпись, к } => (*п, подпись, к),
+        };
+        let строка = bar::Rect { x: x + 10, y: ry + 1, w: W - 20, h: ROW - 2 };
+        if п == фокус {
+            rounded_solid(&mut pool, &mut idx, строка.x, строка.y, строка.w, строка.h, 8, SEL_BG, &mut els);
+        } else if строка.hit(указатель.x, указатель.y) {
+            rounded_solid(&mut pool, &mut idx, строка.x, строка.y, строка.w, строка.h, 8, HOVER_BG, &mut els);
+        }
+        let подпись: String = подпись.chars().take(44).collect();
+        тексты.push((x + 40, ty, подпись, if п == фокус { WHITE } else { LABEL }, false));
+
+        match к {
+            Контрол::Флаг(вкл) => {
+                let (sw, sh) = (44, 22);
+                let (sx, sy) = (правый - sw, ry + (ROW - sh) / 2);
+                rounded_solid(&mut pool, &mut idx, sx, sy, sw, sh, sh / 2,
+                    if *вкл { ACCENT } else { [1.0, 1.0, 1.0, 0.18] }, &mut els);
+                let d = sh - 6;
+                rounded_solid(&mut pool, &mut idx, if *вкл { sx + sw - d - 3 } else { sx + 3 }, sy + 3, d, d, d / 2, WHITE, &mut els);
+                let t = if *вкл { crate::т!("Вкл.", "On") } else { crate::т!("Выкл.", "Off") };
+                let tw = crate::text::width(t, 1);
+                тексты.push((sx - 12 - tw, ty, t.to_string(), DIM, false));
+            }
+            Контрол::Выбор { варианты, текущий } => {
+                let ширины: Vec<i32> = варианты.iter().map(|t| crate::text::width(t, 1) + 28).collect();
+                let всего: i32 = ширины.iter().sum::<i32>() + 4 * (ширины.len() as i32 - 1) + 6;
+                let (sy, sh) = (ry + 6, ROW - 12);
+                let mut sx = правый - всего;
+                rounded_solid(&mut pool, &mut idx, sx, sy, всего, sh, 9, FIELD_BG, &mut els);
+                sx += 3;
+                for (i, (t, w)) in варианты.iter().zip(&ширины).enumerate() {
+                    let r = bar::Rect { x: sx, y: sy + 3, w: *w, h: sh - 6 };
+                    if i == *текущий {
+                        rounded_solid(&mut pool, &mut idx, r.x, r.y, r.w, r.h, 7, SEG_ON, &mut els);
+                    } else if r.hit(указатель.x, указатель.y) {
+                        rounded_solid(&mut pool, &mut idx, r.x, r.y, r.w, r.h, 7, [1.0, 1.0, 1.0, 0.08], &mut els);
+                    }
+                    тексты.push((r.x + 14, ty, t.to_string(), if i == *текущий { WHITE } else { LABEL }, false));
+                    цели.push((r, Цель::Сегмент(п, i)));
+                    sx += w + 4;
+                }
+            }
+            Контрол::Ползунок { доля, текст } => {
+                let поле_значения = 78;
+                let tw = crate::text::width(текст, 1);
+                тексты.push((правый - tw, ty, текст.clone(), if п == фокус || тащим == Some(п) { ACCENT } else { DIM }, false));
+                let (dx, dw) = (правый - поле_значения - 280, 280);
+                let cy = ry + ROW / 2;
+                rounded_solid(&mut pool, &mut idx, dx, cy - 2, dw, 4, 2, [1.0, 1.0, 1.0, 0.18], &mut els);
+                let заполнено = (dw as f64 * доля).round() as i32;
+                if заполнено > 0 {
+                    rounded_solid(&mut pool, &mut idx, dx, cy - 2, заполнено, 4, 2, ACCENT, &mut els);
+                }
+                let d = if тащим == Some(п) { 18 } else { 16 };
+                rounded_solid(&mut pool, &mut idx, dx + заполнено - d / 2, cy - d / 2, d, d, d / 2, WHITE, &mut els);
+                // Ловим во всю высоту строки: в тонкую дорожку не попасть.
+                // Долю хит-тест считает от этого же прямоугольника.
+                цели.push((bar::Rect { x: dx, y: ry, w: dw, h: ROW }, Цель::Дорожка(п)));
+            }
+            Контрол::Приложение { первое, последнее } => {
+                let Параметр::Приложение(i) = п else { continue };
+                let кнопки = [
+                    (crate::т!("Выше", "Up"), ДелоСПриложением::Выше, !*первое),
+                    (crate::т!("Ниже", "Down"), ДелоСПриложением::Ниже, !*последнее),
+                    (crate::т!("Убрать", "Remove"), ДелоСПриложением::Убрать, true),
+                ];
+                let mut bx = правый;
+                for (t, дело, можно) in кнопки.iter().rev() {
+                    let bw = crate::text::width(t, 1) + 24;
+                    bx -= bw;
+                    let r = bar::Rect { x: bx, y: ry + 7, w: bw, h: ROW - 14 };
+                    let цвет = match (дело, r.hit(указатель.x, указатель.y) && *можно) {
+                        (ДелоСПриложением::Убрать, true) => [0.75, 0.25, 0.25, 0.85],
+                        (_, true) => [1.0, 1.0, 1.0, 0.16],
+                        _ => FIELD_BG,
+                    };
+                    rounded_solid(&mut pool, &mut idx, r.x, r.y, r.w, r.h, 8, цвет, &mut els);
+                    тексты.push((r.x + 12, ty, t.to_string(), if *можно { LABEL } else { OFF }, false));
+                    if *можно {
+                        цели.push((r, Цель::Приложение(i, *дело)));
+                    }
+                    bx -= 6;
+                }
+            }
+            Контрол::Кнопка(t) => {
+                let bw = crate::text::width(t, 1) + 32;
+                let r = bar::Rect { x: правый - bw, y: ry + 6, w: bw, h: ROW - 12 };
+                rounded_solid(&mut pool, &mut idx, r.x, r.y, r.w, r.h, 9, SEG_ON, &mut els);
+                тексты.push((r.x + 16, ty, t.to_string(), WHITE, false));
+            }
+        }
+        цели.push((строка, Цель::Строка(п)));
+    }
+
+    // Полоса прокрутки, если всё не влезло.
+    if строки.len() > видимых {
+        let всего = строки.len() as f64;
+        let трек = видимых as i32 * ROW;
+        let ph = ((видимых as f64 / всего) * трек as f64).max(20.0) as i32;
+        let py = y + HEAD_H + ((прокрутка as f64 / всего) * трек as f64) as i32;
+        rounded_solid(&mut pool, &mut idx, x + W - 8, py, 4, ph, 2, [1.0, 1.0, 1.0, 0.25], &mut els);
+    }
+
+    // Подвал: подсказка слева, «Сбросить» и «Готово» справа.
+    let by = y + h - FOOT_H + 14;
+    let mut bx = правый;
+    for п in crate::dock_settings::КНОПКИ.iter().rev() {
+        let t = crate::dock_settings::подпись_кнопки(*п);
+        let bw = crate::text::width(t, 2) + 36;
+        bx -= bw;
+        let r = bar::Rect { x: bx, y: by, w: bw, h: 38 };
+        let цвет = if *п == фокус {
+            SEL_BG
+        } else if *п == Параметр::Готово {
+            SEG_ON
+        } else if r.hit(указатель.x, указатель.y) {
+            [1.0, 1.0, 1.0, 0.16]
+        } else {
+            [1.0, 1.0, 1.0, 0.10]
+        };
+        rounded_solid(&mut pool, &mut idx, r.x, r.y, r.w, r.h, 10, цвет, &mut els);
+        if *п == фокус {
+            rounded_solid(&mut pool, &mut idx, r.x, r.y + r.h - 3, r.w, 3, 1, ACCENT, &mut els);
+        }
+        цели.push((r, Цель::Строка(*п)));
+        bx -= 10;
+    }
+    state.dock_settings_ids = pool;
+
+    for (tx, ty, t, цвет, жирный) in &тексты {
+        if *жирный && *ty == y + 18 {
+            draw_text_w(state, renderer, *tx, *ty, t, crate::text::Weight::Semi, MENU_TEXT, *цвет, слоты, &mut els);
+        } else if *жирный {
+            draw_text_w(state, renderer, *tx, *ty, t, crate::text::Weight::Semi, 1, *цвет, слоты, &mut els);
+        } else {
+            draw_text(state, renderer, *tx, *ty, t, 1, *цвет, слоты, &mut els);
+        }
+        слоты += 1;
+    }
+    for п in crate::dock_settings::КНОПКИ {
+        let Some((r, _)) = цели.iter().find(|(_, ц)| *ц == Цель::Строка(п)) else { continue };
+        let t = crate::dock_settings::подпись_кнопки(п);
+        let tw = crate::text::width(t, 2);
+        draw_text(state, renderer, r.x + (r.w - tw) / 2, r.y + (r.h - crate::text::height(2)) / 2, t, 2, WHITE, слоты, &mut els);
+        слоты += 1;
+    }
+    draw_text(state, renderer, x + 24, by + (38 - th) / 2, crate::т!(
+        "Вверх/Вниз — пункт   Влево/Вправо — значение   Del — убрать   Esc — закрыть",
+        "Up/Down item   Left/Right value   Del remove   Esc close",
+    ), 1, DIM, слоты, &mut els);
+
+    if let Some(о) = state.dock.параметры.as_mut() {
+        о.цели = цели;
+        о.прокрутка = прокрутка;
+        о.панель = bar::Rect { x, y, w: W, h };
+    }
+    els.reverse();
+    els
+}
+
+/// Закреплённые окна: 1:1 в своей точке экрана, без камеры и зума.
+///
+/// Скругление — тем же шейдером, что и у окон холста, с масштабом 1. Порядок
+/// — верхнее первым (список кадра идёт от переднего плана к заднему).
+fn build_pinned_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    скругление: Option<&crate::rounded::Шейдер>,
+) -> Vec<OutputRenderElements> {
+    let mut els = Vec::new();
+    let Some(монитор) = state.монитор_по_выходу(output).or(Some(state.активный)) else {
+        return els;
+    };
+    let окна = state.закреплённые(монитор);
+    if окна.is_empty() {
+        return els;
+    }
+    let радиус = corner_radius_logical(state) as f32;
+    for (window, рамка) in окна {
+        let корень = рамка.loc - window.geometry().loc.to_f64();
+        let phys: Point<i32, Physical> = (корень.x.round() as i32, корень.y.round() as i32).into();
+        let оконные: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            window.render_elements(renderer, phys, smithay::utils::Scale::from(1.0), 1.0);
+        let (x0, y0) = (рамка.loc.x.round() as f32, рамка.loc.y.round() as f32);
+        let (w, h) = (рамка.size.w as f32, рамка.size.h as f32);
+        let r = радиус.min(w / 2.0).min(h / 2.0).max(0.0);
+        // Без жёсткой обрезки: попапы (меню) закреплённого окна лежат в том
+        // же списке и вылезают за его рамку — резать их нельзя.
+        for el in оконные {
+            let el = RescaleRenderElement::from_element(el, Point::from((0, 0)), 1.0);
+            match скругление {
+                Some(ш) if r >= 0.5 => els.push(OutputRenderElements::Rounded(
+                    crate::rounded::Rounded::new(el, ш, [x0, y0, w, h], r, false),
+                )),
+                _ => els.push(OutputRenderElements::Layer(el)),
+            }
+        }
+    }
+    els
+}
+
 /// Меню вайфая: список сетей, ввод пароля и подсказка по клавишам.
 fn build_wifi_elements(
     state: &mut Parallax,
@@ -7033,6 +8929,9 @@ fn build_wifi_elements(
 
     if !state.wifi_menu_open() {
         return Vec::new();
+    }
+    if state.wifi_form_open() {
+        return build_wifi_form_elements(state, renderer, output);
     }
     let Some(w) = state.wifi.as_ref() else { return Vec::new() };
     let snap = w.snap.clone();
@@ -7062,11 +8961,19 @@ fn build_wifi_elements(
         .map(|ap| {
             let mut right = String::new();
             if ap.active {
-                right.push_str("connected  ");
+                right.push_str(crate::т!("подключено  ", "connected  "));
+            } else if ap.path == "/" {
+                right.push_str(crate::т!("сохранена, не в эфире", "saved, out of range"));
             } else if ap.saved {
-                right.push_str("saved  ");
+                right.push_str(crate::т!("сохранена  ", "saved  "));
             }
-            right.push_str(if !ap.secure {
+            right.push_str(if ap.path == "/" {
+                ""
+            } else if ap.eap {
+                "Enterprise"
+            } else if ap.owe {
+                "OWE"
+            } else if !ap.secure {
                 "open"
             } else if ap.sae {
                 "WPA3"
@@ -7078,7 +8985,8 @@ fn build_wifi_elements(
                 left: ap.ssid.clone(),
                 right,
                 dot: if ap.active { 2 } else if ap.saved { 1 } else { 0 },
-                strength: Some(ap.strength),
+                strength: (ap.path != "/").then_some(ap.strength),
+                ползунок: None,
             }
         })
         .collect();
@@ -7090,7 +8998,10 @@ fn build_wifi_elements(
         ),
         (None, Some(text)) => (text.clone(), ACCENT),
         (None, None) => (
-            "Enter connect  D disconnect  F forget  S scan  P radio  Esc".to_string(),
+            crate::т!(
+                "Enter подключить  E настройки  H скрытая  D отключить  F забыть  S скан  P радио",
+                "Enter connect  E settings  H hidden  D disconnect  F forget  S scan  P radio",
+            ).to_string(),
             DIM,
         ),
     };
@@ -7100,6 +9011,327 @@ fn build_wifi_elements(
     );
     if let Some(w) = state.wifi.as_mut() {
         w.rows = hits.into_iter().enumerate().map(|(i, r)| (r, i)).collect();
+    }
+    els
+}
+
+/// Форма настройки сети (см. wifi_form.rs): сведения, защита с EAP и
+/// identity, IPv4/IPv6, DNS, прочее и кнопки. Клавиатура и клики — в
+/// wifi.rs, прямоугольники полей отдаются туда же (`Форма::rows`).
+fn build_wifi_form_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    use crate::wifi_form::{Вид, Поле, Строка};
+    const BG: [f32; 4] = [0.030, 0.030, 0.045, 0.96];
+    const SEL_BG: [f32; 4] = [0.130, 0.230, 0.330, 0.88];
+    const FIELD_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.07];
+    const WHITE: [f32; 4] = [0.95, 0.95, 0.97, 0.98];
+    const DIM: [f32; 4] = [0.62, 0.62, 0.70, 0.80];
+    const HEAD: [f32; 4] = [0.45, 0.70, 0.95, 0.90];
+    const ACCENT: [f32; 4] = [0.35, 0.75, 0.95, 0.95];
+    const WARN: [f32; 4] = [0.95, 0.55, 0.35, 0.95];
+    const W: i32 = 900;
+    const ROW: i32 = 32;
+    const HEAD_H: i32 = 58;
+    const FOOT_H: i32 = 96;
+    const VAL_X: i32 = 330;
+
+    let mut els = Vec::new();
+    let Some(mode) = output.current_mode() else { return els };
+    let Some(ф) = state.wifi.as_ref().and_then(|w| w.форма.as_ref()) else { return els };
+    let строки = ф.строки();
+    let кнопки = ф.кнопки();
+    let фокус = ф.фокус;
+    let грузится = ф.грузится;
+    let ошибка = ф.ошибка.clone();
+    let заголовок = if ф.ssid_правится {
+        crate::т!("WI-FI — скрытая сеть", "WI-FI — hidden network").to_string()
+    } else {
+        format!("WI-FI — {}", ф.п.ssid)
+    };
+    let значения: Vec<(Строка, String)> = строки
+        .iter()
+        .map(|с| match с {
+            Строка::Поле(п) => (с.clone(), ф.значение(*п)),
+            _ => (с.clone(), String::new()),
+        })
+        .collect();
+    let mut прокрутка = ф.прокрутка;
+
+    let видимых = (((mode.size.h - 120 - HEAD_H - FOOT_H) / ROW).max(4) as usize).min(значения.len().max(1));
+    // Прокрутка держит фокус в кадре.
+    if let Some(i) = значения.iter().position(|(с, _)| *с == Строка::Поле(фокус)) {
+        if i < прокрутка {
+            прокрутка = i.saturating_sub(1);
+        } else if i >= прокрутка + видимых {
+            прокрутка = i + 1 - видимых;
+        }
+    }
+    прокрутка = прокрутка.min(значения.len().saturating_sub(видимых));
+    let h = HEAD_H + видимых as i32 * ROW + FOOT_H;
+    let x = (mode.size.w - W) / 2;
+    let y = (mode.size.h - h) / 2;
+
+    let mut idx = 0usize;
+    let mut slot = 0usize;
+    let mut rows: Vec<(bar::Rect, Поле)> = Vec::new();
+    let mut pool = std::mem::take(&mut state.menu_ids);
+    let фон = меню_фон(state, renderer, x, y, W, h, BG, &mut els);
+    rounded_solid(&mut pool, &mut idx, x, y, W, h, 16, фон, &mut els);
+
+    // Подложки строк: выбор, поля ввода, флажки.
+    for (k, (с, _)) in значения.iter().enumerate().skip(прокрутка).take(видимых) {
+        let ry = y + HEAD_H + (k - прокрутка) as i32 * ROW;
+        let Строка::Поле(п) = с else { continue };
+        let rect = bar::Rect { x: x + 10, y: ry, w: W - 20, h: ROW - 2 };
+        rows.push((rect, *п));
+        if *п == фокус {
+            rounded_solid(&mut pool, &mut idx, rect.x, rect.y, rect.w, rect.h, 8, SEL_BG, &mut els);
+        }
+        match п.вид() {
+            Вид::Текст { .. } => {
+                rounded_solid(&mut pool, &mut idx, x + VAL_X - 8, ry + 3, W - VAL_X - 16, ROW - 8, 6, FIELD_BG, &mut els);
+            }
+            Вид::Флаг => {
+                let вкл = значения[k].1 == crate::т!("да", "on");
+                let (tx, ty) = (x + VAL_X, ry + 7);
+                rounded_solid(&mut pool, &mut idx, tx, ty, 36, 16, 8,
+                    if вкл { ACCENT } else { [1.0, 1.0, 1.0, 0.18] }, &mut els);
+                rounded_solid(&mut pool, &mut idx, if вкл { tx + 22 } else { tx + 2 }, ty + 2, 12, 12, 6, WHITE, &mut els);
+            }
+            _ => {}
+        }
+    }
+    // Кнопки.
+    let by = y + h - FOOT_H + 34;
+    let mut bx = x + 22;
+    let mut кнопки_rects = Vec::new();
+    for к in &кнопки {
+        let подпись = к.подпись();
+        let bw = crate::text::width(подпись, 2) + 36;
+        let rect = bar::Rect { x: bx, y: by, w: bw, h: 34 };
+        let главная = *к == Поле::Подключить;
+        let цвет = if *к == фокус {
+            SEL_BG
+        } else if главная {
+            [0.20, 0.45, 0.70, 0.85]
+        } else {
+            [1.0, 1.0, 1.0, 0.10]
+        };
+        rounded_solid(&mut pool, &mut idx, rect.x, rect.y, rect.w, rect.h, 10, цвет, &mut els);
+        if *к == фокус {
+            // Обводка фокуса — тонкая рамка поверх подложки.
+            rounded_solid(&mut pool, &mut idx, rect.x, rect.y + rect.h - 3, rect.w, 3, 1, ACCENT, &mut els);
+        }
+        rows.push((rect, *к));
+        кнопки_rects.push((rect, подпись));
+        bx += bw + 12;
+    }
+    state.menu_ids = pool;
+
+    draw_text_w(state, renderer, x + 22, y + 14, &заголовок, crate::text::Weight::Semi, MENU_TEXT, WHITE, slot, &mut els);
+    slot += 1;
+    if грузится {
+        let t = crate::т!("NetworkManager…", "NetworkManager…");
+        let tw = crate::text::width(t, 1);
+        draw_text(state, renderer, x + W - 24 - tw, y + 22, t, 1, DIM, slot, &mut els);
+        slot += 1;
+    }
+
+    for (k, (с, значение)) in значения.iter().enumerate().skip(прокрутка).take(видимых) {
+        let ry = y + HEAD_H + (k - прокрутка) as i32 * ROW;
+        let ty = ry + (ROW - crate::text::height(1)) / 2 - 1;
+        match с {
+            Строка::Раздел(t) => {
+                draw_text_w(state, renderer, x + 22, ty + 2, t, crate::text::Weight::Semi, 1, HEAD, slot, &mut els);
+                slot += 1;
+            }
+            Строка::Сведение(к, з) => {
+                draw_text(state, renderer, x + 40, ty, к, 1, DIM, slot, &mut els);
+                slot += 1;
+                let з: String = з.chars().take(64).collect();
+                draw_text(state, renderer, x + VAL_X, ty, &з, 1, WHITE, slot, &mut els);
+                slot += 1;
+            }
+            Строка::Поле(п) => {
+                draw_text(state, renderer, x + 40, ty, п.подпись(), 1, if *п == фокус { WHITE } else { DIM }, slot, &mut els);
+                slot += 1;
+                match п.вид() {
+                    Вид::Текст { .. } => {
+                        let max = W - VAL_X - 40;
+                        let mut v = значение.clone();
+                        if *п == фокус {
+                            v.push('_');
+                        }
+                        // Длинное значение показываем с конца: печатают в конец.
+                        while crate::text::width(&v, 1) > max && !v.is_empty() {
+                            v.remove(0);
+                        }
+                        draw_text(state, renderer, x + VAL_X, ty, &v, 1, WHITE, slot, &mut els);
+                        slot += 1;
+                    }
+                    Вид::Выбор => {
+                        let v = format!("<  {}  >", значение);
+                        draw_text(state, renderer, x + VAL_X, ty, &v, 1, if *п == фокус { ACCENT } else { WHITE }, slot, &mut els);
+                        slot += 1;
+                    }
+                    Вид::Флаг | Вид::Кнопка => {}
+                }
+            }
+        }
+    }
+    // Полоса прокрутки, если всё не влезло.
+    if значения.len() > видимых {
+        let всего = значения.len() as f64;
+        let трек = видимых as i32 * ROW;
+        let ph = ((видимых as f64 / всего) * трек as f64).max(20.0) as i32;
+        let py = y + HEAD_H + ((прокрутка as f64 / всего) * трек as f64) as i32;
+        let mut pool = std::mem::take(&mut state.menu_ids);
+        rounded_solid(&mut pool, &mut idx, x + W - 8, py, 4, ph, 2, [1.0, 1.0, 1.0, 0.25], &mut els);
+        state.menu_ids = pool;
+    }
+
+    // Ошибка и подсказка.
+    let низ = y + h - FOOT_H + 8;
+    match &ошибка {
+        Some(e) => {
+            draw_text(state, renderer, x + 22, низ, e, 1, WARN, slot, &mut els);
+        }
+        None => {
+            draw_text(state, renderer, x + 22, низ, crate::т!(
+                "Tab / Вверх / Вниз — поле   Влево / Вправо — выбор   Space — переключить   Enter — подключить   Esc — назад",
+                "Tab / Up / Down field   Left / Right choose   Space toggle   Enter connect   Esc back",
+            ), 1, DIM, slot, &mut els);
+        }
+    }
+    slot += 1;
+    for (rect, подпись) in кнопки_rects {
+        let tw = crate::text::width(подпись, 2);
+        draw_text(state, renderer, rect.x + (rect.w - tw) / 2, rect.y + (rect.h - crate::text::height(2)) / 2,
+            подпись, 2, WHITE, slot, &mut els);
+        slot += 1;
+    }
+
+    if let Some(ф) = state.wifi.as_mut().and_then(|w| w.форма.as_mut()) {
+        ф.rows = rows;
+        ф.прокрутка = прокрутка;
+        ф.панель = bar::Rect { x, y, w: W, h };
+    }
+    els.reverse();
+    els
+}
+
+/// Меню питания: режимы (power-profiles-daemon), заряд в шапке и подсветка
+/// экрана и клавиатуры ползунками (см. питание.rs).
+fn build_power_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    const ACCENT: [f32; 4] = [0.35, 0.75, 0.95, 0.95];
+    const DIM: [f32; 4] = [0.62, 0.62, 0.70, 0.75];
+    use crate::питание::{Строка, ПРОФИЛИ};
+
+    if !state.питание_открыто() {
+        return Vec::new();
+    }
+    let Some(п) = state.питание.as_ref() else { return Vec::new() };
+    let с = п.снимок.clone();
+    let строки = п.строки();
+    let выбрана = п.выбрана;
+    let сообщение = п.сообщение().map(str::to_string);
+
+    let mut rows = Vec::new();
+    let mut что: Vec<Option<Строка>> = Vec::new();
+    let mut sel_row = 0usize;
+    let mut добавить = |rows: &mut Vec<MenuRow>, что: &mut Vec<Option<Строка>>, r: MenuRow, ст: Option<Строка>| {
+        if ст.is_some() && ст == строки.get(выбрана).copied() {
+            sel_row = rows.len();
+        }
+        rows.push(r);
+        что.push(ст);
+    };
+
+    добавить(&mut rows, &mut что, MenuRow::head(crate::т!("РЕЖИМ ПИТАНИЯ", "POWER MODE")), None);
+    for (i, профиль) in ПРОФИЛИ.iter().enumerate() {
+        let активен = с.активный == *профиль;
+        let есть = с.профили.is_empty() || с.профили.iter().any(|x| x == профиль);
+        let mut right = String::new();
+        if !с.служба {
+            right = crate::т!("нет службы", "no daemon").to_string();
+        } else if !есть {
+            right = crate::т!("недоступен", "unavailable").to_string();
+        } else if *профиль == "performance" && !с.ограничение.is_empty() {
+            right = crate::тф!("урезан: {}", "limited: {}", с.ограничение);
+        } else if активен {
+            right = crate::т!("включён", "active").to_string();
+        }
+        добавить(&mut rows, &mut что, MenuRow {
+            header: false,
+            left: format!("{}  {}", i + 1, crate::питание::имя_профиля(профиль)),
+            right,
+            dot: if активен { 2 } else { 0 },
+            strength: None,
+            ползунок: None,
+        }, Some(Строка::Профиль(i)));
+    }
+    if с.экран.is_some() || с.клавиатура.is_some() {
+        добавить(&mut rows, &mut что, MenuRow::head(crate::т!("ПОДСВЕТКА", "BACKLIGHT")), None);
+    }
+    if let Some(э) = &с.экран {
+        let доля = crate::питание::доля_на_глаз(э);
+        добавить(&mut rows, &mut что, MenuRow {
+            header: false,
+            left: crate::тф!("Экран {}%", "Screen {}%", (доля * 100.0).round() as i32),
+            right: String::new(),
+            dot: if э.пишется { 0 } else { 1 },
+            strength: None,
+            ползунок: Some(доля),
+        }, Some(Строка::Экран));
+    }
+    if let Some(к) = &с.клавиатура {
+        добавить(&mut rows, &mut что, MenuRow {
+            header: false,
+            left: crate::тф!("Клавиатура {}/{}", "Keyboard {}/{}", к.сейчас, к.макс),
+            right: String::new(),
+            dot: if к.пишется { 0 } else { 1 },
+            strength: None,
+            ползунок: Some(к.доля()),
+        }, Some(Строка::Клавиатура));
+    }
+
+    let mut title = crate::т!("ПИТАНИЕ", "POWER").to_string();
+    if let Some(заряд) = с.заряд {
+        title.push_str(&format!(" - {заряд}%"));
+        if let Some(в) = с.ватт.filter(|в| *в > 0.05) {
+            title.push_str(&format!(", {в:.1} {}", crate::т!("Вт", "W")));
+        }
+        if let Some(м) = с.минут {
+            let т = crate::питание::время(м);
+            if с.заряжается {
+                title.push_str(&crate::тф!(", до полного {}", ", full in {}", т));
+            } else {
+                title.push_str(&crate::тф!(", осталось {}", ", {} left", т));
+            }
+        } else if с.заряжается {
+            title.push_str(crate::т!(", от сети", ", on AC"));
+        }
+    }
+    let foot = match &сообщение {
+        Some(t) => (t.clone(), ACCENT),
+        None => (
+            crate::т!(
+                "1/2/3 режим   Вверх/Вниз   Влево/Вправо яркость   Esc",
+                "1/2/3 mode   Up/Down   Left/Right brightness   Esc",
+            ).to_string(),
+            DIM,
+        ),
+    };
+    let (els, hits) = build_list_menu(state, renderer, output, &title, &rows, sel_row, (&foot.0, foot.1));
+    if let Some(п) = state.питание.as_mut() {
+        п.rows = hits.into_iter().zip(что).filter_map(|(r, с)| с.map(|с| (r, с))).collect();
     }
     els
 }
@@ -7151,6 +9383,7 @@ fn build_audio_elements(
                 right,
                 dot: if dev.default { 2 } else { 0 },
                 strength: None,
+                ползунок: None,
             });
             row_pick.push(Some(pick));
         }
@@ -7186,6 +9419,627 @@ fn build_audio_elements(
 /// Каркас общий с меню вайфая и звука (build_list_menu) — намеренно: поиск
 /// ведёт себя как ещё одно приклеенное к экрану меню, и человеку не приходится
 /// заново учить, где тут выбранная строка и где подсказка.
+/// Иконки рабочего стола: картинка на холсте и подпись под ней.
+///
+/// Рисуются в координатах ХОЛСТА: точка на экране — `(x - камера) * zoom`,
+/// сторона — `размер * zoom`. То есть ярлык ведёт себя ровно как окно: едет с
+/// паном, мельчает при отдалении. Растр картинки берётся ступенями (см.
+/// `рабстол::ступень_растра`), поэтому панорама не растрирует их заново каждый
+/// кадр.
+///
+/// В обзоре столов не рисуются вовсе: обзор переставляет ОКНА по своей сетке, а
+/// иконки остались бы лежать по настоящим координатам холста — то есть поверх
+/// чужих столов, не совпадая ни с одним.
+fn build_desktop_icons(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    let mut out = Vec::new();
+    if state.рабстол.иконки.is_empty() || state.overview_active {
+        return out;
+    }
+    let Some(mode) = output.current_mode() else { return out };
+
+    /// Подсветка иконки, которую ведут рукой.
+    const ДРАГ: [f32; 4] = [0.55, 0.75, 1.0, 0.16];
+    /// Подпись: белая с лёгкой подложкой — обои под ней бывают любые.
+    const ПОДПИСЬ: [f32; 4] = [0.97, 0.97, 1.0, 0.98];
+    const ТЕНЬ_ПОДПИСИ: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
+
+    let cam_x = state.viewport.cam_x;
+    let cam_y = state.viewport.cam_y;
+    let zoom = state.viewport.zoom;
+    let ведём = state.рабстол.жест.as_ref().filter(|ж| ж.переносим).map(|ж| ж.индекс);
+
+    // Геометрию считаем заранее: дальше нужен &mut state (кэш картинок и
+    // текста), и заимствовать список иконок в это время нельзя.
+    struct Место {
+        индекс: usize,
+        ключ: String,
+        подпись: String,
+        x: i32,
+        y: i32,
+        сторона: i32,
+        подпись_h: i32,
+    }
+    // Свой стол — свои иконки (см. шапку рабстол.rs): маска тега решает, чья
+    // это иконка, а не одно лишь место на холсте.
+    let столы = state.viewport.current_tags();
+    let места: Vec<Место> = state
+        .рабстол
+        .иконки
+        .iter()
+        .enumerate()
+        .filter(|(_, и)| crate::рабстол::виден_на(и.столы, столы))
+        .filter_map(|(i, и)| {
+            let x = ((и.x as f64 - cam_x) * zoom).round() as i32;
+            let y = ((и.y as f64 - cam_y) * zoom).round() as i32;
+            let сторона = ((и.размер as f64 * zoom).round() as i32).max(1);
+            let подпись_h = ((и.подпись_h() as f64 * zoom).round() as i32).max(1);
+            // Отсечение по экрану: на бесконечном холсте иконок может быть
+            // сколько угодно, а видно всегда горсть.
+            let видно = x + сторона > 0
+                && y + сторона + подпись_h > 0
+                && x < mode.size.w
+                && y < mode.size.h;
+            видно.then(|| Место {
+                индекс: i,
+                ключ: и.ключ_картинки().to_string(),
+                подпись: и.имя.clone(),
+                x, y, сторона, подпись_h,
+            })
+        })
+        .collect();
+
+    // Подсветка ведомой иконки — сплошными прямоугольниками из своего пула.
+    {
+        let mut пул = std::mem::take(&mut state.рабстол_ids);
+        let mut idx = 0usize;
+        for м in места.iter().filter(|м| Some(м.индекс) == ведём) {
+            out.push(pooled_solid(
+                &mut пул, &mut idx,
+                (м.x - 4, м.y - 4),
+                (м.сторона + 8, м.сторона + м.подпись_h + 8),
+                ДРАГ,
+            ));
+        }
+        state.рабстол_ids = пул;
+    }
+
+    for м in &места {
+        // Подпись под картинкой, по центру. Рисуется первой в списке (то есть
+        // ПОВЕРХ картинки по порядку элементов) — но они не пересекаются.
+        if !м.подпись.is_empty() {
+            let scale = (((м.подпись_h as f64) / crate::text::height(1) as f64)
+                .round() as i32)
+                .clamp(1, 4);
+            let ширина = crate::text::width_of(&м.подпись, crate::text::Weight::Semi, scale);
+            let tx = м.x + (м.сторона - ширина) / 2;
+            let ty = м.y + м.сторона + (м.подпись_h - crate::text::height(scale)) / 2;
+            // Тень на пиксель вниз-вправо: подпись лежит на чужих обоях, и на
+            // светлой картинке белый текст без неё пропадает.
+            draw_text_w(
+                state, renderer, tx + 1, ty + 1, &м.подпись,
+                crate::text::Weight::Semi, scale, ТЕНЬ_ПОДПИСИ, м.индекс * 2 + 1, &mut out,
+            );
+            draw_text_w(
+                state, renderer, tx, ty, &м.подпись,
+                crate::text::Weight::Semi, scale, ПОДПИСЬ, м.индекс * 2, &mut out,
+            );
+        }
+
+        // Картинка. Не нашлась — рисуем первую букву имени в рамке: молчащая
+        // пустота на её месте выглядела бы как «иконка пропала».
+        match state.рабстол_картинка(&м.ключ, м.сторона).map(|(буфер, (w, h))| {
+            (буфер.clone(), *w, *h)
+        }) {
+            Some((буфер, w, h)) => {
+                // Вписываем в квадрат, сохраняя пропорции значка.
+                let k = (м.сторона as f64 / w.max(h) as f64).max(0.01);
+                let dw = ((w as f64 * k).round() as i32).max(1);
+                let dh = ((h as f64 * k).round() as i32).max(1);
+                let dx = м.x + (м.сторона - dw) / 2;
+                let dy = м.y + (м.сторона - dh) / 2;
+                // Источник — ВЕСЬ буфер, явно. При src = None smithay берёт
+                // src = Rectangle::from_size(size), то есть угол буфера размером
+                // с экранную сторону: растр округлён вверх до ступени, и на
+                // промежуточном зуме от иконки оставался левый верхний кусок.
+                let весь = Rectangle::<f64, Logical>::from_size((w as f64, h as f64).into());
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    Point::<f64, Physical>::from((dx as f64, dy as f64)),
+                    &буфер, None, Some(весь),
+                    Some(Size::<i32, Logical>::from((dw, dh))),
+                    Kind::Unspecified,
+                ) {
+                    Ok(el) => out.push(OutputRenderElements::Memory(el)),
+                    Err(e) => tracing::warn!("plx/desktop: icon image: {:?}", e),
+                }
+            }
+            None => {
+                let буква: String = м.подпись.chars().next()
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "?".into());
+                let scale = ((м.сторона as f64 / (crate::text::height(1) as f64 * 1.6))
+                    .round() as i32)
+                    .clamp(1, 8);
+                let ширина = crate::text::width_of(&буква, crate::text::Weight::Semi, scale);
+                draw_text_w(
+                    state, renderer,
+                    м.x + (м.сторона - ширина) / 2,
+                    м.y + (м.сторона - crate::text::height(scale)) / 2,
+                    &буква, crate::text::Weight::Semi, scale, ПОДПИСЬ,
+                    м.индекс * 2, &mut out,
+                );
+                let mut пул = std::mem::take(&mut state.рабстол_ids);
+                // Номер слота — по номеру иконки, а не `пул.len()`: тот рос на
+                // каждом кадре, пул пух без конца, и у заглушки каждый кадр
+                // был новый Id — то есть полное повреждение её прямоугольника.
+                let mut idx = 16 + м.индекс;
+                out.push(pooled_solid(
+                    &mut пул, &mut idx, (м.x, м.y), (м.сторона, м.сторона),
+                    [0.10, 0.11, 0.16, 0.55],
+                ));
+                state.рабстол_ids = пул;
+            }
+        }
+    }
+
+    out
+}
+
+/// Номера заплат размытия под встроенными виджетами — далеко за номерами
+/// плашек интерфейса, чтобы не делить с ними Id.
+const БЛЮР_ВИДЖЕТ: usize = 1024;
+
+/// Встроенные виджеты рабочего стола (см. виджеты_стола.rs): плашка на матовом
+/// стекле и содержимое по роду.
+///
+/// Как иконки — в координатах ХОЛСТА: точка на экране `(x − камера)·зум`, всё
+/// содержимое множится на `зум · масштаб`. Текст растрируется кратными 13 px
+/// (`text::GLYPH_H`), поэтому кегль берётся ближайшим целым, а строка, которая
+/// при нём не влезает, ужимается на ступень.
+///
+/// Открытые свойства виджета показывают ЧЕРНОВИК прямо на холсте: размер, род
+/// и текст заметки видно, пока их набирают, а не после Enter.
+// Счётчик строк в `текст!` последний раз ничего не читает — это номер слота
+// кэша на СЛЕДУЮЩУЮ строку, которой у рода может и не быть.
+#[allow(unused_assignments)]
+fn build_desktop_widgets(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    use crate::text::Weight;
+    use crate::виджеты_стола::Род;
+
+    let mut out = Vec::new();
+    if state.overview_active {
+        return out;
+    }
+    let Some(mode) = output.current_mode() else { return out };
+
+    // Список к отрисовке: сохранённые плюс черновик из свойств.
+    let mut список = state.рабстол.виджеты.список.clone();
+    if let Some(ред) = state.рабстол.виджеты.редактор.as_ref() {
+        match ред.индекс {
+            Some(i) if i < список.len() => список[i] = ред.черновик.clone(),
+            _ => список.push(ред.черновик.clone()),
+        }
+    }
+    if список.is_empty() {
+        return out;
+    }
+
+    const БЕЛЫЙ: [f32; 4] = [0.96, 0.96, 0.98, 0.98];
+    const ТУСКЛЫЙ: [f32; 4] = [0.78, 0.79, 0.85, 0.78];
+    const ДОРОЖКА: [f32; 4] = [1.0, 1.0, 1.0, 0.13];
+    // Акцент — оттенок обоев на полной яркости с каплей белого: сырой акцент
+    // палитры бывает темнее самих обоев и на стекле пропадает.
+    let акцент: [f32; 4] = match state.палитра_обоев.as_ref() {
+        Some(п) => {
+            let м = п.акцент[0].max(п.акцент[1]).max(п.акцент[2]).max(1e-3);
+            let к = |c: f32| (c / м) * 0.8 + 0.2;
+            [к(п.акцент[0]), к(п.акцент[1]), к(п.акцент[2]), 0.95]
+        }
+        None => [0.35, 0.75, 0.95, 0.95],
+    };
+    let стекло_есть = state.blur_tex.is_some();
+    let подложка: [f32; 4] = if стекло_есть { [0.02, 0.02, 0.05, 0.34] } else { [0.03, 0.03, 0.06, 0.66] };
+
+    let (cam_x, cam_y, zoom) = (state.viewport.cam_x, state.viewport.cam_y, state.viewport.zoom);
+    let столы_текущие = state.viewport.current_tags();
+    let ведём = state.рабстол.жест.as_ref()
+        .filter(|ж| ж.виджет && ж.переносим)
+        .map(|ж| ж.индекс);
+    let замер = state.рабстол.виджеты.замер;
+    let mut пул = std::mem::take(&mut state.виджеты_ids);
+    let mut idx = 0usize;
+
+    // Кегль под высоту строки в базовых пикселях плашки.
+    // Округление со сдвигом вниз: кегли идут шагом 13 px, и честное округление
+    // уже на масштабе 130% делало подпись вдвое крупнее (19.5 px → 26).
+    let кегль = |высота: f64, k: f64| ((высота * k) / crate::text::GLYPH_H as f64 + 0.2).floor().max(1.0) as i32;
+    // Кегль, при котором строка влезает в ширину (не меньше 1).
+    let влезающий = |текст: &str, w: Weight, scale: i32, ширина: i32| {
+        let mut s = scale;
+        while s > 1 && crate::text::width_of(текст, w, s) > ширина {
+            s -= 1;
+        }
+        s
+    };
+
+    // Сверху вниз: последний в списке лежит выше, а список кадра идёт от
+    // переднего плана к заднему.
+    for (i, в) in список.iter().enumerate().rev() {
+        // Плашка чужого стола не рисуется — как и иконка (см. шапку рабстол.rs).
+        if !crate::рабстол::виден_на(в.столы, столы_текущие) {
+            continue;
+        }
+        let р = в.рамка();
+        let sx = ((р.loc.x as f64 - cam_x) * zoom).round() as i32;
+        let sy = ((р.loc.y as f64 - cam_y) * zoom).round() as i32;
+        let sw = ((р.size.w as f64 * zoom).round() as i32).max(1);
+        let sh = ((р.size.h as f64 * zoom).round() as i32).max(1);
+        if sx + sw <= 0 || sy + sh <= 0 || sx >= mode.size.w || sy >= mode.size.h {
+            continue;
+        }
+        let k = zoom * в.масштаб as f64 / 100.0;
+        let px = |v: f64| (v * k).round() as i32;
+        let радиус = px(18.0).clamp(0, sw.min(sh) / 2);
+        let pad = px(18.0);
+        let слот = 4000 + i * 100;
+        let mut строка_н = 0usize;
+        // Мельче этого текст не читается вовсе — рисуем одну плашку.
+        let содержимое = sw >= 60 && sh >= 30;
+
+        macro_rules! текст {
+            ($x:expr, $y:expr, $t:expr, $w:expr, $s:expr, $c:expr) => {{
+                let n = строка_н;
+                строка_н += 1;
+                draw_text_w(state, renderer, $x, $y, $t, $w, $s, $c, слот + n.min(99), &mut out)
+            }};
+        }
+
+        if содержимое {
+            match в.род {
+                Род::Часы => {
+                    let время = crate::bar::clock_text();
+                    let дата = crate::виджеты_стола::длинная_дата();
+                    let шир = sw - 2 * pad;
+                    let s1 = влезающий(&время, Weight::Semi, кегль(62.0, k), шир);
+                    let s2 = влезающий(&дата, Weight::Regular, кегль(15.0, k), шир);
+                    let (h1, h2, зазор) = (crate::text::height(s1), crate::text::height(s2), px(8.0));
+                    let верх = sy + (sh - h1 - зазор - h2) / 2;
+                    let w1 = crate::text::width_of(&время, Weight::Semi, s1);
+                    текст!(sx + (sw - w1) / 2, верх, &время, Weight::Semi, s1, БЕЛЫЙ);
+                    let w2 = crate::text::width_of(&дата, Weight::Regular, s2);
+                    текст!(sx + (sw - w2) / 2, верх + h1 + зазор, &дата, Weight::Regular, s2, ТУСКЛЫЙ);
+                }
+                Род::Календарь => {
+                    if let Some(tm) = crate::bar::local_time() {
+                        let год = tm.tm_year + 1900;
+                        let (сетка, сегодня) = crate::виджеты_стола::сетка_месяца(
+                            год, tm.tm_mon, tm.tm_mday, tm.tm_wday,
+                        );
+                        let заголовок = format!("{} {}", crate::виджеты_стола::имя_месяца(tm.tm_mon), год);
+                        let sз = влезающий(&заголовок, Weight::Semi, кегль(19.0, k), sw - 2 * pad);
+                        текст!(sx + pad, sy + pad, &заголовок, Weight::Semi, sз, БЕЛЫЙ);
+                        let дни: [&str; 7] = т!(
+                            ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"],
+                            ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+                        );
+                        let cw = ((sw - 2 * pad) / 7).max(1);
+                        let sд = кегль(14.0, k);
+                        let y1 = sy + pad + crate::text::height(sз) + px(12.0);
+                        for (j, д) in дни.iter().enumerate() {
+                            let w = crate::text::width_of(д, Weight::Regular, sд);
+                            let цвет = if j >= 5 { акцент } else { ТУСКЛЫЙ };
+                            текст!(sx + pad + j as i32 * cw + (cw - w) / 2, y1, д, Weight::Regular, sд, цвет);
+                        }
+                        // Строк — сколько занял месяц (4–6), а не всегда шесть:
+                        // пустая последняя неделя выглядела бы дырой в плашке.
+                        let недель = (0..6).filter(|r| сетка[r * 7..r * 7 + 7].iter().any(|д| *д > 0)).count() as i32;
+                        let y2 = y1 + crate::text::height(sд) + px(8.0);
+                        let rh = ((sy + sh - pad - y2) / недель.max(1)).max(1);
+                        for (n, д) in сетка.iter().enumerate() {
+                            if *д == 0 {
+                                continue;
+                            }
+                            let (col, row) = ((n % 7) as i32, (n / 7) as i32);
+                            let t = д.to_string();
+                            let w = crate::text::width_of(&t, Weight::Regular, sд);
+                            let th = crate::text::height(sд);
+                            let cx = sx + pad + col * cw;
+                            let cy = y2 + row * rh;
+                            let цвет = if n == сегодня { [0.04, 0.04, 0.07, 0.98] } else { БЕЛЫЙ };
+                            текст!(cx + (cw - w) / 2, cy + (rh - th) / 2, &t, Weight::Regular, sд, цвет);
+                            if n == сегодня {
+                                let d = (cw.min(rh) - px(2.0)).max(4);
+                                rounded_solid(
+                                    &mut пул, &mut idx,
+                                    cx + (cw - d) / 2, cy + (rh - d) / 2, d, d, d / 2, акцент, &mut out,
+                                );
+                            }
+                        }
+                    }
+                }
+                Род::Система => {
+                    let s = кегль(15.0, k);
+                    let th = crate::text::height(s);
+                    let шир = sw - 2 * pad;
+                    let прочерк = "—".to_string();
+                    let строки: [(&str, String, Option<f32>); 4] = match замер {
+                        Some(з) => [
+                            (т!("Процессор", "CPU"), format!("{}%", (з.цп * 100.0).round() as i32), Some(з.цп)),
+                            (
+                                т!("Память", "Memory"),
+                                тф!("{} / {} ГиБ", "{} / {} GiB",
+                                    crate::виджеты_стола::гиб(з.память_занято),
+                                    crate::виджеты_стола::гиб(з.память_всего)),
+                                Some(if з.память_всего > 0 {
+                                    з.память_занято as f32 / з.память_всего as f32
+                                } else { 0.0 }),
+                            ),
+                            (т!("Нагрузка", "Load"), format!("{:.2}", з.нагрузка), None),
+                            (т!("Работает", "Uptime"), crate::виджеты_стола::аптайм_текст(з.аптайм), None),
+                        ],
+                        None => [
+                            (т!("Процессор", "CPU"), прочерк.clone(), Some(0.0)),
+                            (т!("Память", "Memory"), прочерк.clone(), Some(0.0)),
+                            (т!("Нагрузка", "Load"), прочерк.clone(), None),
+                            (т!("Работает", "Uptime"), прочерк, None),
+                        ],
+                    };
+                    let полоса = px(6.0).max(2);
+                    let mut y = sy + pad;
+                    for (имя, значение, доля) in строки.iter() {
+                        if y + th > sy + sh - pad / 2 {
+                            break;
+                        }
+                        текст!(sx + pad, y, имя, Weight::Regular, s, ТУСКЛЫЙ);
+                        let w = crate::text::width_of(значение, Weight::Semi, s);
+                        текст!(sx + sw - pad - w, y, значение, Weight::Semi, s, БЕЛЫЙ);
+                        y += th + px(6.0);
+                        if let Some(доля) = доля {
+                            let заполнено = ((шир as f32 * доля.clamp(0.0, 1.0)).round() as i32).max(полоса);
+                            rounded_solid(&mut пул, &mut idx, sx + pad, y, заполнено, полоса, полоса / 2, акцент, &mut out);
+                            rounded_solid(&mut пул, &mut idx, sx + pad, y, шир, полоса, полоса / 2, ДОРОЖКА, &mut out);
+                            y += полоса + px(12.0);
+                        } else {
+                            y += px(4.0);
+                        }
+                    }
+                }
+                Род::Заметка => {
+                    let s = кегль(15.0, k);
+                    let th = crate::text::height(s);
+                    let шир = sw - 2 * pad;
+                    if в.текст.trim().is_empty() {
+                        let t = т!("ПКМ — написать заметку", "Right click to write a note");
+                        let s0 = влезающий(t, Weight::Regular, s, шир);
+                        текст!(sx + pad, sy + pad, t, Weight::Regular, s0, ТУСКЛЫЙ);
+                    } else {
+                        let mut y = sy + pad;
+                        for строка in crate::виджеты_стола::перенос(&в.текст, шир, s) {
+                            if y + th > sy + sh - pad / 2 || строка_н >= 99 {
+                                break;
+                            }
+                            текст!(sx + pad, y, &строка, Weight::Regular, s, БЕЛЫЙ);
+                            y += th + px(4.0);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Подложка и стекло — ПОЗАДИ содержимого, значит в списке после него.
+        let тон = if Some(i) == ведём {
+            [подложка[0] + 0.10, подложка[1] + 0.14, подложка[2] + 0.20, подложка[3] + 0.10]
+        } else {
+            подложка
+        };
+        rounded_solid(&mut пул, &mut idx, sx, sy, sw, sh, радиус, тон, &mut out);
+        if let Some(el) = стекло(state, renderer, sx, sy, sw, sh, радиус, БЛЮР_ВИДЖЕТ + i) {
+            out.push(el);
+        }
+    }
+
+    state.виджеты_ids = пул;
+    out
+}
+
+/// Свойства иконки и меню «новая иконка» — приклеены к ЭКРАНУ, как все меню
+/// parallax, и собираются тем же каркасом (`build_list_menu`).
+///
+/// Окошко в референсе (driftwm-подобные оболочки рисуют его кнопками «Set» и
+/// слайдером) здесь сделано списком строк: у parallax уже есть один способ
+/// разговаривать с человеком меню — с клавиатурой, стрелками и Escape, — и
+/// второй, мышиный, пришлось бы объяснять отдельно. Мышь при этом работает:
+/// клик по строке выбирает поле, клик мимо — сохраняет и закрывает.
+fn build_desktop_menu_elements(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OutputRenderElements> {
+    const ACCENT: [f32; 4] = [0.35, 0.75, 0.95, 0.95];
+    const DIM: [f32; 4] = [0.62, 0.62, 0.70, 0.75];
+
+    if let Some(меню) = state.рабстол.меню.as_ref() {
+        use crate::рабстол::Уровень;
+        use crate::виджеты_стола::Род;
+        let (уровень, выбор) = (меню.уровень, меню.выбор);
+        let строка = |i: usize, left: String, right: &str| MenuRow {
+            header: false,
+            left,
+            right: right.to_string(),
+            dot: if i == выбор { 2 } else { 0 },
+            strength: None,
+            ползунок: None,
+        };
+        let (rows, title, foot) = match уровень {
+            Уровень::Корень => (
+                vec![
+                    строка(0, т!("Иконка", "Icon").to_string(), т!("ярлык запуска", "launcher")),
+                    строка(1, т!("Виджет", "Widget").to_string(), т!("часы, календарь...  >", "clock, calendar...  >")),
+                ],
+                т!("ПОСТАВИТЬ ЗДЕСЬ", "PLACE HERE"),
+                т!("Enter выбрать  1-2  Esc отмена", "Enter choose  1-2  Esc cancel"),
+            ),
+            Уровень::Виджеты => (
+                Род::ВСЕ.iter().enumerate()
+                    .map(|(i, р)| строка(i, р.имя().to_string(), р.описание()))
+                    .collect(),
+                т!("ВИДЖЕТ", "WIDGET"),
+                т!("Enter поставить  1-4  Esc назад", "Enter place  1-4  Esc back"),
+            ),
+        };
+        let (els, hits) = build_list_menu(
+            state, renderer, output, title, &rows, выбор, (foot, ACCENT),
+        );
+        if let Some(меню) = state.рабстол.меню.as_mut() {
+            меню.строки = hits;
+        }
+        return els;
+    }
+
+    if let Some(ред) = state.рабстол.виджеты.редактор.as_ref() {
+        use crate::виджеты_стола::Поле as ПолеВ;
+        let ч = ред.черновик.clone();
+        let поле = ред.поле;
+        let новый = ред.индекс.is_none();
+        let поля = ПолеВ::для(ч.род);
+        let rows: Vec<MenuRow> = поля.iter().map(|п| {
+            let (left, right) = match п {
+                ПолеВ::Род => (т!("Вид", "Kind"), format!("< {} >", ч.род.имя())),
+                ПолеВ::Масштаб => (т!("Размер", "Size"), format!("{}%", ч.масштаб)),
+                ПолеВ::Столы => (
+                    т!("Столы", "Desktops"),
+                    format!("< {} >", crate::рабстол::столы_текстом(ч.столы)),
+                ),
+                ПолеВ::Текст => (т!("Текст", "Text"), {
+                    // Правый столбец узкий: показываем ХВОСТ текста — туда и
+                    // дописывают, а начало видно на самой плашке.
+                    let всего = ч.текст.chars().count();
+                    let хвост: String = ч.текст.chars().skip(всего.saturating_sub(28)).collect();
+                    if всего > 28 { format!("...{хвост}") } else { хвост }
+                }),
+            };
+            let right = if *п == поле && !matches!(п, ПолеВ::Род | ПолеВ::Столы) {
+                format!("{right}_")
+            } else {
+                right
+            };
+            MenuRow {
+                header: false,
+                left: left.to_string(),
+                right,
+                dot: if *п == поле { 2 } else { 0 },
+                strength: None,
+                ползунок: None,
+            }
+        }).collect();
+        let сел = поля.iter().position(|п| *п == поле).unwrap_or(0);
+        let title = if новый {
+            тф!("НОВЫЙ ВИДЖЕТ: {}", "NEW WIDGET: {}", ч.род.имя().to_uppercase())
+        } else {
+            тф!("ВИДЖЕТ: {}", "WIDGET: {}", ч.род.имя().to_uppercase())
+        };
+        let foot = if новый {
+            т!("Enter поставить  Tab поле  стрелки вид/размер  Esc отмена",
+               "Enter place  Tab field  arrows kind/size  Esc cancel")
+        } else {
+            т!("Enter сохранить  Tab поле  стрелки вид/размер  Delete убрать  Esc отмена",
+               "Enter save  Tab field  arrows kind/size  Delete remove  Esc cancel")
+        };
+        let (els, hits) = build_list_menu(state, renderer, output, &title, &rows, сел, (foot, DIM));
+        if let Some(ред) = state.рабстол.виджеты.редактор.as_mut() {
+            ред.строки = hits;
+        }
+        return els;
+    }
+
+    let Some(ред) = state.рабстол.редактор.as_ref() else { return Vec::new() };
+    let ч = ред.черновик.clone();
+    let поле = ред.поле;
+    let новая = ред.индекс.is_none();
+
+    // Курсор в конце правящейся строки — единственный признак того, какое поле
+    // сейчас принимает буквы (тот же приём, что в поиске окон).
+    let знач = |своё: crate::рабстол::Поле, текст: &str| -> String {
+        if поле == своё { format!("{текст}_") } else { текст.to_string() }
+    };
+    let rows = vec![
+        MenuRow {
+            header: false,
+            left: т!("Имя", "Name").to_string(),
+            right: знач(crate::рабстол::Поле::Имя, &ч.имя),
+            dot: if поле == crate::рабстол::Поле::Имя { 2 } else { 0 },
+            strength: None,
+            ползунок: None,
+        },
+        MenuRow {
+            header: false,
+            left: т!("Картинка", "Image").to_string(),
+            right: знач(crate::рабстол::Поле::Картинка, &ч.картинка),
+            dot: if поле == crate::рабстол::Поле::Картинка { 2 } else { 0 },
+            strength: None,
+            ползунок: None,
+        },
+        MenuRow {
+            header: false,
+            left: т!("Команда", "Command").to_string(),
+            right: знач(crate::рабстол::Поле::Команда, &ч.команда),
+            dot: if поле == crate::рабстол::Поле::Команда { 2 } else { 0 },
+            strength: None,
+            ползунок: None,
+        },
+        MenuRow {
+            header: false,
+            left: т!("Размер", "Size").to_string(),
+            right: знач(crate::рабстол::Поле::Размер, &format!("{}", ч.размер)),
+            dot: if поле == crate::рабстол::Поле::Размер { 2 } else { 0 },
+            strength: None,
+            ползунок: None,
+        },
+        MenuRow {
+            header: false,
+            left: т!("Столы", "Desktops").to_string(),
+            // Номер стола правится стрелками и цифрой, по буквам его не
+            // набирают — поэтому стрелки в строке, а не курсор.
+            right: format!("< {} >", crate::рабстол::столы_текстом(ч.столы)),
+            dot: if поле == crate::рабстол::Поле::Столы { 2 } else { 0 },
+            strength: None,
+            ползунок: None,
+        },
+    ];
+    let title = if новая {
+        т!("НОВАЯ ИКОНКА", "NEW ICON").to_string()
+    } else {
+        тф!("ИКОНКА: {}", "ICON: {}", ч.имя)
+    };
+    let foot = if новая {
+        т!(
+            "Enter создать  Tab поле  стрелки размер/стол  Esc отмена",
+            "Enter create  Tab field  arrows size/desktop  Esc cancel"
+        )
+    } else {
+        т!(
+            "Enter сохранить  Tab поле  стрелки размер/стол  Delete удалить  Esc отмена",
+            "Enter save  Tab field  arrows size/desktop  Delete remove  Esc cancel"
+        )
+    };
+    let сел = поле.номер();
+    let (els, hits) = build_list_menu(
+        state, renderer, output, &title, &rows, сел, (foot, DIM),
+    );
+    if let Some(ред) = state.рабстол.редактор.as_mut() {
+        ред.строки = hits;
+    }
+    els
+}
+
 fn build_search_elements(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
@@ -7226,6 +10080,7 @@ fn build_search_elements(
                 // Точка слева: окно на текущем столе — акцентом, чужое — тускло.
                 dot: if h.tags & current != 0 { 2 } else { 1 },
                 strength: None,
+                ползунок: None,
             }
         })
         .collect();

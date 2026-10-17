@@ -77,6 +77,98 @@ const SNAP_DISTANCE: i32 = 20;
 /// краю съело бы весь бросок (см. finish()).
 const SNAP_MAX_SPEED: f64 = 600.0;
 
+/// Скорость отпускания (px/сек), ниже которой окно просто положили: инерции
+/// нет. Порог опущен со 120: на 120 px/сек рука уже отчётливо ведёт окно, и
+/// обрубать доезд на этой границе значит терять самые частые, короткие подбросы.
+const MIN_FLING: f64 = 60.0;
+
+/// Прилипание плавающего окна к краю экрана в тайлинге (как в KDE/GNOME):
+/// подсказка, куда окно встанет на отпускании. Рисует её
+/// `udev::build_edge_snap_hint`, которая и доводит `текущее` до `цель`.
+#[derive(Clone, Debug)]
+pub struct КрайПревью {
+    pub window: Window,
+    /// Куда окно встанет (холст).
+    pub цель: Rectangle<i32, Logical>,
+    /// Что нарисовано сейчас: плёнка вырастает из самого окна и перетекает
+    /// между зонами, а не прыгает.
+    pub текущее: Rectangle<f64, Logical>,
+    pub шаг: Instant,
+}
+
+/// Полоса у края экрана (экранные px), в которой окно прилипает. Курсор
+/// упирается в край монитора, так что широкой она быть не обязана.
+const КРАЙ_ЗОНА: f64 = 10.0;
+
+/// Доля стороны у угла, где край прилипает четвертью экрана, а не половиной.
+const КРАЙ_УГОЛ: f64 = 0.2;
+
+/// Прямоугольник холста, куда прилипнет окно, если отпустить его с курсором
+/// в `cursor`: левый/правый край — половина экрана, верх — весь экран,
+/// углы — четверти. Только для ПЛАВАЮЩЕГО окна в тайловой раскладке: во
+/// Float холст бесконечен и «край экрана» там ничего не значит.
+fn зона_края(data: &Parallax, window: &Window, cursor: Point<f64, Logical>) -> Option<Rectangle<i32, Logical>> {
+    if data.tile_config.layout == Layout::Float || data.overview_active {
+        return None;
+    }
+    let плавает = data.tagged_windows.iter().any(|tw| &tw.window == window && tw.floating);
+    if !плавает || data.fullscreen_requested(window) {
+        return None;
+    }
+    let zoom = data.viewport.zoom.max(0.01);
+    let x = (cursor.x - data.viewport.cam_x) * zoom;
+    let y = (cursor.y - data.viewport.cam_y) * zoom;
+    let экран = data.screen_size();
+    let (ш, в) = (экран.w as f64, экран.h as f64);
+    let лево = x <= КРАЙ_ЗОНА;
+    let право = x >= ш - 1.0 - КРАЙ_ЗОНА;
+    let верх = y <= КРАЙ_ЗОНА;
+    let низ = y >= в - 1.0 - КРАЙ_ЗОНА;
+    let у_верха = y < в * КРАЙ_УГОЛ;
+    let у_низа = y > в * (1.0 - КРАЙ_УГОЛ);
+    let у_лева = x < ш * КРАЙ_УГОЛ;
+    let у_права = x > ш * (1.0 - КРАЙ_УГОЛ);
+    // (доля x, доля y, доля ширины, доля высоты) рабочей области.
+    let доли: (f64, f64, f64, f64) = if (лево && у_верха) || (верх && у_лева) {
+        (0.0, 0.0, 0.5, 0.5)
+    } else if (право && у_верха) || (верх && у_права) {
+        (0.5, 0.0, 0.5, 0.5)
+    } else if (лево && у_низа) || (низ && у_лева) {
+        (0.0, 0.5, 0.5, 0.5)
+    } else if (право && у_низа) || (низ && у_права) {
+        (0.5, 0.5, 0.5, 0.5)
+    } else if лево {
+        (0.0, 0.0, 0.5, 1.0)
+    } else if право {
+        (0.5, 0.0, 0.5, 1.0)
+    } else if верх {
+        (0.0, 0.0, 1.0, 1.0)
+    } else {
+        return None;
+    };
+    // Рабочая область — экран под камерой с тем же внешним зазором, что у
+    // тайлинга (`tile_work_area`).
+    let внешний = crate::tiling::GAP_OUTER() as f64;
+    let внутр = crate::tiling::GAP_INNER() as f64 / 2.0;
+    let (ox, oy) = (data.viewport.cam_x + внешний / zoom, data.viewport.cam_y + внешний / zoom);
+    let (ow, oh) = ((ш - 2.0 * внешний) / zoom, (в - 2.0 * внешний) / zoom);
+    let (fx, fy, fw, fh) = доли;
+    let mut x0 = ox + ow * fx;
+    let mut y0 = oy + oh * fy;
+    let mut x1 = x0 + ow * fw;
+    let mut y1 = y0 + oh * fh;
+    // Как у слотов тайлинга: полузазор с КАЖДОЙ стороны, тогда половина
+    // экрана ложится ровно туда, где стояло бы тайловое окно.
+    x0 += внутр;
+    x1 -= внутр;
+    y0 += внутр;
+    y1 -= внутр;
+    Some(Rectangle::new(
+        Point::from((x0.round() as i32, y0.round() as i32)),
+        Size::from(((x1 - x0).round().max(1.0) as i32, (y1 - y0).round().max(1.0) as i32)),
+    ))
+}
+
 pub struct MoveSurfaceGrab {
     pub start_data: PointerGrabStartData<Parallax>,
     pub window: Window,
@@ -452,8 +544,59 @@ impl MoveSurfaceGrab {
             // 1:1 (никакого залипания в процессе) — коллизия (2.1, Super+S)
             // толкает соседей, магнитирование применяется один раз при
             // отпускании кнопки (см. button()), не во время перетаскивания.
+            // Окно, прилипшее к краю, оттаскивают — возвращаем ему прежний
+            // размер, а курсор оставляем на той же доле ширины окна, чтобы
+            // окно не уехало из-под руки (как в KDE/GNOME).
+            {
+                let сдвиг = event.location - self.start_data.location;
+                let ушли = сдвиг.x.abs() > 8.0 || сдвиг.y.abs() > 8.0;
+                if ушли {
+                    if let Some(i) = data.до_прилипания.iter().position(|(w, _)| w == &self.window) {
+                        let (_, прежний) = data.до_прилипания.remove(i);
+                        if let Some(g) = data.space.element_geometry(&self.window) {
+                            let доля = ((self.start_data.location.x - g.loc.x as f64)
+                                / g.size.w.max(1) as f64).clamp(0.0, 1.0);
+                            let x = self.start_data.location.x - доля * прежний.w as f64;
+                            let dy = (self.start_data.location.y - g.loc.y as f64)
+                                .min(прежний.h as f64 / 2.0);
+                            self.initial_window_location =
+                                (x.round() as i32, (self.start_data.location.y - dy).round() as i32).into();
+                        }
+                        crate::xwin::set_size(&self.window, Some(прежний), crate::xwin::Tiled::Unset);
+                        crate::xwin::configure(&self.window);
+                        if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| tw.window == self.window) {
+                            tw.float_size = Some(прежний);
+                        }
+                    }
+                }
+            }
             let delta = event.location - self.start_data.location;
             let mut free_loc = (self.initial_window_location.to_f64() + delta).to_i32_round();
+
+            // Подсказка прилипания к краю (только тайловые раскладки).
+            match зона_края(data, &self.window, event.location) {
+                Some(цель) => {
+                    let та_же = data.край_превью.as_ref().is_some_and(|п| п.цель == цель);
+                    if !та_же {
+                        let текущее = data.край_превью.as_ref()
+                            .map(|п| п.текущее)
+                            .or_else(|| data.space.element_geometry(&self.window).map(|g| g.to_f64()))
+                            .unwrap_or_else(|| цель.to_f64());
+                        data.край_превью = Some(КрайПревью {
+                            window: self.window.clone(),
+                            цель,
+                            текущее,
+                            шаг: Instant::now(),
+                        });
+                        data.request_redraw();
+                    }
+                }
+                None => {
+                    if data.край_превью.take().is_some() {
+                        data.request_redraw();
+                    }
+                }
+            }
 
             // ── Обзор столов: окно ходит ТОЛЬКО внутри рабочих столов ──
             // Целевой стол — БЛИЖАЙШИЙ к курсору, поэтому окно можно перетащить
@@ -598,6 +741,17 @@ impl MoveSurfaceGrab {
     /// инерция. Раньше это было телом `PointerGrab::button`, и тачпадному
     /// жесту не доставалось ничего из перечисленного.
     pub fn finish(&mut self, data: &mut Parallax) {
+        self.посадить(data);
+        // Плавающее окно поверх тайлинга за экран не уезжает: ни положенное
+        // за край, ни брошенное. Проверяем в самом конце, одной точкой на
+        // все ветки посадки, — бросок к этому моменту уже знает, где встанет.
+        let ехали: Vec<Window> = std::iter::once(self.window.clone())
+            .chain(self.group_initial.iter().map(|(w, _)| w.clone()))
+            .collect();
+        data.удержать_на_экране(&ехали);
+    }
+
+    fn посадить(&mut self, data: &mut Parallax) {
         // Драг кончился — окно снова принадлежит анимациям (в пути мыши это
         // делает PointerGrab::unset, но жест туда не заходит).
         data.dragged_window = None;
@@ -652,6 +806,26 @@ impl MoveSurfaceGrab {
             return;
         }
 
+        // Прилипание к краю экрана: окно встаёт в подсвеченную зону той же
+        // пружиной, что везёт окна раскладки.
+        if let Some(п) = data.край_превью.take().filter(|п| п.window == self.window) {
+            if !data.до_прилипания.iter().any(|(w, _)| w == &self.window) {
+                if let Some(g) = data.space.element_geometry(&self.window) {
+                    data.до_прилипания.push((self.window.clone(), g.size));
+                }
+            }
+            data.resize_window_animated(&self.window, п.цель, true);
+            if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| tw.window == self.window) {
+                tw.float_position = п.цель.loc;
+                tw.float_size = Some(п.цель.size);
+                tw.float_position_set = true;
+            }
+            tracing::debug!("plx: window snapped to the screen edge {:?}", п.цель);
+            data.request_plane_reset();
+            data.request_redraw();
+            return;
+        }
+
         // Окно созвездия увели руками — гроздь «растащена», и следующий
             // Super+D по ней должен собрать её заново, а не разбирать (см.
             // TaggedWindow::constellation_torn). Тащили всё созвездие целиком
@@ -670,6 +844,18 @@ impl MoveSurfaceGrab {
             data.mark_constellation_torn(&self.window);
         }
 
+        let бросок = self.velocity.launch_velocity();
+        let скорость_броска = (бросок.x * бросок.x + бросок.y * бросок.y).sqrt();
+
+        // Склейка (Super+M): и положенное, и брошенное окно садится впритык к
+        // тому, во что упёрлось, — магнит и свободная инерция ниже не нужны.
+        if data.is_glue_enabled {
+            self.glue_land(data, бросок, скорость_броска);
+            data.request_plane_reset();
+            data.request_redraw();
+            return;
+        }
+
         // Магнитирование (2.1): один раз при отпускании подравниваем край
         // к ближайшему соседу в пределах SNAP_DISTANCE. Со своим тумблером
         // (Super+M) — раньше висело на флаге коллизии, и включить расталкивание
@@ -681,8 +867,6 @@ impl MoveSurfaceGrab {
         // побеждал всегда, и бросок мимо окна, случайно прошедший в 20 px от
         // чужого края, глох на месте: летел-летел и прилип. На холсте, где
         // окон много, под такой край попадаешь постоянно.
-        let бросок = self.velocity.launch_velocity();
-        let скорость_броска = (бросок.x * бросок.x + бросок.y * бросок.y).sqrt();
         if data.is_magnetism_enabled && скорость_броска < SNAP_MAX_SPEED {
             if let Some(loc) = data.space.element_geometry(&self.window).map(|g| g.loc) {
                 if let Some(snapped) = find_snap_target(data, &self.window, loc, &riding) {
@@ -707,10 +891,6 @@ impl MoveSurfaceGrab {
         if !snapped_applied {
             let v = бросок; // px/сек в canvas
             let speed = скорость_броска;
-            // Ниже — окно просто положили. Порог опущен со 120: на 120 px/сек
-            // рука уже отчётливо ведёт окно, и обрубать доезд на этой границе
-            // значит терять самые частые, короткие подбросы.
-            const MIN_FLING: f64 = 60.0;
             if speed > MIN_FLING {
                 // Пружина стартует ровно с той скоростью, с какой курсор
                 // отпустил окно, и тормозит экспоненциально. Раньше тут был
@@ -753,6 +933,92 @@ impl MoveSurfaceGrab {
     }
 }
 
+impl MoveSurfaceGrab {
+    /// Посадка при склейке. Путь броска (|v|/ω, как у свободной инерции)
+    /// считается заранее целиком: если по дороге окно — или любое окно
+    /// едущей с ним группы — упрётся в соседа, группа тормозит ровно до
+    /// касания и подравнивается вдоль стыка (см. cluster::first_contact).
+    /// Не упёрлось — долетает куда летело, а там магнит, как у медленно
+    /// положенного окна: край в пределах SNAP_DISTANCE притягивается.
+    ///
+    /// До этого прилипало только положенное окно, и только при включённом
+    /// магните (Super+G): брошенное пролетало сквозь край, в который в него
+    /// целились, и кластер не складывался.
+    fn glue_land(&self, data: &mut Parallax, v: Point<f64, Logical>, speed: f64) {
+        use crate::cluster::{Rect, GLUE_GAP};
+
+        let movers: Vec<(Window, Rectangle<i32, Logical>)> = std::iter::once(self.window.clone())
+            .chain(self.group_initial.iter().map(|(w, _)| w.clone()))
+            .filter_map(|w| data.space.element_geometry(&w).map(|g| (w, g)))
+            .collect();
+        let Some((первое, primary)) = movers.first().cloned() else { return };
+        if первое != self.window {
+            return;
+        }
+        let едут: Vec<Window> = movers.iter().map(|(w, _)| w.clone()).collect();
+
+        // Препятствия — окна текущего стола в покое (цель их пружины, если
+        // летят): ударяемся туда, где сосед остановится.
+        let tags = data.viewport.current_tags();
+        let obstacles: Vec<Rectangle<i32, Logical>> = data.tagged_windows.iter()
+            .filter(|tw| tw.tags & tags != 0 && !tw.folded)
+            .map(|tw| tw.window.clone())
+            .filter(|w| !едут.iter().any(|e| crate::dwindle::same_window(e, w)))
+            .filter(|w| !data.виджет_ли(w) && !data.is_fullscreen(w))
+            .filter_map(|w| resting_rect(data, &w))
+            .collect();
+
+        let летит = speed > MIN_FLING;
+        let (px, py) = if летит {
+            let omega = crate::anim::glide_omega(speed);
+            (v.x / omega, v.y / omega)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let m_rects: Vec<Rect> = movers.iter().map(|(_, g)| Rect::from_geo(*g)).collect();
+        let o_rects: Vec<Rect> = obstacles.iter().map(|g| Rect::from_geo(*g)).collect();
+        let (mut sx, mut sy) = (px, py);
+        match crate::cluster::first_contact(&m_rects, &o_rects, px, py, GLUE_GAP) {
+            Some(c) => {
+                sx = c.dx;
+                sy = c.dy;
+                let m = m_rects[c.mover];
+                let at = Rect {
+                    x_low: m.x_low + sx, x_high: m.x_high + sx,
+                    y_low: m.y_low + sy, y_high: m.y_high + sy,
+                };
+                let a = crate::cluster::align_along(&at, &o_rects[c.obstacle], c.axis_x, SNAP_DISTANCE as f64);
+                if c.axis_x { sy += a } else { sx += a }
+                tracing::info!("plx: glue — бросок упёрся в соседа, сдвиг ({:.0},{:.0}) вместо ({:.0},{:.0})",
+                    sx, sy, px, py);
+            }
+            None => {
+                let free = Point::from(((primary.loc.x as f64 + px).round() as i32, (primary.loc.y as f64 + py).round() as i32));
+                if let Some(snapped) = find_snap_target(data, &self.window, free, &едут[1..]) {
+                    sx = (snapped.x - primary.loc.x) as f64;
+                    sy = (snapped.y - primary.loc.y) as f64;
+                }
+            }
+        }
+        let shift: Point<i32, Logical> = (sx.round() as i32, sy.round() as i32).into();
+
+        for (w, g) in &movers {
+            let target = g.loc + shift;
+            if летит {
+                data.fling_window_to(w, v, target);
+            } else if shift.x != 0 || shift.y != 0 {
+                data.animate_window_to_dur(w, target, crate::anim::дуг::толчок_соседа());
+            }
+            if let Some(tw) = data.tagged_windows.iter_mut().find(|tw| &tw.window == w) {
+                tw.float_position = target;
+                tw.position = target;
+                tw.float_position_set = true;
+            }
+        }
+    }
+}
+
 impl PointerGrab<Parallax> for MoveSurfaceGrab {
     fn motion(
         &mut self,
@@ -781,8 +1047,20 @@ impl PointerGrab<Parallax> for MoveSurfaceGrab {
         handle: &mut PointerInnerHandle<'_, Parallax>,
         event: &ButtonEvent,
     ) {
-        handle.button(data, event);
         const BTN_LEFT: u32 = 0x110;
+        // Вторая кнопка при Super — поворот (см. tilt_grab.rs). Перенос
+        // кончается на месте: скорость обнуляем, иначе `finish` бросил бы
+        // окно по инерции последних движений.
+        if event.button == 0x111 && event.state == smithay::backend::input::ButtonState::Pressed
+            && data.seat.get_keyboard().is_some_and(|k| k.modifier_state().logo)
+        {
+            self.velocity = VelocityTracker::new();
+            handle.unset_grab(self, data, event.serial, event.time, false);
+            self.finish(data);
+            data.поворот_ждёт = Some(self.window.clone());
+            return;
+        }
+        handle.button(data, event);
         if !handle.current_pressed().contains(&BTN_LEFT) {
             handle.unset_grab(self, data, event.serial, event.time, true);
             self.finish(data);
@@ -825,5 +1103,9 @@ impl PointerGrab<Parallax> for MoveSurfaceGrab {
     }
     fn unset(&mut self, data: &mut Parallax) {
         data.dragged_window = None;
+        // finish() зовётся после unset и подсказку заберёт сам; сюда же
+        // приходят и сорванные хваты — им подсказка не нужна. Поэтому чистим
+        // в finish, а тут только просим кадр.
+        data.request_redraw();
     }
 }

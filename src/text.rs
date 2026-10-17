@@ -297,7 +297,11 @@ const CACHE_LIMIT: usize = 256;
 /// после сброса пришлось бы растрировать заново целиком.
 pub struct TextCache {
     protos: HashMap<Key, (Vec<u8>, i32, i32)>,
-    pools: HashMap<Key, Vec<MemoryRenderBuffer>>,
+    /// Буферы по номеру слота — РАЗРЕЖЕННО. Раньше тут был `Vec`, который
+    /// дорастал до номера слота: виджеты стола берут слоты от 4000, и каждая
+    /// их строка заводила четыре тысячи копий своего растра. Новый кегль на
+    /// зуме — новый ключ и ещё четыре тысячи копий; память уходила гигабайтами.
+    pools: HashMap<Key, HashMap<usize, MemoryRenderBuffer>>,
     /// Когда ключом пользовались в последний раз (номер обращения).
     used: HashMap<Key, u64>,
     tick: u64,
@@ -342,13 +346,12 @@ impl TextCache {
 
         let proto = self.protos.entry(k.clone()).or_insert_with(build);
         let (px, w, h) = (&proto.0, proto.1, proto.2);
-        let pool = self.pools.entry(k).or_default();
-        while pool.len() <= slot {
-            pool.push(MemoryRenderBuffer::from_slice(
+        let buf = self.pools.entry(k).or_default().entry(slot).or_insert_with(|| {
+            MemoryRenderBuffer::from_slice(
                 px, Fourcc::Abgr8888, (w, h), 1, Transform::Normal, None,
-            ));
-        }
-        (&pool[slot], w, h)
+            )
+        });
+        (&*buf, w, h)
     }
 
     /// Буфер строки для слота `slot` начертанием Regular.

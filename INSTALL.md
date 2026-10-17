@@ -186,7 +186,7 @@ of the same shape, so the calling code is identical in both.
 | VR headset | — | yes |
 | windows inside Minecraft | — | yes |
 | multi-user desktop sharing | — | yes |
-| window glow, canvas light, desktop cube | — | yes |
+| window dissolve, screen shader, desktop cube | — | yes |
 
 `plx-standard` is the default and is what most people want: it is the build
 where every pixel takes the shortest path to the screen. The optional parts of

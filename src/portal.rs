@@ -465,7 +465,7 @@ impl crate::state::Parallax {
         // источник типа, которого он не запрашивал.
         let окна_можно = pick.types & SOURCE_WINDOW != 0;
         let window = окна_можно
-            .then(|| self.space.element_under(self.pointer_location).map(|(w, _)| w.clone()))
+            .then(|| self.окно_под(self.pointer_location).map(|(w, _)| w))
             .flatten();
         let source = match &window {
             Some(w) => {

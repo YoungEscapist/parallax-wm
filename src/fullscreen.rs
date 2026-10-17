@@ -77,7 +77,7 @@ impl Parallax {
     /// Теги (столы) окна. У окна, которого нет в списке (override-redirect
     /// меню), тегов нет — такое окно считаем «везде своим», иначе запрос
     /// полного экрана от него не сработал бы нигде.
-    fn window_tags(&self, window: &Window) -> u32 {
+    pub(crate) fn window_tags(&self, window: &Window) -> u32 {
         self.tagged_windows.iter()
             .find(|tw| &tw.window == window)
             .map(|tw| tw.tags)
@@ -85,7 +85,7 @@ impl Parallax {
     }
 
     /// Окно живёт на текущем столе (или тегов у него нет — см. выше).
-    fn window_here(&self, window: &Window) -> bool {
+    pub(crate) fn window_here(&self, window: &Window) -> bool {
         let tags = self.window_tags(window);
         tags == 0 || tags & self.viewport.current_tags() != 0
     }
@@ -107,8 +107,13 @@ impl Parallax {
     }
 
     /// Развёрнутое окно ТЕКУЩЕГО стола, если оно есть.
+    ///
+    /// Если на столе развёрнуто несколько окон одного приложения (см.
+    /// `same_app`), отвечает верхнее — последнее развёрнутое: F11 сворачивает
+    /// сперва его.
     pub fn fullscreen_window_here(&self) -> Option<Window> {
         self.fullscreens.iter()
+            .rev()
             .find(|f| f.pending.is_none() && self.window_here(&f.window))
             .map(|f| f.window.clone())
     }
@@ -283,6 +288,11 @@ impl Parallax {
             tracing::debug!("plx/fullscreen: no window to maximise");
             return;
         };
+        // Полный экран — это место на холсте; закреплённое окно сперва
+        // возвращается на холст туда, где его видно (см. pin.rs).
+        if self.закреплено(&window) {
+            self.toggle_pin(&window);
+        }
         self.set_fullscreen(&window);
     }
 
@@ -301,8 +311,8 @@ impl Parallax {
         if let Some(w) = self.focused_window().filter(|w| self.window_here(w)) {
             return Some(w);
         }
-        if let Some(w) = self.space.element_under(self.pointer_location)
-            .map(|(w, _)| w.clone())
+        if let Some(w) = self.окно_под(self.pointer_location)
+            .map(|(w, _)| w)
             .filter(|w| self.window_here(w))
         {
             return Some(w);
@@ -327,8 +337,18 @@ impl Parallax {
         let развёрнутые: Vec<Window> = self.fullscreens.iter()
             .map(|f| f.window.clone())
             .collect();
+        //
+        // Исключение — окна ОДНОГО приложения. Просмотрщик фото в AyuGram
+        // (и в Telegram вообще) — отдельное окно, которое само просится на весь
+        // экран поверх главного; сворачивать при этом главное окно значило бы
+        // выкидывать из F11 само приложение (жалоба 06.10.2026). Своё окно
+        // встаёт поверх в ту же точку кадра, а закрывшись, возвращает тот же
+        // кадр — главное окно остаётся развёрнутым под ним.
         for other in развёрнутые {
-            if &other != window && (tags == 0 || self.window_tags(&other) & tags != 0) {
+            if &other != window
+                && !same_app(&other, window)
+                && (tags == 0 || self.window_tags(&other) & tags != 0)
+            {
                 self.unset_fullscreen_window(&other);
             }
         }
@@ -790,4 +810,16 @@ impl Parallax {
         // окна само по себе перерисовку не заказывает.
         self.request_redraw();
     }
+}
+
+/// Два окна одного приложения: один клиент Wayland и один app_id.
+///
+/// app_id нужен ради X11: все X-окна приходят от одного клиента — Xwayland, и
+/// по одному клиенту две разные игры считались бы «одним приложением».
+fn same_app(a: &Window, b: &Window) -> bool {
+    let клиент = |w: &Window| crate::xwin::surface(w)
+        .and_then(|s| s.client())
+        .map(|c| c.id());
+    let (Some(ка), Some(кб)) = (клиент(a), клиент(b)) else { return false };
+    ка == кб && crate::xwin::app_id(a).is_some() && crate::xwin::app_id(a) == crate::xwin::app_id(b)
 }

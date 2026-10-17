@@ -98,7 +98,30 @@ nix_profiles=${NIX_PROFILES:-"/nix/var/nix/profiles/default /home/$user/.nix-pro
 # вовсе: btop пишет «No UTF-8 locale detected» и выходит с кодом 1, и в кадре
 # вместо окна оказывается сообщение ghostty об ошибке. Переопределяется
 # переменной HLANG (не LANG: та у самого харнесса своя и в env -i не идёт).
-setsid runuser -u "$user" -- env -i \
+# runuser есть не везде: в Exherbo (util-linux собран без него) его нет вовсе,
+# и харнесс падал с «setsid: failed to execute runuser». Берём первое, что есть
+# на машине; все три варианта делают одно — уронить права до $user и отдать
+# управление env со своим окружением.
+# ИМЕНА ПЕРЕМЕННЫХ ТОЛЬКО ЛАТИНИЦЕЙ — см. предупреждение в шапке файла: bash
+# считает «имя=значение» с кириллицей КОМАНДОЙ, и присваивание молча падает с
+# «command not found», а скрипт идёт дальше с пустой переменной.
+if command -v runuser >/dev/null 2>&1; then
+    as_user="runuser -u $user --"
+elif command -v setpriv >/dev/null 2>&1; then
+    uid=$(id -u "$user"); gid=$(id -g "$user")
+    # --init-groups, а НЕ --clear-groups: у человека в дополнительных группах
+    # лежит доступ к железу (video — камера, input, seat), и харнесс без них
+    # проверяет сеанс, которого не бывает. Поймано замером 11.09.2026: `cam on`
+    # отвечал «камера занята или нет прав», а strace показывал на открытии
+    # /dev/video0 честный EACCES — процесс шёл с ПУСТЫМ списком групп, тогда как
+    # живой сеанс идёт с группой 27 (video). Ветка runuser выше группы
+    # инициализирует всегда, то есть два пути запуска ещё и расходились.
+    as_user="setpriv --reuid=$uid --regid=$gid --init-groups --"
+else
+    as_user="sudo -n -u $user --"
+fi
+# shellcheck disable=SC2086  # слова команды обязаны разойтись на аргументы
+setsid $as_user env -i \
   HOME="$root/home" USER="$user" PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin \
   NIX_PROFILES="$nix_profiles" \
   XCURSOR_THEME="${XCURSOR_THEME:-Bibata-Modern-Ice}" \

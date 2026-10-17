@@ -7,7 +7,7 @@ use smithay::{
         renderer::element::memory::MemoryRenderBuffer,
         session::libseat::LibSeatSession,
     },
-    desktop::{PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output},
+    desktop::{PopupManager, Space, space::SpaceElement, Window, WindowSurfaceType, layer_map_for_output},
     input::{Seat, SeatState},
     reexports::{
         calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic},
@@ -84,6 +84,19 @@ pub struct TaggedWindow {
     /// Float — см. input.rs), при сборке в тайлинг обязано вернуться в
     /// раскладку: иначе «в tiling переносятся не все окна».
     pub float_pinned: bool,
+    /// Место и размер во Float на КАЖДОМ столе, где окно уже бывало
+    /// (ключ — маска стола, `TaggedWindow::tags` в момент ухода).
+    ///
+    /// Без этого поля Float-геометрия хранится в одном экземпляре
+    /// (`float_position`/`float_size`), общем на все столы: перенос окна на
+    /// другой стол и перестановка его там мышью перезаписывали то же самое
+    /// поле, и вернувшись на прежний стол окно оказывалось там, где его
+    /// оставили на ЧУЖОМ столе, а не на своём месте (просьба Ярика
+    /// 19.09.2026 — «окна должны запоминать своё место на каждом столе»).
+    /// Пишется и читается только в `Parallax::tag_window`: там известны и
+    /// старый тег (куда сохранить текущее место перед переездом), и новый
+    /// (что оттуда восстановить, если окно там уже бывало).
+    pub desk_geometry: HashMap<u32, (Point<i32, Logical>, Option<Size<i32, Logical>>)>,
     pub folded: bool,                        // схлопнуто в стопку (2.4)
     /// Где окно стояло ДО того, как его собрали в созвездие.
     ///
@@ -99,6 +112,13 @@ pub struct TaggedWindow {
     /// быть обратной операцией. Возвращать одну позицию, оставив окна в
     /// размерах грозди, — значит распустить её только наполовину.
     pub pre_constellation_size: Option<Size<i32, Logical>>,
+    /// Место и размер окна, пока оно плавало ПОВЕРХ ТАЙЛИНГА. Пишется на
+    /// выходе из тайлинга во Float и читается на обратной сборке: окно
+    /// встаёт туда же и остаётся плавающим (см. tiling.rs, set_layout_inner).
+    pub tile_float: Option<Rectangle<i32, Logical>>,
+    /// Своё место окна на холсте Float, отложенное на время тайлинга: там
+    /// `float_position` занято местом поверх раскладки. Пара к `tile_float`.
+    pub canvas_float: Option<(Point<i32, Logical>, Option<Size<i32, Logical>>)>,
     /// Созвездие, в котором состоит окно, «растащено»: одно из его окон увели
     /// руками (драг мышью или Super+стрелки), и взаимное расположение, ради
     /// которого созвездие и заводили, нарушено.
@@ -112,6 +132,25 @@ pub struct TaggedWindow {
     /// Метка ставится по ДЕЙСТВИЮ, а не по картинке, и ресайз ей не мешает.
     /// См. selection.rs.
     pub constellation_torn: bool,
+    /// Место и размер окна ДО сборки в сетку склейки (Super+M с выделением,
+    /// см. cluster.rs). Та же роль, что у `pre_constellation`: роспуск сетки
+    /// обязан быть обратной операцией и вернуть окна туда, откуда их взяли.
+    pub pre_glue: Option<(Point<i32, Logical>, Size<i32, Logical>)>,
+    /// Окно ЗАКРЕПЛЕНО на экране (Super+P, см. pin.rs): приклеено к камере,
+    /// не зумится и не панится. Значение — левый верхний угол видимой части
+    /// окна в экранных пикселях своего монитора.
+    pub закреплено: Option<crate::pin::Закрепление>,
+    /// ВИДЖЕТ — окно, прибитое к холсту правилом `window{ widget = true }`
+    /// (модель driftwm, см. `config::ПравилоОкна`).
+    ///
+    /// Метка живёт у окна, а не в правиле, потому что её умеет снимать и
+    /// ставить `plx ctl widget` на лету: правило задаёт начальное состояние,
+    /// дальше состояние принадлежит окну.
+    ///
+    /// Что она значит по пунктам: окно не двигается ни мышью, ни жестом, ни
+    /// биндом; лежит ниже обычных окон; не попадает ни в Super+Tab, ни в
+    /// пространственную навигацию, ни в поиск Super+F, ни в чипы панели.
+    pub виджет: bool,
 }
 
 // ── Portal (4.4) ─────────────────────────────────────────────────────────────
@@ -176,6 +215,101 @@ pub struct ПредпросмотрОкно {
     pub rect: Rectangle<i32, Logical>,
 }
 
+/// Драг куба: за грань взялись рукой и крутят.
+///
+/// Скорость здесь — ради ВЫБЕГА (`cube_inertia`): куб, брошенный с размаху,
+/// докручивается сам, как в Compiz, а не встаёт на ближайшую грань в тот же
+/// миг, когда отпустили кнопку.
+#[derive(Clone, Copy, Debug)]
+pub struct КубДраг {
+    /// Сколько курсор прошёл вбок с начала жеста (со знаком).
+    pub накоплено: f64,
+    /// И сколько по вертикали — это наклон куба.
+    pub накоплено_y: f64,
+    /// Поворот куба в момент, когда за него взялись.
+    pub старт_угол: f64,
+    /// Наклон куба в тот же момент.
+    pub старт_наклон: f64,
+    /// Длина пути курсора без знака: по ней протяжка отличается от клика.
+    pub путь: f64,
+    /// Угловая скорость на последних событиях, рад/с. Сглажена — сырое
+    /// «дельта на время» между двумя событиями мыши скачет вдвое.
+    pub скорость: f64,
+    /// Когда пришло прошлое событие движения.
+    pub когда: std::time::Instant,
+}
+
+/// Карусель колонок — обзор ленты (niri) в 3D, см. карусель.rs.
+///
+/// Все величины с целью — пары «сейчас / куда едем»: доводит их `карусель_тик`
+/// одним темпом, чтобы разворот, переезд между этажами и наклон читались
+/// одним движением, а не тремя.
+#[derive(Clone, Debug)]
+pub struct Карусель {
+    /// Этажи ленты по порядку — снимаются на входе, чтобы барабаны не
+    /// переставлялись под руками.
+    pub этажи: Vec<u32>,
+    /// Какая точка дуги каждого этажа смотрит на зрителя: (сейчас, цель).
+    pub фронт: Vec<(f64, f64)>,
+    /// Индекс этажа в центре (дробный во время переезда) и его цель.
+    pub этаж: f64,
+    pub этаж_цель: f64,
+    /// 0 — плоский экран, 1 — карусель. Вход ведёт 0 → 1, выход 1 → 0.
+    pub раскрытие: f64,
+    pub раскрытие_цель: f64,
+    pub наклон: f64,
+    pub наклон_цель: f64,
+    /// X камеры плоского экрана: на входе — откуда вошли, на выходе — куда
+    /// приземлимся (там колонка, на которую кликнули, целиком в кадре).
+    pub кадр_x: f64,
+    pub драг: Option<КарусельДраг>,
+    /// Идёт выход: на какой этаж и на какое окно.
+    pub выход: Option<(u32, Option<Window>)>,
+}
+
+/// Драг карусели: вбок — крутит барабан, вверх-вниз — едет между этажами.
+#[derive(Clone, Copy, Debug)]
+pub struct КарусельДраг {
+    pub накоплено: (f64, f64),
+    pub старт_фронт: f64,
+    pub старт_этаж: f64,
+    /// Длина пути без знака: по ней протяжка отличается от клика.
+    pub путь: f64,
+}
+
+/// Карусель столов — сеточный обзор в 3D, см. карусель_столов.rs.
+///
+/// Как у карусели колонок, всё с целью — пары «сейчас / куда едем», доводит
+/// их `карусель_столов_тик` одним темпом.
+#[derive(Clone, Debug)]
+pub struct КарусельСтолов {
+    /// Столы по порядку бита — снимаются на входе и не переставляются.
+    pub столы: Vec<u32>,
+    pub поворот: f64,
+    pub поворот_цель: f64,
+    /// Выбранный стол (индекс в `столы`): он ярче, на него уходит тап Super,
+    /// если курсор мимо панелей.
+    pub выбран: usize,
+    /// Стол, который стоит на экране при нулевом раскрытии: на входе —
+    /// текущий, на выходе — тот, куда приземляемся.
+    pub плоский: usize,
+    pub раскрытие: f64,
+    pub раскрытие_цель: f64,
+    pub наклон: f64,
+    pub наклон_цель: f64,
+    pub драг: Option<КарусельСтоловДраг>,
+    /// Идёт выход: на какой стол и снимать ли потом фокус.
+    pub выход: Option<(u32, bool)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct КарусельСтоловДраг {
+    pub накоплено: (f64, f64),
+    pub старт_поворот: f64,
+    pub старт_наклон: f64,
+    pub путь: f64,
+}
+
 /// Незаконченный выход из куба: куда уходим и что сделать, когда доиграет.
 ///
 /// Раньше выход из куба был мгновенным — обзор гас в том же кадре, в котором
@@ -236,6 +370,11 @@ pub struct Parallax {
     pub xwm: Option<X11Wm>,
     /// Номер X-дисплея (`DISPLAY=:N`) поднятого Xwayland.
     pub xdisplay: Option<u32>,
+    /// X11-окна, которые клиент замапил сразу свёрнутыми (WM_HINTS initial_state
+    /// = Iconic) и которым мы уже подтвердили IconicState. На экран они выйдут,
+    /// когда клиент попросит Normal или сработает страховка (см. xwayland.rs,
+    /// `показать_свёрнутое`).
+    pub x11_iconic: Vec<smithay::xwayland::X11Surface>,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
     // parallax state
@@ -257,6 +396,9 @@ pub struct Parallax {
     pub render_cursor_logged: std::time::Instant,
     pub render_cam_logged: (f64, f64),
     pub cursor_status: CursorImageStatus,
+    /// Форма курсора на время ресайза за кромку окна (см. `кромка_под`):
+    /// пока край тянут, стрелка не должна меняться от того, над чем едет.
+    pub кромка_курсор: Option<CursorIcon>,
     pub tagged_windows: Vec<TaggedWindow>,
     pub libinput_handle: Option<smithay::reexports::input::Libinput>,
    pub logo_held: bool,
@@ -319,6 +461,9 @@ pub struct Parallax {
     pub momentum: crate::canvas::MomentumState,
     pub camera_anim: Option<crate::anim::CameraAnim>,
     pub zoom_anim: Option<crate::anim::ZoomAnim>,
+    /// Курсор едет назад к центру экрана после того, как пан отпустили, а
+    /// стрелка осталась за видимой частью холста (см. `запустить_возврат_курсора`).
+    pub cursor_return_anim: Option<crate::anim::CameraAnim>,
     /// Закрытые окна, которые ещё гаснут на экране (см. close.rs). Живут уже
     /// без клиента — от окна остался только снимок последнего кадра.
     pub закрытия: Vec<crate::close::Уход>,
@@ -352,10 +497,18 @@ pub struct Parallax {
     /// расталкивание хотелось держать включённым постоянно, а прилипание к
     /// краю соседа — нет.
     pub is_snapping_enabled: bool,
-    /// Магнитирование (Super+M): при ОТПУСКАНИИ окно один раз подравнивается
-    /// краем к ближайшему соседу в пределах SNAP_DISTANCE. Живёт отдельно от
-    /// коллизии и работает независимо от неё.
+    /// Магнитирование (Super+G, было на Super+M): при ОТПУСКАНИИ окно один
+    /// раз подравнивается краем к ближайшему соседу в пределах
+    /// SNAP_DISTANCE. Живёт отдельно от коллизии и работает независимо от
+    /// неё.
     pub is_magnetism_enabled: bool,
+    /// Склейка окон в духе driftwm (Super+M, см. cluster.rs): плавающие
+    /// окна, касающиеся краями, во время ресайза одного растут/толкаются
+    /// вместе с ним — не свободный ресайз одного окна, а сцепленная группа.
+    /// Отдельно от расталкивания (Super+A, толкает всегда) и магнитирования
+    /// (Super+G, подравнивает один раз на отпускании) — склейка работает всё
+    /// время интерактивного ресайза, только когда есть с чем склеиться.
+    pub is_glue_enabled: bool,
     // ── Module 3 ──────────────────────────────────────────────────────────
     /// Оверлей карты окон (Super+` toggle)
     pub is_minimap_visible: bool,
@@ -379,17 +532,13 @@ pub struct Parallax {
     /// Появление рабочего места при запуске (см. `anim::Вход`). `None` — вход
     /// кончился либо выключен настройкой `set{ intro = false }`.
     pub вход: Option<crate::anim::Вход>,
-    /// Палитра ОБОЕВ — ею красится свечение окон (см. src/обои.rs и
-    /// rounded.rs). `None`, пока plx-wall не посчитал палитру или не запущен
-    /// вовсе; тогда свечение просто не включается.
+    /// Палитра ОБОЕВ — из неё берётся акцент виджетов стола (см. src/обои.rs).
+    /// `None`, пока plx-wall не посчитал палитру или не запущен вовсе; тогда
+    /// акцент берётся по умолчанию.
     pub палитра_обоев: Option<crate::обои::Палитра>,
     /// Когда файл палитры правился в прошлый раз — по нему решаем, перечитывать
     /// ли. Читать его каждый кадр незачем: обои меняются раз в минуты.
     pub палитра_правка: Option<std::time::SystemTime>,
-    /// Картинка заливки света на холсте (см. src/свет.rs). Строится один раз на
-    /// смену обоев и живёт здесь, а не в кадре: пересобирать градиент 256×256
-    /// каждый кадр незачем.
-    pub свет: crate::свет::Свет,
     /// Плашка пелены входа. Пул (как у всех прочих плашек кадра) — просто
     /// потому, что `pooled_solid` берёт пул; элемент в нём один.
     pub вход_ids: Vec<crate::udev::SolidSlot>,
@@ -440,6 +589,11 @@ pub struct Parallax {
     /// выполняется. В боксе по той же причине, что и шлем: структура крупная
     /// (полотна окон), а `Parallax` ездит по стеку в каждом обработчике.
     pub mine: Option<Box<crate::mine::Шахта>>,
+    /// Место (`wl_seat`) мода plx-mine. Живёт с самого старта, а не с
+    /// включения режима: клиент, уже открытый к Super+Alt+D (ghostty, Firefox),
+    /// глобал, объявленный позже, не подключает — и панель не получала ни
+    /// кликов, ни клавиш (замер 07.10.2026, см. `mine/seat.rs`).
+    pub mine_место: Option<Seat<Parallax>>,
     /// Зум миникарты (см. canvas::MinimapView): 1.0 — MINIMAP_SPAN_SCREENS
     /// экранов по ширине. ОТОБРАЖАЕМОЕ значение — доводится к
     /// `minimap_zoom_target` в `anim::tick`.
@@ -480,9 +634,10 @@ pub struct Parallax {
     /// трогает — своя копия мира со своим паном, см. `minimap_drag_motion`.
     pub minimap_drag: bool,
     // ── Module 4 ──────────────────────────────────────────────────────────
-    /// Загруженная при старте топология (4.3): app_id → очередь позиций,
-    /// расходуется в XdgShellHandler::app_id_changed по мере появления окон.
-    pub pending_session: HashMap<String, Vec<Point<i32, Logical>>>,
+    /// Иконки на рабочем столе: ярлыки на обоях, их перетаскивание и окошко
+    /// свойств (см. рабстол.rs). Список читается с диска при старте, см.
+    /// `рабстол_загрузить`.
+    pub рабстол: crate::рабстол::Рабстол,
     /// Активный оконный портал (4.4), не более одного одновременно.
     pub portal: Option<Portal>,
     /// Окна, развёрнутые на весь экран (F11 или запрос клиента), и всё, что
@@ -512,6 +667,8 @@ pub struct Parallax {
     pub wifi: Option<crate::wifi::WifiUi>,
     /// Звук: устройства вывода/ввода и состояние меню (см. audio.rs).
     pub audio: Option<crate::audio::AudioUi>,
+    /// Меню питания и подсветки (см. питание.rs).
+    pub питание: Option<crate::питание::ПитаниеUi>,
     /// Трей приложений (StatusNotifierItem): значки Telegram, Vesktop, Steam
     /// и их готовые текстуры. None — сессионная шина не поднялась (см. sni.rs).
     pub tray_apps: Option<crate::sni::TrayApps>,
@@ -585,6 +742,21 @@ pub struct Parallax {
     /// драг идёт, `move_grab` держит их в актуальном состоянии, на отпускании —
     /// чистит. Пусто = ничего не рисуем.
     pub призраки_группы: Vec<Rectangle<i32, Logical>>,
+    /// Перетаскивание (DnD), идущее сейчас: источник и придержанная отмена —
+    /// брошенное на стол становится окном-картинкой (см. картинка.rs).
+    pub dnd_текущий: Option<crate::картинка::ТекущийDnd>,
+    /// Источник, у которого забираем данные броска, и умеет ли он «копию».
+    pub dnd_ждёт_данных: Option<(std::sync::Arc<dyn smithay::input::dnd::Source>, bool)>,
+    pub картинки_tx: Option<smithay::reexports::calloop::channel::Sender<crate::картинка::Весть>>,
+    /// Точки бросков, чьи окна-картинки ещё не появились (холст).
+    pub картинки_ждут: Vec<(Point<f64, Logical>, std::time::Instant)>,
+    /// Окна-картинки, ждущие своего размера, чтобы встать серединой в точку.
+    pub картинки_центр: Vec<crate::картинка::ЖдётМеста>,
+    /// Прилипание плавающего окна к краю экрана в тайлинге (см. move_grab):
+    /// подсказка, куда окно встанет на отпускании.
+    pub край_превью: Option<crate::grabs::move_grab::КрайПревью>,
+    /// Размер окна до прилипания к краю — вернётся, когда его оттащат.
+    pub до_прилипания: Vec<(Window, Size<i32, Logical>)>,
     /// Ячейка панели под курсором — по ней строится предпросмотр
     /// (см. `udev::build_bar_preview`). None — курсор не над панелью.
     pub bar_hover: Option<crate::bar::Cell>,
@@ -596,6 +768,10 @@ pub struct Parallax {
     /// Ведёт `anim::tick`, читают `canvas::preview_geom` (размер и подъём) и
     /// `canvas::preview_fade` (проявление).
     pub preview_anim: f64,
+    /// Глубина значков панели под курсором: ячейка → доля всплытия 0…1.
+    /// Ведёт `anim::tick`, читает отрисовка (`anim::глубина_значка`). Здесь
+    /// только наведённый значок и те, что ещё тонут, — от силы два-три.
+    pub bar_depth: Vec<(crate::bar::Cell, f64)>,
     /// Курсор стоит на самой КАРТОЧКЕ предпросмотра, а не на ячейке панели.
     ///
     /// Держит карточку раскрытой: с 26.08.2026 она работает как маленькая
@@ -663,6 +839,11 @@ pub struct Parallax {
     /// позицией. Заводится там же, где раскладка двигает окно, —
     /// `tiling::resize_window_animated`.
     pub window_size_anims: Vec<(Window, crate::anim::SizeAnim)>,
+    /// Окна, которые прямо сейчас тянут рукой (Super+ПКМ, край окна, аккорд,
+    /// щипок, деление тайлинга), и миг последнего хода руки. Пока окно здесь,
+    /// кадр рисует его в ЗАПРОШЕННОМ размере, не дожидаясь клиента (см.
+    /// `anim::живая_растяжка`).
+    pub живой_размер: Vec<(Window, std::time::Instant)>,
     /// Плитки декораций (тень окна, маска угла, полоса параллакса) и пулы их
     /// буферов — см. decor.rs.
     pub decor: crate::decor::DecorCache,
@@ -673,6 +854,8 @@ pub struct Parallax {
     pub gesture_move_window: Option<Window>,
     /// Super+pinch → resize окна (новый жест, под курсором на начале).
     pub gesture_resize_window: Option<Window>,
+    /// Идущий ресайз щипком Super+2 пальца (input.rs, `pinch_resize_begin`).
+    pub(crate) pinch_resize: Option<crate::input::PinchResize>,
     /// Размеры окон на НАЧАЛО pinch-жеста: само окно под курсором плюс всё
     /// выделение, если оно в него входит (выделенные окна ресайзятся вместе).
     /// Размер считается от этого снимка по абсолютному scale жеста (libinput
@@ -741,8 +924,17 @@ pub struct Parallax {
     /// Накопленный вертикальный ход свайпа в Columns — по нему листаются
     /// столы (см. columns_swipe_workspace).
     pub columns_swipe_dy: f64,
+    /// То же по горизонтали — по нему свайп листает колонки (см.
+    /// columns_swipe_scroll).
+    pub columns_swipe_dx: f64,
     /// Пул под полоски вкладок Columns (niri tab indicator).
     pub tab_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул прямоугольников под иконки рабочего стола: подсветка выбранной и
+    /// заглушка у ярлыка без картинки (см. рабстол.rs).
+    pub рабстол_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул прямоугольников встроенных виджетов: подложки, полосы, «сегодня» в
+    /// календаре (см. виджеты_стола.rs).
+    pub виджеты_ids: Vec<crate::udev::SolidSlot>,
     /// Пул под подсказку вставки при драге в Columns.
     pub hint_ids: Vec<crate::udev::SolidSlot>,
     pub overview_bg_ids: Vec<crate::udev::SolidSlot>,
@@ -756,6 +948,17 @@ pub struct Parallax {
     /// damage tracker индексируется по нему, и новый Id каждый кадр означал бы
     /// полную перерисовку экрана (см. udev::build_wallpaper_backdrop).
     pub wallpaper_id: Option<smithay::backend::renderer::element::Id>,
+    /// Режим «cycle» (галочка в plx-wall, `ctl wallpaper cycle on`): обои
+    /// лежат на холсте зеркальной плиткой и едут за камерой один в один —
+    /// бесконечно, без затухающего хода. См. `udev::wallpaper_cycle_places`.
+    pub обои_цикл: bool,
+    /// Свой Id на каждую плитку режима cycle — по номеру в кадре.
+    pub обои_цикл_ids: Vec<smithay::backend::renderer::element::Id>,
+    /// Свой `Id` на КАЖДУЮ грань куба — для обоев, которыми застелена грань
+    /// (см. `udev::cube_face_wallpaper`). Общий Id на все грани не годится:
+    /// damage tracker считал бы их одним и тем же элементом, который скачет по
+    /// экрану, и перерисовывал бы кадр целиком на каждый поворот.
+    pub куб_фон_ids: Vec<smithay::backend::renderer::element::Id>,
     /// Найденные значки приложений (см. icons.rs). Поиск лезет в файловую
     /// систему, поэтому результат — включая «не нашлось» — кэшируется по имени
     /// на всё время работы.
@@ -771,23 +974,63 @@ pub struct Parallax {
         String,
         (smithay::backend::renderer::element::memory::MemoryRenderBuffer, (i32, i32)),
     >,
+    /// Те же значки в размере `bar::CHIP_ICON_UP` — для чипа, всплывшего под
+    /// курсором. Растянуть на GPU двадцатипиксельный было бы мылом ровно в тот
+    /// миг, когда на значок смотрят, поэтому крупный растрируется отдельно.
+    pub chip_icons_up: std::collections::HashMap<
+        String,
+        (smithay::backend::renderer::element::memory::MemoryRenderBuffer, (i32, i32)),
+    >,
     /// Размытый фон текущего кадра (см. blur.rs). None — блюра нет: выключен,
     /// шейдер не собрался или обоев ещё нет. Плашки в этом случае рисуются как
     /// раньше, сплошной полупрозрачной заливкой.
     pub blur_tex: Option<smithay::backend::renderer::gles::GlesTexture>,
+    /// Кэш размытого фона ПО ВЫХОДАМ: имя монитора → (ключ входных данных,
+    /// готовая текстура).
+    ///
+    /// Свёртка не зависит ни от окон, ни от курсора — только от картинки обоев
+    /// и от того, каким куском она попадает на экран (камера, зум, размер
+    /// выхода). Пока эта тройка не поменялась, повторный счёт даёт ПИКСЕЛЬ В
+    /// ПИКСЕЛЬ ту же текстуру, а стоит трёх офскрин-проходов на кадр. На
+    /// мониторе 200 Гц это было 200 свёрток в секунду на неподвижном экране
+    /// (замер 20.09.2026 — ровно то, из-за чего plx-extra ел треть ядра при
+    /// живой Dota).
+    ///
+    /// Кэш именно по выходам, а не одна текстура: у мониторов свои камеры и
+    /// свои размеры, и общий слот `blur_tex` они бы переписывали друг за другом
+    /// каждый кадр — то есть кэш не попадал бы никогда, а панель второго
+    /// монитора брала бы заплату от первого.
+    pub blur_кэш: std::collections::HashMap<String, (crate::udev::БлюрКлюч, smithay::backend::renderer::gles::GlesTexture)>,
     /// Шейдер скругления, которым обрезается размытый фон под плашками.
     /// Копия того же, что скругляет окна (см. rounded.rs): заводить второй
     /// смысла нет, а тащить `Surface` в сборку элементов панели — лишний шов.
     pub blur_shape: Option<crate::rounded::Шейдер>,
+    /// Матовое стекло под прозрачными окнами — размывает то, что в кадре
+    /// реально лежит ПОД окном (см. `blur::Подложка`). Собирается там же,
+    /// где `blur_shape`.
+    pub стекло: Option<crate::blur::Стекло>,
     /// Шейдер куба рабочих столов (см. src/куб.rs). Компилируется там же и
     /// живёт столько же, что и `blur_shape` выше.
     pub куб_шейдер: Option<crate::куб::Шейдер>,
+    /// Наклонённые и повёрнутые окна (см. наклон.rs). Пусто — все стоят ровно.
+    pub наклоны_окон: Vec<(Window, crate::наклон::ЖивойНаклон)>,
+    /// Окно, хват которого закрыла вторая кнопка при Super: input.rs ставит
+    /// ему поворот мышью (grabs/tilt_grab.rs) сразу после `pointer.button`.
+    pub поворот_ждёт: Option<Window>,
     /// Текущий поворот куба, радианы. 0 — грань стола, стоящего первым в
     /// `overview_order`, смотрит прямо на зрителя.
     pub куб_угол: f64,
     /// Куда куб доворачивается. Разница с `куб_угол` — то, что доигрывает
     /// `anim::tick`; равенство означает «куб стоит».
     pub куб_цель: f64,
+    /// Наклон куба к зрителю, радианы (см. `Куб::наклон`): драг ЛКМ по
+    /// вертикали. Куб в обзоре — трёхмерная вещь, которую крутят рукой во все
+    /// стороны, а не только лента граней, листаемая вбок.
+    pub куб_наклон: f64,
+    /// Куда наклон едет. После драга остаётся там, где отпустили (на куб
+    /// смотрят сверху, сколько хотят); на выходе из обзора — ноль, иначе
+    /// грань наезжала бы на экран наклонённой.
+    pub куб_наклон_цель: f64,
     /// Подложка грани: однотонная плитка, растягиваемая на всю грань. Без неё
     /// окна висели бы в пустоте и куба не читалось бы вовсе.
     pub куб_фон: Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer>,
@@ -810,6 +1053,15 @@ pub struct Parallax {
     /// обзора (цель 1.0 при масштабе «грань во весь экран» — это и есть то
     /// самое отдаление, которого не было вовсе: куб просто возникал готовым).
     pub куб_масштаб_цель: f64,
+    /// Насколько окна ПОДНЯТЫ НАД ГРАНЬЮ, 0…1 — доля от `cube_lift`.
+    ///
+    /// Не настройка, а анимация: на входе в куб окна отрываются от грани и
+    /// всплывают над ней, на выходе — опускаются обратно и ложатся в неё.
+    /// Иначе окна прыгали бы в размере в тот кадр, где куб появляется, — они
+    /// ближе к камере, чем грань, и на ней стоят крупнее.
+    pub куб_подъём: f64,
+    /// Куда `куб_подъём` едет: 1.0 пока куб живой, 0.0 на выходе.
+    pub куб_подъём_цель: f64,
     /// Куб доигрывает ЗАКРЫТИЕ обзора: грань разъезжается обратно на весь
     /// экран, и только когда доехала — обзор гасится по-настоящему.
     ///
@@ -846,6 +1098,9 @@ pub struct Parallax {
     pub аккорд_мимо: bool,
     /// Пальцы на сенсорном экране и то, чем они сейчас заняты (см. сенсор.rs).
     pub сенсор: crate::сенсор::Сенсор,
+    /// Мышь с клавиатуры: разгон удержания и кнопки, зажатые `pointer_drag`
+    /// (см. клавимышь.rs).
+    pub клавимышь: crate::клавимышь::КлавиМышь,
     /// Какие кнопки мыши зажаты ПРЯМО СЕЙЧАС, в нумерации `аккорды::Кнопка`.
     /// Нужно аккордам с прокруткой: «пока держат ЛКМ, колесо зумит».
     pub аккорд_зажаты: [bool; 3],
@@ -868,7 +1123,11 @@ pub struct Parallax {
     /// Драг куба: экранный x начала жеста, поворот в этот момент и путь,
     /// пройденный курсором. Путь нужен, чтобы отличить протяжку (крутим) от
     /// клика (уходим на грань).
-    pub куб_драг: Option<(f64, f64, f64)>,
+    pub куб_драг: Option<КубДраг>,
+    /// Карусель колонок в обзоре ленты; `None` — её нет (см. карусель.rs).
+    pub карусель: Option<Карусель>,
+    /// Карусель столов в сеточном обзоре; `None` — её нет.
+    pub карусель_столов: Option<КарусельСтолов>,
     /// Постоянные Id заплат размытия (по одной на остров панели).
     ///
     /// Раньше заплата брала `Id::new()` на КАЖДЫЙ кадр. Damage tracker ведёт
@@ -909,6 +1168,11 @@ pub struct Parallax {
     /// Пул под списочные меню (вайфай, звук): открыто всегда не больше одного,
     /// поэтому слоты у них общие.
     pub menu_ids: Vec<crate::udev::SolidSlot>,
+    /// Заливки панели приложений и её меню (см. udev::build_dock_elements).
+    pub dock_ids: Vec<crate::udev::SolidSlot>,
+    /// Заливки окна «Параметры панели» (см. udev::build_dock_settings_elements):
+    /// оно бывает открыто вместе с меню, и общий пул дал бы двум плашкам один Id.
+    pub dock_settings_ids: Vec<crate::udev::SolidSlot>,
     /// Растеризованные строки текста для оверлеев (см. text.rs).
     pub text_cache: crate::text::TextCache,
     // ── Мультивыделение / "созвездия" ────────────────────────────────────────
@@ -920,6 +1184,11 @@ pub struct Parallax {
     /// Группы окон ("созвездия", Super+G): двигаются/ресайзятся как единое
     /// целое в Float-режиме — см. selection.rs.
     pub constellations: Vec<Vec<Window>>,
+    /// Панель приложений (см. dock.rs).
+    pub dock: crate::dock::Dock,
+    /// Сетки склейки driftwm (Super+M с выделением, см. cluster.rs) — чтобы
+    /// их можно было распустить тем же нажатием, как созвездие по Win+D.
+    pub glue_grids: Vec<Vec<Window>>,
     /// niri-подобная модель колонок для Layout::Columns (см. columns.rs).
     pub columns: crate::columns::ColumnLayout,
     /// Полосы колонок ОСТАЛЬНЫХ столов (текущая лежит в `columns`). У niri
@@ -969,6 +1238,9 @@ pub struct Parallax {
     /// рядом с собственной, куда более бедной реализацией переноса — она умела
     /// лишь свободный сдвиг и в Tile/Columns просто выходила, ничего не сделав.
     pub touchpad_drag: Option<crate::grabs::move_grab::MoveSurfaceGrab>,
+    /// Ресайз жестом Super+3 пальца — тот же `ResizeSurfaceGrab`, что у
+    /// Win+ПКМ (`resize_to`/`finish`), ведётся сдвигом пальцев.
+    pub touchpad_resize: Option<crate::grabs::resize_grab::ResizeSurfaceGrab>,
     /// Жест Super+2 пальца начался там, где окна нет, — и до конца жеста
     /// переносить нечего. Курсор в этом жесте стоит на месте, поэтому ответ
     /// «под курсором пусто» не изменится, и повторять hit-тест на каждом кадре
@@ -983,8 +1255,9 @@ pub struct Parallax {
     pub touchpad_drag_empty: Option<std::time::Instant>,
     /// Начало rubber-band выделения двумя пальцами во Float (см. input.rs).
     pub touchpad_select_start: Option<Point<f64, Logical>>,
-    /// Доводка курсора, когда пальцы упёрлись в край тачпада (см. input.rs).
-    pub edge_drift: Option<crate::input::EdgeDrift>,
+    /// С какого момента курсор стоит у края экрана и камера едет сама (см.
+    /// `край_пан_шаг`). `None` — не стоит. Держит тик частым.
+    pub край_пан_с: Option<std::time::Instant>,
     /// Layout до входа в niri-режим (Columns). При повторном Win+N восстановить
     /// его, а не всегда Tile.
     pub prev_layout_before_niri: crate::tiling::Layout,
@@ -1212,6 +1485,7 @@ impl Parallax {
         let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
         let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
         let lua_config = crate::config::Config::load();
+        let dock_cfg_init = lua_config.dock.clone();
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "parallax");
         seat.add_keyboard(lua_config.xkb_config(), 200, 25).unwrap();
@@ -1223,6 +1497,12 @@ impl Parallax {
         if lua_config.touch {
             seat.add_touch();
         }
+        // Второе место — СТРОГО после хозяйского: клиенты считают главным то
+        // место, которое увидели первым.
+        #[cfg(feature = "mine")]
+        let mine_место = crate::mine::seat::завести(&mut seat_state, &dh, lua_config.xkb_config());
+        #[cfg(not(feature = "mine"))]
+        let mine_место = None;
         // wp_cursor_shape_v1: клиент называет ФОРМУ курсора ("text", "pointer"),
         // а рисует её компоновщик — своей темой и своего размера. Это и есть
         // штатный способ не давать курсору скакать в размере над каждым окном:
@@ -1266,6 +1546,7 @@ impl Parallax {
             xwayland_shell_state,
             xwm: None,
             xdisplay: None,
+            x11_iconic: Vec::new(),
             popups: PopupManager::default(),
             seat,
             viewport: Viewport::default(),
@@ -1277,6 +1558,7 @@ impl Parallax {
             render_cursor_logged: std::time::Instant::now(),
             render_cam_logged: (0.0, 0.0),
             cursor_status: CursorImageStatus::default_named(),
+            кромка_курсор: None,
             tagged_windows: Vec::new(),
             libinput_handle: None,
            logo_held: false,
@@ -1302,6 +1584,7 @@ impl Parallax {
             fullscreen_resync_лог: None,
             momentum: crate::canvas::MomentumState::new(lua_config.pan_drift),
             camera_anim: None,
+            cursor_return_anim: None,
             zoom_anim: None,
             закрытия: Vec::new(),
             zoom_glide: None,
@@ -1315,6 +1598,7 @@ impl Parallax {
             visited_tags: std::collections::HashSet::from([1u32]),
             is_snapping_enabled: false,
             is_magnetism_enabled: false,
+            is_glue_enabled: false,
             is_minimap_visible: false,
             minimap_slide: 0.0,
             vr: None,
@@ -1323,6 +1607,7 @@ impl Parallax {
             vr_поиск: None,
             vr_раскладка: crate::vr::scene::Раскладка::Дуга,
             mine: None,
+            mine_место,
             bar_hide: 0.0,
             пан_отметка: None,
             minimap_zoom: 1.0,
@@ -1333,7 +1618,7 @@ impl Parallax {
             minimap_manual_zoom: 1.0,
             minimap_manual_center: Point::from((0.0, 0.0)),
             minimap_drag: false,
-            pending_session: crate::session::load(),
+            рабстол: crate::рабстол::Рабстол::default(),
             portal: None,
             fullscreens: Vec::new(),
             portal_pick: None,
@@ -1345,6 +1630,7 @@ impl Parallax {
             tray: None,
             wifi: None,
             audio: None,
+            питание: None,
             tray_apps: None,
             bar_clock: crate::bar::clock_text(),
             bar_date: crate::bar::date_text(),
@@ -1367,9 +1653,17 @@ impl Parallax {
             window_pos_anims: Vec::new(),
             слайд_уходят: Vec::new(),
             призраки_группы: Vec::new(),
+            dnd_текущий: None,
+            dnd_ждёт_данных: None,
+            картинки_tx: None,
+            картинки_ждут: Vec::new(),
+            картинки_центр: Vec::new(),
+            край_превью: None,
+            до_прилипания: Vec::new(),
             bar_hover: None,
             preview_cell: None,
             preview_anim: 0.0,
+            bar_depth: Vec::new(),
             preview_hover: false,
             preview_zoom: 1.0,
             preview_center: Point::from((0.0, 0.0)),
@@ -1387,10 +1681,12 @@ impl Parallax {
             wallpaper_damage: Default::default(),
             window_open_anims: Vec::new(),
             window_size_anims: Vec::new(),
+            живой_размер: Vec::new(),
             decor: crate::decor::DecorCache::new(),
             pre_tiling_view: None,
             gesture_move_window: None,
             gesture_resize_window: None,
+            pinch_resize: None,
             gesture_resize_group: Vec::new(),
             жест_размер_накоп: (0.0, 0.0),
             жест_размер_места: Vec::new(),
@@ -1401,6 +1697,8 @@ impl Parallax {
             selection_drag: None,
             selected_windows: Vec::new(),
             constellations: Vec::new(),
+            dock: crate::dock::Dock::new(dock_cfg_init),
+            glue_grids: Vec::new(),
             columns: crate::columns::ColumnLayout::default(),
             columns_by_tag: HashMap::new(),
             dwindle_trees: HashMap::new(),
@@ -1415,9 +1713,10 @@ impl Parallax {
             overview_exit_pending: false,
             overview_exit_target_ws: None,
             touchpad_drag: None,
+            touchpad_resize: None,
             touchpad_drag_empty: None,
             touchpad_select_start: None,
-            edge_drift: None,
+            край_пан_с: None,
             prev_layout_before_niri: crate::tiling::Layout::Tile,
             shadow_ids: Vec::new(),
             super_tap_shift: false,
@@ -1427,25 +1726,37 @@ impl Parallax {
             columns_float_cam: (0.0, 0.0),
             columns_drag_hint: None,
             columns_swipe_dy: 0.0,
+            columns_swipe_dx: 0.0,
             tab_ids: Vec::new(),
+            рабстол_ids: Vec::new(),
+            виджеты_ids: Vec::new(),
             hint_ids: Vec::new(),
             overview_bg_ids: Vec::new(),
             minimap_ids: Vec::new(),
             вход: None,
             палитра_обоев: None,
             палитра_правка: None,
-            свет: crate::свет::Свет::new(),
             вход_ids: Vec::new(),
             selection_ids: Vec::new(),
             ghost_ids: Vec::new(),
             preview_ids: Vec::new(),
             wallpaper_id: None,
+            обои_цикл: false,
+            обои_цикл_ids: Vec::new(),
+            куб_фон_ids: Vec::new(),
             icon_cache: crate::icons::Кэш::default(),
             chip_icons: std::collections::HashMap::new(),
+            chip_icons_up: std::collections::HashMap::new(),
             blur_tex: None,
+            blur_кэш: std::collections::HashMap::new(),
             blur_shape: None,
+            стекло: None,
             куб_шейдер: None,
+            наклоны_окон: Vec::new(),
+            поворот_ждёт: None,
             куб_угол: 0.0,
+            куб_наклон: 0.0,
+            куб_наклон_цель: 0.0,
             куб_цель: 0.0,
             куб_фон: None,
             куб_переход: false,
@@ -1456,14 +1767,19 @@ impl Parallax {
             аккорд_край: crate::grabs::resize_grab::ResizeEdge::BOTTOM_RIGHT,
             аккорд_мимо: false,
             сенсор: Default::default(),
+            клавимышь: Default::default(),
             аккорд_зажаты: [false; 3],
             аккорд_съедено: [false; 3],
             аккорд_выделение: None,
             аккорд_запуск_в_рамке: None,
             куб_масштаб: 1.0,
             куб_масштаб_цель: 1.0,
+            куб_подъём: 0.0,
+            куб_подъём_цель: 0.0,
             куб_выход: None,
             куб_драг: None,
+            карусель: None,
+            карусель_столов: None,
             blur_ids: Vec::new(),
             portal_ids: Vec::new(),
             portal_pick_ids: Vec::new(),
@@ -1477,6 +1793,8 @@ impl Parallax {
             bt_ind_ids: Vec::new(),
             tray_ids: Vec::new(),
             menu_ids: Vec::new(),
+            dock_ids: Vec::new(),
+            dock_settings_ids: Vec::new(),
             text_cache: crate::text::TextCache::new(),
             image_capture_source_state,
             output_capture_source_state,
@@ -1533,6 +1851,21 @@ impl Parallax {
         self.window_pos_anims.iter()
             .find(|(w, _)| crate::dwindle::same_window(w, window))
             .map(|(_, anim)| anim.target.to_i32_round())
+    }
+
+    /// Где окно ЖИВЁТ, а не где оно в этом кадре: у летящего — цель пружины,
+    /// у уезжающего со слайдом стола — его сохранённый дом, у стоящего — место
+    /// в space, у снятого с холста — `tw.position`. То же правило, что в
+    /// `refresh_tags` (см. `дом_окна`), для тех, кому нужен снимок раскладки.
+    pub(crate) fn дом_окна_сейчас(&self, tw: &TaggedWindow) -> Point<i32, Logical> {
+        let уезжает = self.слайд_уходят.iter()
+            .any(|w| crate::dwindle::same_window(w, &tw.window));
+        дом_окна(
+            уезжает,
+            self.window_anim_target(&tw.window),
+            self.space.element_location(&tw.window),
+        )
+        .unwrap_or(tw.position)
     }
 
     /// Снять анимацию позиции с окна, оставив его там, где оно сейчас.
@@ -1739,6 +2072,12 @@ impl Parallax {
     /// сообщает синхронизации, что камера уехала НАМЕРЕННО и курсор уже
     /// приведён в порядок — иначе она повторит ту же работу.
     pub fn pan_camera_by(&mut self, dcam_x: f64, dcam_y: f64) {
+        // Здесь же и запрет пана в Tile/Columns: через эту точку идут все
+        // ручные способы, и один гейт закрывает их разом.
+        if self.пан_запрещён_раскладкой() {
+            self.momentum.stop();
+            return;
+        }
         // Отметка пана — здесь, в единственной точке, через которую проходят
         // ВСЕ способы вести камеру рукой: Alt+ЛКМ, колесо, жест тачпада, палец
         // на экране. По ней уезжает панель (см. `Parallax::пан_идёт`).
@@ -1748,8 +2087,60 @@ impl Parallax {
         self.viewport.cam_x -= dcam_x;
         self.viewport.cam_y -= dcam_y;
         self.apply_camera();
-        let pos = self.pointer_location;
+        // Стрелка едет с холстом и на пане краем не зажата (см.
+        // `set_pointer_canvas`), так что длинным движением её уводило за кадр,
+        // а на отпускании она летела обратно в центр экрана. Ярик 12.10.2026:
+        // «не работает нормально да и неудобно» — теперь обёртка, как в
+        // Blender: ушла за правый край — вышла из левого, и пан идёт дальше
+        // без остановки. В холсте это сдвиг ровно на видимую ширину/высоту.
+        let vis = self.visible_canvas_size();
+        let mut pos = self.pointer_location;
+        if vis.w > 1.0 && vis.h > 1.0 {
+            pos.x = self.viewport.cam_x + (pos.x - self.viewport.cam_x).rem_euclid(vis.w);
+            pos.y = self.viewport.cam_y + (pos.y - self.viewport.cam_y).rem_euclid(vis.h);
+        }
         self.warp_pointer(pos);
+    }
+
+    /// Идёт ли пан холста прямо сейчас — ручкой (Alt+ЛКМ), тачпадом/свайпом
+    /// или доездом стрелки обратно к центру после отпускания.
+    ///
+    /// Explicit-флаг `pan_button_held` покрывает только Alt+ЛКМ: у
+    /// тачпада/свайпа нет удержания, только поток дискретных событий, поэтому
+    /// их присутствие меряем недавней отметкой `pan_camera_by` — она
+    /// обновляется на КАЖДОЙ его дельте, и жест держит её горячей всё время,
+    /// пока идёт.
+    pub fn is_panning(&self) -> bool {
+        const ЖИВАЯ_ОТМЕТКА: std::time::Duration = std::time::Duration::from_millis(100);
+        self.pan_button_held
+            || self.cursor_return_anim.is_some()
+            || self.пан_отметка.is_some_and(|t| t.elapsed() < ЖИВАЯ_ОТМЕТКА)
+    }
+
+    /// Отпустили пан — если стрелка осталась за видимой частью холста, плавно
+    /// довести её к центру экрана. Если она и так внутри — ничего не делаем.
+    ///
+    /// Инерцию (`momentum`) в этом случае останавливаем: доезжающая камера и
+    /// доезжающая обратно стрелка воюют за одну и ту же точку экрана
+    /// (см. `pin_pointer_after_camera` в anim::tick) — если курсор уже ушёл за
+    /// край, продолжать раскачивать камеру ему вслед незачем.
+    pub fn запустить_возврат_курсора(&mut self) {
+        let vis = self.visible_canvas_size();
+        let p = self.pointer_location;
+        let outside = p.x < self.viewport.cam_x || p.x > self.viewport.cam_x + vis.w
+            || p.y < self.viewport.cam_y || p.y > self.viewport.cam_y + vis.h;
+        if !outside {
+            return;
+        }
+        self.momentum.stop();
+        let target = Point::from((
+            self.viewport.cam_x + vis.w / 2.0,
+            self.viewport.cam_y + vis.h / 2.0,
+        ));
+        self.cursor_return_anim = Some(crate::anim::CameraAnim::new(
+            p, target, crate::anim::дуг::возврат_курсора(),
+        ));
+        self.request_redraw();
     }
 
     /// Курсор едет за содержимым мини-копии мира (карта окон, карточка
@@ -1841,13 +2232,24 @@ impl Parallax {
         // зум живёт в отрисовке (см. render_surface), размер выхода равен
         // экрану, и без этой поправки курсор упирался в невидимую стену на
         // половине экрана (тот самый «кривой хитбокс»).
-        let vis = self.visible_canvas_size();
-        pos.x = pos.x.clamp(self.viewport.cam_x, self.viewport.cam_x + vis.w);
-        pos.y = pos.y.clamp(self.viewport.cam_y, self.viewport.cam_y + vis.h);
+        //
+        // Пока идёт пан (или доезд `cursor_return_anim` после него) зажим
+        // снят намеренно: курсор обязан суметь уйти за край стола рукой, а не
+        // упереться в невидимую стену на полпути. Как только пан отпущен,
+        // `запустить_возврат_курсора` сама решает, возвращать ли стрелку —
+        // здесь её насильно никто не тащит обратно.
+        if !self.is_panning() {
+            let vis = self.visible_canvas_size();
+            pos.x = pos.x.clamp(self.viewport.cam_x, self.viewport.cam_x + vis.w);
+            pos.y = pos.y.clamp(self.viewport.cam_y, self.viewport.cam_y + vis.h);
+        }
         if pos == self.pointer_location {
             return;
         }
         self.pointer_location = pos;
+        // Перенос курсора — это тоже движение: иконку рабочего стола ведут и
+        // мышью, и `plx ctl mouse` (на харнессе другого способа нет вовсе).
+        self.рабстол_движение(pos);
 
         let under = self.surface_under(pos);
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
@@ -1913,6 +2315,92 @@ impl Parallax {
     /// Одна точка вызова вместо правки полутора десятков мест, где меняется
     /// камера: любое движение камеры, откуда бы оно ни пришло, здесь будет
     /// замечено сравнением с pointer_cam_ref.
+    /// Сдвиг камеры (в единицах холста) за шаг `dt`, пока курсор КАСАЕТСЯ края
+    /// экрана. `None` — касания нет или ехать сейчас нельзя.
+    ///
+    /// Перелив в `PointerMotion` (input.rs) двигает камеру только на толчок
+    /// мыши за край: мышь остановилась — встал и холст. Ярик 25.09.2026:
+    /// «чтобы при просто касании края экрана камера начинала двигаться, не
+    /// обязательно двигать в эту сторону». Касание не порождает событий,
+    /// поэтому едем из `anim::tick`, а `край_пан_с` держит тик частым.
+    ///
+    /// Не едем там, где край занят другим делом: соседний монитор с этой
+    /// стороны (край проходной), острова панели и слои (к ним подводят курсор,
+    /// чтобы нажать), зажатая кнопка (выделение, ползунок — жест принадлежит
+    /// окну), захват курсора игрой и полноэкранное окно.
+    pub fn край_пан_шаг(&mut self, dt: std::time::Duration) -> Option<Point<f64, Logical>> {
+        use crate::monitors::Сторона;
+        let скорость = self.lua_config.edge_pan;
+        let можно = скорость > 0.0
+            && self.tile_config.layout == crate::tiling::Layout::Float
+            && !self.overview_active
+            && !self.куб_активен()
+            && self.camera_anim.is_none()
+            && self.zoom_anim.is_none()
+            && self.кнопок_нажато == 0
+            && self.dragged_window.is_none()
+            && self.touchpad_drag.is_none()
+            && self.touchpad_resize.is_none()
+            && self.touchpad_select_start.is_none()
+            && self.bar_hover.is_none()
+            && !self.snip_идёт()
+            && !self.fullscreen_here()
+            && self.курсор_монитор == self.активный;
+        if !можно {
+            self.край_пан_с = None;
+            return None;
+        }
+        let pos = self.pointer_location;
+        if self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top]).is_some() {
+            self.край_пан_с = None;
+            return None;
+        }
+        let под = self.surface_under(pos);
+        let захват = self.pointer_constraint_at(под.as_ref());
+        if захват.locked || захват.confined {
+            self.край_пан_с = None;
+            return None;
+        }
+        let зум = self.viewport.zoom.max(0.01);
+        let экран = self.screen_size();
+        let (w, h) = (экран.w as f64, экран.h as f64);
+        // Экранная точка курсора в логических пикселях. Порог — пиксель:
+        // курсор зажат краем (см. PointerMotion), так что «у края» — это ровно
+        // на нём, и промахнуться, подведя мышь рывком, нельзя.
+        let sx = (pos.x - self.viewport.cam_x) * зум;
+        let sy = (pos.y - self.viewport.cam_y) * зум;
+        const ПОРОГ: f64 = 1.0;
+        let сосед = |с: Сторона| self.сосед(self.активный, с).is_some();
+        let dx: f64 = if sx <= ПОРОГ && !сосед(Сторона::Слева) {
+            -1.0
+        } else if sx >= w - ПОРОГ && !сосед(Сторона::Справа) {
+            1.0
+        } else {
+            0.0
+        };
+        let dy: f64 = if sy <= ПОРОГ && !сосед(Сторона::Сверху) {
+            -1.0
+        } else if sy >= h - ПОРОГ && !сосед(Сторона::Снизу) {
+            1.0
+        } else {
+            0.0
+        };
+        if dx == 0.0 && dy == 0.0 {
+            self.край_пан_с = None;
+            return None;
+        }
+        let now = std::time::Instant::now();
+        let с = *self.край_пан_с.get_or_insert(now);
+        // Разгон за 300 мс с трети скорости: касание сразу даёт движение (его
+        // и просили), но рывка на полной скорости в первый же кадр нет.
+        let разгон = (now.duration_since(с).as_secs_f64() / 0.3).clamp(0.0, 1.0);
+        let v = скорость * (0.35 + 0.65 * разгон);
+        // Диагональ в углу — той же скоростью, а не в √2 быстрее.
+        let норма = (dx * dx + dy * dy).sqrt();
+        let шаг = v * dt.as_secs_f64() / зум / норма;
+        Some(Point::from((dx * шаг, dy * шаг)))
+    }
+
     pub fn sync_pointer_to_camera(&mut self) {
         let cam = (self.viewport.cam_x, self.viewport.cam_y, self.viewport.zoom);
         if cam == self.pointer_cam_ref {
@@ -1952,10 +2440,151 @@ impl Parallax {
         if let Some(hit) = self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top]) {
             return Some(hit);
         }
-        self.space.element_under(pos).and_then(|(window, location)| {
+        // Закреплённые окна висят над холстом (см. pin.rs) и считаются в
+        // экранных координатах — поэтому до обычных окон и своей веткой.
+        if let Some(hit) = self.закреплённая_поверхность_под(pos) {
+            return Some(hit);
+        }
+        // Наклонённое окно (см. наклон.rs) — своей веткой: точку окна под
+        // курсором даёт обратная проекция, а не сдвиг.
+        if let Some(hit) = self.наклонённая_поверхность_под(pos) {
+            return Some(hit);
+        }
+        self.окно_под(pos).and_then(|(window, location)| {
             window.surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                 .map(|(s, p)| (s, (p + location).to_f64()))
         })
+    }
+
+    /// Окно под точкой холста и его `render_location`.
+    ///
+    /// `element_under` считает окно по `geometry()` — то есть по тому, что
+    /// клиент НАРИСОВАЛ. У упрямого клиента (Electron, GTK) это больше слота,
+    /// рендер режет его по запрошенной рамке, и невидимая часть продолжала
+    /// ловить ввод поверх соседа: жалоба Ярика 10.09.2026 «окна залезают друг на
+    /// друга, размер меняется визуально, но не физически». Замер на харнессе:
+    /// Discord asked=615 buffer=940, точка (700,200) — визуально терминал —
+    /// отдавала поверхность Discord'а. Отсюда проверка видимой рамки; не попали
+    /// в неё — ищем ниже, как если бы окна тут не было.
+    pub fn окно_под(&self, pos: Point<f64, Logical>) -> Option<(Window, Point<i32, Logical>)> {
+        // Закреплённое окно — поверх холста, и его «место» — виртуальное
+        // начало в экранных координатах (см. pin.rs). На холсте его копии нет.
+        if let Some((w, начало)) = self.закреплённое_под(pos) {
+            return Some((w, начало.to_i32_round()));
+        }
+        // Наклонённое окно стоит на экране не там, где на холсте: его ищет
+        // обратная проекция, а обычный путь его не видит вовсе (иначе оно
+        // ловило бы клики своим ровным, невидимым прямоугольником).
+        if let Some((w, начало)) = self.наклонённое_под(pos) {
+            return Some((w, начало.to_i32_round()));
+        }
+        self.space
+            .element_under(pos)
+            .filter(|(w, _)| !self.закреплено(w) && self.наклон_окна(w).is_none() && self.в_видимой_рамке(w, pos))
+            .map(|(w, loc)| (w.clone(), loc))
+            .or_else(|| {
+                self.space.elements().rev()
+                    .find(|w| {
+                        !self.закреплено(w)
+                            && self.наклон_окна(w).is_none()
+                            && self.в_видимой_рамке(w, pos)
+                            && self.space.element_geometry(w).is_some_and(|g| {
+                                let loc = g.loc - w.geometry().loc;
+                                w.is_in_input_region(&(pos - loc.to_f64()))
+                            })
+                    })
+                    .map(|w| {
+                        let g = self.space.element_geometry(w).unwrap();
+                        (w.clone(), g.loc - w.geometry().loc)
+                    })
+            })
+    }
+
+    /// Кромка окна под точкой холста: невидимая полоса СНАРУЖИ видимой рамки,
+    /// за которую окно тянут левой кнопкой без Super (как в KDE/GNOME).
+    ///
+    /// Снаружи, а не внутри: рамок у окон parallax нет, и полоса внутри отнимала
+    /// бы у клиента его собственные пиксели — полосы прокрутки, кромки вкладок.
+    /// Окна перебираются сверху вниз: кромка окна работает и поверх окна,
+    /// лежащего НИЖЕ (плавающее над плиткой), но не сквозь то, что выше, —
+    /// чужое окно, его меню, слой, закреплённое.
+    pub fn кромка_под(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(Window, crate::grabs::resize_grab::ResizeEdge)> {
+        use crate::tiling::Layout;
+        if self.overview_active || crate::mine::прячем_курсор(self) {
+            return None;
+        }
+        // Всё, что лежит НАД окнами холста (тот же порядок, что в `surface_under`).
+        if self.portal.as_ref().is_some_and(|п| self.portal_hit_test(п, pos).is_some())
+            || self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top]).is_some()
+            || self.закреплённая_поверхность_под(pos).is_some()
+            || self.наклонённая_поверхность_под(pos).is_some()
+        {
+            return None;
+        }
+        let zoom = self.viewport.zoom.max(0.01);
+        let (зона, угол) = (
+            crate::grabs::resize_grab::КРОМКА_ЗОНА / zoom,
+            crate::grabs::resize_grab::КРОМКА_УГОЛ / zoom,
+        );
+        let tags = self.viewport.current_tags();
+        let раскладка = self.tile_config.layout;
+        for w in self.space.elements().rev() {
+            let Some(g) = self.space.element_geometry(w) else { continue };
+            // Точка на самом окне или на его меню — это клик клиенту, и ниже
+            // искать нечего: всё, что под ним, закрыто.
+            let начало = (g.loc - w.geometry().loc).to_f64();
+            if w.surface_under(pos - начало, WindowSurfaceType::ALL).is_some() && self.в_видимой_рамке(w, pos) {
+                return None;
+            }
+            let Some(tw) = self.tagged_windows.iter().find(|tw| &tw.window == w) else { continue };
+            // В Monocle тайловое окно не ресайзится вовсе (см. resize_grab.rs).
+            let тайловое = !tw.floating && раскладка != Layout::Float;
+            if tw.tags & tags == 0 || tw.виджет || (тайловое && раскладка == Layout::Monocle)
+                || self.закреплено(w) || self.наклон_окна(w).is_some() || self.is_fullscreen(w)
+            {
+                continue;
+            }
+            let рамка = Rectangle::new(g.loc, crate::xwin::видимый_размер(w, g.size)).to_f64();
+            if рамка.contains(pos) {
+                return None;
+            }
+            if let Some(край) = crate::grabs::resize_grab::край_кромки(рамка, pos, зона, угол) {
+                return Some((w.clone(), край));
+            }
+        }
+        None
+    }
+
+    /// Форма курсора над кромкой окна — или той, что уже тянут.
+    pub fn курсор_кромки(&self) -> Option<CursorIcon> {
+        if self.кромка_курсор.is_some() {
+            return self.кромка_курсор;
+        }
+        if self.pan_button_held || self.seat.get_pointer().is_some_and(|p| p.is_grabbed()) {
+            return None;
+        }
+        self.кромка_под(self.pointer_location)
+            .map(|(_, край)| crate::grabs::resize_grab::значок_кромки(край))
+    }
+
+    /// Попадает ли точка холста в ВИДИМУЮ рамку окна — ту, по которой рендер
+    /// режет картинку (`xwin::видимый_размер`, см. udev.rs "нужен_кроп").
+    ///
+    /// Окно во весь экран не режется вовсе, поэтому и здесь не ограничивается:
+    /// иначе полноэкранное окно клиента, который рисует больше выхода, начало
+    /// бы терять ввод по краям.
+    pub(crate) fn в_видимой_рамке(&self, window: &Window, точка: Point<f64, Logical>) -> bool {
+        let Some(g) = self.space.element_geometry(window) else {
+            return false;
+        };
+        if self.is_fullscreen(window) {
+            return true;
+        }
+        let видимо = crate::xwin::видимый_размер(window, g.size);
+        Rectangle::new(g.loc, видимо).to_f64().contains(точка)
     }
 
     /// Стоит ли курсор над layer-поверхностью верхних слоёв (Overlay/Top).
@@ -2457,6 +3086,14 @@ impl Parallax {
             self.viewport.cam_x = дом.x as f64;
             self.viewport.cam_y = дом.y as f64;
             self.apply_camera();
+            // Стол новый, но пустым он бывает не всегда: Win+Shift+цифра
+            // присылает сюда окно и только потом переводит взгляд. Дерева у
+            // такого стола ещё нет — без `arrange` окно осталось бы стоять
+            // там, где его застал перенос (см. `тайлинг_разошёлся`), а
+            // `restore_layout` окон не двигает нарочно.
+            if target_layout != Layout::Float && self.тайлинг_разошёлся() {
+                self.arrange();
+            }
             tracing::info!("plx: view_tag → {:#b} (new workspace → {})", tag, target_layout.symbol());
             return;
         }
@@ -2469,6 +3106,18 @@ impl Parallax {
             // (см. tiling::restore_layout — иначе плавающие слетались в точку).
             self.restore_layout(target_layout);
             tracing::info!("plx: view_tag → {:#b} (layout {})", tag, target_layout.symbol());
+        }
+
+        // Посещённый тайловый стол `arrange` не трогает: он уже разложен, и
+        // лишний проход дёргал бы все его окна анимацией на КАЖДОМ
+        // переключении. Но пока нас тут не было, состав стола мог смениться —
+        // Win+Shift+цифра присылает сюда окно, ничего не зная о дереве этого
+        // стола (`перенести_окно_на_стол` вынимает окно только из дерева
+        // ДОНОРА). Такое окно оставалось стоять там, где его застал перенос:
+        // своего прежнего размера и поверх/позади соседей вместо слота.
+        // Поэтому раскладываем не всегда, а когда дерево разошлось с составом.
+        if target_layout != Layout::Float && self.тайлинг_разошёлся() {
+            self.arrange();
         }
 
         // Плавный "перелёт" в кадр стола вместо мгновенного прыжка. Кадр — это
@@ -2491,7 +3140,22 @@ impl Parallax {
         let сдвиг = (to.x - from.x).abs() > 0.5 || (to.y - from.y).abs() > 0.5;
         let зум_иной = (zoom - self.viewport.zoom).abs() > 0.001;
         self.momentum.stop();
-        if зум_иной {
+        if self.куб_переход {
+            // Переход показывает КУБ (Super+PgUp/PgDn при `cube_switch`), и
+            // второе движение под ним — лишнее. Слайд окон ехал прямо по
+            // граням: уходящий стол уползал вбок по своей грани, а приходящая
+            // грань первые кадры была пустой, с краешком чужого окна (снимок
+            // харнесса 25.09.2026). Перелёт камеры тоже не нужен: грань
+            // рисуется по кадру стола (см. `куб_рамка_стола`), и к концу
+            // поворота камера обязана уже стоять там, иначе после наезда
+            // стол доезжал бы ещё раз.
+            self.camera_anim = None;
+            self.zoom_anim = None;
+            self.viewport.cam_x = x;
+            self.viewport.cam_y = y;
+            self.viewport.zoom = zoom;
+            self.apply_camera();
+        } else if зум_иной {
             self.camera_anim = None;
             self.zoom_anim = Some(ZoomAnim::new_pan(
                 from, to, self.viewport.zoom, zoom, crate::anim::дуг::перелёт_к_столу(),
@@ -2722,7 +3386,9 @@ impl Parallax {
         }
     }
 
-    /// Назначить тег focused окну (Super+Shift+N)
+    /// Назначить тег focused окну (Super+Shift+N) — или всем ВЫДЕЛЕННЫМ, если
+    /// выделение есть (рамка Super+ЛКМ): едут все разом, как и Win+V
+    /// (`float_selected`) действует на выделение, а не на одно окно.
     pub fn tag_window(&mut self, tag: u32) {
         // Переезд окна на другой стол прямо в обзоре оставил бы его миниатюру
         // в чужой ячейке, а снимок геометрии — от старого стола: выходим,
@@ -2731,40 +3397,44 @@ impl Parallax {
         if self.overview_active {
             self.exit_overview_immediate(None);
         }
-        let Some(focused) = self.focused_window_surface() else {
-            self.refresh_tags();
-            return;
+        let цели: Vec<Window> = if !self.selected_windows.is_empty() {
+            self.selected_windows.clone()
+        } else {
+            match self.focused_window_surface() {
+                Some(focused) => self.tagged_windows.iter()
+                    .find(|tw| crate::xwin::is_surface(&tw.window, &focused))
+                    .map(|tw| tw.window.clone())
+                    .into_iter()
+                    .collect(),
+                None => Vec::new(),
+            }
         };
-        let Some((window, floating, old_tag)) = self.tagged_windows.iter()
-            .find(|tw| crate::xwin::is_surface(&tw.window, &focused))
-            .map(|tw| (tw.window.clone(), tw.floating, tw.tags))
-        else {
-            self.refresh_tags();
-            return;
-        };
-        if old_tag == tag {
-            return;
-        }
+        let old_tag = self.viewport.current_tags();
 
-        // Стол-приёмник — лента: окно обязано войти в её МОДЕЛЬ КОЛОНОК, а не
-        // просто сменить тег. Иначе полосе о нём известно только через ленивый
-        // columns_reconcile, который допишет его колонкой в самый конец при
-        // следующем заходе на стол. Плавающие окна не трогаем: в ленте они
-        // остаются плавающими поверх полосы (см. columns_pin_floating).
-        if !floating && self.columns_is_strip_tag(tag) {
-            if self.columns_adopt_window(&window, tag) {
-                tracing::info!("plx: tag_window → {:#b} (into the ribbon)", tag);
-                return;
+        let mut уехали = 0;
+        let mut на_стол = false;
+        let mut сменил_монитор = false;
+        for окно in &цели {
+            match self.перенести_на_стол(окно, tag) {
+                None => {}
+                Some(None) => уехали += 1,
+                Some(Some(монитор)) => {
+                    уехали += 1;
+                    на_стол = true;
+                    сменил_монитор |= монитор;
+                }
             }
         }
-
-        // Стол-приёмник может жить на ДРУГОМ мониторе, а окна лежат на холсте
-        // от дома своего монитора: одной сменой тега окно уехало бы «в никуда»
-        // — с прежнего экрана пропало (тег сменился), на новом не появилось (до
-        // его дома ШАГ_ДОМА пикселей). Перенос делает `перенести_окно_на_стол`,
-        // он же вынимает окно из дерева донора.
-        let сменил_монитор = self.перенести_окно_на_стол(&window, tag, true);
-        tracing::info!("plx: tag_window → {:#b}", tag);
+        if уехали == 0 {
+            self.refresh_tags();
+            return;
+        }
+        tracing::info!("plx: tag_window → {:#b} ({} windows)", tag, уехали);
+        // Всё ушло в ленту — `columns_adopt_window` уже разложил и донора, и
+        // приёмник, а за окном в ленту мы и раньше не ехали.
+        if !на_стол {
+            return;
+        }
         // Окно ушло со СВОЕГО стола — донор обязан сомкнуться сразу. Полоса
         // держит его в колонке, дерево dwindle — в листе, и вычищают их только
         // columns_reconcile / sync_dwindle_tree, то есть arrange. Без него на
@@ -2791,6 +3461,96 @@ impl Parallax {
         }
     }
 
+    /// Раскладка стола `tag`: у текущего она живёт в `tile_config`, у
+    /// остальных — в `tag_layouts` (туда её пишет `view_tag_inner` на уходе).
+    pub(crate) fn раскладка_стола(&self, tag: u32) -> Option<crate::tiling::Layout> {
+        if tag == self.viewport.current_tags() {
+            Some(self.tile_config.layout)
+        } else {
+            self.tag_layouts.get(&tag).copied()
+        }
+    }
+
+    /// Перенести ОДНО окно на стол `tag` — сердцевина [`Self::tag_window`].
+    ///
+    /// `None` — переносить нечего (окна нет или оно уже там); `Some(None)` —
+    /// окно ушло в ленту (её модель колонок всё разложила сама);
+    /// `Some(Some(сменил_монитор))` — окно ушло на обычный стол, дальше
+    /// раскладку и переход делает вызывающий.
+    pub(crate) fn перенести_на_стол(&mut self, window: &Window, tag: u32) -> Option<Option<bool>> {
+        use crate::tiling::Layout;
+        let (floating, old_tag, position, float_size) = self.tagged_windows.iter()
+            .find(|tw| crate::dwindle::same_window(&tw.window, window))
+            .map(|tw| (tw.floating, tw.tags, tw.position, tw.float_size))?;
+        if old_tag == tag {
+            return None;
+        }
+
+        // Место и размер окна запоминаются ЗА СТОЛОМ, который оно покидает, и
+        // возвращаются, когда окно приходит на стол, где уже бывало, — см.
+        // TaggedWindow::desk_geometry.
+        //
+        // Раньше это делалось только для окон с флагом `floating`. Но на
+        // Float-СТОЛЕ окна плавают раскладкой, а флага у них нет — и память не
+        // работала ровно там, где она нужнее всего: окно, ужатое на Float-столе
+        // до 825×307, съездив на тайловый стол и обратно, возвращалось
+        // растянутым на весь экран (замер на харнессе 25.09.2026, жалоба Ярика
+        // «окна не запоминают свой размер на рабочих столах»). Поэтому
+        // «плавающее здесь» = флаг ИЛИ Float-раскладка стола.
+        //
+        // Размер берём настоящий, из space, а не `float_size`: тот `None`,
+        // пока окно ни разу не ресайзили руками, и с `None` клиент при
+        // возврате оставил бы себе размер тайлового слота.
+        let плавает_там = floating || self.раскладка_стола(old_tag) == Some(Layout::Float);
+        let плавает_тут = floating || self.раскладка_стола(tag) == Some(Layout::Float);
+        if плавает_там {
+            let размер = self.space.element_geometry(window).map(|g| g.size).or(float_size);
+            if let Some(tw) = self.tagged_windows.iter_mut()
+                .find(|tw| crate::dwindle::same_window(&tw.window, window))
+            {
+                let место = if floating { tw.float_position } else { position };
+                tw.desk_geometry.insert(old_tag, (место, размер));
+            }
+        }
+        let восстановить = плавает_тут.then(|| self.tagged_windows.iter()
+            .find(|tw| crate::dwindle::same_window(&tw.window, window))
+            .and_then(|tw| tw.desk_geometry.get(&tag).copied()))
+            .flatten();
+
+        // Стол-приёмник — лента: окно обязано войти в её МОДЕЛЬ КОЛОНОК, а не
+        // просто сменить тег. Иначе полосе о нём известно только через ленивый
+        // columns_reconcile, который допишет его колонкой в самый конец при
+        // следующем заходе на стол. Плавающие окна не трогаем: в ленте они
+        // остаются плавающими поверх полосы (см. columns_pin_floating).
+        if !floating && self.columns_is_strip_tag(tag) && self.columns_adopt_window(window, tag) {
+            tracing::info!("plx: tag_window → {:#b} (into the ribbon)", tag);
+            return Some(None);
+        }
+
+        // Стол-приёмник может жить на ДРУГОМ мониторе, а окна лежат на холсте
+        // от дома своего монитора: одной сменой тега окно уехало бы «в никуда»
+        // — с прежнего экрана пропало (тег сменился), на новом не появилось (до
+        // его дома ШАГ_ДОМА пикселей). Перенос делает `перенести_окно_на_стол`,
+        // он же вынимает окно из дерева донора.
+        let сменил_монитор = self.перенести_окно_на_стол(window, tag, true);
+        if let Some((pos, size)) = восстановить {
+            if let Some(tw) = self.tagged_windows.iter_mut()
+                .find(|tw| crate::dwindle::same_window(&tw.window, window))
+            {
+                tw.position = pos;
+                tw.float_position = pos;
+                if size.is_some() {
+                    tw.float_size = size;
+                }
+                tw.float_position_set = true;
+            }
+            self.space.map_element(window.clone(), pos, false);
+            crate::xwin::set_size(window, size, crate::xwin::Tiled::Unset);
+            crate::xwin::configure(window);
+        }
+        Some(Some(сменил_монитор))
+    }
+
     /// Toggle тег на focused окне (Super+Ctrl+Shift+N)
     pub fn toggle_tag(&mut self, tag: u32) {
         if self.overview_active {
@@ -2812,6 +3572,9 @@ impl Parallax {
 
     /// Обновить space — показать только окна с видимыми тегами
     pub fn refresh_tags(&mut self) {
+        // Закреплённые окна едут на открывающийся стол своего монитора: они
+        // приклеены к камере, а не к столу (см. pin.rs).
+        self.закреплённые_на_стол();
         let current = self.viewport.current_tags();
         // Обои едут за столом (см. monitors::СлайдОбоев). Здесь, а не в
         // view_tag: сюда сходятся все смены тегов, а повторный вызов с тем же
@@ -2887,6 +3650,17 @@ impl Parallax {
             .map(|tw| (tw.window.clone(), tw.position))
             .collect();
         for (w, pos) in visible {
+            // Окно уезжало за край в слайде, а его стол снова на экране
+            // (быстрое «туда-обратно»): кладём домой и снимаем пружину, иначе
+            // она дотянула бы его за край уже на своём столе. Раньше это
+            // прибирал только сам слайд, а при переходе с перелётом камеры или
+            // поворотом куба слайда нет.
+            if let Some(i) = self.слайд_уходят.iter()
+                .position(|x| crate::dwindle::same_window(x, &w))
+            {
+                self.слайд_уходят.swap_remove(i);
+                self.window_pos_anims.retain(|(x, _)| !crate::dwindle::same_window(x, &w));
+            }
             self.space.map_element(w, pos, false);
         }
 
@@ -2977,14 +3751,24 @@ impl Parallax {
     /// (`zoom_step_at_cursor`), щипок тачпада и режим лупы. Раньше числа
     /// 0.05/5.0 стояли литералами в трёх местах, и «максимальное отдаление»
     /// нельзя было назвать по имени.
-    pub const ZOOM_MIN: f64 = 0.05;
-    pub const ZOOM_MAX: f64 = 5.0;
+    ///
+    /// 30.09.2026 Ярик попросил снять ограничение на отдаление и
+    /// приближение: пределы раздвинуты с 0.05…5 до 0.01…50. Ниже 0.01 не
+    /// идём нарочно — на этом полу зум зажат по всему коду (`zoom.max(0.01)`
+    /// в рендере, хит-тесте, жестах), и ниже него картинка и клики разъехались
+    /// бы. Запреты зума по раскладкам (Tile, лента) остаются как были.
+    pub const ZOOM_MIN: f64 = 0.01;
+    pub const ZOOM_MAX: f64 = 50.0;
     /// Уровень зума в режиме лупы — самый край отдаления.
     ///
     /// Раньше здесь было 0.2 «≈5 экранов». Ярик 24.08.2026 попросил ровно
     /// максимум: Win+Space должен показывать весь холст разом, а не «немного
     /// подальше», — поэтому уровень и предел зума теперь одно и то же число.
-    pub const ZOOM_NAV_LEVEL: f64 = Self::ZOOM_MIN;
+    ///
+    /// С 30.09.2026 предел зума раздвинут до 0.01, а лупа осталась на прежних
+    /// 0.05: на сотой доле окна превращаются в точки, и «весь холст разом»
+    /// перестаёт что-либо показывать.
+    pub const ZOOM_NAV_LEVEL: f64 = 0.05;
     /// Шаг панорамирования стрелками в режиме обзора (экранные px за нажатие).
     pub const ZOOM_NAV_PAN_STEP: f64 = 220.0;
 
@@ -2994,7 +3778,39 @@ impl Parallax {
     pub fn zoom_locked(&self) -> bool {
         // Обзор столов — исключение: там колесо это его собственный зум, и
         // запирать его заодно значило бы сломать обзор из-за чужого режима.
-        self.zoom_nav_mode && !self.overview_active
+        if self.overview_active {
+            return false;
+        }
+        self.zoom_nav_mode || self.зум_запрещён_раскладкой() || self.fullscreen_here()
+    }
+
+    /// В tiling зума нет вовсе — ни колесом, ни щипком, ни аккордом, ни с
+    /// клавиатуры, ни лупой (просьба Ярика 24.09.2026). Float поначалу заперли
+    /// тоже, но это и есть свободный холст, и без зума он теряет смысл — в тот
+    /// же день вернули. Зумят Float, лента (Columns), монокль и обзор столов.
+    ///
+    /// Полный экран (F11) заперт так же, но отдельно, в `zoom_locked`: окно
+    /// размером с монитор держится на зуме 1 (см. fullscreen.rs), и любой
+    /// щелчок колеса уводил игру/видео мимо экрана (просьба Ярика 25.09.2026).
+    pub fn зум_запрещён_раскладкой(&self) -> bool {
+        matches!(self.tile_config.layout, crate::tiling::Layout::Tile)
+    }
+
+    /// В Tile и Columns (niri) камеру рукой не возят вовсе — ни Alt+ЛКМ, ни
+    /// тачпадом, ни аккордом, ни жестом gesture{}, ни пальцем по экрану, ни
+    /// стрелками лупы и клавимыши, ни краем экрана, ни свайпом по ленте
+    /// (просьба Ярика 01.10.2026: «запрети пан в tiling/niri любыми
+    /// способами»). Вид в этих раскладках ставит сама раскладка: фокус,
+    /// переход на стол, лента — их `camera_anim` гейт не трогает.
+    ///
+    /// Обзор столов — исключение, как и у зума: там пан это навигация самого
+    /// обзора, а не уход вида из раскладки.
+    pub fn пан_запрещён_раскладкой(&self) -> bool {
+        !self.overview_active
+            && matches!(
+                self.tile_config.layout,
+                crate::tiling::Layout::Tile | crate::tiling::Layout::Columns
+            )
     }
 
     /// Super+Space: включить/выключить режим лупы. Вкл — плавное отдаление
@@ -3035,6 +3851,10 @@ impl Parallax {
                 }
             }
         } else {
+            // В tiling лупы нет — это тоже зум (см. zoom_locked).
+            if (self.зум_запрещён_раскладкой() || self.fullscreen_here()) && !self.overview_active {
+                return;
+            }
             // Запоминаем ЦЕЛЬ идущей анимации, а не полпути: войти в лупу
             // можно и посреди перелёта к столу, и тогда «исходным положением»
             // обязан быть тот кадр, куда вид ехал.
@@ -3059,6 +3879,9 @@ impl Parallax {
     /// после отпускания. Автоповтор клавиши складывает цели в непрерывный глайд
     /// (цель отсчитывается от текущей ЦЕЛИ анимации, старт — от реальной cam).
     pub fn zoom_nav_pan(&mut self, dx: f64, dy: f64) {
+        if self.пан_запрещён_раскладкой() {
+            return;
+        }
         self.zoom_anim = None; // фиксируем zoom, чтобы якорный zoom_anim не перебил cam
         let zoom = self.viewport.zoom.max(0.01);
         let step = Self::ZOOM_NAV_PAN_STEP / zoom;

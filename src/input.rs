@@ -10,6 +10,7 @@ use smithay::{
         keyboard::{FilterResult, keysyms},
         pointer::{AxisFrame, ButtonEvent, Focus, GrabStartData, MotionEvent, RelativeMotionEvent},
     },
+    desktop::Window,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
 };
@@ -17,7 +18,6 @@ use smithay::{
 use std::time::{Duration, Instant};
 
 use crate::{
-    canvas::VelocityTracker,
     grabs::{move_grab::MoveSurfaceGrab, resize_grab::{ResizeEdge, ResizeSurfaceGrab}},
     state::Parallax,
     tiling::Layout,
@@ -35,77 +35,26 @@ const TOUCHPAD_MOVE_SPEED: f64 = 2.5;
 /// жеста libinput шлёт кадры каждые ~7 мс, так что запас здесь двадцатикратный.
 const TOUCHPAD_GESTURE_GAP: Duration = Duration::from_millis(150);
 
-// ── Доводка курсора у края тачпада (edge motion) ─────────────────────────────
-//
-// Тачпад кончается раньше, чем экран: окно едет к дальнему краю, пальцы
-// упираются в бортик панели, и перенос обрывается на полпути. Приходится
-// отпускать, возвращать пальцы и начинать заново — а в раскладках, где отпускание
-// что-то ЗАВЕРШАЕТ (вставка в ленту, обмен местами в тайлинге), ещё и с риском
-// уронить окно не туда.
-//
-// Лечится это тем, что в X11 называлось EdgeMotion (драйвер xf86-input-synaptics,
-// опции EdgeMotionMinSpeed/MaxSpeed/UseAlways): «когда палец доходит до края
-// тачпада, указатель продолжает двигаться, пока палец не поднят», причём по
-// умолчанию — только во время перетаскивания, чтобы не мешать обычной работе.
-// libinput этой возможности не унаследовал, поэтому здесь она своя.
-//
-// Чего нам не хватает по сравнению с synaptics: тот видел АБСОЛЮТНУЮ позицию
-// пальца на панели и её нажим, и потому просто проверял «палец в краевой зоне».
-// Для скролла двумя пальцами libinput отдаёт одни лишь дельты — ни координат, ни
-// давления в этих событиях нет. Значит, упор надо узнавать по косвенным
-// признакам, и вот они:
-//
-//   * жест НЕ закончен — кадра с нулевой амплитудой, которым libinput отмечает
-//     отпускание пальцев, ещё не было;
-//   * до этого пальцы ехали быстро (см. `peak`) — то есть человек вёл окно, а
-//     не подкручивал его по пикселю;
-//   * а сейчас движение прекратилось: либо событий нет вовсе, либо приходит
-//     мелкая дрожь от прижатого к бортику пальца.
+/// Идущий ресайз щипком «Super + два пальца» (см. `pinch_resize_begin`).
+pub(crate) struct PinchResize {
+    window: Window,
+    mode: PinchMode,
+    /// Множитель прошлого шага: дереву dwindle нужен инкремент.
+    last_factor: f64,
+}
 
-/// Сколько «неподвижности» внутри идущего жеста считаем упором в край панели.
-const EDGE_IDLE: Duration = Duration::from_millis(80);
-/// Ниже этой скорости (canvas-px/с) кадр жеста считается не движением, а
-/// дрожанием прижатого пальца: упор в бортик почти никогда не даёт чистого нуля,
-/// палец продолжает елозить по последним миллиметрам панели.
-///
-/// Именно на этом доводка и ломалась раньше. Порог был один на всё, скорость
-/// бралась из скользящего окна последних 80 мс, и эта самая дрожь вытесняла из
-/// окна быстрые кадры: в логе 20260816_131327 видно, как за полсекунды упора
-/// скорость сползает 352 → 253 и проваливается под порог, а каждый такой кадр
-/// вдобавок сбрасывал разгон в ноль. Доводка успевала прожить один кадр из
-/// шестидесяти — со стороны «не работает вообще».
-const EDGE_MOVING: f64 = 200.0;
-/// Кадр короче этого (canvas-px) не может считаться движением, какой бы скорость
-/// ни показывало окно выборки.
-///
-/// Нужен ради отзывчивости, а не ради правильности. Окно выборки длиной 80 мс
-/// после остановки пальца ещё столько же помнит быстрые кадры, и без этой
-/// проверки упор замечался бы только через 80 мс окна + 80 мс простоя. С ней
-/// дрожь отсекается сразу, и доводка трогается ровно через [`EDGE_IDLE`].
-const EDGE_JITTER_STEP: f64 = 0.5;
-/// Каким быстрым должен быть жест, чтобы доводка вообще включилась.
-const EDGE_MIN_PEAK: f64 = 300.0;
-/// Сколько холста жест обязан пройти до упора. Отсекает короткий тычок: у него
-/// пиковая скорость бывает высокой, а вести после него нечего.
-const EDGE_MIN_TRAVEL: f64 = 24.0;
-/// Пик скорости живёт не дольше этого — иначе разгон в начале длинного жеста
-/// задавал бы темп доводки через минуту после того, как человек замедлился.
-const EDGE_PEAK_TTL: Duration = Duration::from_millis(500);
-/// С какой скорости доводка стартует и за сколько разгоняется до пиковой.
-/// Оба порога — прямой аналог EdgeMotionMinSpeed/MaxSpeed у synaptics; там темп
-/// рос с нажимом пальца, здесь — со временем упора, потому что нажима нам не
-/// показывают.
-const EDGE_START_SPEED: f64 = 250.0;
-const EDGE_RAMP: Duration = Duration::from_millis(200);
-/// Потолок скорости доводки, canvas-px/с.
-const EDGE_MAX_SPEED: f64 = 1200.0;
-/// Предохранитель: дольше этого одна доводка не едет.
-///
-/// Конец жеста мы узнаём из кадра с нулевой амплитудой, который libinput шлёт
-/// на отпускание пальцев. Если такой кадр по какой-то причине не придёт
-/// (жест оборвали, устройство переоткрыли), доводка иначе тянула бы окно по
-/// холсту бесконечно — а остановить её было бы уже нечем.
-const EDGE_MAX_RUN: Duration = Duration::from_secs(5);
+/// Чем ресайзится окно — выбрано на начале жеста по его раскладке.
+enum PinchMode {
+    /// Плавающее окно: размер от опорного, центр на месте. С ним выделение.
+    Float {
+        rect: Rectangle<i32, Logical>,
+        group: Vec<(Window, Rectangle<i32, Logical>)>,
+    },
+    /// Tile: деления дерева dwindle по обе стороны окна.
+    Tile { base: (f64, f64) },
+    /// Columns: ширина колонки и доля высоты строки на начало жеста.
+    Columns { width: f64, row: f64 },
+}
 
 /// «1»…«9» → номер монитора с нуля. Берём и цифровой ряд, и цифры на
 /// дополнительной клавиатуре: выбор монитора для демонстрации экрана делается
@@ -117,136 +66,6 @@ fn цифра_монитора(raw: u32) -> Option<usize> {
         _ => return None,
     };
     Some(n as usize)
-}
-
-/// Продолжение жеста, когда пальцы упёрлись в край тачпада и дальше не едут.
-pub struct EdgeDrift {
-    /// Скорость жеста по последним кадрам.
-    vel: VelocityTracker,
-    /// Самая высокая скорость, замеченная за последние [`EDGE_PEAK_TTL`], и
-    /// направление в тот момент. Именно они задают темп и курс доводки.
-    ///
-    /// Пик, а не текущая скорость: у бортика палец физически ТОРМОЗИТ, и брать
-    /// темп из последних кадров — значит брать его из самого торможения. Курс
-    /// оттуда же и по той же причине: последние миллиметры палец ёрзает, и
-    /// направление в них случайное.
-    peak: f64,
-    peak_dir: Point<f64, Logical>,
-    peak_at: Instant,
-    /// Когда пальцы в последний раз ДВИГАЛИСЬ (скорость выше [`EDGE_MOVING`]).
-    moving_at: Instant,
-    /// Сколько холста жест прошёл суммарно — против случайного тычка.
-    travel: f64,
-    /// Когда доводка фактически началась — от неё считается разгон.
-    started: Option<Instant>,
-    /// Про этот простой уже отчитались в лог — чтобы не сыпать 60 строк в
-    /// секунду, пока пальцы стоят. Сбрасывается движением пальцев.
-    reported: bool,
-}
-
-impl EdgeDrift {
-    fn new(now: Instant) -> Self {
-        Self {
-            vel: VelocityTracker::new(),
-            peak: 0.0,
-            peak_dir: Point::from((0.0, 0.0)),
-            peak_at: now,
-            moving_at: now,
-            travel: 0.0,
-            started: None,
-            reported: false,
-        }
-    }
-
-    /// Учесть очередной кадр жеста.
-    ///
-    /// Ключевое здесь — что делает МЕДЛЕННЫЙ кадр. Он копится в скорости и в
-    /// пройденном пути, но не объявляет пальцы движущимися и не сбрасывает
-    /// разгон: у бортика панели палец не замирает намертво, он продолжает
-    /// елозить, и если считать эту дрожь движением, доводка не проживёт ни
-    /// одного кадра (см. EDGE_MOVING).
-    ///
-    /// `time` — отметка libinput в мс (не время обработки, см. VelocityTracker),
-    /// `now` — часы для порогов простоя; в тестах оба задаются вручную.
-    fn note(&mut self, step: Point<f64, Logical>, time: u32, now: Instant) {
-        self.vel.push(time, step);
-        let длина = (step.x * step.x + step.y * step.y).sqrt();
-        self.travel += длина;
-        // Дрожь прижатого пальца в скорость идёт (жест ею и заканчивается), а
-        // движением не считается — см. EDGE_JITTER_STEP.
-        if длина < EDGE_JITTER_STEP {
-            return;
-        }
-
-        let v = self.vel.launch_velocity();
-        let speed = (v.x * v.x + v.y * v.y).sqrt();
-        if speed < EDGE_MOVING {
-            return;
-        }
-
-        // Пальцы реально едут: доводка не нужна, а если шла — обрывается.
-        self.moving_at = now;
-        self.started = None;
-        self.reported = false;
-        // Пик обновляем либо когда побит, либо когда протух: иначе разгон в
-        // начале длинного жеста задавал бы темп доводки через минуту после
-        // того, как человек замедлился.
-        if speed >= self.peak || now.duration_since(self.peak_at) > EDGE_PEAK_TTL {
-            self.peak = speed;
-            self.peak_dir = Point::from((v.x / speed, v.y / speed));
-            self.peak_at = now;
-        }
-    }
-
-    /// Что доводка хочет сделать в этот тик: шаг по холсту либо ничего.
-    fn advance(&mut self, dt: Duration, now: Instant) -> Option<Point<f64, Logical>> {
-        // Пальцы ещё едут сами — доводка не нужна.
-        if now.duration_since(self.moving_at) < EDGE_IDLE {
-            return None;
-        }
-        // Жест был слишком вялым или слишком коротким, чтобы его продолжать:
-        // человек возит окно по мелочи или только коснулся панели.
-        if self.peak < EDGE_MIN_PEAK || self.travel < EDGE_MIN_TRAVEL {
-            // Один раз на простой, иначе это 60 строк в секунду.
-            if !self.reported {
-                self.reported = true;
-                tracing::debug!(
-                    "plx/input: no edge assist: idle={}ms peak={:.0} (need {}) travel={:.0} (need {})",
-                    now.duration_since(self.moving_at).as_millis(),
-                    self.peak, EDGE_MIN_PEAK, self.travel, EDGE_MIN_TRAVEL,
-                );
-            }
-            return None;
-        }
-        let fresh = self.started.is_none();
-        let started = *self.started.get_or_insert(now);
-        if fresh {
-            tracing::debug!(
-                "plx/input: edge assist start: idle={}ms peak={:.0} heading=({:.2},{:.2}) travel={:.0}",
-                now.duration_since(self.moving_at).as_millis(),
-                self.peak, self.peak_dir.x, self.peak_dir.y, self.travel,
-            );
-        }
-        let держится = now.duration_since(started);
-        if держится > EDGE_MAX_RUN {
-            if !self.reported {
-                self.reported = true;
-                tracing::debug!("plx/input: edge-assist stop: safety {:?}", EDGE_MAX_RUN);
-            }
-            return None;
-        }
-        // Плавный разгон от EDGE_START_SPEED к пиковой: рывка в момент упора
-        // быть не должно, но и ползти после быстрого жеста доводка не обязана.
-        let ramp = (держится.as_secs_f64() / EDGE_RAMP.as_secs_f64()).clamp(0.0, 1.0);
-        let цель = self.peak.min(EDGE_MAX_SPEED);
-        let speed = EDGE_START_SPEED + (цель - EDGE_START_SPEED).max(0.0) * ramp;
-        let want = speed * dt.as_secs_f64();
-        let step = Point::from((self.peak_dir.x * want, self.peak_dir.y * want));
-        if step.x == 0.0 && step.y == 0.0 {
-            return None;
-        }
-        Some(step)
-    }
 }
 
 impl Parallax {
@@ -363,6 +182,7 @@ impl Parallax {
         !matches!(self.tile_config.layout, Layout::Tile | Layout::Columns)
     }
 
+
     /// Sloppy focus: фокус идёт за курсором (как `sloppyfocus=1` в dwl).
     ///
     /// Три случая, когда он ОБЯЗАН молчать, — и раньше они были разбросаны по
@@ -396,6 +216,9 @@ impl Parallax {
             || self.layer_keyboard.is_some()
             || self.minimap_hit().is_some()
             || self.seat.get_keyboard().is_some_and(|k| k.is_grabbed())
+            // Тянут кромку окна: курсор при этом идёт СНАРУЖИ него, по соседу,
+            // и сосед, получив фокус, поднялся бы над окном, которое ресайзят.
+            || self.кромка_курсор.is_some()
         {
             return;
         }
@@ -403,7 +226,7 @@ impl Parallax {
         if self.focused_surface().as_ref() == Some(surface) {
             return;
         }
-        if let Some((window, _)) = self.space.element_under(pos).map(|(w, l)| (w.clone(), l)) {
+        if let Some((window, _)) = self.окно_под(pos) {
             crate::xwin::focus(self, &window);
         }
     }
@@ -417,10 +240,13 @@ impl Parallax {
     /// свободно и толкает соседей.
     fn start_touchpad_drag(&mut self) {
         let pos = self.pointer_location;
-        let Some((window, loc)) = self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
-        else {
+        let Some((window, loc)) = self.окно_под(pos) else {
             return;
         };
+        // Закреплённое окно жестом холста не возится (см. pin.rs).
+        if self.закреплено(&window) {
+            return;
+        }
         // Снимаем анимации с окна и со всех, кто поедет с ним: недоигранный
         // доезд от прошлого действия иначе каждый тик тянет окно на свою
         // траекторию, и под пальцами оно «резинится».
@@ -443,12 +269,195 @@ impl Parallax {
         self.request_plane_reset();
     }
 
-    /// Запомнить шаг жеста для доводки у края (см. [`EdgeDrift::note`]).
-    fn note_gesture_step(&mut self, step: Point<f64, Logical>, time: u32) {
-        let now = Instant::now();
-        self.edge_drift
-            .get_or_insert_with(|| EdgeDrift::new(now))
-            .note(step, time, now);
+    /// Начать ресайз жестом «Super + три пальца» — ровно Win+ПКМ: угол берётся
+    /// по четверти окна под курсором, в Tile тянутся деления, в Columns ширина
+    /// колонки и доля строки, во Float свободно (со склейкой и выделением).
+    fn start_touchpad_resize(&mut self) {
+        let pos = self.pointer_location;
+        let Some((window, window_loc)) = self.окно_под(pos) else { return };
+        if self.закреплено(&window) || self.виджет_ли(&window) {
+            return;
+        }
+        let geo = self.space.element_geometry(&window)
+            .unwrap_or(Rectangle::new(window_loc, (100, 100).into()));
+        let rel = pos - window_loc.to_f64();
+        let edge = match (
+            rel.x < geo.size.w as f64 / 2.0,
+            rel.y < geo.size.h as f64 / 2.0,
+        ) {
+            (true,  true)  => ResizeEdge::TOP_LEFT,
+            (false, true)  => ResizeEdge::TOP_RIGHT,
+            (true,  false) => ResizeEdge::BOTTOM_LEFT,
+            (false, false) => ResizeEdge::BOTTOM_RIGHT,
+        };
+        let group_initial = self.group_drag_members_excluding(&window)
+            .into_iter()
+            .filter_map(|w| self.space.element_geometry(&w).map(|g| (w, g)))
+            .collect::<Vec<_>>();
+        let glue = if group_initial.is_empty() {
+            self.glue_cluster_snapshot_for_resize(&window, edge)
+        } else {
+            crate::cluster::GlueResizeSnapshot::empty()
+        };
+        self.freeze_window_anim(&window);
+        for (w, _) in &group_initial {
+            self.freeze_window_anim(w);
+        }
+        tracing::debug!("plx/gesture: Super+3 fingers → resize, edge={edge:?}");
+        self.touchpad_resize = Some(ResizeSurfaceGrab::start(
+            GrabStartData { focus: None, button: BTN_RIGHT, location: pos },
+            window, edge, geo, group_initial, glue,
+        ));
+    }
+
+    /// Завершить жестовый перенос или ресайз, если он идёт. `true` — был.
+    fn finish_touchpad_grab(&mut self) -> bool {
+        if let Some(mut grab) = self.touchpad_drag.take() {
+            grab.finish(self);
+            return true;
+        }
+        if let Some(mut grab) = self.touchpad_resize.take() {
+            grab.finish(self);
+            return true;
+        }
+        false
+    }
+
+
+    /// Начать ресайз щипком «Super + два пальца» для окна под курсором.
+    ///
+    /// Окно растёт и сжимается во ВСЕ стороны, а не от левого верхнего угла,
+    /// и из своей раскладки не вынимается. Раньше щипок ставил окну
+    /// `floating = true` в любой раскладке, а размер менял от угла — в Tile и
+    /// Columns окно выпадало из сетки, а на экране это выглядело как зум
+    /// содержимого: кадр растягивал старый буфер до запрошенного размера.
+    fn pinch_resize_begin(&mut self) {
+        let pos = self.pointer_location;
+        let Some((window, _)) = self.окно_под(pos) else { return };
+        if self.закреплено(&window) || self.виджет_ли(&window) {
+            return;
+        }
+        let tiled = self.tile_config.layout != Layout::Float
+            && self.tagged_windows.iter().any(|tw| tw.window == window && !tw.floating);
+        let mode = if !tiled {
+            let Some(rect) = self.space.element_geometry(&window) else { return };
+            // Выделение ресайзится вместе с окном, как у Super+ПКМ.
+            let group = self.group_drag_members_excluding(&window)
+                .into_iter()
+                .filter_map(|w| self.space.element_geometry(&w).map(|g| (w, g)))
+                .collect::<Vec<_>>();
+            self.freeze_window_anim(&window);
+            for (w, _) in &group {
+                self.freeze_window_anim(w);
+            }
+            crate::xwin::set_resizing(&window, true);
+            PinchMode::Float { rect, group }
+        } else {
+            match self.tile_config.layout {
+                Layout::Tile => {
+                    let Some(rect) = self.space.element_geometry(&window) else { return };
+                    PinchMode::Tile { base: (rect.size.w as f64, rect.size.h as f64) }
+                }
+                Layout::Columns => {
+                    let width = self.columns_effective_width_of_window(&window).unwrap_or(0.5);
+                    let row = self.columns_effective_row_fraction_of_window(&window).unwrap_or(0.5);
+                    PinchMode::Columns { width, row }
+                }
+                // Monocle: окно и так во весь экран, тянуть нечего.
+                _ => return,
+            }
+        };
+        tracing::debug!("plx/gesture: Super+pinch → resize, tiled={tiled}");
+        self.gesture_resize_window = Some(window.clone());
+        self.pinch_resize = Some(PinchResize { window, mode, last_factor: 1.0 });
+    }
+
+    /// Шаг ресайза щипком. `scale` — масштаб libinput от НАЧАЛА жеста.
+    fn pinch_resize_step(&mut self, scale: f64) {
+        // Пальцы на тачпаде разводятся максимум раза в полтора, а окно должно
+        // успевать вырасти вдвое — отсюда показатель.
+        const PINCH_GAIN: f64 = 3.0;
+        let Some(mut pr) = self.pinch_resize.take() else { return };
+        let factor = scale.powf(PINCH_GAIN).clamp(0.05, 20.0);
+        match &pr.mode {
+            PinchMode::Float { rect, group } => {
+                // Пол 1 px, как у остальных путей ресайза; максимум клиента —
+                // его физика, шире он не нарисуется (см. resize_grab.rs).
+                let (_, max) = crate::xwin::size_constraints(&pr.window);
+                let max_w = if max.w <= 0 { 20000 } else { max.w.min(20000) };
+                let max_h = if max.h <= 0 { 20000 } else { max.h.min(20000) };
+                let new_w = ((rect.size.w as f64 * factor).round() as i32).clamp(1, max_w);
+                let new_h = ((rect.size.h as f64 * factor).round() as i32).clamp(1, max_h);
+                // Центр окна стоит на месте — окно растёт во все стороны.
+                let cx = rect.loc.x as f64 + rect.size.w as f64 / 2.0;
+                let cy = rect.loc.y as f64 + rect.size.h as f64 / 2.0;
+                let loc = Point::from((
+                    (cx - new_w as f64 / 2.0).round() as i32,
+                    (cy - new_h as f64 / 2.0).round() as i32,
+                ));
+                crate::xwin::set_size(&pr.window, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
+                crate::xwin::configure(&pr.window);
+                self.отметить_живой_размер(&pr.window);
+                self.space.map_element(pr.window.clone(), loc, false);
+                // Выделение — вокруг того же центра на тот же множитель.
+                let fx = new_w as f64 / rect.size.w.max(1) as f64;
+                let fy = new_h as f64 / rect.size.h.max(1) as f64;
+                for (w, g) in group {
+                    let gw = ((g.size.w as f64 * fx).round() as i32).max(1);
+                    let gh = ((g.size.h as f64 * fy).round() as i32).max(1);
+                    let gx = (cx + (g.loc.x as f64 - cx) * fx).round() as i32;
+                    let gy = (cy + (g.loc.y as f64 - cy) * fy).round() as i32;
+                    crate::xwin::set_size(w, Some((gw, gh).into()), crate::xwin::Tiled::Keep);
+                    crate::xwin::configure(w);
+                    self.отметить_живой_размер(w);
+                    self.space.map_element(w.clone(), Point::from((gx, gy)), false);
+                }
+            }
+            PinchMode::Tile { base } => {
+                // Дерево dwindle принимает ИНКРЕМЕНТ — отдаём разницу с
+                // прошлым шагом, считанную от опорного размера.
+                let dw = base.0 * (factor - pr.last_factor);
+                let dh = base.1 * (factor - pr.last_factor);
+                let w = pr.window.clone();
+                self.dwindle_resize_centered(&w, dw, dh);
+            }
+            PinchMode::Columns { width, row } => {
+                let w = pr.window.clone();
+                let wf = (width * factor).clamp(
+                    crate::columns::MIN_SIZE_FACTOR,
+                    crate::columns::MAX_WIDTH_FACTOR,
+                );
+                self.columns_resize_of_window(&w, wf, row * factor);
+            }
+        }
+        pr.last_factor = factor;
+        self.pinch_resize = Some(pr);
+        self.request_redraw();
+    }
+
+    fn pinch_resize_end(&mut self) {
+        self.gesture_resize_window = None;
+        let Some(pr) = self.pinch_resize.take() else { return };
+        let PinchMode::Float { group, .. } = pr.mode else { return };
+        crate::xwin::set_resizing(&pr.window, false);
+        // Итог запоминаем КАЖДОМУ окну группы — иначе переход
+        // Float→тайлинг→Float вернул бы им доресайзные размеры и места.
+        let окна = std::iter::once(pr.window.clone()).chain(group.into_iter().map(|(w, _)| w));
+        for w in окна {
+            let size = crate::xwin::current_size(&w);
+            let loc = self.space.element_location(&w);
+            if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| tw.window == w) {
+                tw.float_size = Some(size);
+                if let Some(loc) = loc {
+                    tw.float_position = loc;
+                    tw.position = loc;
+                    tw.float_position_set = true;
+                }
+            }
+            if self.overview_active {
+                self.overview_note_resize(&w, size);
+            }
+        }
     }
 
     /// Продвинуть активный жест на `step` canvas-пикселей: курсор едет, а вместе
@@ -489,24 +498,15 @@ impl Parallax {
         if let Some(mut grab) = self.touchpad_drag.take() {
             grab.drag_to(self, cursor, time);
             self.touchpad_drag = Some(grab);
+        } else if let Some(mut grab) = self.touchpad_resize.take() {
+            grab.resize_to(self, cursor);
+            self.touchpad_resize = Some(grab);
         } else if let Some(start) = self.touchpad_select_start {
             self.selection_drag = Some(crate::grabs::rect_from_points(start, cursor));
         }
         self.request_redraw();
     }
 
-    /// Один шаг доводки курсора у края тачпада. Зовётся из `anim::tick` (~60 Гц).
-    pub fn edge_drift_tick(&mut self, dt: Duration) {
-        // Доводить нечего: ни окна на пальцах, ни рамки выделения.
-        if self.touchpad_drag.is_none() && self.touchpad_select_start.is_none() {
-            self.edge_drift = None;
-            return;
-        }
-        let Some(drift) = self.edge_drift.as_mut() else { return };
-        let Some(step) = drift.advance(dt, Instant::now()) else { return };
-        let time = self.start_time.elapsed().as_millis() as u32;
-        self.gesture_advance(step, time);
-    }
 
     pub(crate) fn kill_focused(&mut self) {
         if let Some(surface) = self.focused_surface() {
@@ -633,10 +633,14 @@ impl Parallax {
                {
                    let сейчас = self.pointer_screen_physical();
                    let экран = self.screen_size();
-                   self.bar_hover_update(smithay::utils::Point::from((
+                   let будет = smithay::utils::Point::from((
                        (сейчас.x + delta.x).clamp(0.0, экран.w as f64),
                        (сейчас.y + delta.y).clamp(0.0, экран.h as f64),
-                   )));
+                   ));
+                   self.bar_hover_update(будет);
+                   // Панель приложений: наведение, перетаскивание значка,
+                   // автоскрытие (см. dock.rs).
+                   self.dock_motion(будет);
                }
 
                // Драг по карточке предпросмотра и по карте окон — их
@@ -661,8 +665,12 @@ impl Parallax {
                // статичен»): на отпускании по ней считается грань, на которую
                // мы уходим, и примёрзшая стрелка означала бы «отпустил над
                // одной гранью, попал на другую».
+               if self.карусель_драг_движение(delta.x, delta.y) {
+                   self.drag_pointer_by_screen(delta.x, delta.y);
+                   return;
+               }
                if self.куб_драг.is_some() {
-                   self.куб_драг_движение(delta.x);
+                   self.куб_драг_движение(delta.x, delta.y);
                    self.drag_pointer_by_screen(delta.x, delta.y);
                    return;
                }
@@ -833,15 +841,28 @@ impl Parallax {
                // обновлена выше — её и читает отрисовка рамки, отдельного
                // состояния «докуда дотянули» для этого не нужно.
                if self.snip_идёт() {
+                   self.snip_движение();
                    self.pointer_warped();
                    self.request_redraw();
                    return;
                }
 
+               // Ведение иконки рабочего стола (см. рабстол.rs). Без жеста —
+               // пустой вызов: одна проверка Option на движение мыши.
+               self.рабстол_движение(self.pointer_location);
+
                let pos = self.pointer_location;
                let serial = SERIAL_COUNTER.next_serial();
                let pointer = self.seat.get_pointer().unwrap();
-               let under = self.surface_under(pos);
+               // Над кромкой окна (см. `кромка_под`) под курсором «никого»:
+               // иначе окно, лежащее ниже, брало sloppy-фокус, поднималось
+               // наверх и хоронило под собой то самое окно, чей край хотели
+               // взять, — у плавающего над плиткой кромка не ловилась вовсе.
+               let under = if !pointer.is_grabbed() && self.кромка_под(pos).is_some() {
+                   None
+               } else {
+                   self.surface_under(pos)
+               };
 
                // Sloppy focus — но НЕ в Columns: там вид ездит по полосе от
                // клавиш и жестов, курсор при этом стоит на месте экрана (это
@@ -908,9 +929,16 @@ impl Parallax {
                     pos = self.pointer_location;
                 }
                 self.pointer_location = pos;
+                self.рабстол_движение(pos);
+                self.dock_motion(smithay::utils::Point::from((screen_pos.x, screen_pos.y)));
                 let serial = SERIAL_COUNTER.next_serial();
                 let pointer = self.seat.get_pointer().unwrap();
-                let under = self.surface_under(pos);
+                // Над кромкой окна под курсором «никого» — как в PointerMotion.
+                let under = if !pointer.is_grabbed() && self.кромка_под(pos).is_some() {
+                    None
+                } else {
+                    self.surface_under(pos)
+                };
 
                 self.sloppy_focus(pos, under.as_ref().map(|(s, _)| s));
 
@@ -932,7 +960,9 @@ impl Parallax {
                 let button     = event.button_code();
                 let btn_state  = event.state();
                 let kb_mods = keyboard.modifier_state();
-                let alt_held = kb_mods.alt;
+                // Свою кнопку клавимышь жмёт при зажатом Alt своего бинда —
+                // для пана/выделения он не в счёт (см. `alt_для_мыши`).
+                let alt_held = self.alt_для_мыши(kb_mods.alt);
 
                 // Счётчик удерживаемых кнопок — ДО любых ранних выходов: ниже
                 // клик перехватывают меню, полка и обзор, и после каждого из
@@ -940,7 +970,16 @@ impl Parallax {
                 // съеденное компоновщиком, навсегда оставит счётчик
                 // рассогласованным (кнопку-то отпустят). По нему запрещён
                 // переход курсора на соседний монитор — см. движение мыши.
-                if ButtonState::Pressed == btn_state {
+                //
+                // Повтор от аккорда (`аккорд_мимо`) не считается: это то же
+                // физическое нажатие, уже учтённое, когда оно пришло с железа.
+                // Считать его дважды значило навсегда оставить счётчик на 1
+                // после каждого удержания дольше `mouse_chord_timeout`
+                // (выделение текста, драг): нажатие приходит дважды, а
+                // отпускание — одно. Так умирал край-пан (Ярик 26.09.2026:
+                // «камера не передвигается, если подвести курсор к краю»).
+                if self.аккорд_мимо {
+                } else if ButtonState::Pressed == btn_state {
                     self.кнопок_нажато += 1;
                 } else {
                     self.кнопок_нажато = self.кнопок_нажато.saturating_sub(1);
@@ -1009,6 +1048,47 @@ impl Parallax {
                     }
                 }
 
+                // Отпускание кнопки, которой держат иконку рабочего стола,
+                // разбирается ПЕРВЫМ и где угодно: ведомую иконку вполне могли
+                // увести под окно, и ждать отпускания над пустым местом
+                // значило бы залипание жеста навсегда (см. рабстол.rs).
+                if ButtonState::Released == btn_state && self.рабстол_жест_идёт() {
+                    let точка = self.pointer_location;
+                    if self.рабстол_кнопка(точка, button == BTN_RIGHT, false) {
+                        съел("desktop icon", self.pointer_screen_physical());
+                        return;
+                    }
+                }
+
+                // Окно «Параметры панели» (dock_settings.rs): и нажатие, и
+                // отпускание — по отпусканию кончается перетаскивание ползунка.
+                // Список «+» открывается ПОВЕРХ окна, поэтому окно ниже списка.
+                if !курсор_у_клиента && self.dock_settings_is_open() && !self.dock_picker_open() {
+                    let screen = self.pointer_screen_physical();
+                    if self.dock_settings_button(screen, ButtonState::Pressed == btn_state) {
+                        съел("dock settings", screen);
+                        return;
+                    }
+                }
+                // Список приложений панели («+», см. dock.rs) — приклеенное к
+                // экрану меню, как блютузное ниже.
+                if ButtonState::Pressed == btn_state && !курсор_у_клиента && self.dock_picker_open() {
+                    let screen = self.pointer_screen_physical();
+                    if self.dock_picker_click(screen) {
+                        съел("dock app list", screen);
+                        return;
+                    }
+                }
+                // Сама панель приложений и её меню: и нажатие, и отпускание —
+                // по отпусканию решается, клик это или перетаскивание.
+                if !курсор_у_клиента {
+                    let screen = self.pointer_screen_physical();
+                    if self.dock_button(screen, button, ButtonState::Pressed == btn_state) {
+                        съел("dock", screen);
+                        return;
+                    }
+                }
+
                 if ButtonState::Pressed == btn_state && !курсор_у_клиента && self.bt_menu_open() {
                     let screen = self.pointer_screen_physical();
                     if self.bt_click(screen) {
@@ -1026,11 +1106,23 @@ impl Parallax {
                     }
                 }
 
+                // Свойства иконки и меню «новая иконка» — такие же приклеенные
+                // к экрану органы, как меню выше (см. рабстол.rs).
+                if ButtonState::Pressed == btn_state && !курсор_у_клиента
+                    && self.рабстол_меню_открыто()
+                {
+                    let screen = self.pointer_screen_physical();
+                    if self.рабстол_клик_экранный(screen) {
+                        съел("desktop icon properties", screen);
+                        return;
+                    }
+                }
+
                 // Меню вайфая и звука приклеены к экрану, как и блютузное.
                 if ButtonState::Pressed == btn_state && !курсор_у_клиента
-                    && (self.wifi_menu_open() || self.audio_menu_open()) {
+                    && (self.wifi_menu_open() || self.audio_menu_open() || self.питание_открыто()) {
                     let screen = self.pointer_screen_physical();
-                    if self.wifi_click(screen) || self.audio_click(screen) {
+                    if self.wifi_click(screen) || self.audio_click(screen) || self.питание_клик(screen) {
                         съел("wifi/audio menu", screen);
                         return;
                     }
@@ -1149,6 +1241,18 @@ impl Parallax {
                     // нарисованы не там, где лежат на холсте, и `element_under`
                     // ответил бы про окно из совсем другого места экрана —
                     // клик по грани уносил на чужой стол.
+                    // КАРУСЕЛЬ — тот же уговор, что у куба: окна нарисованы не
+                    // там, где лежат на холсте, и основному хендлеру клик не
+                    // отдаётся. Протяжка крутит барабан и едет по этажам,
+                    // короткий клик сворачивает карусель на колонку под ним.
+                    if self.карусель_активна() && button == BTN_LEFT && !alt_held && !self.logo_held {
+                        if ButtonState::Pressed == btn_state {
+                            self.карусель_драг_начать();
+                        } else if self.карусель_драг_кончить() {
+                            self.карусель_выход_к_курсору();
+                        }
+                        return;
+                    }
                     if self.куб_активен() && button == BTN_LEFT && !alt_held && !self.logo_held {
                         if ButtonState::Pressed == btn_state {
                             self.куб_драг_начать();
@@ -1215,6 +1319,7 @@ impl Parallax {
                         }
                     }
                     self.pan_button_held = false;
+                    self.запустить_возврат_курсора();
                 }
 
                 // Висящий pointer-grab съедает Win+ЛКМ/Win+ПКМ целиком: ветка
@@ -1241,8 +1346,8 @@ impl Parallax {
                     let pos = self.pointer_location;
                     if cfg!(debug_assertions) || tracing::enabled!(tracing::Level::DEBUG) {
                         let smithay_pos = pointer.current_location();
-                        let hit = self.space.element_under(pos)
-                            .and_then(|(w, _)| self.space.element_geometry(w));
+                        let hit = self.окно_под(pos)
+                            .and_then(|(w, _)| self.space.element_geometry(&w));
                         // Отставание КАРТИНКИ: где стрелку нарисовал последний
                         // ушедший на монитор кадр против того, где курсор сейчас.
                         // Ненулевое значение здесь и есть «кликаю не туда, где
@@ -1273,10 +1378,27 @@ impl Parallax {
                         self.log_pointer_local(pos);
                     }
 
-                    if let Some((window, window_loc)) = self
-                        .space.element_under(pos)
-                        .map(|(w, l)| (w.clone(), l))
-                    {
+                    // ЛКМ по кромке окна (полоса снаружи рамки, см.
+                    // `кромка_под`) → ресайз за этот край, без Super.
+                    if button == BTN_LEFT && !kb_mods.logo && !курсор_у_клиента {
+                        if let Some((window, edge)) = self.кромка_под(pos) {
+                            if let Some(geo) = self.space.element_geometry(&window) {
+                                tracing::debug!("plx: resize grab by the window edge, edge={edge:?}");
+                                let glue = self.glue_cluster_snapshot_for_resize(&window, edge);
+                                self.freeze_window_anim(&window);
+                                self.кромка_курсор = Some(crate::grabs::resize_grab::значок_кромки(edge));
+                                crate::xwin::focus(self, &window);
+                                let grab = ResizeSurfaceGrab::start(
+                                    GrabStartData { focus: None, button, location: pos },
+                                    window, edge, geo, Vec::new(), glue,
+                                );
+                                pointer.set_grab(self, grab, serial, Focus::Clear);
+                                return;
+                            }
+                        }
+                    }
+
+                    if let Some((window, window_loc)) = self.окно_под(pos) {
                         // Окно игры (plx-mine): кнопка уходит ЕМУ и только ему.
                         //
                         // Ни хватов parallax, ни смены фокуса, ни сброса выделения:
@@ -1307,8 +1429,28 @@ impl Parallax {
                             return;
                         }
 
-                        // Super+ЛКМ → перемещение окна
-                        if kb_mods.logo && button == BTN_LEFT {
+                        // Закреплённое окно (Super+Y, см. pin.rs) возится и
+                        // тянется в экранных пикселях — свои хваты.
+                        if kb_mods.logo && (button == BTN_LEFT || button == BTN_RIGHT)
+                            && self.закреплено(&window)
+                        {
+                            let start = GrabStartData { focus: None, button, location: pos };
+                            if button == BTN_LEFT {
+                                if let Some(g) = self.начать_перенос_закреплённого(window.clone(), start) {
+                                    pointer.set_grab(self, g, serial, Focus::Keep);
+                                }
+                            } else if let Some(g) = self.начать_ресайз_закреплённого(window.clone(), start) {
+                                pointer.set_grab(self, g, serial, Focus::Keep);
+                            }
+                            crate::xwin::focus(self, &window);
+                            return;
+                        }
+
+                        // Super+ЛКМ → перемещение окна. Виджет не двигается
+                        // руками вовсе (см. виджеты.rs): клик по нему проваливается
+                        // ниже, в обычный фокус, и человек получает ровно то же,
+                        // что в driftwm — «драг виджета ничего не делает».
+                        if kb_mods.logo && button == BTN_LEFT && !self.виджет_ли(&window) {
                             let initial_window_location = window_loc;
                             let focus = crate::xwin::surface(&window)
                                 .map(|s| (s, window_loc.to_f64()));
@@ -1343,7 +1485,7 @@ impl Parallax {
                         // см. dwindle.rs). Columns: ширину активной
                         // колонки. Обзор: свободный ресайз миниатюры (см.
                         // resize_grab.rs, ветка overview_active). Monocle: no-op.
-                        if kb_mods.logo && button == BTN_RIGHT {
+                        if kb_mods.logo && button == BTN_RIGHT && !self.виджет_ли(&window) {
                             tracing::debug!("plx: resize grab start");
                             let geo = self.space.element_geometry(&window)
                                 .unwrap_or(Rectangle::new(window_loc, (100, 100).into()));
@@ -1362,6 +1504,14 @@ impl Parallax {
                                 .into_iter()
                                 .filter_map(|w| self.space.element_geometry(&w).map(|g| (w, g)))
                                 .collect::<Vec<_>>();
+                            // Склейка driftwm (Super+M, is_glue_enabled) — только
+                            // если нет явного выделения/созвездия: два способа
+                            // тащить соседей не должны накладываться друг на друга.
+                            let glue = if group_initial.is_empty() {
+                                self.glue_cluster_snapshot_for_resize(&window, edge)
+                            } else {
+                                crate::cluster::GlueResizeSnapshot::empty()
+                            };
                             // Ресайз двигает окно напрямую (LEFT/TOP-края) —
                             // недолетевшая анимация позиции дралась бы с ним.
                             self.freeze_window_anim(&window);
@@ -1370,7 +1520,7 @@ impl Parallax {
                             }
                             let grab = ResizeSurfaceGrab::start(
                                 GrabStartData { focus: None, button, location: pos },
-                                window, edge, geo, group_initial,
+                                window, edge, geo, group_initial, glue,
                             );
                             pointer.set_grab(self, grab, serial, Focus::Keep);
                             return;
@@ -1403,6 +1553,18 @@ impl Parallax {
                             return;
                         }
 
+                        // Иконки рабочего стола лежат на холсте под окнами —
+                        // значит, разбираются ровно здесь, где окна под
+                        // курсором нет. ЛКМ по иконке (запуск или перенос) и
+                        // ПКМ (свойства, а по пустому месту — «новая иконка»);
+                        // ЛКМ мимо иконок проваливается ниже, к рамке
+                        // выделения, как и было. См. рабстол.rs.
+                        if !alt_held && !kb_mods.logo
+                            && self.рабстол_кнопка(pos, button == BTN_RIGHT, true)
+                        {
+                            return;
+                        }
+
                         let all: Vec<_> = self.space.elements().cloned().collect();
                         for w in all {
                             w.set_activated(false);
@@ -1427,7 +1589,7 @@ impl Parallax {
                     // Наша позиция курсора — та же, по которой рисуется стрелка
                     // (см. комментарий выше о расхождении с smithay).
                     let pos = self.pointer_location;
-                    let clicked_window = self.space.element_under(pos).map(|(w, _)| w.clone());
+                    let clicked_window = self.окно_под(pos).map(|(w, _)| w);
                     if let Some(window) = clicked_window {
                         self.exit_overview_to_window(&window);
                     } else {
@@ -1439,6 +1601,17 @@ impl Parallax {
                 pointer.button(self, &ButtonEvent {
                     button, state: btn_state, serial, time: event.time_msec(),
                 });
+                // Вторая кнопка в хвате Super+ЛКМ/ПКМ закрыла его и попросила
+                // поворот (см. grabs/tilt_grab.rs). Ставим здесь: изнутри
+                // хвата новый не поставить.
+                if let Some(window) = self.поворот_ждёт.take() {
+                    if self.куб_шейдер.is_some() && smithay::utils::IsAlive::alive(&window) && !self.is_fullscreen(&window) {
+                        let start = GrabStartData { focus: None, button, location: self.pointer_location };
+                        let grab = crate::grabs::tilt_grab::TiltGrab::new(self, start, window);
+                        pointer.set_grab(self, grab, serial, Focus::Keep);
+                        tracing::debug!("plx/tilt: drag rotation started");
+                    }
+                }
                 pointer.frame(self);
             }
 
@@ -1459,6 +1632,23 @@ impl Parallax {
                 let alt_held = self.seat.get_keyboard()
                     .map(|kb| kb.modifier_state().alt)
                     .unwrap_or(false);
+                // Колесо клавимыши (Alt+E/Y) — прокрутка, а не Alt+колесо.
+                let alt_held = self.alt_для_мыши(alt_held);
+
+                // Колесо над панелью приложений меняет размер её значков.
+                if source != AxisSource::Finger {
+                    let screen = self.pointer_screen_physical();
+                    if self.dock_settings_axis(screen, v) || self.dock_axis(screen, v) {
+                        return;
+                    }
+                }
+                // Открытое меню питания: колесо водит яркость выбранной строки.
+                if self.питание_открыто() {
+                    if v != 0.0 {
+                        self.питание_колесо(v < 0.0);
+                    }
+                    return;
+                }
 
                 // ── Таблица жестов: два пальца ───────────────────────────
                 //
@@ -1560,18 +1750,16 @@ impl Parallax {
                     // во второй раз было бы ровно тем же самым багом заново.
                     if h == 0.0 && v == 0.0 {
                         // Финальный кадр амплитуды 0 = пальцы отпущены. Это
-                        // единственный конец жеста, который нам показывают, —
-                        // и он же единственное, что останавливает доводку
-                        // (ровно как EdgeMotion у synaptics вёл указатель
-                        // «пока палец не поднят»).
+                        // единственный конец жеста, который нам показывают.
+                        //
+                        // Доводки «пальцы встали — окно едет само» (EdgeDrift)
+                        // здесь больше нет: вырезана 29.09.2026 по просьбе
+                        // Ярика, у края остался только довод по краю НАКЛАДКИ
+                        // (touchpad.rs), он видит настоящее положение пальца.
                         tracing::debug!(
-                            "plx/gesture: zero frame, idle before it={}ms, window={}",
-                            self.edge_drift.as_ref()
-                                .map(|d| d.moving_at.elapsed().as_millis())
-                                .unwrap_or(0),
+                            "plx/gesture: zero frame, window={}",
                             self.touchpad_drag.is_some(),
                         );
-                        self.edge_drift = None;
                         self.touchpad_drag_empty = None;
                         if let Some(mut grab) = self.touchpad_drag.take() {
                             grab.finish(self);
@@ -1612,7 +1800,6 @@ impl Parallax {
                         h * TOUCHPAD_MOVE_SPEED / zoom,
                         v * TOUCHPAD_MOVE_SPEED / zoom,
                     ));
-                    self.note_gesture_step(step, event.time_msec());
                     self.gesture_advance(step, event.time_msec());
                     return;
                 }
@@ -1675,6 +1862,7 @@ impl Parallax {
                         // отпущены — это сигнал "стоп", запускаем инерцию отсюда.
                         tracing::debug!("plx/gesture: Alt+2 fingers → canvas pan finished, inertia");
                         self.momentum.launch();
+                        self.запустить_возврат_курсора();
                         self.pan_log_left = 60;
                     }
                     return;
@@ -1692,7 +1880,7 @@ impl Parallax {
                     && !logo_held
                     && self.tile_config.layout == Layout::Float
                     && !self.overview_active
-                    && self.space.element_under(self.pointer_location).is_none()
+                    && self.окно_под(self.pointer_location).is_none()
                     && !self.курсор_над_слоем(self.pointer_location);
                 // Проверка на тачпад — снаружи скобок: начатое выделение не
                 // должно перехватывать ещё и колесо мыши, если по нему крутнули
@@ -1702,7 +1890,6 @@ impl Parallax {
                 {
                     if h == 0.0 && v == 0.0 {
                         // Пальцы отпущены — применяем рамку.
-                        self.edge_drift = None;
                         if self.touchpad_select_start.take().is_some() {
                             let rect = self.selection_drag.take();
                             self.select_windows_in_rect(rect);
@@ -1721,7 +1908,6 @@ impl Parallax {
                         h * TOUCHPAD_MOVE_SPEED / zoom,
                         v * TOUCHPAD_MOVE_SPEED / zoom,
                     ));
-                    self.note_gesture_step(step, event.time_msec());
                     self.gesture_advance(step, event.time_msec());
                     return;
                 }
@@ -1733,11 +1919,41 @@ impl Parallax {
                 // экрана под передней гранью. Раньше колесо крутило грани, и
                 // отодвинуть куб было нечем — жалоба «куб не даёт зумить».
                 // Поворот остался у горизонтального колеса, Shift+колеса и у
-                // драга ЛКМ (см. куб_драг_движение).
+                // драга ЛКМ (см. куб_драг_движение); наклон — у Ctrl+колеса
+                // и у того же драга по вертикали.
+                // ── КАРУСЕЛЬ: колесо — между этажами, по горизонтали и с Shift —
+                // крутит барабан на колонку, с Ctrl — наклон.
+                if self.карусель_активна() && source != AxisSource::Finger {
+                    let (shift, ctrl) = self.seat.get_keyboard()
+                        .map(|kb| {
+                            let m = kb.modifier_state();
+                            (m.shift, m.ctrl)
+                        })
+                        .unwrap_or((false, false));
+                    if ctrl && v != 0.0 {
+                        self.карусель_наклонить(if v < 0.0 { 1.0 } else { -1.0 });
+                    } else if h != 0.0 || (shift && v != 0.0) {
+                        let d = if h != 0.0 { h } else { v };
+                        self.карусель_повернуть(if d > 0.0 { 1 } else { -1 });
+                    } else if v != 0.0 {
+                        self.карусель_на_этаж(if v > 0.0 { 1 } else { -1 });
+                    }
+                    return;
+                }
                 if self.куб_активен() && source != AxisSource::Finger {
-                    let shift = self.seat.get_keyboard()
-                        .map(|kb| kb.modifier_state().shift)
-                        .unwrap_or(false);
+                    let (shift, ctrl) = self.seat.get_keyboard()
+                        .map(|kb| {
+                            let m = kb.modifier_state();
+                            (m.shift, m.ctrl)
+                        })
+                        .unwrap_or((false, false));
+                    // Ctrl+колесо — НАКЛОН куба: колесо от себя (v < 0)
+                    // кладёт переднюю грань вверх и показывает дно, как драг
+                    // рукой вверх.
+                    if ctrl && v != 0.0 {
+                        self.куб_наклонить(if v < 0.0 { 1.0 } else { -1.0 });
+                        return;
+                    }
                     if h != 0.0 || (shift && v != 0.0) {
                         let d = if h != 0.0 { h } else { v };
                         // Знак: колесо ВНИЗ (d > 0) — на СЛЕДУЮЩИЙ стол, как
@@ -1749,6 +1965,34 @@ impl Parallax {
                     }
                     if v != 0.0 {
                         self.куб_зум(if v < 0.0 { 1.1 } else { 1.0 / 1.1 });
+                        return;
+                    }
+                }
+
+                // ── Наклон и вращение окна под курсором (см. наклон.rs) ─────
+                //
+                // Super+Ctrl+колесо — вращение в плоскости экрана (колесо вниз —
+                // по часовой), Super+Shift+колесо — наклон влево-вправо,
+                // Super+Ctrl+Shift+колесо — вперёд-назад. Голое Super+колесо не
+                // занято ничем и уходит клиенту, как раньше.
+                if logo_held && v != 0.0 && source != AxisSource::Finger {
+                    let (shift, ctrl) = self.seat.get_keyboard()
+                        .map(|kb| {
+                            let m = kb.modifier_state();
+                            (m.shift, m.ctrl)
+                        })
+                        .unwrap_or((false, false));
+                    if shift || ctrl {
+                        let шаг = crate::наклон::ШАГ_ГРАДУСОВ.to_radians()
+                            * if v > 0.0 { 1.0 } else { -1.0 };
+                        let pos = self.pointer_location;
+                        if let Some((window, _)) = self.окно_под(pos) {
+                            match (ctrl, shift) {
+                                (true, false) => self.наклонить_окно(&window, 0.0, 0.0, шаг),
+                                (false, true) => self.наклонить_окно(&window, шаг, 0.0, 0.0),
+                                _ => self.наклонить_окно(&window, 0.0, шаг, 0.0),
+                            }
+                        }
                         return;
                     }
                 }
@@ -1853,28 +2097,26 @@ impl Parallax {
                 if self.жест_начало(crate::gestures::ОсноваЖеста::Щипок, event.fingers()) {
                     return;
                 }
-                tracing::debug!("plx/gesture: pinch started, logo_held={}", self.logo_held);
+                tracing::debug!(
+                    "plx/gesture: pinch started, fingers={}, logo_held={}",
+                    event.fingers(), self.logo_held,
+                );
                 self.pinch_last_scale = 1.0;
-                // Super+2-пальца pinch → resize окна под курсором (в любом режиме;
-                // вытаскиваем из тайлинга во floating, иначе arrange его сожмёт).
                 if self.logo_held {
-                    let pos = self.pointer_location;
-                    self.gesture_resize_window = self.space.element_under(pos).map(|(w, _)| w.clone());
-                    if let Some(window) = self.gesture_resize_window.clone() {
-                        if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                            tw.window == window
-                        }) {
-                            tw.floating = true;
-                        }
-                        // Опорные размеры на весь жест — от них считаем
-                        // абсолютный scale (см. gesture_resize_group). Вместе с
-                        // окном ресайзится выделение, если окно в нём состоит.
-                        let mut group = vec![window.clone()];
-                        group.extend(self.group_drag_members_excluding(&window));
-                        self.gesture_resize_group = group.into_iter()
-                            .map(|w| { let s = crate::xwin::current_size(&w); (w, s) })
-                            .collect();
+                    // Двухпальцевая прокрутка, с которой libinput мог начать
+                    // этот же жест, уже успела схватить окно — отпускаем.
+                    self.finish_touchpad_grab();
+                    if event.fingers() >= 3 {
+                        // Super+3 пальца — ресайз окна, тот же grab, что у
+                        // Win+ПКМ. libinput сам решает, свайп это или щипок:
+                        // три пальца чуть разъехались — и пришёл щипок. Ведём
+                        // ровно как свайп, по сдвигу центра.
+                        self.start_touchpad_resize();
+                        return;
                     }
+                    // Super+2 пальца щипком — ресайз окна под курсором во все
+                    // стороны. Окно остаётся в своей раскладке (см. PinchResize).
+                    self.pinch_resize_begin();
                 }
             }
 
@@ -1892,33 +2134,25 @@ impl Parallax {
                 if self.жест_щипок_шаг(scale) {
                     return;
                 }
-                if scale <= 0.0 { return; }
-
-                if let Some(window) = self.gesture_resize_window.clone() {
-                    // Размеры считаются от опорных по АБСОЛЮТНОМУ scale жеста
-                    // (см. Parallax::gesture_resize_group), а показатель PINCH_GAIN
-                    // усиливает жест: пальцы на тачпаде разводятся максимум
-                    // раза в полтора, а окно должно успевать вырасти вдвое.
-                    const PINCH_GAIN: f64 = 3.0;
-                    self.pinch_last_scale = scale;
-                    if self.gesture_resize_group.is_empty() {
-                        let s = crate::xwin::current_size(&window);
-                        self.gesture_resize_group = vec![(window.clone(), s)];
+                // Super+3 пальца, распознанные щипком, — ресайз (см. Begin).
+                if self.touchpad_drag.is_some() || self.touchpad_resize.is_some() {
+                    let d = event.delta();
+                    if d.x != 0.0 || d.y != 0.0 {
+                        let zoom = self.viewport.zoom;
+                        self.gesture_advance(Point::from((d.x / zoom, d.y / zoom)), event.time_msec());
                     }
-                    let factor = scale.powf(PINCH_GAIN).clamp(0.05, 20.0);
-                    for (w, base) in self.gesture_resize_group.clone() {
-                        // Пол — 1 px (нулевая поверхность недопустима), а не
-                        // «приличные» 50: щипок ужимает окно во что угодно, как
-                        // и остальные пути ресайза. Потолок оставлен только от
-                        // переполнения арифметики размеров.
-                        let new_w = (base.w as f64 * factor).round().clamp(1.0, 20000.0) as i32;
-                        let new_h = (base.h as f64 * factor).round().clamp(1.0, 20000.0) as i32;
-                        crate::xwin::set_size(&w, Some((new_w, new_h).into()), crate::xwin::Tiled::Keep);
-                        crate::xwin::configure(&w);
-                    }
-                    self.request_redraw();
                     return;
                 }
+                if scale <= 0.0 { return; }
+
+                if self.pinch_resize.is_some() {
+                    self.pinch_last_scale = scale;
+                    self.pinch_resize_step(scale);
+                    return;
+                }
+                // Super зажат, но под пальцами не оказалось окна: щипок не
+                // уходит ни в зум, ни куда-либо ещё.
+                if self.logo_held { return; }
 
                 let alt_held = self.seat.get_keyboard()
                     .map(|kb| kb.modifier_state().alt)
@@ -1964,18 +2198,10 @@ impl Parallax {
                     return;
                 }
                 self.pinch_last_scale = 1.0;
-                let group = std::mem::take(&mut self.gesture_resize_group);
-                tracing::debug!("plx/gesture: pinch finished, windows in the group={}", group.len());
-                self.gesture_resize_window = None;
-                // Запоминаем итоговый размер КАЖДОМУ окну группы — иначе
-                // следующий переход Float→tiling→Float вернул бы соседям
-                // выделения их доресайзные размеры.
-                for (w, _) in group {
-                    let size = crate::xwin::current_size(&w);
-                    if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| tw.window == w) {
-                        tw.float_size = Some(size);
-                    }
+                if self.finish_touchpad_grab() {
+                    return;
                 }
+                self.pinch_resize_end();
             }
 
             // ── Swipe (2 пальца, любой режим) → pan canvas ───────────────
@@ -1986,10 +2212,13 @@ impl Parallax {
                 if self.жест_начало(crate::gestures::ОсноваЖеста::Свайп, event.fingers()) {
                     return;
                 }
-                // Super+2-палец → перемещение окна под курсором (новый жест).
-                if self.logo_held && self.tile_config.layout == Layout::Float {
-                    let pos = self.pointer_location;
-                    self.gesture_move_window = self.space.element_under(pos).map(|(w, _)| w.clone());
+                // Super+3 пальца → ресайз окна под курсором, тот же
+                // ResizeSurfaceGrab, что у Win+ПКМ: в Tile тянет деления, в
+                // Columns ширину колонки и долю строки, во Float свободно.
+                // Перенос остаётся за Super+2 пальцами (прокрутка, см. ось).
+                if self.logo_held {
+                    self.finish_touchpad_grab();
+                    self.start_touchpad_resize();
                 }
             }
 
@@ -2000,24 +2229,14 @@ impl Parallax {
                 }
                 if delta.x == 0.0 && delta.y == 0.0 { return; }
 
-                if let Some(window) = self.gesture_move_window.clone() {
-                    if let Some(geo) = self.space.element_geometry(&window) {
-                        let new_loc = smithay::utils::Point::from((
-                            geo.loc.x + delta.x.round() as i32,
-                            geo.loc.y + delta.y.round() as i32,
-                        ));
-                        self.space.map_element(window.clone(), new_loc, true);
-                        if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-                            tw.window == window
-                        }) {
-                            tw.float_position = new_loc;
-                            tw.position = new_loc;
-                            tw.float_position_set = true;
-                        }
-                    }
-                    self.request_redraw();
+                if self.touchpad_drag.is_some() || self.touchpad_resize.is_some() {
+                    let zoom = self.viewport.zoom;
+                    self.gesture_advance(Point::from((delta.x / zoom, delta.y / zoom)), event.time_msec());
                     return;
                 }
+                // Super зажат, а окна под курсором не было: голый свайп ниже
+                // (листание ленты, пан) с Super не путаем.
+                if self.logo_held { return; }
 
                 // ── Columns/niri: голый свайп 3+ пальцами листает полосу ─────
                 // Горизонталь — прокрутка вида по колонкам (на отпускании
@@ -2064,7 +2283,7 @@ impl Parallax {
                 if self.жест_конец(event.cancelled()) {
                     return;
                 }
-                if self.gesture_move_window.take().is_some() {
+                if self.finish_touchpad_grab() {
                     return;
                 }
                 // В Columns свайп заканчивается «прилипанием» к ближайшей
@@ -2077,6 +2296,7 @@ impl Parallax {
                     return;
                 }
                 self.momentum.launch();
+                self.запустить_возврат_курсора();
             }
 
             // ── Удержание ────────────────────────────────────────────────
@@ -2144,6 +2364,26 @@ pub(crate) fn разобрать_клавишу(
     const SUPER_R: u32 = keysyms::KEY_Super_R;
     let sym = handle.modified_sym();
     let raw = sym.raw();
+
+    // ── Мышь и камера с клавиатуры (см. клавимышь.rs) ──
+    //
+    // Автоповтора у композитора нет: libinput отдаёт по два события на
+    // клавишу, повтор рисует клиент. Поэтому «зажать Alt+L и ехать» держится
+    // здесь: нажатие взвело ход, а кончиться он обязан ровно с отпусканием
+    // ТОЙ ЖЕ клавиши. Любое другое событие ход обрывает — отпустили Alt,
+    // нажали соседнюю клавишу, — иначе курсор ехал бы сам по себе.
+    //
+    // Стоит раньше всех веток: модификаторы (Super/Shift/Alt) ниже уходят в
+    // ранний `return`, и до общего разбора их отпускание не доходит.
+    let латинская = handle
+        .raw_latin_sym_or_raw_current_sym()
+        .map(|s| s.raw())
+        .unwrap_or(raw);
+    if !pressed && state.клавимышь_отпущена(латинская) {
+        // Нажатие клиенту не отдавали (бинд его съел) — отпускание тоже.
+        return FilterResult::Intercept(());
+    }
+    state.клавимышь_чужая_клавиша(латинская);
 
     // Трекаем Super по keysym + детект "тапа" (обзор столов)
     if raw == SUPER_L || raw == SUPER_R {
@@ -2252,10 +2492,10 @@ pub(crate) fn разобрать_клавишу(
 
     // Для layout-independence: берём latin sym если отличается
     // (важно теперь вдвойне — с несколькими XKB-раскладками
-    // биндинги должны срабатывать независимо от активной)
-    let raw_latin = handle.raw_latin_sym_or_raw_current_sym()
-        .map(|s| s.raw())
-        .unwrap_or(raw);
+    // биндинги должны срабатывать независимо от активной).
+    // Посчитан выше, в ветке клавиатурной мыши: отпускание клавиши до сюда
+    // не доходит, а ход обязан кончаться именно по нему.
+    let raw_latin = латинская;
 
     tracing::debug!(
         "KEY: key={} alt={} shift={} ctrl={} logo={}", raw_latin, alt, shift, ctrl, logo
@@ -2298,6 +2538,17 @@ pub(crate) fn разобрать_клавишу(
         }
     }
 
+    // Свойства иконки рабочего стола — такое же поле ввода, как
+    // поиск выше, и устроено так же: голые клавиши целиком его,
+    // символ — из текущей раскладки (имя ярлыка бывает русским).
+    // См. рабстол.rs.
+    if state.рабстол_меню_открыто() && !logo && !ctrl && !alt {
+        let ch = handle.modified_sym().key_char();
+        if state.рабстол_клавиша(raw_latin, ch) {
+            return FilterResult::Intercept(());
+        }
+    }
+
     // Открытое меню блютуза забирает ГОЛЫЕ клавиши: стрелки,
     // Enter и буквы действий принадлежат ему, а не клиенту
     // под курсором (см. bluetooth.rs). Комбинации с
@@ -2318,6 +2569,26 @@ pub(crate) fn разобрать_клавишу(
     if state.wifi_menu_open() && !logo && !ctrl && !alt {
         let ch = handle.modified_sym().key_char();
         if state.wifi_key(raw_latin, ch) {
+            return FilterResult::Intercept(());
+        }
+    }
+    // Меню панели приложений и её список «+» (поиск по имени — символы
+    // из текущей раскладки, как у поиска окон).
+    if state.dock_settings_is_open() && !state.dock_picker_open() && state.dock.меню.is_none()
+        && !logo && !ctrl && !alt
+    {
+        if state.dock_settings_key(raw_latin) {
+            return FilterResult::Intercept(());
+        }
+    }
+    if (state.dock.меню.is_some() || state.dock_picker_open()) && !logo && !ctrl && !alt {
+        let ch = handle.modified_sym().key_char();
+        if state.dock_key(raw_latin, ch) {
+            return FilterResult::Intercept(());
+        }
+    }
+    if state.питание_открыто() && !logo && !ctrl && !alt {
+        if state.питание_клавиша(raw_latin) {
             return FilterResult::Intercept(());
         }
     }
@@ -2372,159 +2643,31 @@ pub(crate) fn разобрать_клавишу(
     // ── Биндинги из Lua-конфига (см. src/config.rs, default_config.lua) ──
     let mods = crate::config::ModMask { ctrl, alt, shift, logo };
     if let Some(action) = state.lua_config.find_action(mods, raw_latin) {
+        // Мышь и камера с клавиатуры отданы окну (`keymouse_block_apps`,
+        // по умолчанию Dota 2): клавишу НЕ съедаем, а пропускаем в игру —
+        // Alt+клик там пинг, и исчезни он, лечение оказалось бы хуже болезни.
+        if state.клавимышь_отдана_окну(&action) {
+            return FilterResult::Forward;
+        }
+        // Пан и зум клавишами заперты в tiling и в ленте колонок. Клавишу
+        // тоже отдаём окну, а не глотаем впустую: Alt+стрелки — это «назад/
+        // вперёд» в браузере и файловом менеджере.
+        if state.клавимышь_камера_заперта(&action) {
+            return FilterResult::Forward;
+        }
         if из_игры && matches!(action, crate::config::Action::MineMode) {
             tracing::warn!("plx/mine: the mode can only be left from the host keyboard");
             return FilterResult::Intercept(());
         }
+        // Какой клавишей вызвали действие — знать нужно только клавиатурной
+        // мыши: ход (`pointer_move`, `pan_camera`) держится, пока держат ЭТУ
+        // клавишу, а само действие про клавиши ничего не знает — его же зовут
+        // жесты, шлем и управляющий сокет.
+        state.клавимышь_клавиша(Some(raw_latin));
         state.dispatch_action(action);
+        state.клавимышь_клавиша(None);
         return FilterResult::Intercept(());
     }
 
     FilterResult::Forward
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Кадры жеста: `шаг` canvas-пикселей каждые `период` мс, `сколько` штук.
-    /// Возвращает время последнего кадра.
-    fn кадры(
-        drift: &mut EdgeDrift,
-        t0: Instant,
-        мс: u32,
-        шаг: f64,
-        период: u32,
-        сколько: u32,
-    ) -> u32 {
-        let mut t = мс;
-        for _ in 0..сколько {
-            drift.note(
-                Point::from((шаг, 0.0)),
-                t,
-                t0 + Duration::from_millis(t as u64),
-            );
-            t += период;
-        }
-        t - период
-    }
-
-    /// Главная регрессия: палец упёрся в бортик и продолжает елозить по нему
-    /// мелкими шагами. Раньше эта дрожь вытесняла быстрые кадры из окна выборки
-    /// и сбрасывала разгон — в логе 20260816_131327 скорость сползала 352 → 253
-    /// и проваливалась под порог, доводка жила один кадр из шестидесяти.
-    /// Теперь она обязана начаться и НЕ прерваться.
-    #[test]
-    fn дрожь_у_бортика_не_отменяет_доводку() {
-        let t0 = Instant::now();
-        let mut d = EdgeDrift::new(t0);
-
-        // Полноценный жест: 6 px за кадр каждые 8 мс ≈ 750 canvas-px/с.
-        let t = кадры(&mut d, t0, 0, 6.0, 8, 30);
-        // Палец в бортике: те же кадры, но по 0.2 px.
-        let t = кадры(&mut d, t0, t + 8, 0.2, 8, 20);
-
-        let простой = t + 8 + EDGE_IDLE.as_millis() as u32 + 1;
-        let now = t0 + Duration::from_millis(простой as u64);
-        let шаг = d
-            .advance(Duration::from_millis(16), now)
-            .expect("доводка обязана начаться после упора");
-        assert!(шаг.x > 0.0 && шаг.y == 0.0, "курс доводки не тот: {шаг:?}");
-
-        // И продолжиться: следующие кадры дрожи её не гасят.
-        let t = кадры(&mut d, t0, простой, 0.2, 8, 10);
-        let now = t0 + Duration::from_millis((t + 8 + EDGE_IDLE.as_millis() as u32) as u64);
-        assert!(
-            d.advance(Duration::from_millis(16), now).is_some(),
-            "дрожь прижатого пальца оборвала доводку",
-        );
-    }
-
-    /// Разгон: сразу после упора доводка идёт медленно и лишь потом выходит на
-    /// скорость жеста. Рывок в момент упора читается как «окно выстрелило».
-    #[test]
-    fn доводка_разгоняется_плавно() {
-        let t0 = Instant::now();
-        let mut d = EdgeDrift::new(t0);
-        let t = кадры(&mut d, t0, 0, 8.0, 8, 30);
-
-        let старт = t + 8 + EDGE_IDLE.as_millis() as u32 + 1;
-        let dt = Duration::from_millis(16);
-        let первый = d
-            .advance(dt, t0 + Duration::from_millis(старт as u64))
-            .expect("доводка не началась");
-        let поздний = d
-            .advance(
-                dt,
-                t0 + Duration::from_millis((старт + EDGE_RAMP.as_millis() as u32) as u64),
-            )
-            .expect("доводка оборвалась на разгоне");
-        assert!(
-            поздний.x > первый.x * 1.5,
-            "разгона нет: первый шаг {:.2}, поздний {:.2}",
-            первый.x, поздний.x,
-        );
-    }
-
-    /// Человек просто остановился посреди медленного жеста — вести окно дальше
-    /// нельзя, он его именно ставит. Это тот самый случай, ради которого нужен
-    /// порог по скорости: у упора в бортик скорость до него высокая, у
-    /// осмысленной остановки — нет.
-    #[test]
-    fn медленный_жест_не_едет_сам() {
-        let t0 = Instant::now();
-        let mut d = EdgeDrift::new(t0);
-        // 1 px за кадр ≈ 125 canvas-px/с — ниже EDGE_MIN_PEAK.
-        let t = кадры(&mut d, t0, 0, 1.0, 8, 40);
-        let now = t0 + Duration::from_millis((t + 8 + 500) as u64);
-        assert!(d.advance(Duration::from_millis(16), now).is_none());
-    }
-
-    /// Короткий тычок: скорость высокая, а вести после него нечего — окно
-    /// уехало бы само от одного касания панели.
-    #[test]
-    fn короткий_тычок_не_едет() {
-        let t0 = Instant::now();
-        let mut d = EdgeDrift::new(t0);
-        let t = кадры(&mut d, t0, 0, 6.0, 8, 3);
-        assert!(d.travel < EDGE_MIN_TRAVEL, "тычок вышел слишком длинным");
-        let now = t0 + Duration::from_millis((t + 8 + 500) as u64);
-        assert!(d.advance(Duration::from_millis(16), now).is_none());
-    }
-
-    /// Пальцы поехали снова — доводка обязана уступить живому вводу и начать
-    /// разгон заново, а не складываться с ним.
-    #[test]
-    fn возобновлённое_движение_обрывает_доводку() {
-        let t0 = Instant::now();
-        let mut d = EdgeDrift::new(t0);
-        let t = кадры(&mut d, t0, 0, 6.0, 8, 30);
-        let старт = t + 8 + EDGE_IDLE.as_millis() as u32 + 1;
-        assert!(d
-            .advance(Duration::from_millis(16), t0 + Duration::from_millis(старт as u64))
-            .is_some());
-
-        let t = кадры(&mut d, t0, старт, 6.0, 8, 10);
-        let now = t0 + Duration::from_millis((t + 8) as u64);
-        assert!(
-            d.advance(Duration::from_millis(16), now).is_none(),
-            "доводка едет поверх живого жеста",
-        );
-    }
-
-    /// Предохранитель: без финального кадра libinput доводка не должна тянуть
-    /// окно по холсту вечно.
-    #[test]
-    fn предохранитель_останавливает_бесконечную_доводку() {
-        let t0 = Instant::now();
-        let mut d = EdgeDrift::new(t0);
-        let t = кадры(&mut d, t0, 0, 6.0, 8, 30);
-        let старт = t + 8 + EDGE_IDLE.as_millis() as u32 + 1;
-        let dt = Duration::from_millis(16);
-        assert!(d
-            .advance(dt, t0 + Duration::from_millis(старт as u64))
-            .is_some());
-        let поздно = старт as u64 + EDGE_MAX_RUN.as_millis() as u64 + 100;
-        assert!(d.advance(dt, t0 + Duration::from_millis(поздно)).is_none());
-    }
 }

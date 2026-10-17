@@ -10,6 +10,7 @@ use smithay::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::protocol::wl_seat::WlSeat,
         wayland_server::protocol::wl_output::WlOutput,
+        wayland_server::Resource,
     },
     utils::{Logical, Point, Rectangle, Serial, Size},
     wayland::shell::xdg::{
@@ -57,7 +58,7 @@ impl XdgShellHandler for Parallax {
         tracing::info!("plx: toplevel_destroyed count={}", self.tagged_windows.len());
     }
 
-    /// Восстановление позиции из сохранённой сессии (4.3): app_id обычно
+    /// Восстановление окна из сохранённой сессии (session.rs): app_id обычно
     /// приходит от клиента ПОСЛЕ new_toplevel (первого коммита ещё не было),
     /// поэтому ждём именно этот колбэк, а не new_toplevel.
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
@@ -69,53 +70,13 @@ impl XdgShellHandler for Parallax {
             .map(|tw| tw.window.clone())
         {
             self.ensure_chip_icon(&window);
+            // Правила окон — здесь по той же причине: на `new_toplevel` app_id
+            // ещё пустой, а правило ищется именно по нему.
+            self.применить_правила(&window);
+            // Картинка, брошенная на стол (см. картинка.rs): плавает и встаёт
+            // туда, куда её бросили.
+            self.картинка_появилась(&window);
         }
-        let app_id = match crate::session::toplevel_app_id(&surface) {
-            Some(id) => id,
-            None => return,
-        };
-        // Позиции берутся В ПОРЯДКЕ СОХРАНЕНИЯ: у одного app_id их бывает
-        // несколько (два терминала), и `pop()` отдавал бы последнее окно
-        // прошлого сеанса первому окну нового — то есть заведомо не то место.
-        let saved_pos = match self.pending_session.get_mut(&app_id) {
-            Some(v) if !v.is_empty() => v.remove(0),
-            _ => return,
-        };
-        // Место из прошлого сеанса могло остаться далеко на холсте: камера
-        // тогда стояла там, а при запуске она в доме монитора. Класть туда
-        // окно — значит потерять его с глаз (см. `место_обитаемо`).
-        if !self.место_обитаемо(saved_pos) {
-            tracing::info!(
-                "plx/session: place {:?} of app_id={} is off-canvas — ignored",
-                saved_pos, app_id,
-            );
-            return;
-        }
-        let Some(tw) = self.tagged_windows.iter_mut().find(|tw| {
-            crate::xwin::is_surface(&tw.window, &surface.wl_surface())
-        }) else {
-            return;
-        };
-        // Плавающему окну место возвращаем целиком; ТАЙЛОВОМУ — только как
-        // «дом» на случай Super+V/Super+D. Иначе восстановление дерётся с
-        // раскладкой: `arrange()` уже поставил окно в слот дерева, а телепорт
-        // отсюда уводил его из слота — ровно то, что видно глазом как «первое
-        // окно при запуске уехало в угол».
-        tw.float_position = saved_pos;
-        tw.float_position_set = true;
-        if !tw.floating {
-            tracing::info!(
-                "plx/session: place {:?} of app_id={} kept as float home (window is tiled)",
-                saved_pos, app_id,
-            );
-            return;
-        }
-        tw.position = saved_pos;
-        let window = tw.window.clone();
-        self.space.map_element(window, saved_pos, false);
-        self.request_plane_reset();
-        tracing::info!("plx/session: restored position app_id={} → {:?}", app_id, saved_pos);
-        self.request_redraw();
     }
 
     /// Клиент сам просится на весь экран: полноэкранное видео, игра,
@@ -142,6 +103,68 @@ impl XdgShellHandler for Parallax {
         }
     }
 
+    /// Клиент просит таскать себя сам: за свой заголовок (CSD-приложения GTK,
+    /// Chromium) или за любое место окна (mpv: `window-dragging`). Раньше
+    /// просьба тонула молча — у Wayland-окон двигать можно было только
+    /// Super+ЛКМ, а у X11 это давно делает `xwayland::move_request`.
+    ///
+    /// Закреплённое окно (Super+Y) возится своим хватом в экранных пикселях:
+    /// холстовый двигал бы его по холсту, с которым оно больше не связано.
+    fn move_request(&mut self, surface: ToplevelSurface, seat: WlSeat, serial: Serial) {
+        let Some((window, pointer, start_data)) = self.xdg_хват(&surface, &seat, serial) else {
+            tracing::debug!("plx: xdg move request ignored (stale serial or not the pressed client)");
+            return;
+        };
+        tracing::debug!("plx: xdg move request");
+        if self.закреплено(&window) {
+            if let Some(grab) = self.начать_перенос_закреплённого(window, start_data) {
+                pointer.set_grab(self, grab, serial, Focus::Clear);
+            }
+            return;
+        }
+        // Виджет руками не двигается (см. виджеты.rs), развёрнутое окно — тоже:
+        // его место держит договор полного экрана.
+        if self.виджет_ли(&window) || self.fullscreen_requested(&window) {
+            return;
+        }
+        let Some(loc) = self.space.element_location(&window) else { return };
+        self.freeze_window_anim(&window);
+        let grab = crate::grabs::move_grab::MoveSurfaceGrab::new(start_data, window, loc, Vec::new());
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        seat: WlSeat,
+        serial: Serial,
+        edges: xdg_toplevel::ResizeEdge,
+    ) {
+        let Some((window, pointer, start_data)) = self.xdg_хват(&surface, &seat, serial) else {
+            return;
+        };
+        let края = crate::grabs::resize_grab::ResizeEdge::from(edges);
+        if края.is_empty() {
+            return;
+        }
+        if self.закреплено(&window) {
+            if let Some(grab) = self.начать_ресайз_закреплённого_за_край(window, start_data, края) {
+                pointer.set_grab(self, grab, serial, Focus::Clear);
+            }
+            return;
+        }
+        if self.виджет_ли(&window) || self.fullscreen_requested(&window) {
+            return;
+        }
+        let Some(geo) = self.space.element_geometry(&window) else { return };
+        self.freeze_window_anim(&window);
+        let glue = self.glue_cluster_snapshot_for_resize(&window, края);
+        let grab = crate::grabs::resize_grab::ResizeSurfaceGrab::start(
+            start_data, window, края, geo, Vec::new(), glue,
+        );
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+    }
+
     /// Всплывающее окно клиента: выпадающее меню, контекстное меню, подсказка,
     /// список автодополнения.
     ///
@@ -165,17 +188,28 @@ impl XdgShellHandler for Parallax {
     /// ему, а клик мимо — закрывает. Без этого меню не закрывается по щелчку
     /// снаружи и не отдаёт клавиатуру (стрелки, Escape).
     fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
-        let Some(seat) = Seat::<Parallax>::from_resource(&seat) else { return };
+        let Some(mut seat) = Seat::<Parallax>::from_resource(&seat) else { return };
         let kind = PopupKind::Xdg(surface);
-        let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
-            self.space
-                .elements()
-                .find(|w| crate::xwin::is_surface(w, &root))
-                .cloned()
-                .and_then(|w| crate::focus::KeyboardFocusTarget::for_window(&w))
+        let Some(окно) = find_popup_root_surface(&kind).ok().and_then(|root| {
+            self.space.elements().find(|w| crate::xwin::is_surface(w, &root)).cloned()
         }) else {
             return;
         };
+        let Some(root) = crate::focus::KeyboardFocusTarget::for_window(&окно) else { return };
+
+        // Меню панели в мире Minecraft — захват МЕСТА МОДА, какое бы место ни
+        // назвал клиент. Firefox (и вообще GTK) просит захват на месте по
+        // умолчанию, то есть на хозяйском, хотя ПКМ пришла от места мода: тогда
+        // хозяйская клавиатура уезжала в меню, Minecraft терял фокус и открывал
+        // меню паузы (жалоба 07.10.2026 «ПКМ по окну выбрасывает в Escape игры»).
+        if crate::mine::панель_а_не_игра(self, &окно) {
+            if let Some(место) = self.mine.as_ref().and_then(|ш| ш.место.clone()) {
+                if место != seat {
+                    tracing::info!("plx/mine: panel popup grab moved to the mod seat");
+                    seat = место;
+                }
+            }
+        }
 
         let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) else { return };
 
@@ -221,6 +255,36 @@ impl XdgShellHandler for Parallax {
 }
 
 impl Parallax {
+    /// Проверка просьбы xdg_toplevel.move/resize: окно наше, а `serial` —
+    /// от живого нажатия кнопки, которое клиент сейчас и получил. Без этого
+    /// любое окно могло бы утащить указатель в хват когда вздумается.
+    fn xdg_хват(
+        &self,
+        surface: &ToplevelSurface,
+        seat: &WlSeat,
+        serial: Serial,
+    ) -> Option<(
+        Window,
+        smithay::input::pointer::PointerHandle<Parallax>,
+        smithay::input::pointer::GrabStartData<Parallax>,
+    )> {
+        let seat = Seat::<Parallax>::from_resource(seat)?;
+        let pointer = seat.get_pointer()?;
+        if !pointer.has_grab(serial) {
+            return None;
+        }
+        let start_data = pointer.grab_start_data()?;
+        // Нажатие обязано принадлежать этому же клиенту.
+        let (фокус, _) = start_data.focus.as_ref()?;
+        if !фокус.id().same_client_as(&surface.wl_surface().id()) {
+            return None;
+        }
+        let window = self.tagged_windows.iter()
+            .map(|tw| tw.window.clone())
+            .find(|w| crate::xwin::is_surface(w, surface.wl_surface()))?;
+        Some((window, pointer, start_data))
+    }
+
     /// Подвинуть меню так, чтобы оно поместилось на экране.
     ///
     /// Клиент выбирает место сам, относительно своего окна, и без поправки

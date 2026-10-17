@@ -90,6 +90,16 @@ fi
 # Активационное окружение шины: службы, поднятые ПО ТРЕБОВАНИЮ (портал —
 # первая из них), наследуют окружение не от нас, а от dbus-daemon. Без этой
 # строки портал видит пустой XDG_CURRENT_DESKTOP и не находит свой .conf.
+# Тема курсора — одна на всех. Композитор и Xwayland берут XCURSOR_THEME, а
+# GTK под Wayland читает gsettings — и там на свежей системе стоит Adwaita.
+# Отсюда «курсор меняется не на тот»: над одним окном стрелка Bibata, над
+# соседним — Adwaita другой формы и размера. Шина к этому месту уже поднята.
+if [ -n "${XCURSOR_THEME:-}" ] && command -v gsettings >/dev/null 2>&1; then
+    gsettings set org.gnome.desktop.interface cursor-theme "$XCURSOR_THEME" >/dev/null 2>&1 || true
+    [ -n "${XCURSOR_SIZE:-}" ] &&
+        gsettings set org.gnome.desktop.interface cursor-size "$XCURSOR_SIZE" >/dev/null 2>&1 || true
+fi
+
 if command -v dbus-update-activation-environment >/dev/null 2>&1; then
     dbus-update-activation-environment \
         XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_RUNTIME_DIR WAYLAND_DISPLAY \

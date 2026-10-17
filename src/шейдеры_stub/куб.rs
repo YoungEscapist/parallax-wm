@@ -18,7 +18,7 @@ use smithay::utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, 
 // Настоящая геометрия куба — тот же файл, что и в полной сборке.
 #[path = "../куб_math.rs"]
 mod math;
-pub use math::{Куб, оборот, стол_грани, шагов_до};
+pub use math::{Куб, Плоскость, оборот, стол_грани, шагов_до};
 
 /// Программы нет и компилировать нечего.
 #[derive(Debug, Clone)]
@@ -47,6 +47,18 @@ impl<E> Грань<E> {
         _rect: (f32, f32, f32, f32),
     ) -> Self {
         Self { inner }
+    }
+
+    pub fn на_плоскости(
+        inner: E,
+        _шейдер: &Шейдер,
+        _uniforms: Vec<smithay::backend::renderer::gles::Uniform<'static>>,
+    ) -> Self {
+        Self { inner }
+    }
+
+    pub fn с_отсечением(self, _clip: (f32, f32, f32, f32)) -> Self {
+        self
     }
 }
 

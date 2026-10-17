@@ -72,7 +72,15 @@ impl Parallax {
         if self.is_selected(window) {
             члены.extend(self.selected_windows.iter().cloned());
         }
-        члены.extend(self.constellation_members_excluding(window));
+        // Тайловое окно созвездия едет одно: место ему даёт раскладка, а
+        // созвездие переживает tiling только затем, чтобы снова стать
+        // гроздью, когда окна вернутся на холст (см. gather_all_into_tiling).
+        let тайловое = self.tile_config.layout != Layout::Float
+            && !self.overview_active
+            && self.tagged_windows.iter().any(|tw| !tw.floating && same_window(&tw.window, window));
+        if !тайловое {
+            члены.extend(self.constellation_members_excluding(window));
+        }
         // Одно и то же окно может прийти обоими путями (выделено И в созвездии).
         let mut итог: Vec<Window> = Vec::new();
         for w in члены {
@@ -178,6 +186,11 @@ impl Parallax {
         if self.selected_windows.len() < 2 {
             return;
         }
+        // Брошенное окно сначала останавливаем: иначе оно доезжает в гроздь
+        // со скоростью броска и выбивает из неё соседей (см. остановить_полёт).
+        for w in self.selected_windows.clone() {
+            self.остановить_полёт(&w);
+        }
         // Созвездия живут во Float (свободные позиции) — переводим туда, если
         // сейчас тайлинг, и помечаем выделенные окна плавающими.
         if self.tile_config.layout != crate::tiling::Layout::Float {
@@ -268,15 +281,25 @@ impl Parallax {
         self.request_redraw();
     }
 
-    /// Super+D без выделения: строго и безотказно собрать ВСЕ окна текущего
-    /// тега в tiling. Снимаем floating (иначе apply_tile_layout их игнорирует —
-    /// `!tw.floating`), распускаем созвездия и раскладываем в Tile.
+    /// Super+D без выделения: собрать окна текущего тега в tiling. Снимаем
+    /// floating (иначе apply_tile_layout их игнорирует — `!tw.floating`) и
+    /// раскладываем в Tile.
+    ///
+    /// Кроме плавающих НАМЕРЕННО (`float_pinned`: Win+V, диалог): они остаются плавающими и встают туда, где
+    /// висели поверх раскладки до ухода во Float (`TaggedWindow::tile_float`).
+    /// Раньше флаг снимался со всех подряд, и цикл Tile → Float → Tile
+    /// загонял поднятые окна в раскладку.
+    ///
+    /// Созвездия НЕ распускаем: окна при выходе из tiling возвращаются на свои
+    /// float-места, то есть гроздь встаёт как стояла — и должна ехать целиком,
+    /// как до сборки. Раньше здесь был `constellations.clear()`, и созвездия
+    /// (к тому же со ВСЕХ столов, не только с текущего) пропадали молча.
+    /// В самом tiling группа не тянется: см. group_drag_members_excluding.
     pub fn gather_all_into_tiling(&mut self) {
         self.clear_selection();
-        self.constellations.clear();
         let current = self.viewport.current_tags();
         for tw in self.tagged_windows.iter_mut() {
-            if tw.tags & current != 0 {
+            if tw.tags & current != 0 && !tw.float_pinned {
                 tw.floating = false;
                 // float_position_set НЕ трогаем: сохранённая float-позиция —
                 // это "своё место" окна, куда оно вернётся при выходе из tiling
@@ -358,6 +381,13 @@ impl Parallax {
             None => return,
         };
         let group = self.constellations.remove(idx);
+        // Поверх тайлинга окна возвращаются только в пределы экрана.
+        let рамка = self.рамка_плавающих();
+        // Та же предосторожность, что при сборке: летящее окно уехало бы
+        // мимо своего прежнего места.
+        for w in &group {
+            self.остановить_полёт(w);
+        }
 
         // Центр тяжести группы.
         let (mut cx, mut cy, mut n) = (0.0f64, 0.0f64, 0.0f64);
@@ -411,6 +441,10 @@ impl Parallax {
                         (cy + dy - итоговый.h as f64 / 2.0).round() as i32,
                     ))
                 }
+            };
+            let pos = match рамка {
+                Some(рамка) => crate::tiling::зажать_в_рамку(рамка, pos, итоговый),
+                None => pos,
             };
             self.animate_window_to_dur(w, pos, crate::anim::дуг::созвездие());
             if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| &tw.window == w) {
@@ -478,6 +512,10 @@ impl Parallax {
         };
 
         let Some(idx) = по_выделению.or_else(по_фокусу).or_else(единственное_здесь) else {
+            // Созвездия нет — может, это сетка склейки (Super+M).
+            if self.ungroup_glue_grid_in_place() {
+                return;
+            }
             tracing::info!("plx: dissolve: no constellation found (neither in the selection nor under focus)");
             return;
         };

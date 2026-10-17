@@ -453,8 +453,11 @@ impl crate::state::Parallax {
                 let level = ((pos.x - cell.rect.x as f64) / cell.rect.w as f64).clamp(0.0, 1.0);
                 self.audio_send(crate::audio::Cmd::SetVolume(level as f32));
             }
-            // Батарея — только показ, нажимать не на что.
-            CellKind::Battery => {}
+            // Батарея — меню питания: режимы и подсветка (см. питание.rs).
+            CellKind::Battery => {
+                self.tray_set_open(false);
+                self.питание_меню();
+            }
             CellKind::Power(action) => {
                 let ready = armed.is_some_and(|(a, at)| a == action && at.elapsed() < ARM_TTL);
                 if ready {

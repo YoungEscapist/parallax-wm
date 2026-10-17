@@ -85,7 +85,11 @@ The gesture model in `src/gestures.rs` — touchpad gestures as a binding table,
 [driftwm](https://github.com/malbiruk/driftwm), and the trigger names are kept
 identical on purpose so that a configuration line can be moved from one
 compositor to the other unchanged. driftwm is also where the idea of doing zoom
-in the renderer rather than in output scale came from.
+in the renderer rather than in output scale came from, and where the widget
+model in `src/виджеты.rs` comes from: a widget is not a kind of surface but a
+window rule (`widget = true`) that pins an ordinary client to the canvas, below
+the other windows and out of the window cycle — the key name is kept identical
+for the same reason as the gesture triggers.
 
 > driftwm — a trackpad-first infinite canvas Wayland compositor
 > Copyright (C) 2026 Klim Kostiuk

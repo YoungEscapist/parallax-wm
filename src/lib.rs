@@ -28,6 +28,7 @@ mod bluetooth;
 mod canvas;
 mod close;
 mod capture;
+mod cluster;
 mod columns;
 mod constellation;
 mod config;
@@ -61,6 +62,13 @@ mod обои;
 #[cfg(not(feature = "shaders"))]
 #[path = "шейдеры_stub/обои.rs"]
 mod обои;
+/// Экранный шейдер поверх всего кадра (как decoration:screen_shader).
+///
+/// Без фичи `shaders` модуль собирается тот же, но ручка до него не доходит:
+/// путь подменяется пустым (см. udev::рисовать_поверхность), и ни программы,
+/// ни буфера не заводится.
+#[path = "экран.rs"]
+mod экран;
 /// Куб рабочих столов (Compiz Desktop Cube).
 #[cfg(feature = "shaders")]
 #[path = "куб.rs"]
@@ -68,20 +76,27 @@ mod куб;
 #[cfg(not(feature = "shaders"))]
 #[path = "шейдеры_stub/куб.rs"]
 mod куб;
-/// Свет на холсте в цвет обоев: заливка сцены и свет на окнах.
-#[cfg(feature = "shaders")]
-#[path = "свет.rs"]
-mod свет;
-#[cfg(not(feature = "shaders"))]
-#[path = "шейдеры_stub/свет.rs"]
-mod свет;
+// Наклон и вращение окон (см. наклон.rs): шейдер — тот же, что у куба.
+#[path = "наклон.rs"]
+mod наклон;
+// Карусель колонок (обзор ленты в 3D): чистая геометрия поверх `куб`, общая
+// для обеих сборок — без шейдера она просто не включается.
+#[path = "карусель.rs"]
+mod карусель;
+// Карусель столов (сеточный обзор в 3D): тоже чистая геометрия поверх `куб`.
+#[path = "карусель_столов.rs"]
+mod карусель_столов;
 mod overview;
+mod pin;
+#[path = "картинка.rs"]
+mod картинка;
+mod dock;
+mod dock_settings;
 mod portal;
 mod portal_stream;
 mod rounded;
 mod screencopy;
 mod selection;
-mod session;
 #[cfg(feature = "share")]
 mod share;
 #[cfg(not(feature = "share"))]
@@ -100,16 +115,34 @@ mod vr;
 #[path = "vr_stub/mod.rs"]
 mod vr;
 mod audio;
+#[path = "питание.rs"]
+mod питание;
 mod tiling;
 mod touchpad;
 /// Сенсорный экран ноутбука: касание клиенту, органам компоновщика и камере.
 #[path = "сенсор.rs"]
 mod сенсор;
 mod tray;
+/// Виджеты — окна, прибитые к холсту правилом `window{ widget = true }`
+/// (модель driftwm, см. виджеты.rs).
+#[path = "виджеты.rs"]
+mod виджеты;
+/// Иконки на рабочем столе: ярлыки прямо на обоях (см. рабстол.rs).
+#[path = "рабстол.rs"]
+mod рабстол;
+/// Встроенные виджеты рабочего стола: часы, календарь, система, заметка
+/// (см. виджеты_стола.rs).
+#[path = "виджеты_стола.rs"]
+mod виджеты_стола;
 mod wifi;
+mod wifi_form;
 mod winit;
 mod xwayland;
 mod xwin;
+/// Мышь и камера с клавиатуры (см. клавимышь.rs): обычные действия `bind{}`,
+/// а не отдельный режим.
+#[path = "клавимышь.rs"]
+mod клавимышь;
 
 use smithay::reexports::{
     calloop::{
@@ -326,6 +359,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<'static, Parallax> = EventLoop::try_new()?;
     let display: Display<Parallax> = Display::new()?;
     let mut state = Parallax::new(&mut event_loop, display);
+    // Иконки рабочего стола читаются с диска сразу: они часть картинки, и
+    // появиться позже окон означало бы мигнуть пустыми обоями (см. рабстол.rs).
+    state.рабстол_загрузить();
+    state.виджеты_загрузить();
 
     let force_tty   = std::env::args().any(|a| a == "--tty");
     let force_winit = std::env::args().any(|a| a == "--winit");
@@ -460,6 +497,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             event_loop.handle().insert_source(from_wifi, |event, _, state| {
                 if let channel::Event::Msg(event) = event {
                     state.handle_wifi_event(event);
+                }
+            })?;
+        }
+        // Питание: режимы, заряд, подсветка (см. питание.rs). В харнессе — со
+        // своими службами, как звук: на общей шине он менял бы режим живой
+        // машины.
+        let (to_plx, from_power) = channel::channel::<crate::питание::Event>();
+        if let Some(tx) = полка_и_меню.then(|| crate::питание::spawn(to_plx)).flatten() {
+            state.init_питание(tx);
+            event_loop.handle().insert_source(from_power, |event, _, state| {
+                if let channel::Event::Msg(event) = event {
+                    state.питание_событие(event);
                 }
             })?;
         }

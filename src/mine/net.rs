@@ -18,10 +18,12 @@
 //! проверив, что в него никто не слушает, чтобы не отобрать сокет у живого
 //! композитора соседнего сеанса.
 
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use smithay::reexports::calloop::{
     generic::Generic, Interest, Mode, PostAction, RegistrationToken,
@@ -55,6 +57,13 @@ pub struct Мод {
     pub pid: Option<u32>,
     /// Помечен мёртвым — уберём в тике, а не посреди разбора сообщения.
     pub жив: bool,
+    /// Мод умеет принимать dmabuf (бит из его «привета»).
+    pub dmabuf: bool,
+    /// Дескрипторы к сообщениям `Буфер`, в том же порядке, что и сами
+    /// сообщения в очереди. Пишущий поток, встретив `Буфер`, берёт отсюда
+    /// первый и прикладывает его к сообщению (SCM_RIGHTS). Порядок держится
+    /// потому, что `Буфер` никогда не роняется — см. [`послать_буфер`].
+    pub дескрипторы: Arc<Mutex<VecDeque<OwnedFd>>>,
 }
 
 /// Завести слушателя. Токен возвращается наружу: при выходе из режима его
@@ -153,6 +162,7 @@ fn принять(state: &mut Parallax, поток: UnixStream) {
     };
 
     let исходящие = Arc::new(Очередь::new());
+    let дескрипторы = Arc::new(Mutex::new(VecDeque::new()));
     шахта.мод = Some(Мод {
         исходящие: исходящие.clone(),
         токен: None,
@@ -160,6 +170,8 @@ fn принять(state: &mut Parallax, поток: UnixStream) {
         имя: String::new(),
         pid,
         жив: true,
+        dmabuf: false,
+        дескрипторы: дескрипторы.clone(),
     });
 
     // Пишущий поток: сокет принадлежит ему одному, блокировки здесь безопасны.
@@ -171,6 +183,27 @@ fn принять(state: &mut Parallax, поток: UnixStream) {
             .spawn(move || {
                 while let Some(сообщение) = исходящие.взять() {
                     let mut ушло = 0;
+                    // Сообщение с дескриптором: первый кусок уходит через
+                    // sendmsg вместе с ним, остаток — обычной записью ниже.
+                    // Ядро прикладывает SCM_RIGHTS к первому байту, и мод на
+                    // том конце получает дескриптор вместе с началом `Буфер`.
+                    if сообщение.get(4) == Some(&proto::тип::БУФЕР) {
+                        let fd = match дескрипторы.lock() {
+                            Ok(mut д) => д.pop_front(),
+                            Err(отравлен) => отравлен.into_inner().pop_front(),
+                        };
+                        let Some(fd) = fd else {
+                            tracing::warn!("plx/mine: buffer message without a descriptor — dropping the link");
+                            return;
+                        };
+                        match послать_с_дескриптором(&сокет, &сообщение, &fd) {
+                            Ok(n) => ушло = n,
+                            Err(e) => {
+                                tracing::warn!("plx/mine: sendmsg: {e}");
+                                return;
+                            }
+                        }
+                    }
                     while ушло < сообщение.len() {
                         match сокет.write(&сообщение[ушло..]) {
                             Ok(0) => return,
@@ -294,6 +327,56 @@ pub fn отключить(state: &mut Parallax) {
     if let Some(т) = мод.токен {
         state.петля.remove(т);
     }
+}
+
+/// Отдать начало сообщения вместе с дескриптором. Сокет неблокирующий (флаг
+/// общий с читающей половиной), поэтому EAGAIN ждём коротким сном, как и
+/// обычная запись. Возвращает, сколько байт сообщения ушло.
+fn послать_с_дескриптором(сокет: &UnixStream, сообщение: &[u8], fd: &OwnedFd) -> std::io::Result<usize> {
+    let сырой = fd.as_raw_fd();
+    loop {
+        let mut iov = libc::iovec {
+            iov_base: сообщение.as_ptr() as *mut libc::c_void,
+            iov_len: сообщение.len(),
+        };
+        // Место под один int в управляющем сообщении, выровненное как велит
+        // CMSG_SPACE. u64-массив — ради выравнивания cmsghdr.
+        let mut упр = [0u64; 4];
+        let мест = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as usize;
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = упр.as_mut_ptr().cast();
+        msg.msg_controllen = мест as _;
+        unsafe {
+            let c = libc::CMSG_FIRSTHDR(&msg);
+            (*c).cmsg_level = libc::SOL_SOCKET;
+            (*c).cmsg_type = libc::SCM_RIGHTS;
+            (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<libc::c_int>(), сырой);
+        }
+        let n = unsafe { libc::sendmsg(сокет.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(2)),
+            ErrorKind::Interrupted => {}
+            _ => return Err(e),
+        }
+    }
+}
+
+/// Отдать моду полотно-dmabuf: сообщение и дескриптор. Не роняется никогда —
+/// иначе дескриптор приложился бы к чужому сообщению.
+pub fn послать_буфер(state: &mut Parallax, сообщение: &proto::ОтДавна, fd: OwnedFd) {
+    let Some(мод) = state.mine.as_mut().and_then(|ш| ш.мод.as_mut()) else { return };
+    match мод.дескрипторы.lock() {
+        Ok(mut д) => д.push_back(fd),
+        Err(отравлен) => отравлен.into_inner().push_back(fd),
+    }
+    мод.исходящие.положить(сообщение.в_байты(), false);
 }
 
 /// Поставить сообщение в очередь мода.

@@ -120,7 +120,19 @@ impl DataDeviceHandler for Parallax {
     fn data_device_state(&mut self) -> &mut DataDeviceState { &mut self.data_device_state }
 }
 
-impl DndGrabHandler for Parallax {}
+impl DndGrabHandler for Parallax {
+    /// Бросок закончился. Брошенное мимо окон — на рабочий стол — забирает
+    /// себе композитор (картинка становится окном, см. картинка.rs).
+    fn dropped(
+        &mut self,
+        _target: Option<smithay::input::dnd::DndTarget<'_, Self>>,
+        validated: bool,
+        _seat: Seat<Self>,
+        location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        self.dnd_брошен(validated, location);
+    }
+}
 
 impl WaylandDndGrabHandler for Parallax {
     fn dnd_requested<S: Source>(&mut self, source: S, _icon: Option<WlSurface>,
@@ -129,6 +141,9 @@ impl WaylandDndGrabHandler for Parallax {
             GrabType::Pointer => {
                 let ptr = seat.get_pointer().unwrap();
                 let start_data = ptr.grab_start_data().unwrap();
+                // Источник оборачиваем: если бросят на стол, отмену броска
+                // придержим, пока не заберём у него данные (см. картинка.rs).
+                let source = self.dnd_начат(source);
                 let grab = DnDGrab::new_pointer(&self.display_handle, start_data, source, seat);
                 ptr.set_grab(self, grab, serial, Focus::Keep);
             }

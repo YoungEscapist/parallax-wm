@@ -151,12 +151,19 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
         "key" => клавиша(хвост, state),
         "pointer" => указатель(state),
         "cube" => куб(state),
+        "tilt" => state.наклон_отчёт(),
+        "carousel" => карусель(state),
         "share" => раздача(хвост, state),
         "portal" => портал(хвост, state),
         "vr" => шлем(хвост, state),
         "mine" => шахта(хвост, state),
+        "widget" => виджет(хвост, state),
+        "icon" => иконка(хвост, state),
+        "desk" => стол_виджеты(хвост, state),
+        "picture" => картинка(хвост, state),
+        "wallpaper" => обои(хвост, state),
         "help" => т!(
-            "shot <путь> | action <имя> [k=v ...] | windows | pointer | cube | \
+            "shot <путь> | action <имя> [k=v ...] | windows | pointer | cube | carousel | \
              mouse to X Y | mouse move DX DY | mouse down|up|click [левая|правая|средняя] | \
              mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
              touch down|move <слот> X Y | touch up <слот> | touch tap X Y | \
@@ -166,8 +173,12 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
              portal [pick [типы] | cancel] | \
              vr [mode|on|off|ar|layout|recenter|menu|keys|pults|press <пульт> <n>|\
              status|panels|input|gestures|shot <путь>] | \
-             mine [on|off|mode|layout|status|panels|ray x y z dx dy dz|pin ключ x y|game номер]",
-            "shot <path> | action <name> [k=v ...] | windows | pointer | cube | \
+             mine [on|off|mode|layout|status|panels|ray x y z dx dy dz|pin ключ x y|game номер] | \
+             widget [list | on|off [app_id] | move X Y [app_id]] | \
+             icon [list | add имя [cmd=…] [image=…] [x=…] [y=…] [size=…] [desktop=…] | rm имя | move имя X Y | desktop имя N] | \
+             desk [list | add clock|calendar|system|note [x=…] [y=…] [scale=…] [text=…] [desktop=…] | rm N | move N X Y | desktop N СТОЛ] | \
+             picture drop X Y <uri|путь> | wallpaper [cycle on|off|toggle]",
+            "shot <path> | action <name> [k=v ...] | windows | pointer | cube | carousel | \
              mouse to X Y | mouse move DX DY | mouse down|up|click [left|right|middle] | \
              mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
              touch down|move <slot> X Y | touch up <slot> | touch tap X Y | \
@@ -177,7 +188,11 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
              portal [pick [types] | cancel] | \
              vr [mode|on|off|ar|layout|recenter|menu|keys|pults|press <panel> <n>|\
              status|panels|input|gestures|shot <path>] | \
-             mine [on|off|mode|layout|status|panels|ray x y z dx dy dz|pin key x y|game number]"
+             mine [on|off|mode|layout|status|panels|ray x y z dx dy dz|pin key x y|game number] | \
+             widget [list | on|off [app_id] | move X Y [app_id]] | \
+             icon [list | add name [cmd=…] [image=…] [x=…] [y=…] [size=…] [desktop=…] | rm name | move name X Y | desktop name N] | \
+             desk [list | add clock|calendar|system|note [x=…] [y=…] [scale=…] [text=…] [desktop=…] | rm N | move N X Y | desktop N СТОЛ] | \
+             picture drop X Y <uri|path> | wallpaper [cycle on|off|toggle]"
         )
         .into(),
         иное => тф!("ошибка: не знаю команду '{}'", "error: unknown command '{}'", иное),
@@ -736,6 +751,11 @@ fn нажать_клавишу(state: &mut Parallax, код: u32, нажата: 
 
 /// Имя → скан-код evdev. Числом можно задать любой код напрямую.
 fn код_клавиши(имя: &str) -> Option<u32> {
+    // Имена клавиш в config.lua пишутся как keysym'ы xkb — `Right`, `Return`,
+    // `Print`, — и рука сама набирает их в сокет так же. Регистр здесь ничего
+    // не значит, а «не знаю клавишу 'Right'» выглядит как поломка бинда.
+    let строчными = имя.to_lowercase();
+    let имя = строчными.as_str();
     if let Ok(n) = имя.parse::<u32>() {
         // Голое число — это КОД, а не цифровая клавиша: «key 32» = KEY_D.
         // Цифры набираются именами: «key цифра1».
@@ -766,6 +786,18 @@ fn код_клавиши(имя: &str) -> Option<u32> {
         "цифра8" | "d8" => 9,
         "цифра9" | "d9" => 10,
         "цифра0" | "d0" => 11,
+        // Знаки верхнего ряда и пунктуация: без них с сокета не проверить ни
+        // зум камеры (`minus`/`equal`), ни наклон колеса (`comma`/`period`),
+        // ни миникарту (`grave`) — а именно на них висят бинды по умолчанию.
+        "minus" => 12,
+        "equal" => 13,
+        "bracketleft" => 26,
+        "bracketright" => 27,
+        "semicolon" => 39,
+        "grave" => 41,
+        "comma" => 51,
+        "period" => 52,
+        "slash" => 53,
         "backspace" => 14,
         "tab" => 15,
         "enter" | "return" => 28,
@@ -785,6 +817,8 @@ fn код_клавиши(имя: &str) -> Option<u32> {
         "f10" => 68,
         "f11" => 87,
         "f12" => 88,
+        // PrtScr: в evdev это KEY_SYSRQ (xkb называет её Print).
+        "print" | "sysrq" => 99,
         "home" => 102,
         "up" | "вверх" => 103,
         "pgup" => 104,
@@ -811,6 +845,25 @@ fn код_клавиши(имя: &str) -> Option<u32> {
 /// перспективой миниатюр на кадре был бы похож на куб, стоящий лицом,
 /// и «колесо не сработало» неотличимо от «куб вообще не включён» (ленточная
 /// раскладка граней не получает — см. `куб_активен`).
+/// `wallpaper cycle on|off|toggle` — бесконечные обои плиткой по холсту. Шлёт
+/// plx-wall, когда в его меню ставят или снимают галочку «cycle» и когда
+/// применяют обои. Без аргументов — нынешнее состояние.
+fn обои(хвост: &str, state: &mut Parallax) -> String {
+    let слова: Vec<&str> = хвост.split_whitespace().collect();
+    match слова.as_slice() {
+        [] | ["cycle"] => {}
+        ["cycle", "on"] => state.обои_цикл = true,
+        ["cycle", "off"] => state.обои_цикл = false,
+        ["cycle", "toggle"] => state.обои_цикл = !state.обои_цикл,
+        _ => return т!(
+            "ошибка: wallpaper [cycle on|off|toggle]",
+            "error: wallpaper [cycle on|off|toggle]"
+        ).into(),
+    }
+    state.request_redraw();
+    format!("cycle={}", if state.обои_цикл { "on" } else { "off" })
+}
+
 fn куб(state: &mut Parallax) -> String {
     let грань = state
         .куб_стол_в_точке(state.pointer_screen_physical())
@@ -838,9 +891,9 @@ fn куб(state: &mut Parallax) -> String {
         .collect();
     тф!(
         "куб={} стол={} столы=[{}] грани=[{}] угол={:.3} цель={:.3} масштаб={:.2} заполнение={:.2} \
-         передний={} под_курсором={} драг={}",
+         передний={} под_курсором={} драг={} подъём={:.2} подъём_px={:.0} наклон={:.3} наклон_цель={:.3}",
         "cube={} desktop={} desktops=[{}] faces=[{}] angle={:.3} target={:.3} scale={:.2} fill={:.2} \
-         front={} under_cursor={} drag={}",
+         front={} under_cursor={} drag={} lift={:.2} lift_px={:.0} tilt={:.3} tilt_target={:.3}",
         state.куб_активен(),
         // Текущий стол рядом с передней гранью: в покое они обязаны совпадать,
         // и без этой пары «куб показывает не тот стол» ловится только глазами.
@@ -854,6 +907,76 @@ fn куб(state: &mut Parallax) -> String {
         передний,
         грань,
         state.куб_драг.is_some(),
+        // Подъём окон над гранью: доля анимации и во что она выливается для
+        // НИЖНЕГО окна стопки. Без пары «доля + пиксели» «окна не поднялись»
+        // неотличимо от «подъём выключен ручкой».
+        state.куб_подъём,
+        state.куб_подъём_пикселей(0, state.screen_size().w as f32),
+        state.куб_наклон,
+        state.куб_наклон_цель,
+    )
+}
+
+/// Состояние карусели ленты: этажи, раскрытие, наклон, фронты барабанов и
+/// колонка под курсором (этаж + окно). Без этой строки «клик уехал не туда» и
+/// «барабан не доехал» различались бы только на глаз.
+fn карусель(state: &mut Parallax) -> String {
+    if let Some(к) = state.карусель_столов.clone() {
+        let столы: Vec<String> = к.столы.iter().map(|m| format!("{}", m.trailing_zeros() + 1)).collect();
+        let форма = match crate::карусель_столов::форма(к.столы.len()) {
+            crate::карусель_столов::Форма::Квадрат { на_сторону } => format!("square:{на_сторону}"),
+            crate::карусель_столов::Форма::Круг => "circle".to_string(),
+            crate::карусель_столов::Форма::Книга => "book".to_string(),
+        };
+        let под = state
+            .карусель_столов_под_курсором()
+            .map(|m| format!("{}", m.trailing_zeros() + 1))
+            .unwrap_or_else(|| "-".into());
+        return format!(
+            "desk_carousel=yes active={} shape={} desks=[{}] selected={} flat={} turn={:.3}->{:.3} open={:.3}->{:.3} tilt={:.3}->{:.3} drag={} exit={} under_cursor={}",
+            state.карусель_активна(),
+            форма,
+            столы.join(","),
+            к.столы.get(к.выбран).map(|m| m.trailing_zeros() + 1).unwrap_or(0),
+            к.столы.get(к.плоский).map(|m| m.trailing_zeros() + 1).unwrap_or(0),
+            к.поворот, к.поворот_цель,
+            к.раскрытие, к.раскрытие_цель,
+            к.наклон, к.наклон_цель,
+            к.драг.is_some(),
+            к.выход.map(|(m, _)| format!("{}", m.trailing_zeros() + 1)).unwrap_or_else(|| "-".into()),
+            под,
+        );
+    }
+    let Some(к) = state.карусель.clone() else {
+        return тф!("карусель=нет доступна={}", "carousel=none available={}", state.карусель_доступна());
+    };
+    let этажи: Vec<String> = к.этажи.iter().map(|m| format!("{}", m.trailing_zeros() + 1)).collect();
+    let фронты: Vec<String> = к.фронт.iter().map(|f| format!("{:.0}->{:.0}", f.0, f.1)).collect();
+    let колонок: Vec<String> = к.этажи.iter().map(|&m| format!("{}", state.карусель_колонки(m).0.len())).collect();
+    let под = state
+        .карусель_под_курсором()
+        .map(|(m, w)| {
+            let id = w
+                .and_then(|w| state.space.elements().position(|e| e == &w))
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".into());
+            format!("{}:{}", m.trailing_zeros() + 1, id)
+        })
+        .unwrap_or_else(|| "-".into());
+    тф!(
+        "карусель=да активна={} этажи=[{}] колонок=[{}] этаж={:.3}->{:.3} раскрытие={:.3}->{:.3} наклон={:.3}->{:.3} фронт=[{}] кадр_x={:.0} драг={} выход={} под_курсором={}",
+        "carousel=yes active={} floors=[{}] columns=[{}] floor={:.3}->{:.3} open={:.3}->{:.3} tilt={:.3}->{:.3} front=[{}] frame_x={:.0} drag={} exit={} under_cursor={}",
+        state.карусель_активна(),
+        этажи.join(","),
+        колонок.join(","),
+        к.этаж, к.этаж_цель,
+        к.раскрытие, к.раскрытие_цель,
+        к.наклон, к.наклон_цель,
+        фронты.join(","),
+        к.кадр_x,
+        к.драг.is_some(),
+        к.выход.as_ref().map(|(m, _)| format!("{}", m.trailing_zeros() + 1)).unwrap_or_else(|| "-".into()),
+        под,
     )
 }
 
@@ -873,6 +996,373 @@ fn указатель(state: &mut Parallax) -> String {
         state.viewport.cam_x, state.viewport.cam_y, state.viewport.zoom,
         под, state.bar_hover, state.minimap_manual,
     )
+}
+
+/// `icon [list | add | rm | move | desktop]` — иконки рабочего стола из
+/// терминала.
+///
+/// Тот же список, что правится мышью (см. рабстол.rs), — команда нужна там, где
+/// мышь неуместна: скрипт установки, раскладка ярлыков одним махом, проверка на
+/// харнессе. Без `x`/`y` иконка ложится в середину видимой части холста — туда,
+/// куда человек сейчас смотрит.
+fn иконка(хвост: &str, state: &mut Parallax) -> String {
+    let (что, довод) = match хвост.split_once(char::is_whitespace) {
+        Some((первое, остаток)) => (первое, остаток.trim()),
+        None => (хвост, ""),
+    };
+    match что {
+        "" | "list" | "список" => {
+            if state.рабстол.иконки.is_empty() {
+                return т!("иконок нет", "no icons").into();
+            }
+            state.рабстол.иконки.iter()
+                .map(|и| format!(
+                    "{} {},{} {}px desktop={} image={} cmd={}\n",
+                    и.имя, и.x, и.y, и.размер,
+                    crate::рабстол::столы_текстом(и.столы),
+                    if и.картинка.is_empty() { "—" } else { &и.картинка },
+                    if и.команда.is_empty() { "—" } else { &и.команда },
+                ))
+                .collect()
+        }
+        "add" | "добавить" => {
+            let mut части = довод.split_whitespace();
+            let Some(имя) = части.next().map(|s| s.to_string()).filter(|s| !s.is_empty()) else {
+                return т!("ошибка: icon add имя [ключ=значение ...]",
+                          "error: icon add name [key=value ...]").into();
+            };
+            let mut иконка = crate::рабстол::Иконка {
+                имя,
+                картинка: String::new(),
+                команда: String::new(),
+                x: 0,
+                y: 0,
+                размер: 64,
+                // Без `desktop=` иконка достаётся столу, на котором стоим:
+                // команда ставит её туда же, куда поставила бы рука.
+                столы: state.viewport.current_tags(),
+            };
+            let mut место_задано = false;
+            for кусок in части {
+                let Some((ключ, значение)) = кусок.split_once('=') else { continue };
+                match ключ {
+                    "cmd" | "команда" => иконка.команда = значение.to_string(),
+                    "image" | "icon" | "картинка" => иконка.картинка = значение.to_string(),
+                    "x" => {
+                        иконка.x = значение.parse().unwrap_or(0);
+                        место_задано = true;
+                    }
+                    "y" => {
+                        иконка.y = значение.parse().unwrap_or(0);
+                        место_задано = true;
+                    }
+                    "size" | "размер" => {
+                        иконка.размер = значение.parse::<i32>().unwrap_or(64)
+                            .clamp(crate::рабстол::МИН_РАЗМЕР, crate::рабстол::МАКС_РАЗМЕР);
+                    }
+                    // `desktop=3` — только на третьем столе, `desktop=all` (или
+                    // 0) — на всех.
+                    "desktop" | "стол" => {
+                        иконка.столы = match значение {
+                            "all" | "все" | "*" => 0,
+                            v => crate::рабстол::маска_стола(v.parse::<u32>().unwrap_or(1)),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            if !место_задано {
+                // Середина видимой части холста: «куда человек смотрит».
+                let vis = state.visible_canvas_size();
+                иконка.x = (state.viewport.cam_x + vis.w / 2.0).round() as i32 - иконка.размер / 2;
+                иконка.y = (state.viewport.cam_y + vis.h / 2.0).round() as i32 - иконка.размер / 2;
+            }
+            let (имя, x, y) = (иконка.имя.clone(), иконка.x, иконка.y);
+            state.рабстол_добавить(иконка);
+            тф!("ok: {} {},{}", "ok: {} {},{}", имя, x, y)
+        }
+        "rm" | "remove" | "удалить" => {
+            let Some(i) = state.рабстол.иконки.iter().position(|и| и.имя == довод) else {
+                return тф!("ошибка: иконки '{}' нет", "error: no icon '{}'", довод);
+            };
+            state.рабстол.иконки.remove(i);
+            state.рабстол_сохранить();
+            state.request_redraw();
+            тф!("ok: {} удалена", "ok: {} removed", довод)
+        }
+        "move" | "двинуть" => {
+            let mut части = довод.split_whitespace();
+            let (Some(имя), Some(x), Some(y)) = (
+                части.next().map(|s| s.to_string()),
+                части.next().and_then(|s| s.parse::<i32>().ok()),
+                части.next().and_then(|s| s.parse::<i32>().ok()),
+            ) else {
+                return т!("ошибка: icon move имя X Y", "error: icon move name X Y").into();
+            };
+            let Some(и) = state.рабстол.иконки.iter_mut().find(|и| и.имя == имя) else {
+                return тф!("ошибка: иконки '{}' нет", "error: no icon '{}'", имя);
+            };
+            и.x = x;
+            и.y = y;
+            state.рабстол_сохранить();
+            state.request_redraw();
+            тф!("ok: {} {},{}", "ok: {} {},{}", имя, x, y)
+        }
+        // `icon desktop имя N` — перенести иконку на другой стол (0 — на все).
+        "desktop" | "стол" => {
+            let mut части = довод.split_whitespace();
+            let (Some(имя), Some(номер)) = (
+                части.next().map(|s| s.to_string()),
+                части.next().map(|s| match s {
+                    "all" | "все" | "*" => 0,
+                    v => v.parse::<u32>().unwrap_or(1),
+                }),
+            ) else {
+                return т!("ошибка: icon desktop имя N|all", "error: icon desktop name N|all").into();
+            };
+            let Some(и) = state.рабстол.иконки.iter_mut().find(|и| и.имя == имя) else {
+                return тф!("ошибка: иконки '{}' нет", "error: no icon '{}'", имя);
+            };
+            и.столы = crate::рабстол::маска_стола(номер);
+            let текст = crate::рабстол::столы_текстом(и.столы);
+            state.рабстол_сохранить();
+            state.request_redraw();
+            тф!("ok: {} на столе {}", "ok: {} on desktop {}", имя, текст)
+        }
+        иное => тф!(
+            "ошибка: icon [list | add | rm | move | desktop], а не '{иное}'",
+            "error: icon [list | add | rm | move | desktop], not '{иное}'"
+        ),
+    }
+}
+
+/// `desk [list | add РОД [x=…] [y=…] [scale=…] [text=…] | rm N | move N X Y]` —
+/// встроенные виджеты рабочего стола (см. виджеты_стола.rs). Тот же список, что
+/// ставится мышью по ПКМ; номер — позиция в `desk list`.
+fn стол_виджеты(хвост: &str, state: &mut Parallax) -> String {
+    use crate::виджеты_стола::{Род, Виджет, МИН_МАСШТАБ, МАКС_МАСШТАБ};
+    let (что, довод) = match хвост.split_once(char::is_whitespace) {
+        Some((первое, остаток)) => (первое, остаток.trim()),
+        None => (хвост, ""),
+    };
+    let номер = |s: Option<&str>, state: &Parallax| -> Option<usize> {
+        s?.parse::<usize>().ok().filter(|i| *i < state.рабстол.виджеты.список.len())
+    };
+    match что {
+        "" | "list" => {
+            if state.рабстол.виджеты.список.is_empty() {
+                return т!("виджетов нет", "no widgets").into();
+            }
+            state.рабстол.виджеты.список.iter().enumerate()
+                .map(|(i, в)| {
+                    let р = в.рамка();
+                    format!(
+                        "{} {} {},{} {}x{} {}% desktop={}\n",
+                        i, в.род.ключ(), в.x, в.y, р.size.w, р.size.h, в.масштаб,
+                        crate::рабстол::столы_текстом(в.столы),
+                    )
+                })
+                .collect()
+        }
+        "add" => {
+            let mut части = довод.split_whitespace();
+            let Some(род) = части.next().and_then(Род::из_ключа) else {
+                return т!("ошибка: desk add clock|calendar|system|note [x=…] [y=…] [scale=…] [text=…]",
+                          "error: desk add clock|calendar|system|note [x=…] [y=…] [scale=…] [text=…]").into();
+            };
+            let vis = state.visible_canvas_size();
+            let mut в = Виджет::новый(род, 0, 0);
+            в.столы = state.viewport.current_tags();
+            let (mut x, mut y) = (None, None);
+            for кусок in части {
+                let Some((ключ, значение)) = кусок.split_once('=') else { continue };
+                match ключ {
+                    "x" => x = значение.parse().ok(),
+                    "y" => y = значение.parse().ok(),
+                    "scale" => в.масштаб = значение.parse::<i32>().unwrap_or(100).clamp(МИН_МАСШТАБ, МАКС_МАСШТАБ),
+                    // Пробелы в заметке — подчёркиванием: строку команды режем по пробелам.
+                    "text" => в.текст = значение.replace('_', " "),
+                    "desktop" | "стол" => {
+                        в.столы = match значение {
+                            "all" | "все" | "*" => 0,
+                            v => crate::рабстол::маска_стола(v.parse::<u32>().unwrap_or(1)),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            let р = в.рамка();
+            в.x = x.unwrap_or((state.viewport.cam_x + vis.w / 2.0).round() as i32 - р.size.w / 2);
+            в.y = y.unwrap_or((state.viewport.cam_y + vis.h / 2.0).round() as i32 - р.size.h / 2);
+            let (xx, yy) = (в.x, в.y);
+            state.виджет_добавить(в);
+            тф!("ok: {} {},{}", "ok: {} {},{}", род.ключ(), xx, yy)
+        }
+        "rm" => {
+            let Some(i) = номер(довод.split_whitespace().next(), state) else {
+                return т!("ошибка: desk rm N", "error: desk rm N").into();
+            };
+            state.рабстол.виджеты.список.remove(i);
+            state.виджеты_сохранить();
+            state.request_redraw();
+            "ok".into()
+        }
+        "move" => {
+            let mut части = довод.split_whitespace();
+            let i = номер(части.next(), state);
+            let x = части.next().and_then(|s| s.parse::<i32>().ok());
+            let y = части.next().and_then(|s| s.parse::<i32>().ok());
+            let (Some(i), Some(x), Some(y)) = (i, x, y) else {
+                return т!("ошибка: desk move N X Y", "error: desk move N X Y").into();
+            };
+            let в = &mut state.рабстол.виджеты.список[i];
+            в.x = x;
+            в.y = y;
+            state.виджеты_сохранить();
+            state.request_redraw();
+            "ok".into()
+        }
+        // `desk desktop N СТОЛ` — перенести плашку на другой стол (0 — на все).
+        "desktop" | "стол" => {
+            let mut части = довод.split_whitespace();
+            let i = номер(части.next(), state);
+            let стол = части.next().map(|s| match s {
+                "all" | "все" | "*" => 0,
+                v => v.parse::<u32>().unwrap_or(1),
+            });
+            let (Some(i), Some(стол)) = (i, стол) else {
+                return т!("ошибка: desk desktop N СТОЛ|all", "error: desk desktop N DESKTOP|all").into();
+            };
+            state.рабстол.виджеты.список[i].столы = crate::рабстол::маска_стола(стол);
+            state.виджеты_сохранить();
+            state.request_redraw();
+            "ok".into()
+        }
+        иное => тф!(
+            "ошибка: desk [list | add | rm | move | desktop], а не '{иное}'",
+            "error: desk [list | add | rm | move | desktop], not '{иное}'"
+        ),
+    }
+}
+
+/// `widget [list | on|off [app_id] | move X Y [app_id]]` — виджеты на лету.
+///
+/// Правило `window{ widget = true }` срабатывает при появлении окна, и
+/// подбирать виджету место, перезапуская его после каждой правки конфига, —
+/// та самая работа, ради которой команда и написана. Без `app_id` берётся
+/// окно в фокусе; с `app_id` — первое подходящее (тот же разбор шаблона со
+/// звёздочкой, что в правилах, см. config::ПравилоОкна).
+/// Бросок картинки на стол без живого источника DnD: `picture drop X Y
+/// <uri|путь>` (экранные пиксели). Данные идут тем же разбором, что и
+/// настоящий бросок `text/uri-list` (см. картинка.rs), — проверяется всё,
+/// кроме самого разговора с источником.
+fn картинка(хвост: &str, state: &mut Parallax) -> String {
+    let mut части = хвост.splitn(4, char::is_whitespace);
+    let (Some("drop"), Some(x), Some(y), Some(что)) = (части.next(), части.next(), части.next(), части.next())
+    else {
+        return т!("ошибка: picture drop X Y <uri|путь>", "error: picture drop X Y <uri|path>").into();
+    };
+    let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>()) else {
+        return т!("ошибка: X и Y — числа", "error: X and Y must be numbers").into();
+    };
+    let zoom = state.viewport.zoom.max(0.01);
+    let точка = smithay::utils::Point::from((
+        state.viewport.cam_x + x / zoom,
+        state.viewport.cam_y + y / zoom,
+    ));
+    state.картинка_брошена_текстом(что.trim(), точка);
+    "ok".into()
+}
+
+fn виджет(хвост: &str, state: &mut Parallax) -> String {
+    let (что, довод) = match хвост.split_once(char::is_whitespace) {
+        Some((первое, остаток)) => (первое, остаток.trim()),
+        None => (хвост, ""),
+    };
+    match что {
+        "" | "list" | "список" => {
+            let mut out = String::new();
+            for tw in state.tagged_windows.iter().filter(|tw| tw.виджет) {
+                let место = state.space.element_location(&tw.window)
+                    .map(|l| format!("{},{}", l.x, l.y))
+                    .unwrap_or_else(|| "—".into());
+                let размер = tw.window.geometry().size;
+                out.push_str(&format!(
+                    "{} {} {}x{}\n",
+                    crate::xwin::app_id(&tw.window).unwrap_or_else(|| "—".into()),
+                    место, размер.w, размер.h,
+                ));
+            }
+            if out.is_empty() {
+                return т!("виджетов нет", "no widgets").into();
+            }
+            out
+        }
+        "on" | "off" | "вкл" | "выкл" => {
+            let включить = matches!(что, "on" | "вкл");
+            let Some(окно) = окно_по_имени(state, довод) else {
+                return if довод.is_empty() {
+                    т!("ошибка: нет окна в фокусе — укажите app_id",
+                       "error: no focused window — name an app_id").into()
+                } else {
+                    тф!("ошибка: окна '{}' нет", "error: no window '{}'", довод)
+                };
+            };
+            state.виджет_пометить(&окно, включить);
+            тф!("ok: {} widget={}", "ok: {} widget={}",
+                crate::xwin::app_id(&окно).unwrap_or_default(), включить)
+        }
+        "move" | "двинуть" => {
+            let mut части = довод.split_whitespace();
+            let (Some(x), Some(y)) = (
+                части.next().and_then(|s| s.parse::<i32>().ok()),
+                части.next().and_then(|s| s.parse::<i32>().ok()),
+            ) else {
+                return т!("ошибка: widget move X Y [app_id]", "error: widget move X Y [app_id]").into();
+            };
+            let имя = части.next().unwrap_or("");
+            let Some(окно) = окно_по_имени(state, имя) else {
+                return if имя.is_empty() {
+                    т!("ошибка: нет окна в фокусе — укажите app_id",
+                       "error: no focused window — name an app_id").into()
+                } else {
+                    тф!("ошибка: окна '{}' нет", "error: no window '{}'", имя)
+                };
+            };
+            if !state.виджет_передвинуть(&окно, x, y) {
+                return тф!(
+                    "ошибка: '{}' — не виджет; пометьте его widget on",
+                    "error: ‘{}’ is not a widget; mark it with widget on",
+                    crate::xwin::app_id(&окно).unwrap_or_default()
+                );
+            }
+            тф!("ok: {},{}", "ok: {},{}", x, y)
+        }
+        иное => тф!(
+            "ошибка: widget [list | on|off [app_id] | move X Y [app_id]], а не '{иное}'",
+            "error: widget [list | on|off [app_id] | move X Y [app_id]], not '{иное}'"
+        ),
+    }
+}
+
+/// Окно по `app_id` (шаблон со звёздочкой допускается) либо, если имя пустое,
+/// окно в фокусе.
+fn окно_по_имени(state: &Parallax, имя: &str) -> Option<smithay::desktop::Window> {
+    if имя.is_empty() {
+        return state.focused_window();
+    }
+    state.tagged_windows.iter()
+        .map(|tw| tw.window.clone())
+        .find(|w| {
+            let app = crate::xwin::app_id(w).unwrap_or_default();
+            let title = crate::xwin::title(w).unwrap_or_default();
+            crate::config::ПравилоОкна {
+                app_id: Some(имя.to_string()),
+                ..Default::default()
+            }
+            .подходит(&app, &title)
+                || title.to_lowercase().contains(&имя.to_lowercase())
+        })
 }
 
 /// Список окон в том виде, в каком его надо мерить: что попросили у клиента и

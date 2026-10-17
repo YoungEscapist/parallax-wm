@@ -126,6 +126,10 @@ pub const DOT: i32 = 20;
 /// `draw_bar_window_chip`), — а лишние 4 px на стороне это четверть
 /// разрешения значка.
 pub const CHIP_ICON: i32 = DOT;
+/// Сторона значка, всплывшего под курсором (см. `anim::глубина_значка`):
+/// 26 из 20. Больше нельзя — значок упрётся в соседей (между ячейками 6 px) и
+/// в кромку острова.
+pub const CHIP_ICON_UP: i32 = DOT * 13 / 10;
 /// Столов на панели — столько же, сколько тегов у Super+цифра.
 pub const TAGS: i32 = 9;
 /// Толщина разделителя между группами внутри острова.
@@ -135,7 +139,7 @@ const SEP_W: i32 = 1;
 pub const TEXT: i32 = 2;
 /// Масштаб мелкого текста (дата).
 pub const TEXT_SMALL: i32 = 1;
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -166,7 +170,7 @@ pub enum Cell {
     Kb,
     /// Громкость: клик — меню звука, правый клик — немота.
     Volume,
-    /// Заряд. Кликать не на что.
+    /// Заряд. Клик — меню питания и подсветки (см. питание.rs).
     Battery,
     /// Иконка трея (индекс в списке `sni::Item`): клик — Activate,
     /// правый — ContextMenu, средний — SecondaryActivate.
@@ -609,6 +613,10 @@ impl crate::state::Parallax {
         let focused = self.focused_window();
         self.tagged_windows.iter()
             .filter(|tw| tw.tags & current != 0)
+            // Виджеты — не задачи: чип у часов на обоях занимал бы место в
+            // панели и открывался бы по клику (см. виджеты.rs). Тот же фильтр
+            // стоит в `bar_window_at`, и порядок чипов обязан совпадать.
+            .filter(|tw| !tw.виджет)
             .map(|tw| {
                 let имя = crate::xwin::app_id(&tw.window)
                     .filter(|s| !s.trim().is_empty())
@@ -641,35 +649,44 @@ impl crate::state::Parallax {
         if self.chip_icons.contains_key(&app_id) {
             return;
         }
-        let найденный = self.icon_cache
-            .значок_приложения(&app_id, CHIP_ICON as u32)
+        // Два размера из одного источника: лежащий значок и всплывший под
+        // курсором (см. `CHIP_ICON_UP`).
+        let mut найти = |цель: i32| self.icon_cache
+            .значок_приложения(&app_id, цель as u32)
             .cloned()
             // Среди установленных приложений значка нет — спрашиваем само окно.
             // У игр из Steam (`dota2`) и всего, что запускается мимо .desktop,
             // это единственный источник, и панель иначе рисует букву.
             .or_else(|| match window.underlying_surface() {
                 smithay::desktop::WindowSurface::X11(s) => {
-                    let значок = crate::icons::значок_окна_x11(s.window_id(), CHIP_ICON as u32);
+                    let значок = crate::icons::значок_окна_x11(s.window_id(), цель as u32);
                     tracing::debug!(
-                        "plx/icons: icon \"{}\" from _NET_WM_ICON — {}",
-                        app_id, if значок.is_some() { "found" } else { "missing" },
+                        "plx/icons: icon \"{}\" ({}px) from _NET_WM_ICON — {}",
+                        app_id, цель, if значок.is_some() { "found" } else { "missing" },
                     );
                     значок
                 }
                 _ => None,
             });
-        let Some(значок) = найденный else {
+        let Some(значок) = найти(CHIP_ICON) else {
             return;
         };
-        let буфер = smithay::backend::renderer::element::memory::MemoryRenderBuffer::from_slice(
-            &значок.rgba,
-            smithay::backend::allocator::Fourcc::Abgr8888,
-            (значок.w, значок.h),
-            1,
-            smithay::utils::Transform::Normal,
-            None,
+        let крупный = найти(CHIP_ICON_UP);
+        let в_буфер = |з: &crate::sni::Icon| (
+            smithay::backend::renderer::element::memory::MemoryRenderBuffer::from_slice(
+                &з.rgba,
+                smithay::backend::allocator::Fourcc::Abgr8888,
+                (з.w, з.h),
+                1,
+                smithay::utils::Transform::Normal,
+                None,
+            ),
+            (з.w, з.h),
         );
-        self.chip_icons.insert(app_id, (буфер, (значок.w, значок.h)));
+        if let Some(крупный) = крупный {
+            self.chip_icons_up.insert(app_id.clone(), в_буфер(&крупный));
+        }
+        self.chip_icons.insert(app_id, в_буфер(&значок));
         self.request_redraw();
     }
 
@@ -678,6 +695,7 @@ impl crate::state::Parallax {
         let current = self.viewport.current_tags();
         self.tagged_windows.iter()
             .filter(|tw| tw.tags & current != 0)
+            .filter(|tw| !tw.виджет)
             .nth(i)
             .map(|tw| tw.window.clone())
     }
@@ -802,13 +820,15 @@ impl crate::state::Parallax {
             Cell::Handle => self.tray_toggle(),
             Cell::Window(i) if middle => self.bar_window_close(i),
             Cell::Window(i) => self.bar_window_focus(i),
-            // Часы, дата, заряд и счётчик остатка — только показ.
+            // Часы, дата и счётчик остатка — только показ.
             // Остановка — только средним: раздачу выключают редко и намеренно,
             // а обычный клик по чипу случается, когда человек тычет в код,
             // диктуя его вслух.
             Cell::Share if middle => self.dispatch_action(crate::config::Action::ShareStop),
             Cell::Share => {}
-            Cell::Clock | Cell::Date | Cell::Battery | Cell::Sep | Cell::WindowsMore(_) => {}
+            // Заряд открывает меню питания: режимы и подсветка, как в GNOME.
+            Cell::Battery => self.питание_меню(),
+            Cell::Clock | Cell::Date | Cell::Sep | Cell::WindowsMore(_) => {}
         }
         self.request_redraw();
         true
