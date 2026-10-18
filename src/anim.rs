@@ -283,6 +283,20 @@ pub fn ease_calm(t: f64) -> f64 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
+/// Ease-out quart: мягче кубической в начале движения, с длинной посадкой.
+#[inline]
+pub fn ease_out_quart(t: f64) -> f64 {
+    let inv = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - inv * inv * inv * inv
+}
+
+/// Smoothstep: ровное проявление без рывка на старте и хвоста в конце.
+#[inline]
+pub fn smoothstep(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Ease-out с лёгким перелётом: плашка выскакивает чуть больше себя и
 /// садится обратно. Классический `back` с c1 = 1.70158 даёт перелёт ~10% —
 /// для карточки под курсором это уже кривляние, поэтому c1 ослаблен вдвое
@@ -317,18 +331,48 @@ pub struct CameraAnim {
     pub to: Point<f64, Logical>,
     pub start: Instant,
     pub duration: Duration,
+    /// Камера проскакивает цель и садится обратно — тем же отскоком, что и
+    /// окна, едущие в слот (`set{ anim_bounce }`). Только у прыжка к окну:
+    /// закладки и миникарта летят спокойной кривой, как раньше.
+    pub отскок: bool,
 }
 
 impl CameraAnim {
     pub fn new(from: Point<f64, Logical>, to: Point<f64, Logical>, duration: Duration) -> Self {
-        Self { from, to, start: Instant::now(), duration }
+        Self { from, to, start: Instant::now(), duration, отскок: false }
     }
 
-    /// Eased progress in [0, 1].
+    /// Прыжок с отскоком (см. поле `отскок`). При `anim_bounce = 0` это та же
+    /// спокойная кривая, что у `new`.
+    pub fn с_отскоком(from: Point<f64, Logical>, to: Point<f64, Logical>, duration: Duration) -> Self {
+        Self { отскок: true, ..Self::new(from, to, duration) }
+    }
+
+    /// Eased progress in [0, 1] (с отскоком — чуть больше единицы на перелёте).
     fn t(&self) -> f64 {
         let elapsed = self.start.elapsed().as_secs_f64();
         let dur = self.duration.as_secs_f64().max(1e-6);
-        ease_calm(elapsed / dur)
+        Self::кривая(elapsed / dur, self.отскок)
+    }
+
+    /// Ход по доле времени. Отдельно ради тестов (без `sleep`).
+    ///
+    /// С отскоком — переходная характеристика пружины с затуханием окон
+    /// (`затухание_слота`): старт с нулевой скоростью, как у `ease_calm`,
+    /// перелёт ≈ 3% при `anim_bounce = 0.25`. Частота подобрана так, что к
+    /// концу огибающая гаснет до 1%, а последние 15% времени остаток
+    /// стягивается в ноль — камера встаёт РОВНО в цель, когда время вышло.
+    fn кривая(доля: f64, отскок: bool) -> f64 {
+        let u = доля.clamp(0.0, 1.0);
+        let zeta = затухание_слота();
+        if !отскок || zeta >= 0.999 {
+            return ease_calm(u);
+        }
+        let omega = 100f64.ln() / zeta;
+        let корень = (1.0 - zeta * zeta).sqrt();
+        let wd = omega * корень;
+        let x = 1.0 - (-zeta * omega * u).exp() * ((wd * u).cos() + zeta / корень * (wd * u).sin());
+        x + (1.0 - x) * smoothstep((u - 0.85) / 0.15)
     }
 
     pub fn is_done(&self) -> bool {
@@ -876,11 +920,11 @@ pub struct OpenAnim {
 /// значило бы держать и тик анимаций.
 const ЖДАТЬ_КАДРА: Duration = Duration::from_secs(4);
 
-const OPEN_ANIM_MIN_SCALE: f64 = 0.88;
+const OPEN_ANIM_MIN_SCALE: f64 = 0.94;
 /// Доля времени, за которую окно проявляется целиком. Меньше единицы: сначала
 /// оно должно СТАТЬ видимым, а уже потом доехать до своего размера — иначе
 /// последняя треть роста идёт под полупрозрачной плёнкой.
-const OPEN_ANIM_FADE: f64 = 0.6;
+const OPEN_ANIM_FADE: f64 = 0.7;
 
 impl OpenAnim {
     pub fn new(duration: Duration) -> Self {
@@ -939,8 +983,11 @@ impl OpenAnim {
     pub fn кадр(доля: f64) -> (f64, f32) {
         let доля = доля.clamp(0.0, 1.0);
         (
-            OPEN_ANIM_MIN_SCALE + (1.0 - OPEN_ANIM_MIN_SCALE) * ease_out_cubic(доля),
-            ease_out_cubic((доля / OPEN_ANIM_FADE).clamp(0.0, 1.0)) as f32,
+            // Рост короткий (6%) и по ease-out-quart: начало мягче, чем у
+            // кубической, хвост длиннее — окно не прыгает в размер, а
+            // доплывает до него (Ярик 18.10.2026: «появление аккуратнее»).
+            OPEN_ANIM_MIN_SCALE + (1.0 - OPEN_ANIM_MIN_SCALE) * ease_out_quart(доля),
+            smoothstep((доля / OPEN_ANIM_FADE).clamp(0.0, 1.0)) as f32,
         )
     }
 }
@@ -2477,6 +2524,23 @@ mod tests {
     /// Отскок (`set{ anim_bounce }`): окно проскакивает слот на несколько
     /// процентов пути и садится РОВНО в него. Без ручки перелёта нет вовсе —
     /// ровно то, что было до неё.
+    /// Прыжок камеры к окну с отскоком: перелёт небольшой, конец ровно в цели,
+    /// без ручки — прежняя спокойная кривая.
+    #[test]
+    fn прыжок_камеры_с_отскоком() {
+        let _г = ЗАМОК_ТЕМПА.lock().unwrap_or_else(|e| e.into_inner());
+        set_bounce(0.25);
+        let макс = (0..=200).map(|i| CameraAnim::кривая(i as f64 / 200.0, true)).fold(0.0, f64::max);
+        assert!(макс > 1.01 && макс < 1.06, "перелёт {макс}");
+        assert!((CameraAnim::кривая(1.0, true) - 1.0).abs() < 1e-9);
+        assert!(CameraAnim::кривая(0.0, true).abs() < 1e-9);
+        set_bounce(0.0);
+        for i in 0..=20 {
+            let u = i as f64 / 20.0;
+            assert!((CameraAnim::кривая(u, true) - ease_calm(u)).abs() < 1e-12);
+        }
+    }
+
     #[test]
     fn отскок_перелетает_и_садится() {
         let _г = ЗАМОК_ТЕМПА.lock().unwrap_or_else(|e| e.into_inner());

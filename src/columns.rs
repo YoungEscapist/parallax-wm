@@ -1712,7 +1712,8 @@ impl Parallax {
         let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
         let to = Point::from((target_x, self.columns_cur_y()));
         if (to.x - from.x).abs() > 0.5 || (to.y - from.y).abs() > 0.5 {
-            self.camera_anim = Some(CameraAnim::new(from, to, crate::anim::дуг::подводка_ленты()));
+            // переход к соседней колонке — тот же прыжок по окнам, с отскоком
+            self.camera_anim = Some(CameraAnim::с_отскоком(from, to, crate::anim::дуг::подводка_ленты()));
         }
     }
 

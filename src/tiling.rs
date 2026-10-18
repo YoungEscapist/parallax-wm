@@ -1286,7 +1286,7 @@ impl Parallax {
         let from = Point::from((self.viewport.cam_x, self.viewport.cam_y));
         let to = Point::from((to_x, to_y));
         if (to.x - from.x).abs() > 0.5 || (to.y - from.y).abs() > 0.5 {
-            self.camera_anim = Some(CameraAnim::new(from, to, crate::anim::дуг::прыжок_к_окну()));
+            self.camera_anim = Some(CameraAnim::с_отскоком(from, to, crate::anim::дуг::прыжок_к_окну()));
         }
     }
 

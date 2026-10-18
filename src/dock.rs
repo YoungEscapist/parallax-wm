@@ -1113,6 +1113,20 @@ impl Parallax {
         л.фон.hit(x, y).then_some(Цель::Фон)
     }
 
+    /// Заберёт ли панель нажатие в этой точке экрана: значок, «+», её фон,
+    /// открытое меню, список приложений или окно параметров. Спрашивают
+    /// аккорды: такое нажатие ждать второй кнопки не должно (см.
+    /// `аккорд_кнопка_внутри`).
+    pub fn dock_под(&mut self, pos: Point<f64, Physical>) -> bool {
+        if !self.dock_enabled() {
+            return false;
+        }
+        self.dock.меню.is_some()
+            || self.dock_picker_open()
+            || self.dock_settings_is_open()
+            || self.dock_цель(pos.x, pos.y).is_some()
+    }
+
     /// Движение мыши (экранные пиксели). Зовётся на каждое движение.
     pub fn dock_motion(&mut self, pos: Point<f64, Physical>) {
         // Тащат ползунок окна параметров — движение его, а не панели.
