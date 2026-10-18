@@ -75,17 +75,6 @@ fn push_black(buf: &mut Vec<u8>, alpha: f32) {
     buf.extend_from_slice(&[0, 0, 0, a]);
 }
 
-/// Цвет с premultiplied-альфой.
-fn push_color(buf: &mut Vec<u8>, rgb: [f32; 3], alpha: f32) {
-    let a = alpha.clamp(0.0, 1.0);
-    buf.extend_from_slice(&[
-        (rgb[0] * a * 255.0).round() as u8,
-        (rgb[1] * a * 255.0).round() as u8,
-        (rgb[2] * a * 255.0).round() as u8,
-        (a * 255.0).round() as u8,
-    ]);
-}
-
 /// Зеркалирование плитки по горизонтали/вертикали — остальные три угла это те
 /// же пиксели, форма симметрична.
 fn flip(src: &[u8], w: i32, h: i32, horiz: bool, vert: bool) -> Vec<u8> {
@@ -194,9 +183,6 @@ pub struct DecorCache {
     proto: Option<Proto>,
     shadow_corner: [Vec<MemoryRenderBuffer>; 4],
     shadow_edge: [Vec<MemoryRenderBuffer>; 4],
-    parallax_w: i32,
-    parallax_proto: Vec<u8>,
-    parallax_row: Vec<MemoryRenderBuffer>,
     /// Плитки ореола (см. `гало`) и то, с какими значениями их последний раз
     /// рисовали.
     halo: Vec<(MemoryRenderBuffer, Vec<f32>)>,
@@ -209,9 +195,6 @@ impl DecorCache {
             proto: None,
             shadow_corner: Default::default(),
             shadow_edge: Default::default(),
-            parallax_w: 0,
-            parallax_proto: Vec::new(),
-            parallax_row: Vec::new(),
             halo: Vec::new(),
         }
     }
@@ -297,38 +280,5 @@ impl DecorCache {
             }
         }
         &self.shadow_edge[edge][slot]
-    }
-
-    /// Полоса параллакс-фона: точки вдоль X с шагом `spacing`, высотой `dot`.
-    /// Одна такая полоса на ряд сетки вместо ~24 отдельных точек.
-    pub fn parallax_row(
-        &mut self,
-        slot: usize,
-        width: i32,
-        dot: i32,
-        spacing: i32,
-        color: [f32; 4],
-    ) -> &MemoryRenderBuffer {
-        if self.parallax_w != width || self.parallax_proto.is_empty() {
-            self.parallax_w = width;
-            self.parallax_row.clear();
-            let mut px = Vec::with_capacity((width * dot * 4) as usize);
-            for _ in 0..dot {
-                for x in 0..width {
-                    let on = x % spacing < dot;
-                    push_color(
-                        &mut px,
-                        [color[0], color[1], color[2]],
-                        if on { color[3] } else { 0.0 },
-                    );
-                }
-            }
-            self.parallax_proto = px;
-        }
-        while self.parallax_row.len() <= slot {
-            let buf = buffer_from(&self.parallax_proto, width, dot);
-            self.parallax_row.push(buf);
-        }
-        &self.parallax_row[slot]
     }
 }

@@ -25,7 +25,10 @@ use smithay::{
                 texture::TextureRenderElement,
                 utils::{CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement},
             },
-            gles::{GlesRenderer, GlesTexture},
+            gles::{
+                GlesPixelProgram, GlesRenderer, GlesTexture, Uniform, UniformName, UniformType,
+                element::PixelShaderElement,
+            },
             utils::CommitCounter,
         },
         session::{libseat::LibSeatSession, Event as SessionEvent, Session},
@@ -86,6 +89,9 @@ smithay::backend::renderer::element::render_elements! {
     Cursor = WaylandSurfaceRenderElement<GlesRenderer>,
     // Текстурные элементы: курсор темы и плитки декораций (см. decor.rs).
     Memory = MemoryRenderBufferRenderElement<GlesRenderer>,
+    // Фон по умолчанию: сетка точек одним пиксельным шейдером на холсте (см.
+    // build_parallax_elements).
+    Фон = PixelShaderElement,
     Solid = SolidColorRenderElement,
     // Layer-поверхности (обои, панели, меню plx-wall): обёрнуты в Rescale, чтобы
     // не масштабироваться вместе с зумом холста (см. build_layer_elements).
@@ -2238,64 +2244,138 @@ fn build_minimap_thumbnails(
     out
 }
 
-/// Бесшовный параллакс-фон (5.1): редкая сетка точек на самом заднем слое,
-/// сдвигается на camera*0.3 вместо camera*1.0 — создаёт эффект глубины
-/// (фон "отстаёт" от окон при панорамировании).
-const PARALLAX_FACTOR: f64 = 0.3;
-const PARALLAX_SPACING_PX: i32 = 160;
-const PARALLAX_DOT_PX: i32 = 3;
+/// Фон по умолчанию — сетка точек, как у driftwm (`dot_grid.glsl`): она лежит
+/// НА ХОЛСТЕ, едет за камерой один в один и масштабируется зумом вместе с
+/// окнами.
+///
+/// Раньше здесь были полосы из MemoryRenderBuffer с шагом в пикселях ЭКРАНА:
+/// сдвиг считался как camera·zoom·0.3, а размер полосы делился на зум. На
+/// отдалении полосы раздувались в 1/zoom раз — точки становились чёрточками и
+/// пятнами, а сама сетка ехала под курсором при зуме к точке («ломается при
+/// зуме»). Теперь всё считает один пиксельный шейдер: экран → холст ровно по
+/// `screen_to_canvas`, точка ищется в координатах холста.
+///
+/// На сильном отдалении шаг сетки удваивается, пока точки на экране не
+/// разойдутся хотя бы на 28 px (MIN_GAP в шейдере), а мелкая сетка плавно гаснет:
+/// без этого на птичьем глазе шаг в 160 холста стал бы 8 px экрана, и фон
+/// превратился бы в рябь.
+const ФОН_ШАГ: f64 = 160.0;
+/// Период, по модулю которого камера уходит в шейдер. Кратен шагу на любом
+/// уровне детализации (до 2^8): float в GLSL на координатах дома второго
+/// монитора (миллион, `monitors::ШАГ_ДОМА`) теряет доли пикселя, а остаток
+/// от деления на кратный период сетку не сдвигает.
+const ФОН_ПЕРИОД: f64 = ФОН_ШАГ * 256.0;
 
-const PARALLAX_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
+// В GLSL только ASCII, даже в комментариях: кириллицу компилятор шейдеров
+// не принимает (см. экран.rs). Числа здесь и в ФОН_ШАГ обязаны совпадать.
+const ФОН_ШЕЙДЕР: &str = r#"
+precision highp float;
+varying vec2 v_coords;
+uniform vec2 size;
+uniform float alpha;
+uniform vec2 u_camera;
+uniform float u_zoom;
 
-/// ВАЖНО про damage tracking: раньше здесь на каждый кадр создавался один
-/// `SolidColorBuffer`, и все ~375 точек сетки (3840x2160 при шаге 160) шли
-/// через `from_buffer`, то есть делили ОДИН Id, у которого вдобавок каждый
-/// кадр было новое значение. Это обе болезни из `pooled_solid` разом, причём
-/// в самом заднем слое, который строится безусловно на каждый кадр: экран
-/// повреждался целиком всегда, `queue_frame` никогда не отдавал `EmptyFrame`,
-/// цепочка VBlank не прерывалась и 4K перерисовывалось ~60 раз в секунду на
-/// неподвижной картинке. Починка теней и масок углов до этого ничего не
-/// меняла, пока параллакс оставался таким.
+const vec3 BG = vec3(0.1, 0.1, 0.1);
+const vec3 DOT = vec3(1.0, 1.0, 1.0);
+const float DOT_ALPHA = 0.08;
+const float SPACING = 160.0;
+const float RADIUS = 1.5;
+const float MIN_GAP = 28.0;
+
+float dot_at(vec2 p, float sp) {
+    vec2 g = mod(p, sp);
+    vec2 d = min(g, sp - g);
+    // distance in SCREEN pixels: half a pixel of antialiasing at any zoom;
+    // the radius grows with zoom but never thinner than a pixel
+    float r = max(RADIUS * u_zoom, 1.0);
+    return 1.0 - smoothstep(r - 0.5, r + 0.5, length(d) * u_zoom);
+}
+
+void main() {
+    vec2 p = v_coords * size / u_zoom + u_camera;
+    float lod = max(0.0, log2(MIN_GAP / (SPACING * u_zoom)));
+    float sp = SPACING * exp2(floor(lod));
+    float a = max(dot_at(p, sp * 2.0), dot_at(p, sp) * (1.0 - fract(lod)));
+    gl_FragColor = vec4(mix(BG, DOT, a * DOT_ALPHA), 1.0) * alpha;
+}
+"#;
+
+/// Элемент фона одного монитора и то, с какими значениями его последний раз
+/// обновляли: `update_uniforms` бьёт счётчик коммитов, а значит и весь экран
+/// в damage, поэтому зовём его только на настоящем движении камеры.
+pub struct ФонТочки {
+    элемент: PixelShaderElement,
+    камера: (f32, f32),
+    зум: f32,
+}
+
+/// Программа фона, своя у каждого контекста EGL (как и прочие шейдеры, см.
+/// `Surface::rounded`); собирается один раз и хранится в данных контекста.
+/// `None` — не собралась, тогда фона нет и виден CLEAR_COLOR.
+fn фон_программа(renderer: &mut GlesRenderer) -> Option<GlesPixelProgram> {
+    struct Программа(Option<GlesPixelProgram>);
+    if let Some(п) = renderer.egl_context().user_data().get::<Программа>() {
+        return п.0.clone();
+    }
+    let п = match renderer.compile_custom_pixel_shader(
+        ФОН_ШЕЙДЕР,
+        &[
+            UniformName::new("u_camera", UniformType::_2f),
+            UniformName::new("u_zoom", UniformType::_1f),
+        ],
+    ) {
+        Ok(п) => Some(п),
+        Err(e) => {
+            tracing::warn!("plx/udev: background shader failed to compile: {e:?}");
+            None
+        }
+    };
+    renderer.egl_context().user_data().insert_if_missing(|| Программа(п.clone()));
+    п
+}
+
 fn build_parallax_elements(
     state: &mut Parallax,
     renderer: &mut GlesRenderer,
-    mode: Mode,
+    output: &Output,
 ) -> Vec<OutputRenderElements> {
-    let mut out = Vec::new();
-    let zoom = state.viewport.zoom.max(0.01);
-
-    let shift_x = state.viewport.cam_x * zoom * PARALLAX_FACTOR;
-    let shift_y = state.viewport.cam_y * zoom * PARALLAX_FACTOR;
-    let offset_x = shift_x.rem_euclid(PARALLAX_SPACING_PX as f64);
-    let offset_y = shift_y.rem_euclid(PARALLAX_SPACING_PX as f64);
-
-    // Один элемент на РЯД сетки вместо точки: точки ряда лежат в одной текстуре
-    // (см. decor.rs). Было ~24×14 ≈ 340 элементов на кадр, стало ~15.
-    let row_w = mode.size.w + PARALLAX_SPACING_PX;
-    // Ширина/высота задаются в логических единицах и умножаются рендером на
-    // zoom, а сетка живёт в экранных пикселях — поэтому делим на zoom заранее.
-    let dst = Size::<i32, Logical>::from((
-        (row_w as f64 / zoom).round().max(1.0) as i32,
-        (PARALLAX_DOT_PX as f64 / zoom).round().max(1.0) as i32,
-    ));
-
-    let mut slot = 0usize;
-    let mut y = -(offset_y as i32);
-    while y < mode.size.h {
-        let buf = state.decor.parallax_row(
-            slot, row_w, PARALLAX_DOT_PX, PARALLAX_SPACING_PX, PARALLAX_COLOR,
-        );
-        let loc = Point::<f64, Physical>::from((-offset_x, y as f64));
-        match MemoryRenderBufferRenderElement::from_buffer(
-            renderer, loc, buf, None, None, Some(dst), Kind::Unspecified,
-        ) {
-            Ok(el) => out.push(OutputRenderElements::Memory(el)),
-            Err(e) => tracing::warn!("plx/udev: parallax: {:?}", e),
-        }
-        slot += 1;
-        y += PARALLAX_SPACING_PX;
+    let Some(mode) = output.current_mode() else { return Vec::new() };
+    let Some(программа) = фон_программа(renderer) else { return Vec::new() };
+    // Площадь в ЛОГИЧЕСКИХ единицах экрана: шейдер получает её как `size`, и
+    // `v_coords · size / zoom + camera` — это ровно `screen_to_canvas`.
+    let масштаб = output.current_scale().fractional_scale().max(0.01);
+    let площадь = Rectangle::<i32, Logical>::from_size(Size::from((
+        (mode.size.w as f64 / масштаб).ceil() as i32,
+        (mode.size.h as f64 / масштаб).ceil() as i32,
+    )));
+    let зум = state.viewport.zoom.max(0.01) as f32;
+    let камера = (
+        state.viewport.cam_x.rem_euclid(ФОН_ПЕРИОД) as f32,
+        state.viewport.cam_y.rem_euclid(ФОН_ПЕРИОД) as f32,
+    );
+    let форма = |камера: (f32, f32), зум: f32| {
+        vec![Uniform::new("u_camera", камера), Uniform::new("u_zoom", зум)]
+    };
+    let фон = state.фон_точки.entry(output.name()).or_insert_with(|| ФонТочки {
+        элемент: PixelShaderElement::new(
+            программа,
+            площадь,
+            Some(vec![площадь]),
+            1.0,
+            форма(камера, зум),
+            Kind::Unspecified,
+        ),
+        камера,
+        зум,
+    });
+    фон.элемент.resize(площадь, Some(vec![площадь]));
+    if фон.камера != камера || фон.зум != зум {
+        фон.элемент.update_uniforms(форма(камера, зум));
+        фон.камера = камера;
+        фон.зум = зум;
     }
-    out
+    vec![OutputRenderElements::Фон(фон.элемент.clone())]
 }
 
 /// Цвет "clear" компоситора (см. render_frame ниже): то, что видно там, где не
@@ -6809,9 +6889,7 @@ pub fn собрать_элементы(
         // Карусель — не коробка из обоев, а окна в воздухе: за ней остаются
         // обычные обои стола, иначе прозрачные окна висели бы над серым.
         let плитками = if куб_рисуется && state.карусель.is_none() {
-            if let Some(mode) = output.current_mode() {
-                elements.extend(build_parallax_elements(state, renderer, mode));
-            }
+            elements.extend(build_parallax_elements(state, renderer, output));
             true
         } else { match build_wallpaper_backdrop(state, renderer, output) {
             Some(плитки) => {
@@ -6825,14 +6903,12 @@ pub fn собрать_элементы(
                 false
             }
         } };
-        if let Some(mode) = output.current_mode() {
-            // Под обоями во весь экран сетку не строим — её всё равно не видно.
-            // Плитки кроют холст по определению, а вот `background_covers_output`
-            // спрашивает СВОЮ карту слоёв: у монитора, которому plx-wall поверхность не
-            // вешал, она пуста, и сетка строилась бы под чужими обоями впустую.
-            if !плитками && !background_covers_output(state, output, state.screen_size()) {
-                elements.extend(build_parallax_elements(state, renderer, mode));
-            }
+        // Под обоями во весь экран сетку не строим — её всё равно не видно.
+        // Плитки кроют холст по определению, а вот `background_covers_output`
+        // спрашивает СВОЮ карту слоёв: у монитора, которому plx-wall поверхность не
+        // вешал, она пуста, и сетка строилась бы под чужими обоями впустую.
+        if !плитками && !background_covers_output(state, output, state.screen_size()) {
+            elements.extend(build_parallax_elements(state, renderer, output));
         }
 
     }

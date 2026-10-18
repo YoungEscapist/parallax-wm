@@ -959,6 +959,11 @@ pub struct Parallax {
     /// damage tracker считал бы их одним и тем же элементом, который скачет по
     /// экрану, и перерисовывал бы кадр целиком на каждый поворот.
     pub куб_фон_ids: Vec<smithay::backend::renderer::element::Id>,
+    /// Фон по умолчанию (сетка точек, см. `udev::build_parallax_elements`) —
+    /// свой элемент на каждый монитор, по имени выхода. Элемент живёт всё
+    /// время работы: его Id и счётчик коммитов и есть то, по чему damage
+    /// tracker понимает, что фон не менялся.
+    pub фон_точки: HashMap<String, crate::udev::ФонТочки>,
     /// Найденные значки приложений (см. icons.rs). Поиск лезет в файловую
     /// систему, поэтому результат — включая «не нашлось» — кэшируется по имени
     /// на всё время работы.
@@ -1744,6 +1749,7 @@ impl Parallax {
             обои_цикл: false,
             обои_цикл_ids: Vec::new(),
             куб_фон_ids: Vec::new(),
+            фон_точки: HashMap::new(),
             icon_cache: crate::icons::Кэш::default(),
             chip_icons: std::collections::HashMap::new(),
             chip_icons_up: std::collections::HashMap::new(),
