@@ -95,6 +95,9 @@ mod dock_settings;
 mod portal;
 mod portal_stream;
 mod rounded;
+/// Режим cycle: обои плиткой по холсту, как `tile` у driftwm.
+#[path = "плитка_обоев.rs"]
+mod плитка_обоев;
 mod screencopy;
 mod selection;
 #[cfg(feature = "share")]
@@ -408,12 +411,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("parallax socket: {:?}", state.socket_name);
 
-    // Управляющий сокет: в харнессе всегда, в живом сеансе — только по
-    // PLX_CTL=1 (см. ctl.rs, там же почему не по умолчанию).
-    if headless || std::env::var_os("PLX_CTL").is_some() {
-        if let Err(e) = crate::ctl::init(&event_loop.handle(), &state) {
-            tracing::warn!("plx/ctl: socket failed to start: {}", e);
-        }
+    // Управляющий сокет: в харнессе и по PLX_CTL=1 — целиком, в живом сеансе —
+    // только `wallpaper` (см. ctl.rs). Без него галочка cycle в plx-wall
+    // молча стреляла в пустоту: сокета не было вовсе.
+    let полный = headless || std::env::var_os("PLX_CTL").is_some();
+    if let Err(e) = crate::ctl::init(&event_loop.handle(), &state, полный) {
+        tracing::warn!("plx/ctl: socket failed to start: {}", e);
     }
 
     // Отдаём окружение сессии в D-Bus/systemd --user. Без этого

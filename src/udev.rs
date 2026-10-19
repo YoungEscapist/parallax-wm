@@ -108,6 +108,9 @@ smithay::backend::renderer::element::render_elements! {
     // за камерой (см. build_wallpaper_backdrop). Своя, а не Layer, именно ради
     // Id: у элемента он обязан быть свой, а не поверхностный.
     Wallpaper = CropRenderElement<TextureRenderElement<GlesTexture>>,
+    // Обои режима cycle: та же текстура во весь экран, плитки рисует шейдер
+    // (см. src/плитка_обоев.rs).
+    ОбоиПлиткой = crate::плитка_обоев::Плитка<TextureRenderElement<GlesTexture>>,
     // Размытый фон под островом панели: та же текстура, но обрезанная
     // скруглением плашки тем же шейдером, что и углы окон (см. blur.rs).
     Blur = crate::rounded::Rounded<CropRenderElement<TextureRenderElement<GlesTexture>>>,
@@ -1126,6 +1129,7 @@ fn add_surface(
     if state.blur_shape.is_none() {
         state.blur_shape = crate::rounded::Шейдер::new(&mut device.gles);
         state.куб_шейдер = crate::куб::Шейдер::new(&mut device.gles);
+        state.обои_цикл_шейдер = crate::плитка_обоев::Шейдер::new(&mut device.gles);
     }
     if state.стекло.is_none() {
         state.стекло = crate::blur::Стекло::new(&mut device.gles);
@@ -4101,106 +4105,26 @@ fn wallpaper_placement(
     })
 }
 
-/// Ниже этого зума плитки режима cycle перестают мельчать: на птичьем глазе
-/// (зум 0.05) их иначе были бы сотни на кадр. Ниже предела обои едут чуть
-/// медленнее окон — на таком отдалении это читается как глубина, а не как ошибка.
-const ОБОИ_ЦИКЛ_МИН_ЗУМ: f64 = 0.25;
-
-/// На сколько пикселей кадра режим cycle отступает от его краёв (см.
-/// `build_wallpaper_cycle`).
-const ОБОИ_ЦИКЛ_ОТСТУП: f64 = 2.0;
-
-/// Режим «cycle»: где лечь плиткам обоев, в ФИЗИЧЕСКИХ пикселях экрана.
+/// Раскладка режима cycle для этого монитора — общий расчёт кадра и блюра.
 ///
-/// В отличие от [`wallpaper_placement`] картинка здесь лежит НА ХОЛСТЕ: плитка
-/// размером «накрыть экран» при зуме 1, масштабируется зумом и едет за камерой
-/// один в один, как окна. Холст покрыт целиком на любой камере.
-///
-/// **Соседние плитки отражены** (нечётные столбцы — по горизонтали, нечётные
-/// ряды — по вертикали). Именно это убирает шов, из-за которого плитку когда-то
-/// выкинули (`dawn-wallpaper-no-repeat`): у отражённой соседки край ровно тот
-/// же, что у этой, и стыка не видно ни на какой картинке.
-///
-/// Края считаются округлением ГРАНИЦ, а не размеров: так соседние плитки
-/// делят одну целую границу и чёрной нитки между ними не бывает.
-fn wallpaper_cycle_places(
-    камера: (f64, f64),
-    зум: f64,
-    масштаб: f64,
-    стол: f64,
-    картинка: (i32, i32),
-    экран: (i32, i32),
-) -> Vec<(МестоОбоев, Transform)> {
-    if картинка_негодна(картинка)
-        || экран.0 <= 0
-        || экран.1 <= 0
-        || !камера.0.is_finite()
-        || !камера.1.is_finite()
-        || !зум.is_finite()
-        || !масштаб.is_finite()
-        || масштаб <= 0.0
-        || !стол.is_finite()
-    {
-        return Vec::new();
-    }
-    let (эw, эh) = (экран.0 as f64, экран.1 as f64);
-    let з = зум.max(ОБОИ_ЦИКЛ_МИН_ЗУМ);
-    let покрытие = (эw / картинка.0 as f64).max(эh / картинка.1 as f64);
-    let (w, h) = (картинка.0 as f64 * покрытие * з, картинка.1 as f64 * покрытие * з);
-    // Где на экране лежит начало холста (угол плитки 0,0). Стол — тот же
-    // виртуальный ход, что и у одиночной копии: Super+N камеру не двигает.
-    let начало_x = -камера.0 * з * масштаб - стол * эw * ОБОИ_ШАГ_СТОЛА;
-    let начало_y = -камера.1 * з * масштаб;
-    let первый_i = ((-начало_x) / w).floor() as i64;
-    let первый_j = ((-начало_y) / h).floor() as i64;
-    let mut out = Vec::new();
-    let mut j = первый_j;
-    loop {
-        let y0 = (начало_y + j as f64 * h).round();
-        if y0 >= эh {
-            break;
-        }
-        let y1 = (начало_y + (j + 1) as f64 * h).round();
-        let mut i = первый_i;
-        loop {
-            let x0 = (начало_x + i as f64 * w).round();
-            if x0 >= эw {
-                break;
-            }
-            let x1 = (начало_x + (i + 1) as f64 * w).round();
-            let поворот = match (i.rem_euclid(2) == 1, j.rem_euclid(2) == 1) {
-                (false, false) => Transform::Normal,
-                (true, false) => Transform::Flipped,
-                (false, true) => Transform::Flipped180,
-                (true, true) => Transform::_180,
-            };
-            out.push((
-                МестоОбоев { x: x0, y: y0, w: (x1 - x0).max(1.0), h: (y1 - y0).max(1.0) },
-                поворот,
-            ));
-            i += 1;
-        }
-        j += 1;
-    }
-    out
-}
-
-/// Плитки режима cycle для этого монитора — общий расчёт кадра и блюра.
+/// `картинка` — размер БУФЕРА обоев целиком: в режиме cycle крой viewporter
+/// (центральный кусок под пропорцию экрана) не нужен, плитка — вся картинка,
+/// иначе бесшовная текстура подрезалась бы и шов появлялся бы на стыке.
 fn wallpaper_cycle_for(
     state: &Parallax,
     output: &Output,
     картинка: (i32, i32),
     экран: (i32, i32),
-) -> Vec<(МестоОбоев, Transform)> {
+) -> Option<crate::плитка_обоев::Раскладка> {
     let дом = state.монитор_дом();
-    wallpaper_cycle_places(
+    crate::плитка_обоев::Раскладка::new(
         (
             state.viewport.cam_x - дом.x as f64,
             state.viewport.cam_y - дом.y as f64,
         ),
         state.viewport.zoom,
         output.current_scale().fractional_scale(),
-        state.обои_фаза(),
+        state.обои_фаза() * экран.0 as f64 * ОБОИ_ШАГ_СТОЛА,
         картинка,
         экран,
     )
@@ -4217,17 +4141,17 @@ fn картинка_негодна(картинка: (i32, i32)) -> bool {
 /// весь кадр — прежнее поведение, которое верно ровно для приклеенного к экрану
 /// фонового слоя (`build_layer_elements` вместо своей отрисовки).
 ///
-/// Список, а не одна штука, — потому что этого ждёт `blur::Блюр::размыть`, и
-/// менять его форму ради одного элемента незачем: обоев в кадре бывает ноль или
-/// одна.
+/// Режим cycle отдаёт не места, а раскладку плиток для того же шейдера,
+/// которым рисуется кадр (`blur::Сцена::Мозаика`).
 fn wallpaper_screen_place(
     state: &Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
     экран: Size<i32, Physical>,
-) -> Vec<crate::blur::Плитка> {
+) -> crate::blur::Сцена {
+    use crate::blur::Сцена;
     if !state.lua_config.infinite_wallpaper && !state.обои_цикл {
-        return Vec::new();
+        return Сцена::Плитки(Vec::new());
     }
     // Слой берём тот же, что и сам кадр (`build_wallpaper_backdrop`): свой у
     // этого монитора, а на время отрисовки «свой» — это активный, потому что
@@ -4235,19 +4159,22 @@ fn wallpaper_screen_place(
     // (`monitors::войти_в_монитор` подменяет и `layer_output`). Разъехаться
     // этим двум нельзя — блюр размывал бы не то, что нарисовано.
     let Some(поверхность) = state.фоновая_поверхность() else {
-        return Vec::new();
+        return Сцена::Плитки(Vec::new());
     };
-    let Some((_, вид)) = wallpaper_texture_sized(&поверхность, renderer) else {
-        return Vec::new();
+    let Some((текстура, вид)) = wallpaper_texture_sized(&поверхность, renderer) else {
+        return Сцена::Плитки(Vec::new());
     };
     // Размер — по ПОВЕРХНОСТИ, ровно как в build_wallpaper_backdrop, и отсчёт
     // от ДОМА своего монитора: оба расчёта обязаны совпадать до пикселя.
     let размер = вид.dst;
     if state.обои_цикл {
-        return wallpaper_cycle_for(state, output, (размер.w, размер.h), (экран.w, экран.h))
-            .into_iter()
-            .map(|(м, поворот)| crate::blur::Плитка { x: м.x, y: м.y, w: м.w, h: м.h, поворот })
-            .collect();
+        use smithay::backend::renderer::Texture as _;
+        let раскладка = wallpaper_cycle_for(
+            state, output, (текстура.width() as i32, текстура.height() as i32), (экран.w, экран.h),
+        );
+        if let (Some(раскладка), Some(шейдер)) = (раскладка, state.обои_цикл_шейдер.as_ref()) {
+            return Сцена::Мозаика { программа: шейдер.программа().clone(), раскладка };
+        }
     }
     let дом = state.монитор_дом();
     let Some(место) = wallpaper_placement(
@@ -4259,15 +4186,15 @@ fn wallpaper_screen_place(
         (размер.w, размер.h),
         (экран.w, экран.h),
     ) else {
-        return Vec::new();
+        return Сцена::Плитки(Vec::new());
     };
-    vec![crate::blur::Плитка {
+    Сцена::Плитки(vec![crate::blur::Плитка {
         x: место.x,
         y: место.y,
         w: место.w,
         h: место.h,
         поворот: Transform::Normal,
-    }]
+    }])
 }
 
 /// Текстура фонового слоя (обои) вместе с её логическим размером.
@@ -5169,7 +5096,9 @@ fn build_wallpaper_backdrop(
         state.request_redraw();
     }
     if state.обои_цикл {
-        return build_wallpaper_cycle(state, output, ctx, текстура, &вид, экран);
+        if let Some(кадр) = build_wallpaper_cycle(state, output, ctx.clone(), текстура.clone(), экран) {
+            return Some(кадр);
+        }
     }
     let место = wallpaper_placement(
         (
@@ -5224,93 +5153,60 @@ fn build_wallpaper_backdrop(
     Some(vec![OutputRenderElements::Wallpaper(обрезанное)])
 }
 
-/// Кадр режима cycle: плитки из [`wallpaper_cycle_places`], каждая своим
-/// элементом со своим постоянным Id (`Parallax::обои_цикл_ids`, по номеру в
-/// кадре) и своим зеркалом.
+/// Кадр режима cycle: ОДИН элемент во весь экран, плитки рисует шейдер
+/// (см. src/плитка_обоев.rs). `None` — шейдера нет или раскладка вырождена:
+/// тогда обои лягут прежней одиночной копией.
 fn build_wallpaper_cycle(
     state: &mut Parallax,
     output: &Output,
     ctx: smithay::backend::renderer::ContextId<GlesTexture>,
     текстура: GlesTexture,
-    вид: &smithay::backend::renderer::utils::SurfaceView,
     экран: (i32, i32),
 ) -> Option<Vec<OutputRenderElements>> {
-    let места = wallpaper_cycle_for(state, output, (вид.dst.w, вид.dst.h), экран);
-    if места.is_empty() {
-        return None;
-    }
-    while state.обои_цикл_ids.len() < места.len() {
-        state.обои_цикл_ids.push(Id::new());
-    }
-    let снимок = state.wallpaper_damage.snapshot();
-    let кадр = Rectangle::<i32, Physical>::new((0, 0).into(), (экран.0, экран.1).into());
-    // Отступ в пару пикселей от края кадра: у роликов по краю часто идёт
-    // тёмная кромка кодировщика, и на стыке отражённых плиток она складывалась
-    // в видимую нитку (замер 08.10.2026: −4 уровня яркости на 1–2 px).
-    let отступ = ОБОИ_ЦИКЛ_ОТСТУП.min(вид.src.size.w / 8.0).min(вид.src.size.h / 8.0);
-    let s0 = Rectangle::<f64, Logical>::new(
-        (вид.src.loc.x + отступ, вид.src.loc.y + отступ).into(),
-        (вид.src.size.w - 2.0 * отступ, вид.src.size.h - 2.0 * отступ).into(),
+    use smithay::backend::renderer::Texture as _;
+    let шейдер = state.обои_цикл_шейдер.clone()?;
+    let размер_текстуры = (текстура.width() as i32, текстура.height() as i32);
+    let раскладка = wallpaper_cycle_for(state, output, размер_текстуры, экран)?;
+    let id = state.обои_цикл_id.get_or_insert_with(Id::new).clone();
+    let el = TextureRenderElement::from_texture_with_damage(
+        id,
+        ctx,
+        Point::<f64, Physical>::from((0.0, 0.0)),
+        текстура,
+        1,
+        Transform::Normal,
+        Some(1.0),
+        // Текстура ЦЕЛИКОМ — крой viewporter здесь не нужен (см.
+        // wallpaper_cycle_for). Задаём явно: при `None` smithay берёт крой по
+        // размеру ЭЛЕМЕНТА (экрана), и `v_coords` уходили далеко за 1 —
+        // плитки выходили в разы мельче (замер 19.10.2026).
+        Some(Rectangle::<f64, Logical>::new(
+            (0.0, 0.0).into(),
+            (размер_текстуры.0 as f64, размер_текстуры.1 as f64).into(),
+        )),
+        Some(Size::<i32, Logical>::from(экран)),
+        None,
+        state.wallpaper_damage.snapshot(),
+        Kind::Unspecified,
     );
-    let mut out = Vec::with_capacity(места.len());
-    for (n, (место, поворот)) in места.into_iter().enumerate() {
-        // Видимую часть плитки отсекаем САМИ: smithay, отсекая элемент с
-        // отражённой текстурой, берёт из кадра не ту половину.
-        let x0 = место.x.max(0.0);
-        let y0 = место.y.max(0.0);
-        let x1 = (место.x + место.w).min(экран.0 as f64);
-        let y1 = (место.y + место.h).min(экран.1 as f64);
-        if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
-            continue;
-        }
-        let (по_x, по_y) = match поворот {
-            Transform::Flipped => (true, false),
-            Transform::Flipped180 => (false, true),
-            Transform::_180 => (true, true),
-            _ => (false, false),
-        };
-        // Видимая доля плитки по осям, а из неё — кусок ИСХОДНОГО кадра (в
-        // координатах буфера), который ляжет в видимую часть. По отражённой
-        // оси доля берётся с другого конца.
-        let (a_x, b_x) = ((x0 - место.x) / место.w, (x1 - место.x) / место.w);
-        let (a_y, b_y) = ((y0 - место.y) / место.h, (y1 - место.y) / место.h);
-        let (a_x, b_x) = if по_x { (1.0 - b_x, 1.0 - a_x) } else { (a_x, b_x) };
-        let (a_y, b_y) = if по_y { (1.0 - b_y, 1.0 - a_y) } else { (a_y, b_y) };
-        let буф_x = s0.loc.x + a_x * s0.size.w;
-        let буф_y = s0.loc.y + a_y * s0.size.h;
-        let буф_w = (b_x - a_x) * s0.size.w;
-        let буф_h = (b_y - a_y) * s0.size.h;
-        // Размер элемента на экране — целый, и smithay считает от него.
-        let (ew, eh) = ((x1 - x0).round().max(1.0), (y1 - y0).round().max(1.0));
-        // ГРАБЛЯ smithay: `TextureRenderElement` переводит `src` в буфер,
-        // отражая его относительно РАЗМЕРА ЭЛЕМЕНТА на экране, а не размера
-        // текстуры (`to_buffer(.., &logical_size)`). У плитки не в размер кадра
-        // отражённая ось уезжала за текстуру: такие плитки пропадали или
-        // показывали не ту половину (замер 08.10.2026, тестовая картинка с
-        // метками по углам). Поэтому подаём крой, который после ЕГО отражения
-        // станет нужным куском буфера: x = ew − буф_x − буф_w.
-        let src_x = if по_x { ew - буф_x - буф_w } else { буф_x };
-        let src_y = if по_y { eh - буф_y - буф_h } else { буф_y };
-        let src = Rectangle::<f64, Logical>::new((src_x, src_y).into(), (буф_w, буф_h).into());
-        let el = TextureRenderElement::from_texture_with_damage(
-            state.обои_цикл_ids[n].clone(),
-            ctx.clone(),
-            Point::<f64, Physical>::from((x0, y0)),
-            текстура.clone(),
-            1,
-            поворот,
-            Some(1.0),
-            Some(src),
-            Some(Size::<i32, Logical>::from((ew as i32, eh as i32))),
-            None,
-            снимок.clone(),
-            Kind::Unspecified,
-        );
-        if let Some(обрезанное) = CropRenderElement::from_element(el, 1.0, кадр) {
-            out.push(OutputRenderElements::Wallpaper(обрезанное));
-        }
+    // Свой счётчик: растёт, когда сменился кадр обоев ИЛИ раскладка (камера,
+    // зум, стол). Иначе damage tracker не узнал бы о сдвиге — геометрия
+    // элемента всегда «весь экран».
+    let кадр_обоев = smithay::backend::renderer::element::Element::current_commit(&el);
+    let запись = state.обои_цикл_вид.entry(output.name()).or_insert((
+        раскладка,
+        кадр_обоев,
+        smithay::backend::renderer::utils::CommitCounter::default(),
+    ));
+    if запись.0 != раскладка || запись.1 != кадр_обоев {
+        запись.0 = раскладка;
+        запись.1 = кадр_обоев;
+        запись.2.increment();
     }
-    (!out.is_empty()).then_some(out)
+    let коммит = запись.2;
+    Some(vec![OutputRenderElements::ОбоиПлиткой(crate::плитка_обоев::Плитка::new(
+        el, &шейдер, &раскладка, коммит,
+    ))])
 }
 
 /// Дать что-нибудь сделать с ГЛАВНЫМ рендерером вне пути отрисовки.
@@ -5467,7 +5363,7 @@ fn build_closing_elements(state: &mut Parallax, screen: Size<i32, Physical>) -> 
                         (loc.x.round() as i32, loc.y.round() as i32).into(),
                         (размер.w, размер.h).into(),
                     );
-                    if let Some(подложка) = стекло.подложка(id, кусок, screen) {
+                    if let Some(подложка) = стекло.подложка(id, кусок, screen, state.lua_config.blur_radius) {
                         out.push(OutputRenderElements::Стекло(
                             crate::rounded::Rounded::new(подложка, ш, rect, радиус, true).растворить(р),
                         ));
@@ -5680,7 +5576,7 @@ pub fn пересчитать_блюр(
             match wallpaper_texture(state, renderer, output) {
                 Some(исходник) => {
                     match блюр.размыть(
-                        renderer, &исходник, &плитки, mode.size, crate::blur::РАДИУС,
+                        renderer, &исходник, плитки, mode.size, crate::blur::РАДИУС,
                     ) {
                         Some(новая) => {
                             state.blur_кэш.insert(имя, (ключ, новая.clone()));
@@ -6793,7 +6689,7 @@ pub fn собрать_элементы(
                     if let (Some(стекло), Some(ш), Some(экран_кадра)) =
                         (state.стекло.as_ref(), state.blur_shape.as_ref(), экран_кадра)
                     {
-                        if let Some(подложка) = стекло.подложка(id, rect, экран_кадра) {
+                        if let Some(подложка) = стекло.подложка(id, rect, экран_кадра, state.lua_config.blur_radius) {
                             let маска = crate::rounded::Rounded::new(
                                 подложка, ш,
                                 [x0 as f32, y0 as f32, w as f32, h as f32],

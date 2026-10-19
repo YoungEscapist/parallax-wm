@@ -347,6 +347,15 @@ impl DmabufHandler for Parallax {
                 return;
             }
         }
+        // Headless-харнесс: устройств udev нет, рендерер свой (headless.rs).
+        // Без этого любой dmabuf клиента в харнессе получал отказ.
+        // SAFETY: зовётся из диспетчеризации Wayland, вне такта отрисовки.
+        if let Some(gles) = unsafe { crate::headless::рендерер() } {
+            if gles.import_dmabuf(&dmabuf, None).is_ok() {
+                let _ = notifier.successful::<Parallax>();
+                return;
+            }
+        }
         tracing::warn!("plx/dmabuf: import failed");
         notifier.failed();
     }

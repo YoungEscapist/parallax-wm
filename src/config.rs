@@ -796,6 +796,10 @@ pub struct Config {
     /// ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО: код проходом рендера живьём не отсмотрен, а
     /// ошибка там стоит чёрного экрана.
     pub blur: bool,
+    /// `set{ blur_radius = ... }` — радиус размытия под прозрачными окнами, в
+    /// пикселях экрана (4..160). Было зашито 12; 19.10.2026 по образцу
+    /// Sarods2d подняли до 48 — фон окна читается цветом, а не формой обоев.
+    pub blur_radius: f32,
     /// `set{ close_anim = ... }` — спокойное угасание закрытого окна
     /// (см. close.rs). Включено.
     ///
@@ -923,6 +927,7 @@ impl Default for Config {
             anim_ms: Vec::new(),
             resize_anim: true,
             blur: false,
+            blur_radius: 48.0,
             close_anim: true,
             intro: true,
             notify_sound: String::new(),
@@ -1376,6 +1381,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
     let gaps_out: Rc<RefCell<i32>> = Rc::new(RefCell::new(18));
     let bar_вид: Rc<RefCell<crate::bar::Вид>> = Rc::new(RefCell::new(crate::bar::Вид::default()));
     let blur: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let blur_radius: Rc<RefCell<f32>> = Rc::new(RefCell::new(48.0));
     let dissolve: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
     let dissolve_mosaic: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
     let cube: Rc<RefCell<f32>> = Rc::new(RefCell::new(0.0));
@@ -1674,6 +1680,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         let gaps_in = gaps_in.clone();
         let gaps_out = gaps_out.clone();
         let blur = blur.clone();
+        let blur_radius = blur_radius.clone();
         let dissolve = dissolve.clone();
         let dissolve_mosaic = dissolve_mosaic.clone();
         let cube = cube.clone();
@@ -1825,6 +1832,9 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("blur") {
                 *blur.borrow_mut() = v;
+            }
+            if let Ok(Some(v)) = tbl.get::<Option<f32>>("blur_radius") {
+                *blur_radius.borrow_mut() = v.clamp(4.0, 160.0);
             }
             if let Ok(Some(v)) = tbl.get::<Option<bool>>("infinite_wallpaper") {
                 *infinite_wallpaper.borrow_mut() = v;
@@ -2506,6 +2516,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
         anim_ms: anim_ms.borrow().clone(),
         resize_anim: *resize_anim.borrow(),
         blur: *blur.borrow(),
+        blur_radius: *blur_radius.borrow(),
         close_anim: *close_anim.borrow(),
         intro: *intro.borrow(),
         notify_sound: notify_sound.borrow().clone(),

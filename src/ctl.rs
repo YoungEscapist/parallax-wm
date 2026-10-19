@@ -6,10 +6,10 @@
 //! то есть ловит чужие нажатия (и умеет, например, увести VT). Сокет разрывает
 //! эту связку: тот же `dispatch_action`, но по строке в UNIX-сокет.
 //!
-//! **Где включается.** Только по `PLX_CTL=1` (и всегда — в `--headless`).
-//! В живом сеансе по умолчанию выключен: это дыра ровно того размера, что и
-//! права на сокет, — кто может писать в него, тот может выполнить любое
-//! действие композитора.
+//! **Где включается.** Целиком — только по `PLX_CTL=1` (и всегда — в `--headless`).
+//! В живом сеансе по умолчанию урезан до `wallpaper`: полный сокет — дыра ровно
+//! того размера, что и права на него, — кто может писать в него, тот может
+//! выполнить любое действие композитора. А `wallpaper cycle` нужен plx-wall.
 //!
 //! Формат — строки, ответ — строки, соединение одноразовое:
 //! ```text
@@ -53,6 +53,7 @@ pub fn путь_сокета(state: &Parallax) -> std::path::PathBuf {
 pub fn init(
     handle: &LoopHandle<'static, Parallax>,
     state: &Parallax,
+    полный: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let путь = путь_сокета(state);
     // Остаток от прошлого запуска: bind по занятому пути падает с EADDRINUSE,
@@ -60,14 +61,18 @@ pub fn init(
     let _ = std::fs::remove_file(&путь);
     let listener = UnixListener::bind(&путь)?;
     listener.set_nonblocking(true)?;
-    tracing::info!("plx/ctl: listening on {:?}", путь);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&путь, std::fs::Permissions::from_mode(0o600));
+    }
+    tracing::info!("plx/ctl: listening on {:?} (full={})", путь, полный);
 
     handle.insert_source(
         Generic::new(listener, Interest::READ, Mode::Level),
-        |_, listener, state: &mut Parallax| {
+        move |_, listener, state: &mut Parallax| {
             loop {
                 match listener.accept() {
-                    Ok((stream, _)) => обслужить(stream, state),
+                    Ok((stream, _)) => обслужить(stream, state, полный),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => {
                         tracing::warn!("plx/ctl: accept: {}", e);
@@ -81,7 +86,7 @@ pub fn init(
     Ok(())
 }
 
-fn обслужить(stream: UnixStream, state: &mut Parallax) {
+fn обслужить(stream: UnixStream, state: &mut Parallax, полный: bool) {
     // Блокирующее чтение — сознательно: команда это одна короткая строка от
     // своего же харнесса, а неблокирующий разбор по кускам стоил бы буфера
     // состояния на соединение ради нулевой выгоды.
@@ -105,7 +110,16 @@ fn обслужить(stream: UnixStream, state: &mut Parallax) {
                 if s.is_empty() {
                     continue;
                 }
-                ответ.push_str(&выполнить(s, state));
+                // Живой сеанс без PLX_CTL: только раскладка обоев от plx-wall,
+                // остальное (spawn, mouse, key…) — та самая дыра из шапки.
+                if !полный && s.split_whitespace().next() != Some("wallpaper") {
+                    ответ.push_str(т!(
+                        "ошибка: в живом сеансе доступно только wallpaper (PLX_CTL=1 — всё)",
+                        "error: only wallpaper is available in a live session (PLX_CTL=1 for all)"
+                    ));
+                } else {
+                    ответ.push_str(&выполнить(s, state));
+                }
                 ответ.push('\n');
             }
             Err(_) => break,

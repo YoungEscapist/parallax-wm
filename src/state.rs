@@ -949,11 +949,24 @@ pub struct Parallax {
     /// полную перерисовку экрана (см. udev::build_wallpaper_backdrop).
     pub wallpaper_id: Option<smithay::backend::renderer::element::Id>,
     /// Режим «cycle» (галочка в plx-wall, `ctl wallpaper cycle on`): обои
-    /// лежат на холсте зеркальной плиткой и едут за камерой один в один —
-    /// бесконечно, без затухающего хода. См. `udev::wallpaper_cycle_places`.
+    /// повторяются по холсту в своём размере и едут за камерой один в один,
+    /// как `tile` у driftwm. См. src/плитка_обоев.rs.
     pub обои_цикл: bool,
-    /// Свой Id на каждую плитку режима cycle — по номеру в кадре.
-    pub обои_цикл_ids: Vec<smithay::backend::renderer::element::Id>,
+    /// Шейдер плитки режима cycle. Компилируется там же, где `куб_шейдер`.
+    pub обои_цикл_шейдер: Option<crate::плитка_обоев::Шейдер>,
+    /// Id элемента режима cycle — один на кадр, плитки рисует шейдер.
+    pub обои_цикл_id: Option<smithay::backend::renderer::element::Id>,
+    /// По выходу: прошлая раскладка, прошлый коммит кадра обоев и свой
+    /// счётчик (см. `плитка_обоев::Плитка`). Свой у каждого монитора: общий
+    /// дёргался бы на каждом кадре от раскладки соседа.
+    pub обои_цикл_вид: HashMap<
+        String,
+        (
+            crate::плитка_обоев::Раскладка,
+            smithay::backend::renderer::utils::CommitCounter,
+            smithay::backend::renderer::utils::CommitCounter,
+        ),
+    >,
     /// Свой `Id` на КАЖДУЮ грань куба — для обоев, которыми застелена грань
     /// (см. `udev::cube_face_wallpaper`). Общий Id на все грани не годится:
     /// damage tracker считал бы их одним и тем же элементом, который скачет по
@@ -1747,7 +1760,9 @@ impl Parallax {
             preview_ids: Vec::new(),
             wallpaper_id: None,
             обои_цикл: false,
-            обои_цикл_ids: Vec::new(),
+            обои_цикл_шейдер: None,
+            обои_цикл_id: None,
+            обои_цикл_вид: HashMap::new(),
             куб_фон_ids: Vec::new(),
             фон_точки: HashMap::new(),
             icon_cache: crate::icons::Кэш::default(),

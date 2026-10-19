@@ -142,6 +142,19 @@ pub fn init_headless(
     РЕНДЕРЕР.with(|р| р.set(&mut *gles as *mut GlesRenderer));
     tracing::info!("plx/headless: GLES on {}", путь);
 
+    // linux-dmabuf, как у живого udev: без него харнесс не проверяет клиентов,
+    // что отдают кадры видеопамятью (живые обои plx-wall, см. его gbm.rs).
+    if state.dmabuf_global.is_none() {
+        use smithay::backend::renderer::ImportDma as _;
+        let узел = smithay::backend::drm::DrmNode::from_path(&путь)?;
+        let feedback = smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
+            узел.dev_id(), gles.dmabuf_formats(),
+        ).build()?;
+        let global = state.dmabuf_state
+            .create_global_with_default_feedback::<Parallax>(&state.display_handle, &feedback);
+        state.dmabuf_global = Some(global);
+    }
+
     let режимы = режимы_из_окружения();
     let коннекторы = имена_из_окружения(режимы.len());
     let mut экраны: Vec<Экран> = Vec::new();
@@ -268,6 +281,7 @@ pub fn init_headless(
         state.blur_shape = crate::rounded::Шейдер::new(&mut gles);
         state.стекло = crate::blur::Стекло::new(&mut gles);
         state.куб_шейдер = crate::куб::Шейдер::new(&mut gles);
+        state.обои_цикл_шейдер = crate::плитка_обоев::Шейдер::new(&mut gles);
     }
     state.apply_camera_all();
 
@@ -296,6 +310,13 @@ fn такт(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mu
 
     if let Some(путь) = state.shot_request.take() {
         снимок(экраны, gles, state, &путь);
+    }
+
+    // Замер (`PLX_HEADLESS_BENCH=1`): собирать сцену КАЖДЫЙ такт, как живой
+    // монитор, и раз в 120 тактов писать, сколько стоила сборка. В неё входит
+    // импорт буфера обоев — у живых обоев это главная цена кадра на CPU.
+    if std::env::var_os("PLX_HEADLESS_BENCH").is_some() {
+        замер_такта(экраны, gles, state);
     }
 
     // Мультиюзер: кадры гостям. На живом железе их шлёт `render_surface` после
@@ -332,6 +353,34 @@ fn такт(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mu
         crate::udev::отдать_кадр_курсору(state, &выход, теперь, Some(Duration::ZERO));
     }
     let _ = state.display_handle.flush_clients();
+}
+
+fn замер_такта(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mut Parallax) {
+    thread_local! {
+        static ЗАМЕР: std::cell::Cell<(u32, f64, f64)> = const { std::cell::Cell::new((0, 0.0, 0.0)) };
+    }
+    let t0 = std::time::Instant::now();
+    for экран in экраны.iter_mut() {
+        let свой = state.монитор_по_выходу(&экран.output);
+        let вернуть = свой.and_then(|i| state.войти_в_монитор(i));
+        crate::udev::пересчитать_блюр(state, gles, экран.blur.as_mut(), &экран.output);
+        let (elements, _) = crate::udev::собрать_элементы(
+            state, gles, &экран.output, экран.rounded.as_ref(), экран.last_elements,
+        );
+        экран.last_elements = elements.len();
+        state.покинуть_монитор(вернуть);
+    }
+    let мс = t0.elapsed().as_secs_f64() * 1000.0;
+    ЗАМЕР.with(|з| {
+        let (n, сумма, худший) = з.get();
+        let (n, сумма, худший) = (n + 1, сумма + мс, худший.max(мс));
+        if n >= 120 {
+            tracing::info!("plx/headless: bench avg {:.2} ms worst {:.2} ms per tick", сумма / n as f64, худший);
+            з.set((0, 0.0, 0.0));
+        } else {
+            з.set((n, сумма, худший));
+        }
+    });
 }
 
 /// Собирает кадр ТЕМ ЖЕ кодом, что и монитор, и кладёт его в PNG.
