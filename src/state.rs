@@ -1502,6 +1502,9 @@ impl Parallax {
         let image_capture_source_state = ImageCaptureSourceState::new();
         let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
         let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
+        // Виртуальные мышь и клавиатура для удалённого управления и wtype
+        // (см. virtual_input.rs).
+        crate::virtual_input::init(&dh);
         let lua_config = crate::config::Config::load();
         let dock_cfg_init = lua_config.dock.clone();
         let mut seat_state = SeatState::new();

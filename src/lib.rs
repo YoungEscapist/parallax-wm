@@ -112,6 +112,7 @@ mod switcher;
 mod synth;
 mod text;
 mod udev;
+mod virtual_input;
 #[cfg(feature = "vr")]
 mod vr;
 #[cfg(not(feature = "vr"))]

@@ -312,6 +312,13 @@ fn такт(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mu
         снимок(экраны, gles, state, &путь);
     }
 
+    // Захват экрана клиентами (ext-image-copy-capture: grim, портал, Nixith
+    // Connect). На живом железе кадры им отдаёт render_surface после вывода
+    // на монитор; здесь монитора нет, поэтому сцену собираем по их запросу.
+    if !state.pending_frames.is_empty() {
+        отдать_захват(экраны, gles, state);
+    }
+
     // Замер (`PLX_HEADLESS_BENCH=1`): собирать сцену КАЖДЫЙ такт, как живой
     // монитор, и раз в 120 тактов писать, сколько стоила сборка. В неё входит
     // импорт буфера обоев — у живых обоев это главная цена кадра на CPU.
@@ -445,6 +452,31 @@ fn снимок(экраны: &mut [Экран], gles: &mut GlesRenderer, state:
             ),
             Err(e) => tracing::warn!("plx/headless: PNG {:?}: {}", файл, e),
         }
+    }
+}
+
+fn отдать_захват(экраны: &mut [Экран], gles: &mut GlesRenderer, state: &mut Parallax) {
+    state.sync_pointer_to_camera();
+    for экран in экраны.iter_mut() {
+        let output = экран.output.clone();
+        let ждут = state.pending_frames.iter().any(|p| {
+            p.session.source().user_data().get::<smithay::output::WeakOutput>().and_then(|w| w.upgrade()).as_ref() == Some(&output)
+        });
+        if !ждут {
+            continue;
+        }
+        let свой = state.монитор_по_выходу(&output);
+        let вернуть = свой.and_then(|i| state.войти_в_монитор(i));
+        let (elements, курсорных) = crate::udev::собрать_элементы(
+            state,
+            gles,
+            &output,
+            экран.rounded.as_ref(),
+            экран.last_elements,
+        );
+        экран.last_elements = elements.len();
+        crate::screencopy::serve_pending(state, &output, gles, &elements, курсорных);
+        state.покинуть_монитор(вернуть);
     }
 }
 
