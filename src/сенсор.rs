@@ -310,6 +310,7 @@ impl Parallax {
             || self.bar_inside(экран)
             || self.tray_inside(экран)
             || self.preview_hit().is_some()
+            || self.всплывашка_над(экран)
             || self.minimap_hit().is_some()
             || self.курсор_над_слоем(self.pointer_location)
     }

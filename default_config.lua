@@ -329,11 +329,22 @@ set{ gaps_in = 16, gaps_out = 18 }
 -- The look of the bar: geometry, colours, which islands it carries. Colours are
 -- #rrggbb or #rrggbbaa. Any part can be turned off: what is off takes no space
 -- and catches no clicks.
+--
+-- popups — little windows that slide out under the bar cells, like the
+-- popouts of Quickshell shells: hover the clock for a calendar (the wheel turns
+-- months), the volume for a slider, mute and output/input choice, the battery
+-- for power modes and brightness, the layout for the list of layouts, a tray
+-- icon for its tooltip. Clicking the clock, volume or battery pins the popout;
+-- Esc, a click elsewhere or a second click closes it. The wheel over volume and
+-- battery changes volume and brightness. The accent comes from the plx-wall
+-- wallpaper palette. popups = false brings back the old behaviour: clicking
+-- volume or battery opens the menu in the middle of the screen.
 -- bar{
 --   height = 34, top = 8, radius = 12, edge = 24, pad = 14, gap = 6,
 --   bg = "#0a0a12a6", fg = "#edf2fff5", dim = "#d9dff28c",
 --   clock = true, date = true, keyboard = true, volume = true,
 --   battery = true, tray = true, windows = true, tags = true,
+--   popups = true,
 -- }
 
 -- Blur behind the bar. Off: never watched live, see the description above.

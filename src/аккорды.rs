@@ -275,6 +275,7 @@ impl Parallax {
         self.bar_inside(экран)
             || self.dock_под(экран)
             || self.preview_hit().is_some()
+            || self.всплывашка_над(экран)
             || self.курсор_над_слоем(точка)
             || self.рабстол_иконка_в_точке(точка).is_some()
     }

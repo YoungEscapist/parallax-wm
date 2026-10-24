@@ -768,6 +768,10 @@ pub struct Parallax {
     /// Ведёт `anim::tick`, читают `canvas::preview_geom` (размер и подъём) и
     /// `canvas::preview_fade` (проявление).
     pub preview_anim: f64,
+    /// Всплывающее окошко под ячейкой панели (календарь, звук, питание,
+    /// раскладка, подпись трея): что показано, доля раскрытия, где карточка,
+    /// закреплено ли (см. всплывашки.rs).
+    pub всплывашка: crate::всплывашки::Состояние,
     /// Глубина значков панели под курсором: ячейка → доля всплытия 0…1.
     /// Ведёт `anim::tick`, читает отрисовка (`anim::глубина_значка`). Здесь
     /// только наведённый значок и те, что ещё тонут, — от силы два-три.
@@ -944,6 +948,8 @@ pub struct Parallax {
     pub ghost_ids: Vec<crate::udev::SolidSlot>,
     /// Пул слотов карточки предпросмотра (см. udev::build_bar_preview).
     pub preview_ids: Vec<crate::udev::SolidSlot>,
+    /// Пул слотов всплывающего окошка панели (см. udev::build_bar_popout).
+    pub всплывашка_ids: Vec<crate::udev::SolidSlot>,
     /// Id элемента обоев бесконечного холста. Постоянный на всё время работы:
     /// damage tracker индексируется по нему, и новый Id каждый кадр означал бы
     /// полную перерисовку экрана (см. udev::build_wallpaper_backdrop).
@@ -1684,6 +1690,7 @@ impl Parallax {
             bar_hover: None,
             preview_cell: None,
             preview_anim: 0.0,
+            всплывашка: Default::default(),
             bar_depth: Vec::new(),
             preview_hover: false,
             preview_zoom: 1.0,
@@ -1761,6 +1768,7 @@ impl Parallax {
             selection_ids: Vec::new(),
             ghost_ids: Vec::new(),
             preview_ids: Vec::new(),
+            всплывашка_ids: Vec::new(),
             wallpaper_id: None,
             обои_цикл: false,
             обои_цикл_шейдер: None,

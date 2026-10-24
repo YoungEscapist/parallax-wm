@@ -638,6 +638,9 @@ impl Parallax {
                        (сейчас.y + delta.y).clamp(0.0, экран.h as f64),
                    ));
                    self.bar_hover_update(будет);
+                   // Ползунок во всплывающем окошке панели (громкость,
+                   // яркость) едет за рукой, пока кнопку держат.
+                   self.всплывашка_движение(будет);
                    // Панель приложений: наведение, перетаскивание значка,
                    // автоскрытие (см. dock.rs).
                    self.dock_motion(будет);
@@ -1124,6 +1127,19 @@ impl Parallax {
                     let screen = self.pointer_screen_physical();
                     if self.wifi_click(screen) || self.audio_click(screen) || self.питание_клик(screen) {
                         съел("wifi/audio menu", screen);
+                        return;
+                    }
+                }
+
+                // Всплывающее окошко панели (календарь, звук, питание…) висит
+                // ПОД панелью и поверх окон: щелчок по нему — его, отпускание
+                // ползунка — тоже. Щелчок мимо закрывает закреплённое окошко,
+                // но не съедается: его получит то, во что попали.
+                if !курсор_у_клиента {
+                    let screen = self.pointer_screen_physical();
+                    let нажата = ButtonState::Pressed == btn_state;
+                    if self.всплывашка_кнопка(screen, button == BTN_LEFT, нажата) {
+                        съел("bar popout", screen);
                         return;
                     }
                 }
@@ -1635,6 +1651,14 @@ impl Parallax {
                 // Колесо клавимыши (Alt+E/Y) — прокрутка, а не Alt+колесо.
                 let alt_held = self.alt_для_мыши(alt_held);
 
+                // Колесо над всплывающим окошком панели или над его ячейкой:
+                // месяц календаря, громкость, яркость, раскладка.
+                {
+                    let screen = self.pointer_screen_physical();
+                    if self.всплывашка_колесо(screen, v) {
+                        return;
+                    }
+                }
                 // Колесо над панелью приложений меняет размер её значков.
                 if source != AxisSource::Finger {
                     let screen = self.pointer_screen_physical();
@@ -2459,6 +2483,12 @@ pub(crate) fn разобрать_клавишу(
     // экрана — отмена (см. portal.rs). Перехватываем до
     // всех биндов и до клиента: пока идёт выбор, клавиша
     // принадлежит выбору.
+    // Esc закрывает ЗАКРЕПЛЁННОЕ окошко панели (щелчком по часам, звуку,
+    // заряду). Просто наведённое Esc не трогает — клавиша принадлежит окну.
+    if raw == keysyms::KEY_Escape && state.всплывашка_esc() {
+        return FilterResult::Intercept(());
+    }
+
     if state.portal_picking() && raw == keysyms::KEY_Escape {
         state.portal_pick_click(true);
         return FilterResult::Intercept(());

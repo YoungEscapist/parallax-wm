@@ -60,6 +60,10 @@ pub struct Вид {
     pub tray: bool,
     pub windows: bool,
     pub tags: bool,
+    /// Всплывающие окошки под ячейками (календарь, звук, питание, раскладка,
+    /// подписи трея — см. всплывашки.rs). Выключены — щелчки по звуку и
+    /// заряду снова открывают меню посреди экрана.
+    pub popups: bool,
 }
 
 impl Default for Вид {
@@ -82,6 +86,7 @@ impl Default for Вид {
             tray: true,
             windows: true,
             tags: true,
+            popups: true,
         }
     }
 }
@@ -92,7 +97,7 @@ static ВИД: std::sync::RwLock<Вид> = std::sync::RwLock::new(Вид {
     fg: [0.93, 0.95, 1.0, 0.96],
     dim: [0.85, 0.87, 0.95, 0.55],
     clock: true, date: true, keyboard: true, volume: true,
-    battery: true, tray: true, windows: true, tags: true,
+    battery: true, tray: true, windows: true, tags: true, popups: true,
 });
 
 /// Текущий вид панели. Отравленный замок (паника в чужом потоке) не повод
@@ -774,6 +779,9 @@ impl crate::state::Parallax {
             self.bar_hover = стало;
             self.request_redraw();
         }
+        // Всплывающее окошко под ячейкой: на нём ли курсор (оно держится
+        // раскрытым, пока к нему тянутся) и что в нём под стрелкой.
+        self.всплывашка_наведение(pos);
     }
 
     /// Лежит ли точка НА ПАНЕЛИ — без единого побочного действия.
@@ -801,6 +809,13 @@ impl crate::state::Parallax {
         let Some(cell) = l.hit(pos.x, pos.y) else {
             return l.inside(pos.x, pos.y);
         };
+        // Часы, звук и заряд щелчком закрепляют своё окошко (повторный —
+        // закрывает). С `bar{ popups = false }` сюда не заходим, и щелчок
+        // ведёт себя по-старому.
+        if self.всплывашка_щелчок_по_ячейке(cell, right, middle) {
+            self.request_redraw();
+            return true;
+        }
         match cell {
             Cell::Tag(mask) => {
                 // Переход делаем не своим кодом, а тем же действием, что и

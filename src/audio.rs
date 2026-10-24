@@ -330,7 +330,9 @@ impl crate::state::Parallax {
 
     pub fn audio_sync_watch(&mut self) {
         let tray = self.tray_open();
-        let menu = self.audio_menu_open();
+        // Окошко звука под панелью — то же, что открытое меню: на него смотрят,
+        // и громкость обязана отвечать, а не догонять раз в пять секунд.
+        let menu = self.audio_menu_open() || self.всплывашка.следит_звук();
         self.audio_send(Cmd::Watch { tray, menu });
     }
 

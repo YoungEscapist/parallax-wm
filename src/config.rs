@@ -2024,6 +2024,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
             for (имя, цель) in [
                 ("clock", 0usize), ("date", 1), ("keyboard", 2), ("volume", 3),
                 ("battery", 4), ("tray", 5), ("windows", 6), ("tags", 7),
+                ("popups", 8),
             ] {
                 let Ok(Some(v)) = tbl.get::<Option<bool>>(имя) else { continue };
                 match цель {
@@ -2034,7 +2035,8 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                     4 => в.battery = v,
                     5 => в.tray = v,
                     6 => в.windows = v,
-                    _ => в.tags = v,
+                    7 => в.tags = v,
+                    _ => в.popups = v,
                 }
             }
             Ok(())
