@@ -853,18 +853,27 @@ impl crate::state::Parallax {
             return;
         };
         bt.open = !bt.open;
-        // Пока меню открыто, опрос идёт часто, закрыли — редко (см. POLL_BG).
-        let _ = bt.tx.send(Cmd::Watch(bt.open));
         // А вот при закрытии гасим поиск — в фоне он жрёт эфир и батарею
         // наушников — и отпускаем растеризованные строки: имена и проценты всё
-        // равно поменяются к следующему открытию.
+        // равно поменяются к следующему открытию. Поиск, который ведёт окошко
+        // панели, не трогаем: на него ещё смотрят.
         if !bt.open {
-            if bt.snap.discovering {
+            if bt.snap.discovering && !self.всплывашка.следит_блютуз() {
                 let _ = bt.tx.send(Cmd::Discovery(false));
             }
             self.text_cache.clear();
         }
+        self.bt_sync_watch();
         self.request_redraw();
+    }
+
+    /// Пока меню или окошко панели открыто, опрос идёт часто, закрыли —
+    /// редко (см. POLL_BG).
+    pub fn bt_sync_watch(&mut self) {
+        let on = self.bt_menu_open() || self.всплывашка.следит_блютуз();
+        if let Some(bt) = self.bt.as_ref() {
+            let _ = bt.tx.send(Cmd::Watch(on));
+        }
     }
 
     pub fn bt_menu_open(&self) -> bool {

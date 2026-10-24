@@ -122,7 +122,7 @@ fn shellexpand(путь: &str) -> String {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Проигрыватель {
+pub(crate) enum Проигрыватель {
     PwPlay,
     PaPlay,
 }
@@ -130,14 +130,14 @@ enum Проигрыватель {
 impl Проигрыватель {
     /// Имя программы — оно же то, что человек наберёт в терминале, проверяя
     /// звук руками (см. предупреждение о молчащем проигрывателе).
-    fn имя(self) -> &'static str {
+    pub(crate) fn имя(self) -> &'static str {
         match self {
             Self::PwPlay => "pw-play",
             Self::PaPlay => "paplay",
         }
     }
 
-    fn найти() -> Option<Self> {
+    pub(crate) fn найти() -> Option<Self> {
         // pw-play первым: PipeWire в сессии и так поднят (см. launch_native.sh),
         // а paplay идёт через слой совместимости с pulse.
         for п in [Self::PwPlay, Self::PaPlay] {
@@ -148,7 +148,7 @@ impl Проигрыватель {
         None
     }
 
-    fn команда(self, файл: &Path, громкость: f32) -> Command {
+    pub(crate) fn команда(self, файл: &Path, громкость: f32) -> Command {
         let mut cmd = match self {
             Self::PwPlay => {
                 let mut c = Command::new(self.имя());

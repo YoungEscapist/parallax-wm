@@ -3456,6 +3456,51 @@ fn build_bar_elements(
                 draw_tray_icon(state, renderer, i, r, глубина, slot, &mut idx_значков, &mut els);
                 slot += 1;
             }
+            bar::Cell::Wifi => {
+                // Дуги по уровню сигнала, как в полке; пока подключаемся —
+                // загораются по очереди. Выключенное радио — оранжевая точка.
+                let Some(w) = data.wifi else { continue };
+                let фаза = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64() % 3600.0)
+                    .unwrap_or(0.0);
+                let дуг = bar::wifi_arcs(&w, фаза);
+                let горит = if открыто_у(state, bar::Cell::Wifi) { BAR_TEXT() } else { с_альфой(BAR_TEXT(), 0.9) };
+                let погашено = с_альфой(BAR_DIM(), 0.4);
+                let точка = if !w.enabled {
+                    TRAY_WARN
+                } else if w.connected || w.connecting {
+                    горит
+                } else {
+                    BAR_DIM()
+                };
+                let значок = bar::Rect { x: r.x, y: r.y, w: DOT, h: r.h };
+                let h = mask_h_fit(WIFI_W, WIFI_DOT.len() as i32, BAR_H() / 2, DOT);
+                draw_mask(state, renderer, "bar-wifi-dot", &WIFI_DOT, WIFI_W, значок, h, точка, &mut els);
+                for (n, маска, имя) in [(1, &WIFI_ARC1, "bar-wifi-a1"), (2, &WIFI_ARC2, "bar-wifi-a2"), (3, &WIFI_ARC3, "bar-wifi-a3")] {
+                    let цвет = if n <= дуг { горит } else { погашено };
+                    draw_mask(state, renderer, имя, маска, WIFI_W, значок, h, цвет, &mut els);
+                }
+            }
+            bar::Cell::Bluetooth => {
+                let Some(b) = data.bluetooth else { continue };
+                let цвет = if !b.powered {
+                    с_альфой(BAR_DIM(), 0.45)
+                } else if b.connected > 0 || открыто_у(state, bar::Cell::Bluetooth) {
+                    BAR_TEXT()
+                } else {
+                    BAR_DIM()
+                };
+                let значок = bar::Rect { x: r.x, y: r.y, w: DOT, h: r.h };
+                let h = mask_h_fit(BT_RUNE_W, BT_RUNE.len() as i32, BAR_H() * 9 / 16, DOT);
+                draw_mask(state, renderer, "bar-bt", &BT_RUNE, BT_RUNE_W, значок, h, цвет, &mut els);
+            }
+            bar::Cell::Power => {
+                let цвет = if открыто_у(state, bar::Cell::Power) { BAR_TEXT() } else { BAR_DIM() };
+                let значок = bar::Rect { x: r.x, y: r.y, w: DOT, h: r.h };
+                let h = mask_h_fit(POWER_W, POWER.len() as i32, BAR_H() / 2, DOT);
+                draw_mask(state, renderer, "bar-power", &POWER, POWER_W, значок, h, цвет, &mut els);
+            }
             _ => {}
         }
     }
@@ -3464,6 +3509,13 @@ fn build_bar_elements(
     // переднему, а в кадре порядок обратный.
     els.reverse();
     els
+}
+
+/// Стоит ли под этой ячейкой открытое окошко — её значок тогда горит ярче,
+/// как подсвеченная кнопка у шеллов на Quickshell.
+fn открыто_у(state: &Parallax, cell: bar::Cell) -> bool {
+    let с = &state.всплывашка;
+    с.открыто && с.что.is_some() && с.что == crate::всплывашки::Окошко::для(cell)
 }
 
 // ── Предпросмотр по наведению на панель ──────────────────────────────────────
@@ -3795,13 +3847,26 @@ fn build_bar_popout(
                 crate::всплывашки::Штрих::Значок { r, h, какой, цвет } => {
                     // Имена масок свои («pop-…»): ключ кэша — имя, размер и
                     // цвет, и совпади он с панелью, один буфер попал бы в
-                    // кадр дважды.
-                    let (имя, маска): (&str, &[u32]) = match какой {
-                        crate::всплывашки::Значок::Звук => ("pop-vol", &VOLUME),
-                        crate::всплывашки::Значок::ЗвукВыкл => ("pop-vol-muted", &VOLUME_MUTED),
+                    // кадр дважды. По той же причине у каждого значка свой
+                    // слот: замок стоит у каждой защищённой сети одним и тем
+                    // же цветом и размером.
+                    use crate::всплывашки::Значок as З;
+                    let (имя, маска, ширина): (&str, &[u32], i32) = match какой {
+                        З::Звук => ("pop-vol", &VOLUME, VOLUME_W),
+                        З::ЗвукВыкл => ("pop-vol-muted", &VOLUME_MUTED, VOLUME_W),
+                        З::ВайфайТочка => ("pop-wifi-dot", &WIFI_DOT, WIFI_W),
+                        З::ВайфайДуга(1) => ("pop-wifi-a1", &WIFI_ARC1, WIFI_W),
+                        З::ВайфайДуга(2) => ("pop-wifi-a2", &WIFI_ARC2, WIFI_W),
+                        З::ВайфайДуга(_) => ("pop-wifi-a3", &WIFI_ARC3, WIFI_W),
+                        З::Блютуз => ("pop-bt", &BT_RUNE, BT_RUNE_W),
+                        З::Сон => ("pop-sleep", &SLEEP, POWER_W),
+                        З::Перезагрузка => ("pop-reboot", &REBOOT, POWER_W),
+                        З::Выключение => ("pop-off", &POWER, POWER_W),
+                        З::Замок => ("pop-lock", &LOCK, LOCK_W),
                     };
                     let ячейка = crate::tray::Rect { x: r.x, y: r.y, w: r.w, h: r.h };
-                    draw_mask(state, renderer, имя, маска, VOLUME_W, ячейка, *h, с_альфой(*цвет, а), &mut els);
+                    draw_mask_slot(state, renderer, имя, маска, ширина, ячейка, *h, с_альфой(*цвет, а), slot, &mut els);
+                    slot += 1;
                 }
             }
         }
@@ -7434,6 +7499,8 @@ pub fn render_all(state: &mut Parallax) {
 
 // ── Блютуз: меню устройств и индикатор ───────────────────────────────────────
 
+/// Ширина сетки руны блютуза.
+const BT_RUNE_W: i32 = 11;
 /// Руна блютуза 11×16: вертикаль с двумя треугольниками, как на устройствах.
 const BT_RUNE: [u32; 16] = [
     0b00001100000,
@@ -7678,6 +7745,27 @@ const SLEEP: [u32; 20] = [
         0b00000111111111000000,
         0b00000001111100000000,
         0b00000000000000000000,
+    ];
+
+/// Замок защищённой сети: дужка и корпус с прорезью.
+const LOCK_W: i32 = 14;
+const LOCK: [u32; 16] = [
+        0b00000111100000,
+        0b00001111110000,
+        0b00011100111000,
+        0b00011000011000,
+        0b00011000011000,
+        0b00011000011000,
+        0b01111111111110,
+        0b01111111111110,
+        0b01111111111110,
+        0b01111110011110,
+        0b01111100001110,
+        0b01111110011110,
+        0b01111110011110,
+        0b01111111111110,
+        0b01111111111110,
+        0b00111111111100,
     ];
 
 /// Масштаб шрифта в меню: «пиксель» глифа стороной в 2 экранных.
@@ -10201,10 +10289,28 @@ fn draw_mask(
     color: [f32; 4],
     out: &mut Vec<OutputRenderElements>,
 ) {
+    draw_mask_slot(state, renderer, name, rows, mask_w, cell, h, color, 0, out);
+}
+
+/// То же со своим слотом буфера — для значков, которые в одном кадре
+/// встречаются дважды одним цветом и размером (см. заметку про Id в text.rs).
+#[allow(clippy::too_many_arguments)]
+fn draw_mask_slot(
+    state: &mut Parallax,
+    renderer: &mut GlesRenderer,
+    name: &str,
+    rows: &[u32],
+    mask_w: i32,
+    cell: crate::tray::Rect,
+    h: i32,
+    color: [f32; 4],
+    slot: usize,
+    out: &mut Vec<OutputRenderElements>,
+) {
     let w = (h * mask_w / rows.len() as i32).max(1);
     let x = cell.x + (cell.w - w) / 2;
     let y = cell.y + (cell.h - h) / 2;
-    let (buf, _, _) = state.text_cache.bitmap_fit(name, rows, mask_w, w, h, color, 0);
+    let (buf, _, _) = state.text_cache.bitmap_fit(name, rows, mask_w, w, h, color, slot);
     match MemoryRenderBufferRenderElement::from_buffer(
         renderer,
         Point::<f64, Physical>::from((x as f64, y as f64)),
@@ -10279,14 +10385,18 @@ fn build_tray_elements(
     // Всё нужное снимаем сразу: дальше state занят пулом и кэшем текста.
     let open = tray.open;
     let snap = tray.snap.clone();
-    let armed = [PowerAction::Off, PowerAction::Reboot, PowerAction::Sleep]
+    // Зажатая кнопка питания и её заливка (см. зажим.rs).
+    let держат = [PowerAction::Off, PowerAction::Reboot, PowerAction::Sleep]
         .into_iter()
-        .find(|a| tray.is_armed(*a));
-    // Тире тут нарочно нет: в шрифте (см. text.rs) только ASCII и кириллица,
-    // и на месте «—» получался вопросительный знак.
-    let hint = armed
-        .map(|a| format!("press again: {}", a.human()))
-        .or_else(|| tray.notice_text().map(str::to_string));
+        .find_map(|a| state.зажим.доля(a, crate::зажим::Откуда::Полка).map(|д| (a, д)));
+    let сделано = state.зажим.сделано().is_some();
+    let hint = match (держат, state.зажим.щёлкнули()) {
+        (Some((a, _)), _) if сделано => Some(format!("{}...", a.human())),
+        (Some((a, _)), _) => Some(format!("hold: {}", a.human())),
+        (None, Some(_)) => Some("hold the button for a second".to_string()),
+        (None, None) => tray.notice_text().map(str::to_string),
+    };
+    let тревога_подсказки = держат.is_some() || state.зажим.щёлкнули().is_some();
     // Доля выезда — с той же сглаживающей кривой, что у карточки предпросмотра:
     // полка выезжает быстро и мягко тормозит у своего места.
     let выезд = crate::anim::ease_out_cubic(state.shelf_anim.clamp(0.0, 1.0));
@@ -10373,13 +10483,17 @@ fn build_tray_elements(
                     rounded_solid(&mut pool, &mut idx, x, y, w, h, 0, c, &mut els);
                 }
             }
-            // Взведённая кнопка питания подсвечена: видно, что следующий клик
-            // уже сработает.
-            CellKind::Power(a) if armed == Some(a) => {
-                rounded_solid(
-                    &mut pool, &mut idx, r.x, r.y, r.w, r.h, BAR_RADIUS() / 2,
-                    [0.95, 0.45, 0.30, 0.30], &mut els,
-                );
+            // Зажатая кнопка питания заливается снизу вверх, пока её держат.
+            CellKind::Power(a) if держат.is_some_and(|(д, _)| д == a) => {
+                let доля = держат.map(|(_, д)| д).unwrap_or(0.0).clamp(0.0, 1.0);
+                let fh = (r.h as f64 * доля).round() as i32;
+                if fh > 0 {
+                    let a = if сделано { 0.85 } else { 0.45 };
+                    rounded_solid(
+                        &mut pool, &mut idx, r.x, r.y + r.h - fh, r.w, fh,
+                        (BAR_RADIUS() / 2).min(fh / 2), [0.95, 0.45, 0.30, a], &mut els,
+                    );
+                }
             }
             _ => {}
         }
@@ -10438,7 +10552,7 @@ fn build_tray_elements(
                     PowerAction::Reboot => ("pwr-reboot", &REBOOT),
                     PowerAction::Sleep => ("pwr-sleep", &SLEEP),
                 };
-                let color = if armed == Some(a) { TRAY_WARN } else { TRAY_DIM };
+                let color = if держат.is_some_and(|(д, _)| д == a) { BAR_TEXT() } else { TRAY_DIM };
                 draw_mask(state, renderer, name, mask, POWER_W, r, BAR_H() * 3 / 5, color, &mut els);
             }
             CellKind::VolumeSlider => {}
@@ -10448,7 +10562,7 @@ fn build_tray_elements(
     // Подсказка под рядом: чем закончилась команда и, главное, что взведённая
     // кнопка ждёт второго клика.
     if let (Some(text), Some(panel)) = (hint, lay.panel) {
-        let color = if armed.is_some() { TRAY_WARN } else { TRAY_DIM };
+        let color = if тревога_подсказки { TRAY_WARN } else { TRAY_DIM };
         let w = crate::text::width(&text, 1);
         draw_text(
             state, renderer,

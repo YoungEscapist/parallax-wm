@@ -339,12 +339,18 @@ set{ gaps_in = 16, gaps_out = 18 }
 -- battery changes volume and brightness. The accent comes from the plx-wall
 -- wallpaper palette. popups = false brings back the old behaviour: clicking
 -- volume or battery opens the menu in the middle of the screen.
+--
+-- wifi and bluetooth are small icons with popouts for networks and devices
+-- (toggle, list, scan; right click on the icon flips the radio/adapter). power
+-- is a power icon in place of the shelf handle: sleep, reboot and power off by
+-- HOLDING (a second; the button fills up and a tone rises; let go early and
+-- nothing happens). sounds = false keeps the hold but silences it.
 -- bar{
 --   height = 34, top = 8, radius = 12, edge = 24, pad = 14, gap = 6,
 --   bg = "#0a0a12a6", fg = "#edf2fff5", dim = "#d9dff28c",
 --   clock = true, date = true, keyboard = true, volume = true,
 --   battery = true, tray = true, windows = true, tags = true,
---   popups = true,
+--   popups = true, wifi = true, bluetooth = true, power = true, sounds = true,
 -- }
 
 -- Blur behind the bar. Off: never watched live, see the description above.

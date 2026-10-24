@@ -64,6 +64,16 @@ pub struct Вид {
     /// подписи трея — см. всплывашки.rs). Выключены — щелчки по звуку и
     /// заряду снова открывают меню посреди экрана.
     pub popups: bool,
+    /// Значки вайфая и блютуза — по одному квадратику, у каждого своё
+    /// окошко. Без адаптера значка нет сам собой.
+    pub wifi: bool,
+    pub bluetooth: bool,
+    /// Значок питания в конце острова: окошко со сном, перезагрузкой и
+    /// выключением (зажатием, см. зажим.rs). Стоит на месте полосочки полки —
+    /// всё, что было в полке, теперь в окошках. Только при `popups`.
+    pub power: bool,
+    /// Звуки зажатия (см. звуки.rs).
+    pub sounds: bool,
 }
 
 impl Default for Вид {
@@ -87,6 +97,10 @@ impl Default for Вид {
             windows: true,
             tags: true,
             popups: true,
+            wifi: true,
+            bluetooth: true,
+            power: true,
+            sounds: true,
         }
     }
 }
@@ -98,6 +112,7 @@ static ВИД: std::sync::RwLock<Вид> = std::sync::RwLock::new(Вид {
     dim: [0.85, 0.87, 0.95, 0.55],
     clock: true, date: true, keyboard: true, volume: true,
     battery: true, tray: true, windows: true, tags: true, popups: true,
+    wifi: true, bluetooth: true, power: true, sounds: true,
 });
 
 /// Текущий вид панели. Отравленный замок (паника в чужом потоке) не повод
@@ -182,6 +197,14 @@ pub enum Cell {
     Tray(usize),
     /// Полосочка полки состояния: клик открывает и закрывает её.
     Handle,
+    /// Вайфай: значок-квадратик, дуги по уровню сигнала. Наведение — окошко
+    /// сетей, правый щелчок — радио.
+    Wifi,
+    /// Блютуз: руна. Наведение — окошко устройств, правый щелчок — адаптер.
+    Bluetooth,
+    /// Питание: окошко со сном, перезагрузкой и выключением. Стоит на месте
+    /// полосочки полки (см. `Вид::power`).
+    Power,
     /// Мультиюзер: код доступа и сколько гостей подключено. Средний клик —
     /// остановить раздачу.
     ///
@@ -291,6 +314,45 @@ pub struct Data {
     pub tray: usize,
     /// Мультиюзер: код доступа и число впущенных гостей. None — раздачи нет.
     pub share: Option<(String, usize)>,
+    /// Вайфай; None — значка нет (выключен в `bar{}` или нет адаптера).
+    pub wifi: Option<WifiCell>,
+    /// Блютуз; None — значка нет.
+    pub bluetooth: Option<BtCell>,
+    /// Значок питания вместо полосочки полки.
+    pub power: bool,
+}
+
+/// Что показывает значок вайфая.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WifiCell {
+    /// Радио включено.
+    pub enabled: bool,
+    /// Подключены к сети.
+    pub connected: bool,
+    /// Идёт подключение — дуги перебегают (см. `wifi_arcs`).
+    pub connecting: bool,
+    /// 0…100.
+    pub strength: u8,
+}
+
+/// Сколько дуг вайфая гореть: 1 из 3 при слабом сигнале, все при сильном.
+/// Пока подключаемся, дуги загораются по очереди — `фаза` идёт от часов.
+pub fn wifi_arcs(w: &WifiCell, фаза: f64) -> i32 {
+    if w.connecting {
+        return (фаза * 4.0).floor().rem_euclid(4.0) as i32;
+    }
+    if !w.enabled || !w.connected {
+        return 0;
+    }
+    1 + (w.strength as i32 / 34).min(2)
+}
+
+/// Что показывает значок блютуза.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BtCell {
+    pub powered: bool,
+    pub connected: usize,
+    pub discovering: bool,
 }
 
 /// Подпись чипа раздачи. Одна функция и для замера ширины, и для отрисовки —
@@ -408,6 +470,14 @@ pub fn layout(d: &Data) -> Layout {
     if !d.kb.is_empty() {
         right_cells.push((Cell::Kb, tws(&d.kb, TEXT)));
     }
+    // Вайфай и блютуз — голыми значками, без подписи: имя сети и список
+    // устройств живут в их окошках, а на панели хватает «есть/нет/сколько».
+    if d.wifi.is_some() {
+        right_cells.push((Cell::Wifi, DOT));
+    }
+    if d.bluetooth.is_some() {
+        right_cells.push((Cell::Bluetooth, DOT));
+    }
     if let Some((percent, _)) = d.volume {
         // Значок + проценты: значок квадратный со стороной в высоту строки.
         right_cells.push((Cell::Volume, DOT + gap() + tws(&percent_text(percent), TEXT)));
@@ -426,7 +496,11 @@ pub fn layout(d: &Data) -> Layout {
     if !right_cells.is_empty() {
         right_cells.push((Cell::Sep, SEP_W + gap() * 2));
     }
-    right_cells.push((Cell::Handle, handle_w));
+    if d.power {
+        right_cells.push((Cell::Power, DOT));
+    } else {
+        right_cells.push((Cell::Handle, handle_w));
+    }
 
     let right_inner: i32 = right_cells.iter().map(|(_, w)| *w).sum::<i32>()
         + gap() * (right_cells.len() as i32 - 1);
@@ -606,6 +680,25 @@ impl crate::state::Parallax {
             // на которой rustc ругается «found both … which look alike», а
             // человек не видит разницы вовсе.
             share: self.раздача_код_и_гостей(),
+            wifi: вид.wifi.then(|| self
+                .wifi_snapshot()
+                .filter(|s| s.present)
+                .map(|s| WifiCell {
+                    enabled: s.enabled,
+                    connected: s.ssid.is_some(),
+                    connecting: s.connecting,
+                    strength: s.strength,
+                })).flatten(),
+            bluetooth: вид.bluetooth.then(|| self
+                .bt
+                .as_ref()
+                .filter(|b| b.snap.adapter.is_some())
+                .map(|b| BtCell {
+                    powered: b.snap.powered,
+                    connected: b.snap.connected_count(),
+                    discovering: b.snap.discovering,
+                })).flatten(),
+            power: вид.power && вид.popups,
         }
     }
 
@@ -843,6 +936,19 @@ impl crate::state::Parallax {
             Cell::Share => {}
             // Заряд открывает меню питания: режимы и подсветка, как в GNOME.
             Cell::Battery => self.питание_меню(),
+            // Правый щелчок — радио и адаптер, как в полке; левый сюда
+            // доходит, только когда окошки выключены (`bar{ popups = false }`).
+            Cell::Wifi if right => {
+                let on = self.wifi_snapshot().is_some_and(|s| s.enabled);
+                self.wifi_send(crate::wifi::Cmd::Radio(!on));
+            }
+            Cell::Wifi => self.wifi_toggle_menu(),
+            Cell::Bluetooth if right => {
+                let on = self.bt.as_ref().is_some_and(|b| b.snap.powered);
+                self.bt_send(crate::bluetooth::Cmd::Power(!on));
+            }
+            Cell::Bluetooth => self.bt_toggle_menu(),
+            Cell::Power => self.tray_toggle(),
             Cell::Clock | Cell::Date | Cell::Sep | Cell::WindowsMore(_) => {}
         }
         self.request_redraw();
@@ -875,6 +981,9 @@ mod tests {
             battery: Some((85, true)),
             tray: 3,
             share: None,
+            wifi: Some(WifiCell { enabled: true, connected: true, connecting: false, strength: 70 }),
+            bluetooth: Some(BtCell { powered: true, connected: 1, discovering: false }),
+            power: true,
         }
     }
 
@@ -1047,10 +1156,47 @@ mod tests {
                 "иконки наехали: {:?} и {:?}", пара[0], пара[1],
             );
         }
-        // Полка — всегда последняя ячейка правого острова, за иконками.
-        let handle = l.cells.iter().find(|c| c.cell == Cell::Handle).expect("полка");
-        assert!(handle.rect.x > иконки.last().unwrap().x);
-        assert!(handle.rect.x + handle.rect.w <= l.right.x + l.right.w);
+        // Питание (а без окошек — полка) — всегда последняя ячейка правого
+        // острова, за иконками.
+        for (power, хвост) in [(true, Cell::Power), (false, Cell::Handle)] {
+            let l = layout(&Data { tray: 5, power, ..данные() });
+            let последняя = l.cells.iter().find(|c| c.cell == хвост).expect("хвост острова");
+            assert!(последняя.rect.x > иконки.last().unwrap().x);
+            assert!(последняя.rect.x + последняя.rect.w <= l.right.x + l.right.w);
+            let другой = if power { Cell::Handle } else { Cell::Power };
+            assert!(l.cells.iter().all(|c| c.cell != другой), "и полка, и питание сразу");
+        }
+    }
+
+    /// Вайфай и блютуз — квадратики в значок шириной, между раскладкой и
+    /// звуком; щелчок по ним попадает в них, а не в соседей.
+    #[test]
+    fn вайфай_и_блютуз_маленькие_и_свои() {
+        let l = layout(&данные());
+        let ячейка = |c: Cell| l.cells.iter().find(|i| i.cell == c).expect("ячейка").rect;
+        let (kb, wifi, bt, vol) = (ячейка(Cell::Kb), ячейка(Cell::Wifi), ячейка(Cell::Bluetooth), ячейка(Cell::Volume));
+        assert_eq!((wifi.w, bt.w), (DOT, DOT));
+        assert!(kb.x < wifi.x && wifi.x < bt.x && bt.x < vol.x, "порядок: {kb:?} {wifi:?} {bt:?} {vol:?}");
+        for (r, c) in [(wifi, Cell::Wifi), (bt, Cell::Bluetooth)] {
+            assert_eq!(l.hit((r.x + r.w / 2) as f64, (r.y + r.h / 2) as f64), Some(c));
+        }
+        // Без адаптеров — без значков и без дырок.
+        let без = layout(&Data { wifi: None, bluetooth: None, ..данные() });
+        assert!(без.cells.iter().all(|c| !matches!(c.cell, Cell::Wifi | Cell::Bluetooth)));
+        assert_eq!(l.right.w - без.right.w, (DOT + gap()) * 2);
+    }
+
+    /// Дуги вайфая: по уровню, ноль без сети, перебегают при подключении.
+    #[test]
+    fn дуги_вайфая() {
+        let w = |strength, connected| WifiCell { enabled: true, connected, connecting: false, strength };
+        assert_eq!(wifi_arcs(&w(10, true), 0.0), 1);
+        assert_eq!(wifi_arcs(&w(50, true), 0.0), 2);
+        assert_eq!(wifi_arcs(&w(90, true), 0.0), 3);
+        assert_eq!(wifi_arcs(&w(90, false), 0.0), 0);
+        let идёт = WifiCell { connecting: true, ..w(0, false) };
+        let кадры: Vec<i32> = (0..4).map(|i| wifi_arcs(&идёт, i as f64 * 0.25 + 0.01)).collect();
+        assert_eq!(кадры, vec![0, 1, 2, 3]);
     }
 
     /// Пустые модули не оставляют дырок: без раскладки, звука и заряда правый
@@ -1063,6 +1209,8 @@ mod tests {
             volume: None,
             battery: None,
             tray: 0,
+            wifi: None,
+            bluetooth: None,
             ..данные()
         }).right;
         assert!(пустой.w < полный.w, "остров не сжался: {} против {}", пустой.w, полный.w);

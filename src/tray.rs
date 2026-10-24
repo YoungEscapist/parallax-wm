@@ -27,8 +27,6 @@ const POLL: Duration = Duration::from_millis(2000);
 /// то есть он нужен всегда; но два файла в /sys ради процента, который за
 /// полминуты меняется на единицу, чаще читать незачем.
 const POLL_BG: Duration = Duration::from_secs(30);
-/// Сколько кнопка питания остаётся взведённой до второго клика.
-const ARM_TTL: Duration = Duration::from_secs(4);
 /// Сколько держим сообщение о результате команды.
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 
@@ -296,20 +294,10 @@ pub struct TrayUi {
     tx: mpsc::Sender<Cmd>,
     pub snap: Snapshot,
     pub open: bool,
-    /// Взведённая кнопка питания и когда её взвели: выключение и перезагрузку
-    /// делаем со второго клика. Один промах мимо шкалы громкости не должен
-    /// стоить человеку сеанса.
-    pub armed: Option<(PowerAction, Instant)>,
     notice: Option<(String, Instant)>,
 }
 
 impl TrayUi {
-    /// Взведена ли эта кнопка прямо сейчас (просроченные не считаются).
-    pub fn is_armed(&self, action: PowerAction) -> bool {
-        self.armed
-            .is_some_and(|(a, at)| a == action && at.elapsed() < ARM_TTL)
-    }
-
     pub fn notice_text(&self) -> Option<&str> {
         self.notice
             .as_ref()
@@ -324,7 +312,6 @@ impl crate::state::Parallax {
             tx,
             snap: Snapshot::default(),
             open: false,
-            armed: None,
             notice: None,
         });
     }
@@ -357,7 +344,6 @@ impl crate::state::Parallax {
     pub fn tray_toggle(&mut self) {
         let Some(tray) = self.tray.as_mut() else { return };
         tray.open = !tray.open;
-        tray.armed = None;
         let open = tray.open;
         self.tray_send(Cmd::Watch(open));
         // Вайфай и звук показывает полка, а спрашивают о них свои модули —
@@ -373,19 +359,30 @@ impl crate::state::Parallax {
         }
     }
 
-    /// Снять протухший взвод кнопки питания. `true` — что-то изменилось и
-    /// кадр надо перерисовать: без этого подсвеченная кнопка так и висела бы
-    /// на экране, хотя нажатие на неё уже не сработает (см. `is_armed`).
-    /// Зовётся из анимационного тика — он один тикает и на статичном экране.
-    pub fn tray_expire_armed(&mut self) -> bool {
-        let Some(tray) = self.tray.as_mut() else { return false };
-        match tray.armed {
-            Some((_, at)) if at.elapsed() >= ARM_TTL => {
-                tray.armed = None;
-                true
-            }
-            _ => false,
+    /// Выключить, перезагрузить или усыпить машину — тем же потоком полки,
+    /// откуда бы ни пришла команда (полка или окошко панели, см. зажим.rs).
+    pub fn tray_power(&self, action: PowerAction) {
+        if self.tray.is_none() {
+            tracing::warn!("plx/tray: no tray thread — {} is not possible", action.human());
         }
+        self.tray_send(Cmd::Power(action));
+    }
+
+    /// Кнопка питания полки под точкой (для зажатия: съехал курсор с кнопки —
+    /// зажатие сорвалось).
+    pub fn tray_power_at(&self, pos: smithay::utils::Point<f64, smithay::utils::Physical>) -> Option<PowerAction> {
+        let tray = self.tray.as_ref()?;
+        layout(
+            tray.open, tray.snap.battery.is_some(), self.screen_size().w, self.bar_hide,
+            self.shelf_anim,
+        )
+        .cells
+        .into_iter()
+        .find(|c| c.rect.hit(pos.x, pos.y))
+        .and_then(|c| match c.kind {
+            CellKind::Power(a) => Some(a),
+            _ => None,
+        })
     }
 
     /// Лежит ли точка на полке — тихий хит-тест для сенсорного экрана
@@ -423,12 +420,6 @@ impl crate::state::Parallax {
             return false;
         };
 
-        // Любой клик не по взведённой кнопке снимает взвод.
-        let armed = tray.armed;
-        if let Some(t) = self.tray.as_mut() {
-            t.armed = None;
-        }
-
         match cell.kind {
             // Меню большие и живут по центру экрана — полку под ними
             // закрываем, чтобы не спорили за клики.
@@ -458,15 +449,12 @@ impl crate::state::Parallax {
                 self.tray_set_open(false);
                 self.питание_меню();
             }
-            CellKind::Power(action) => {
-                let ready = armed.is_some_and(|(a, at)| a == action && at.elapsed() < ARM_TTL);
-                if ready {
-                    self.tray_send(Cmd::Power(action));
-                } else if let Some(t) = self.tray.as_mut() {
-                    t.armed = Some((action, Instant::now()));
-                    tracing::info!("plx/tray: {} — waiting for the second click", action.human());
-                }
+            // Сон, перезагрузка и выключение — зажатием (см. зажим.rs): правый
+            // щелчок по ним ничего не делает, как и раньше не делал.
+            CellKind::Power(action) if !right => {
+                self.зажим_начать(action, crate::зажим::Откуда::Полка);
             }
+            CellKind::Power(_) => {}
         }
         self.request_redraw();
         true

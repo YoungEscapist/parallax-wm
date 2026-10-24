@@ -42,6 +42,9 @@ const NM_IP6: &str = "org.freedesktop.NetworkManager.IP6Config";
 const POLL_IDLE: Duration = Duration::from_millis(2000);
 /// Опрос при открытом меню: список точек живой.
 const POLL_MENU: Duration = Duration::from_millis(1200);
+/// Опрос ради одного значка на панели: есть ли сеть и какой уровень. Значок
+/// висит всегда, а сеть меняется редко — чаще незачем.
+const POLL_BAR: Duration = Duration::from_secs(5);
 /// Как часто просить NM пересканировать эфир при открытом меню.
 const RESCAN: Duration = Duration::from_secs(10);
 const RETRY: Duration = Duration::from_secs(5);
@@ -98,8 +101,9 @@ pub enum Event {
 
 #[derive(Debug)]
 pub enum Cmd {
-    /// Опрашивать состояние: (полка открыта, меню открыто).
-    Watch { tray: bool, menu: bool },
+    /// Опрашивать состояние: полка открыта, меню (или окошко панели) открыто,
+    /// значок на панели есть.
+    Watch { tray: bool, menu: bool, bar: bool },
     Scan,
     Radio(bool),
     /// Подключиться. `psk` нужен только для защищённой сети без профиля.
@@ -126,13 +130,13 @@ pub fn spawn(to_plx: channel::Sender<Event>) -> Option<mpsc::Sender<Cmd>> {
 fn serve(to_plx: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
     let mut conn = zbus::blocking::Connection::system().ok();
     let mut last: Option<Snapshot> = None;
-    let (mut tray, mut menu) = (false, false);
+    let (mut tray, mut menu, mut bar) = (false, false, false);
     let mut next_poll = Instant::now();
     let mut next_scan = Instant::now();
     let mut next_retry = Instant::now() + RETRY;
 
     loop {
-        let watching = tray || menu;
+        let watching = tray || menu || bar;
         let cmd = if watching {
             match rx.recv_timeout(next_poll.saturating_duration_since(Instant::now())) {
                 Ok(cmd) => Some(cmd),
@@ -147,7 +151,7 @@ fn serve(to_plx: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
         };
 
         if let Some(cmd) = cmd {
-            if let Cmd::Watch { tray: t, menu: m } = cmd {
+            if let Cmd::Watch { tray: t, menu: m, bar: b } = cmd {
                 // Меню только что открыли — список надо показать сразу, а не
                 // через секунду, и сразу же попросить свежий скан.
                 if m && !menu {
@@ -155,6 +159,7 @@ fn serve(to_plx: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
                 }
                 tray = t;
                 menu = m;
+                bar = b;
                 last = None;
             } else if let Some(c) = conn.as_ref() {
                 match &cmd {
@@ -181,7 +186,7 @@ fn serve(to_plx: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
                 let _ = to_plx.send(Event::Notice("NetworkManager is not available".into()));
             }
             next_poll = Instant::now();
-            if !(tray || menu) {
+            if !(tray || menu || bar) {
                 continue;
             }
         }
@@ -206,7 +211,13 @@ fn serve(to_plx: channel::Sender<Event>, rx: mpsc::Receiver<Cmd>) {
 
         match read_state(c, menu) {
             Some(snap) => {
-                next_poll = Instant::now() + if menu { POLL_MENU } else { POLL_IDLE };
+                next_poll = Instant::now() + if menu {
+                    POLL_MENU
+                } else if tray {
+                    POLL_IDLE
+                } else {
+                    POLL_BAR
+                };
                 if last.as_ref() != Some(&snap) {
                     last = Some(snap.clone());
                     if to_plx.send(Event::State(snap)).is_err() {
@@ -757,6 +768,9 @@ impl crate::state::Parallax {
             форма: None,
             ждём: None,
         });
+        // Значок на панели нужен с первого кадра — без этого поток спал бы
+        // до первого открытия полки, и значка не было бы вовсе.
+        self.wifi_sync_watch();
     }
 
     pub fn handle_wifi_event(&mut self, event: Event) {
@@ -1008,8 +1022,10 @@ impl crate::state::Parallax {
     /// него кто-то смотрит.
     pub fn wifi_sync_watch(&mut self) {
         let tray = self.tray_open();
-        let menu = self.wifi_menu_open();
-        self.wifi_send(Cmd::Watch { tray, menu });
+        // Окошко панели показывает тот же список сетей, что и меню.
+        let menu = self.wifi_menu_open() || self.всплывашка.следит_вайфай();
+        let bar = crate::bar::вид().wifi;
+        self.wifi_send(Cmd::Watch { tray, menu, bar });
     }
 
     pub fn wifi_toggle_menu(&mut self) {
@@ -1035,6 +1051,13 @@ impl crate::state::Parallax {
             self.wifi_send(Cmd::Disconnect);
             return;
         }
+        self.wifi_connect_ap(ap);
+    }
+
+    /// Подключиться к сети: известную поднять, к незнакомой защищённой —
+    /// форма с паролем (меню открывается само), к открытой — сразу. Общая для
+    /// меню и окошка панели (всплывашки.rs).
+    pub fn wifi_connect_ap(&mut self, ap: Ap) {
         // Незнакомая защищённая сеть — форма с фокусом на том, что нужно
         // ввести: пароль, а у Enterprise — identity (см. wifi_form.rs).
         if ap.secure && !ap.saved && !ap.owe {

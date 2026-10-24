@@ -1563,7 +1563,10 @@ impl Parallax {
                 || self.minimap_follow != self.minimap_center_target
             ))
             || self.portal_cast.is_some()
-            || self.tray.as_ref().is_some_and(|t| t.armed.is_some())
+            // Кнопку питания держат: заливка растёт или стекает (зажим.rs).
+            || self.зажим_занят()
+            // Значок вайфая на панели перебирает дуги, пока идёт подключение.
+            || (crate::bar::вид().wifi && self.wifi_snapshot().is_some_and(|w| w.connecting))
             // Полка выезжает из-под панели или уезжает обратно.
             || self.shelf_anim != if self.tray.as_ref().is_some_and(|t| t.open) { 1.0 } else { 0.0 }
             // Карточка предпросмотра раскрывается или сворачивается. Держит её
@@ -1636,14 +1639,6 @@ pub fn tick(state: &mut Parallax) {
             state.палитра_обоев = Some(п);
             dirty = true;
         }
-    }
-
-    // Взвод кнопки питания в полке протухает по времени, а не по событию, —
-    // снять его больше некому: на статичном экране других тиков нет. Кадр
-    // просим напрямую: камеры это не касается, а `dirty` тянет за собой
-    // apply_camera.
-    if state.tray_expire_armed() {
-        state.request_redraw();
     }
 
     // Реальный dt, а не фиксированные 16мс: тик зовут и 60Гц-таймер из main.rs,
@@ -2148,6 +2143,11 @@ pub fn tick(state: &mut Parallax) {
     // Кадр — напрямую, как у взвода кнопки выше: `dirty` тянет apply_camera,
     // а камеры окошко не касается.
     if state.всплывашка_тик(dt) {
+        state.request_redraw();
+    }
+    // Зажатие сна, перезагрузки и выключения: заливка, звон, сама команда
+    // (зажим.rs). Тоже мимо `dirty` — камеры не касается.
+    if state.зажим_тик(dt) {
         state.request_redraw();
     }
 

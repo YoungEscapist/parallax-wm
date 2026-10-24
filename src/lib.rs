@@ -27,6 +27,12 @@ mod bar;
 /// раскладка, подписи трея (как popout'ы шеллов на Quickshell).
 #[path = "всплывашки.rs"]
 mod всплывашки;
+/// Зажатие для сна, перезагрузки и выключения: заливка кнопки и команда.
+#[path = "зажим.rs"]
+mod зажим;
+/// Звуки интерфейса, посчитанные на месте (тон зажатия, звоны).
+#[path = "звуки.rs"]
+mod звуки;
 mod blur;
 mod bluetooth;
 mod canvas;
@@ -455,10 +461,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // BlueZ живёт на СИСТЕМНОЙ шине, поэтому поток поднимается независимо от
     // сессионной (её может и не быть): меню устройств и автоподключение
     // работают даже в сессии, запущенной без dbus-run-session. См. bluetooth.rs.
+    //
+    // В харнессе — только по `PLX_HEADLESS_BT=1`, и ставить её можно лишь
+    // вместе со СВОЕЙ системной шиной (DBUS_SYSTEM_BUS_ADDRESS на поддельный
+    // BlueZ): на настоящей автоподключение подняло бы адаптер живой машины и
+    // увело бы её наушники.
     {
         use smithay::reexports::calloop::channel;
         let (to_plx, from_bt) = channel::channel::<crate::bluetooth::Event>();
-        if let Some(tx) = (!headless).then(|| crate::bluetooth::spawn(to_plx)).flatten() {
+        let блютуз = !headless || std::env::var_os("PLX_HEADLESS_BT").is_some();
+        if let Some(tx) = блютуз.then(|| crate::bluetooth::spawn(to_plx)).flatten() {
             let autoconnect = state.lua_config.bluetooth_autoconnect;
             state.init_bluetooth(tx, autoconnect);
             event_loop.handle().insert_source(from_bt, |event, _, state| {
