@@ -343,8 +343,8 @@ set{ gaps_in = 16, gaps_out = 18 }
 -- wifi and bluetooth are small icons with popouts for networks and devices
 -- (toggle, list, scan; right click on the icon flips the radio/adapter). power
 -- is a power icon in place of the shelf handle: sleep, reboot and power off by
--- HOLDING (a second; the button fills up and a tone rises; let go early and
--- nothing happens). sounds = false keeps the hold but silences it.
+-- HOLDING (a second; the button fills up while soft notes climb; let go early
+-- and nothing happens). sounds = false keeps the hold but silences it.
 -- bar{
 --   height = 34, top = 8, radius = 12, edge = 24, pad = 14, gap = 6,
 --   bg = "#0a0a12a6", fg = "#edf2fff5", dim = "#d9dff28c",
@@ -511,10 +511,12 @@ set{ intro = true }
 -- The notification sound: a short tone on every popup — parallax hears them
 -- itself, on the session bus, so the notification daemon can be any (mako,
 -- dunst, your own).
---   notify_sound  — path to a file; empty = the built-in tone (a soft glassy
---                   one, CC0, see assets/sounds/README.md), "off" = silence.
---                   Two more sit next to the built-in one: notify-cloud.ogg is
---                   warmer, notify-polite.ogg is three quiet wooden clicks.
+--   notify_sound  — path to a file; empty = the built-in tone (two soft
+--                   mallet notes, made in code), "off" = silence. Three more
+--                   are in assets/sounds/ (CC0, see the README there):
+--                   notify-glass.ogg is a long glassy chime (the old default),
+--                   notify-cloud.ogg is warmer, notify-polite.ogg is three
+--                   quiet wooden clicks.
 --   notify_volume — loudness, 0.0…1.0.
 -- An application that asked for silence with the suppress-sound hint (music
 -- players on a track change) will not sound.

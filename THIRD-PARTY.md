@@ -157,8 +157,9 @@ binary by `src/text.rs`. Copyright 2014 The Nunito Project Authors
 
 `assets/sounds/notify-*.ogg`, from
 [akx/Notifications](https://github.com/akx/Notifications), used under CC0 1.0
-(public domain dedication). `notify-glass.ogg` is compiled into the binary by
-`src/notify.rs`. Details in [assets/sounds/README.md](assets/sounds/README.md).
+(public domain dedication). None of them is compiled into the binary — the
+built-in tone is synthesised in `src/звуки.rs`; these are optional files for
+`notify_sound`. Details in [assets/sounds/README.md](assets/sounds/README.md).
 
 ### Cover art
 
