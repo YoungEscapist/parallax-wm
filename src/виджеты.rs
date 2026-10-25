@@ -79,11 +79,19 @@ impl Parallax {
         };
 
         let плавает = правило.float || правило.widget;
+        // Окно, которое всплыло плавающим только по правилу и без места,
+        // ставим посередине. Без этого оно оставалось там, куда его успела
+        // положить раскладка до того, как пришёл app_id: в тайлинге — в
+        // левый верхний угол слота, под панелью; во Float — у центра по
+        // ПРЕДСКАЗАННОМУ размеру (полэкрана), то есть со сдвигом. Плававшее
+        // и до правила (диалог, повторный app_id) не трогаем.
+        let по_центру;
         if let Some(tw) = self
             .tagged_windows
             .iter_mut()
             .find(|tw| crate::dwindle::same_window(&tw.window, window))
         {
+            по_центру = плавает && место.is_none() && !tw.floating;
             tw.виджет = правило.widget;
             if плавает {
                 tw.floating = true;
@@ -110,6 +118,12 @@ impl Parallax {
         if let Some(место) = место {
             self.space.map_element(window.clone(), место, false);
         }
+        // Wayland-клиент говорит app_id раньше первого буфера: размера ещё
+        // нет, центрировать нечего — тогда на первом кадре (см. commit в
+        // handlers/compositor.rs).
+        if по_центру && !self.поставить_по_центру(window) {
+            self.по_центру_на_первом_кадре.push(window.clone());
+        }
         if правило.widget {
             self.опустить_виджеты();
             // Виджет фокус не берёт: `insert_new_window` отдал его новому окну
@@ -134,6 +148,45 @@ impl Parallax {
             место,
             размер,
         );
+    }
+
+    /// Поставить плавающее окно посередине того, что сейчас на экране: рамки
+    /// плавающих поверх тайлинга либо кадра камеры (Float, лента). `false` —
+    /// размер окна ещё неизвестен (первого буфера не было).
+    pub fn поставить_по_центру(&mut self, window: &Window) -> bool {
+        let размер = window.geometry().size;
+        if размер.w <= 0 || размер.h <= 0 {
+            return false;
+        }
+        let рамка = self.рамка_плавающих();
+        let кадр = рамка.unwrap_or_else(|| self.visible_canvas_rect());
+        let mut место = Point::from((
+            кадр.loc.x + (кадр.size.w - размер.w) / 2,
+            кадр.loc.y + (кадр.size.h - размер.h) / 2,
+        ));
+        // Над тайлингом окно обязано целиком влезать в рамку (см.
+        // `удержать_на_экране`); холст Float бесконечный, там жать некуда.
+        if let Some(рамка) = рамка {
+            место = crate::tiling::зажать_в_рамку(рамка, место, размер);
+        }
+        if let Some(tw) = self
+            .tagged_windows
+            .iter_mut()
+            .find(|tw| crate::dwindle::same_window(&tw.window, window))
+        {
+            tw.position = место;
+            tw.float_position = место;
+        }
+        self.space.map_element(window.clone(), место, false);
+        self.request_redraw();
+        tracing::info!(
+            "plx/widget: {:?} centred at {:?} ({}x{})",
+            crate::xwin::app_id(window),
+            место,
+            размер.w,
+            размер.h,
+        );
+        true
     }
 
     /// Окно помечено виджетом?

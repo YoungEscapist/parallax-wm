@@ -841,6 +841,10 @@ pub struct Parallax {
     pub фон_побудка: Option<std::time::Instant>,
     /// Анимации появления новых окон "с ростом" (Float-режим).
     pub window_open_anims: Vec<(Window, crate::anim::OpenAnim)>,
+    /// Окна, которые правило `window{ float = true }` без x/y сделало
+    /// плавающими раньше первого кадра: встанут посередине, как только станет
+    /// известен их настоящий размер (см. `Parallax::применить_правила`).
+    pub по_центру_на_первом_кадре: Vec<Window>,
     /// Плавная смена РАЗМЕРА окна в кадре (см. `anim::SizeAnim`): настоящий
     /// размер клиенту отправлен сразу, а картинка едет пружиной вслед за
     /// позицией. Заводится там же, где раскладка двигает окно, —
@@ -1712,6 +1716,7 @@ impl Parallax {
             фон_побудка: None,
             wallpaper_damage: Default::default(),
             window_open_anims: Vec::new(),
+            по_центру_на_первом_кадре: Vec::new(),
             window_size_anims: Vec::new(),
             живой_размер: Vec::new(),
             decor: crate::decor::DecorCache::new(),

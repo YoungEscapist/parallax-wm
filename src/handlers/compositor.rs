@@ -64,16 +64,19 @@ impl CompositorHandler for Parallax {
             }
         }
 
-        if let Some(window) = self
+        let window = self
             .space
             .elements()
             .find(|w| crate::xwin::is_surface(w, surface))
-            .cloned()
-        {
+            .cloned();
+        if let Some(window) = window {
             window.on_commit();
             // trace!: срабатывает на каждый commit каждого клиента — у
             // анимированного окна это десятки строк в секунду в горячем пути.
             tracing::trace!("plx: commit for mapped window");
+            if self.по_центру_на_первом_кадре.contains(&window) && self.поставить_по_центру(&window) {
+                self.по_центру_на_первом_кадре.retain(|w| w != &window);
+            }
         }
 
         // Эластичное расталкивание соседей при ресайзе — ТОЛЬКО в режиме

@@ -707,6 +707,7 @@ impl Parallax {
         // Иначе анимации продолжат слать configure/map_element мёртвому окну.
         self.window_pos_anims.retain(|(w, _)| w != window);
         self.window_open_anims.retain(|(w, _)| w != window);
+        self.по_центру_на_первом_кадре.retain(|w| w != window);
         // Из BSP-деревьев окно убираем ЯВНО: дерево неактивного тега само
         // синхронизируется только когда на этот тег переключатся, а до тех пор
         // держало бы мёртвый Window живым (см. dwindle.rs, sync_dwindle_tree).
