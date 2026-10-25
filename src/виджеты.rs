@@ -136,15 +136,25 @@ impl Parallax {
                 self.снять_фокус_с_виджета(window);
             }
         }
+        // «Поверх» держится не подъёмом после каждого фокуса, а местом в
+        // стопке: `Space` при каждой вставке сортирует окна по z_index, так что
+        // окно выше Shell не перекроют ни raise_element от фокуса, ни
+        // map_element раскладок (а их по коду десятки). Порядок в стопке — это
+        // и кадр, и хит-тест (см. «Z-порядок» вверху файла).
+        if правило.above {
+            window.override_z_index(smithay::desktop::space::RenderZindex::Shell as u8 + 1);
+            self.space.raise_element(window, false);
+        }
         if плавает || размер.is_some() || место.is_some() {
             self.arrange();
         }
         self.request_redraw();
         tracing::info!(
-            "plx/widget: rule applied to app_id={:?} widget={} float={} pos={:?} size={:?}",
+            "plx/widget: rule applied to app_id={:?} widget={} float={} above={} pos={:?} size={:?}",
             crate::xwin::app_id(window),
             правило.widget,
             плавает,
+            правило.above,
             место,
             размер,
         );
@@ -177,6 +187,10 @@ impl Parallax {
             tw.position = место;
             tw.float_position = место;
         }
+        // Окно успело встать в раскладку до правила, и анимация въезда в слот
+        // ещё идёт: не сняв её, следующие тики увозили окно из центра обратно
+        // в угол слота (замер 25.10: 696 → 980 → 968,26 за полсекунды).
+        self.freeze_window_anim(window);
         self.space.map_element(window.clone(), место, false);
         self.request_redraw();
         tracing::info!(

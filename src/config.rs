@@ -420,6 +420,10 @@ pub struct ПравилоОкна {
     /// `widget = true` подразумевает `float = true`: прибитое окно в раскладке
     /// участвовать не может.
     pub float: bool,
+    /// Всегда поверх обычных окон. Нужно лаунчеру обычным окном (okno): с
+    /// sloppy focus стоило увести курсор на соседа — и сосед, получив фокус,
+    /// поднимался и накрывал лаунчер целиком.
+    pub above: bool,
 }
 
 impl ПравилоОкна {
@@ -2303,6 +2307,7 @@ pub fn load_from_str(source: &str) -> mlua::Result<Config> {
                 w: число("w").or_else(|| число("width")),
                 h: число("h").or_else(|| число("height")),
                 float: tbl.get::<bool>("float").unwrap_or(false),
+                above: tbl.get::<bool>("above").unwrap_or(false),
             };
             if правило.app_id.is_none() && правило.title.is_none() {
                 tracing::warn!("plx/config: window{{}} without app_id/title — skipped");

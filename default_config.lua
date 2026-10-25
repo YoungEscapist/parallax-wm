@@ -1055,7 +1055,11 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 --                    Super+F search and of the taskbar chips. This is what a
 --                    desktop widget is: a clock, a system monitor, a calendar.
 --                    Implies float = true — a pinned window cannot be tiled.
---   float          — floating, but ordinary (same as toggle_floating at birth)
+--   float          — floating, but ordinary (same as toggle_floating at birth);
+--                    without x/y it opens in the middle of the screen
+--   above          — always above ordinary windows: focusing another window
+--                    (focus follows the mouse) no longer buries it. For a
+--                    launcher that is a normal window, like okno
 --   x, y           — where to put it, in CANVAS coordinates (not screen ones)
 --   w, h           — size in logical pixels; one side alone keeps the other
 --
