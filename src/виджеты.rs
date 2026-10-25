@@ -142,7 +142,8 @@ impl Parallax {
         // map_element раскладок (а их по коду десятки). Порядок в стопке — это
         // и кадр, и хит-тест (см. «Z-порядок» вверху файла).
         if правило.above {
-            window.override_z_index(smithay::desktop::space::RenderZindex::Shell as u8 + 1);
+            window.override_z_index(crate::fullscreen::Z_ПОВЕРХ);
+            self.полный_экран_под_поверх();
             self.space.raise_element(window, false);
         }
         if плавает || размер.is_some() || место.is_some() {

@@ -1059,7 +1059,10 @@ monitor{ name = "HDMI-A-1", x = 320, y = 1080 }
 --                    without x/y it opens in the middle of the screen
 --   above          — always above ordinary windows: focusing another window
 --                    (focus follows the mouse) no longer buries it. For a
---                    launcher that is a normal window, like okno
+--                    launcher that is a normal window, like okno. Against a
+--                    fullscreen window the newer one wins: a game started from
+--                    the launcher covers it, a launcher opened over a game
+--                    stays above it
 --   x, y           — where to put it, in CANVAS coordinates (not screen ones)
 --   w, h           — size in logical pixels; one side alone keeps the other
 --

@@ -37,7 +37,7 @@
 //! кладём в ячейку его стола (`tag_cameras`), откуда его достанет view_tag.
 
 use smithay::{
-    desktop::Window,
+    desktop::{Window, space::{RenderZindex, SpaceElement}},
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{IsAlive, Logical, Point, Rectangle, Size},
 };
@@ -45,6 +45,14 @@ use smithay::{
 use std::time::Duration;
 
 use crate::state::Parallax;
+
+/// Место в стопке окна с `window{ above = true }`: выше обычных окон (Shell).
+pub const Z_ПОВЕРХ: u8 = RenderZindex::Shell as u8 + 1;
+/// Развёрнутое на весь экран — выше даже них, но только пока оно новее: кто
+/// появился позже, тот и сверху. Иначе лаунчер, оставленный открытым
+/// (okno keep-open), висел бы поверх запущенной из него игры, а открытый
+/// поверх игры — прятался бы под неё, стоило курсору съехать на игру.
+const Z_ПОЛНЫЙ_ЭКРАН: u8 = RenderZindex::Shell as u8 + 2;
 
 /// Сколько ждём от клиента кадр во весь экран, прежде чем переключить холст
 /// без него. Верхняя граница на случай клиента, который наш размер не примет
@@ -64,6 +72,8 @@ pub struct Fullscreen {
     /// Камера и зум до входа — кадр ТОГО стола, на котором окно развернули.
     prev_cam: (f64, f64),
     prev_zoom: f64,
+    /// Место в стопке до входа (см. `Z_ПОЛНЫЙ_ЭКРАН`).
+    prev_z: u8,
     /// Пока `Some` — клиенту размер уже отправлен, но кадра нужного размера от
     /// него ещё не было, и холст мы не трогали. Внутри — крайний срок ожидания.
     pending: Option<std::time::Instant>,
@@ -400,6 +410,7 @@ impl Parallax {
             prev_pinned,
             prev_cam,
             prev_zoom,
+            prev_z: window.z_index(),
             pending: Some(std::time::Instant::now() + WAIT_FOR_BUFFER),
         });
 
@@ -601,6 +612,11 @@ impl Parallax {
         };
         let loc = Point::<i32, Logical>::from((cam_x.round() as i32, cam_y.round() as i32));
 
+        // Новее всех окон `above` — значит, выше них (см. `Z_ПОЛНЫЙ_ЭКРАН`).
+        // Стопку пересортирует map_element ниже, а у окна чужого стола —
+        // его возвращение в space при переходе на стол.
+        window.override_z_index(Z_ПОЛНЫЙ_ЭКРАН);
+
         if let Some(tw) = self.tagged_windows.iter_mut().find(|tw| &tw.window == window) {
             tw.position = loc;
         }
@@ -731,6 +747,7 @@ impl Parallax {
             tw.float_pinned = fs.prev_pinned;
             tw.position = fs.prev_loc;
         }
+        window.override_z_index(fs.prev_z);
         let свой_стол = self.window_here(&window);
         if свой_стол {
             self.space.map_element(window.clone(), fs.prev_loc, true);
@@ -786,6 +803,20 @@ impl Parallax {
         self.arrange();
         self.request_redraw();
         tracing::info!("plx/fullscreen: leaving fullscreen");
+    }
+
+    /// Открылось окно `above` (лаунчер): развёрнутые раньше опускаются на своё
+    /// прежнее место в стопке, и оно встаёт над ними — лаунчер, открытый
+    /// поверх игры, видно, и он не прячется под неё от sloppy focus.
+    pub fn полный_экран_под_поверх(&mut self) {
+        for f in &self.fullscreens {
+            if f.window.z_index() == Z_ПОЛНЫЙ_ЭКРАН {
+                f.window.override_z_index(f.prev_z);
+                // Space сортирует по z_index только при вставке. Окна чужого
+                // стола в space нет — raise_element его просто не найдёт.
+                self.space.raise_element(&f.window, false);
+            }
+        }
     }
 
     /// Окно закрылось: если это оно было развёрнуто, снимаем режим, не трогая
