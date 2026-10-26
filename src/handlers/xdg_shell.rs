@@ -122,9 +122,18 @@ impl XdgShellHandler for Parallax {
             }
             return;
         }
-        // Виджет руками не двигается (см. виджеты.rs), развёрнутое окно — тоже:
-        // его место держит договор полного экрана.
-        if self.виджет_ли(&window) || self.fullscreen_requested(&window) {
+        // Виджет не двигается ни Super+мышью, ни жестом, но САМ попросить о
+        // переносе может: его тянут за тело (виджет TuiMus). Свой хват — без
+        // раскладок и подъёма наверх (см. «Перенос» в виджеты.rs).
+        if self.виджет_ли(&window) {
+            if let Some(grab) = self.начать_перенос_виджета(window, start_data) {
+                pointer.set_grab(self, grab, serial, Focus::Clear);
+            }
+            return;
+        }
+        // Развёрнутое окно руками не двигается: его место держит договор
+        // полного экрана.
+        if self.fullscreen_requested(&window) {
             return;
         }
         let Some(loc) = self.space.element_location(&window) else { return };

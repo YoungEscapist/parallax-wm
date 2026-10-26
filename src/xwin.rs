@@ -410,6 +410,13 @@ pub fn focus(state: &mut Parallax, window: &Window) {
         crate::mine::игру_наверх(state);
         return;
     }
+    // Виджет фокус не берёт и наверх не поднимается (см. виджеты.rs): иначе
+    // курсор, проехавший над ним, через sloppy focus уводил бы клавиатуру у
+    // окна, в котором печатают, и вытаскивал виджет поверх окон. Щелчки и
+    // наведение до виджета доходят и без фокуса — их несёт указатель.
+    if state.виджет_ли(window) {
+        return;
+    }
     let serial = smithay::utils::SERIAL_COUNTER.next_serial();
     state.space.raise_element(window, true);
     // Меню и тултипы обязаны остаться поверх своего окна. raise_element выше
@@ -615,6 +622,7 @@ impl Parallax {
                 // и решать по нему здесь было бы гаданием (см.
                 // `Parallax::применить_правила`).
                 виджет: false,
+                без_декора: false,
             },
         );
 
@@ -767,7 +775,7 @@ impl Parallax {
             None => (geo, geo.to_f64()),
         };
         let окно = window.clone();
-        let стекло = self.lua_config.blur && has_transparency(window);
+        let стекло = self.lua_config.blur && !self.без_декора(window) && has_transparency(window);
         let уход = crate::udev::with_primary_renderer(self, |_state, renderer| {
             crate::close::снять(renderer, &окно, rect, холст, стекло, crate::anim::дуг::закрытие_окна())
         });

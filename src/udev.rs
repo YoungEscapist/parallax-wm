@@ -2715,8 +2715,8 @@ fn build_shadow_elements(
         if state.is_fullscreen(&window) {
             continue;
         }
-        // Наклонённое окно — без тени (см. наклон.rs).
-        if state.наклон_окна(&window).is_some() {
+        // Наклонённое окно — без тени (см. наклон.rs); `decor = false` — тоже.
+        if state.наклон_окна(&window).is_some() || state.без_декора(&window) {
             continue;
         }
         let Some((x0, y0raw, w, h)) = window_screen_rect(state, &window) else { continue };
@@ -2852,7 +2852,9 @@ fn build_halo_elements(
         // У окна, развёрнутого в 3D (`flip3d`), тени нет: она плоский
         // прямоугольник, приклеенный к экрану, и под повёрнутым окном выдала бы
         // обман в первом же кадре — ровно тот же довод, что у теней при кубе.
-        if state.разворот_окна(&window).is_some() || state.наклон_окна(&window).is_some() {
+        if state.разворот_окна(&window).is_some() || state.наклон_окна(&window).is_some()
+            || state.без_декора(&window)
+        {
             continue;
         }
         let Some((x0, y0, w, h)) = window_screen_rect(state, &window) else { continue };
@@ -6722,7 +6724,13 @@ pub fn собрать_элементы(
                     let (x0, y0) = в_кадре(geo.loc.x as f64, geo.loc.y as f64);
                     let w = size.w as f64 * масштаб.0;
                     let h = size.h as f64 * масштаб.1;
-                    let r = (радиус_лог as f64 * масштаб_1).min(w / 2.0).min(h / 2.0);
+                    // `decor = false` — углы как есть: прозрачному виджету
+                    // скругление срезало бы буквы у краёв.
+                    let r = if state.без_декора(&window) {
+                        0.0
+                    } else {
+                        (радиус_лог as f64 * масштаб_1).min(w / 2.0).min(h / 2.0)
+                    };
                     // Порог «мельче двух радиусов не скругляем» — только для
                     // обычного (не режущего) случая: жёсткая обрезка обязана
                     // сработать, даже если дуга по углам вышла бы нулевой.
@@ -6826,6 +6834,7 @@ pub fn собрать_элементы(
             if state.lua_config.blur
                 && state.стекло.is_some()
                 && !state.overview_active
+                && !state.без_декора(&window)
                 && crate::xwin::has_transparency(&window)
             {
                 let размер = рамка;
