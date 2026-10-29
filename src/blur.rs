@@ -147,6 +147,9 @@ pub enum Сцена {
     Мозаика {
         программа: GlesTexProgram,
         раскладка: crate::плитка_обоев::Раскладка,
+        /// Плитки big picture поверх: текстура, место на экране, альфа (см.
+        /// src/большие_обои.rs).
+        поверх: Vec<(GlesTexture, Rectangle<i32, Physical>, f32)>,
     },
 }
 
@@ -236,7 +239,7 @@ impl Блюр {
             frame.clear(smithay::backend::renderer::Color32F::BLACK, &[полный]).ok()?;
             let к = УЖАТИЕ as f64;
             match сцена {
-                Сцена::Мозаика { программа, раскладка } => {
+                Сцена::Мозаика { программа, раскладка, поверх } => {
                     // Та же раскладка, ужатая в УЖАТИЕ раз: экран, плитка и
                     // угол — всё в пикселях маленького буфера.
                     let р = crate::плитка_обоев::Раскладка {
@@ -248,6 +251,23 @@ impl Блюр {
                         исходник, src_full, полный, &[полный], &[], Transform::Normal, 1.0,
                         Some(&программа), &р.uniforms(),
                     ).ok()?;
+                    for (текстура, место, альфа) in поверх {
+                        let dst = Rectangle::<i32, Physical>::new(
+                            Point::from(((место.loc.x as f64 / к).round() as i32, (место.loc.y as f64 / к).round() as i32)),
+                            Size::from((
+                                (место.size.w as f64 / к).round().max(1.0) as i32,
+                                (место.size.h as f64 / к).round().max(1.0) as i32,
+                            )),
+                        );
+                        let Some(видно) = dst.intersection(полный) else { continue };
+                        let src = Rectangle::<f64, BufferCoords>::from_size(Size::from((
+                            текстура.width() as f64,
+                            текстура.height() as f64,
+                        )));
+                        frame.render_texture_from_to(
+                            &текстура, src, dst, &[видно], &[], Transform::Normal, альфа, None, &[],
+                        ).ok()?;
+                    }
                 }
                 Сцена::Плитки(плитки) if плитки.is_empty() => {
                     frame.render_texture_from_to(

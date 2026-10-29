@@ -4274,6 +4274,13 @@ fn wallpaper_cycle_for(
     картинка: (i32, i32),
     экран: (i32, i32),
 ) -> Option<crate::плитка_обоев::Раскладка> {
+    // В big picture период — НАСТОЯЩИЙ размер картинки, а текстура слоя
+    // только её обзор: шейдер берёт её долями, так что обзор растягивается до
+    // настоящего размера сам (см. src/большие_обои.rs).
+    let картинка = state
+        .обои_большие
+        .as_ref()
+        .map_or(картинка, |б| (б.описание.w as i32, б.описание.h as i32));
     let дом = state.монитор_дом();
     crate::плитка_обоев::Раскладка::new(
         (
@@ -4302,13 +4309,13 @@ fn картинка_негодна(картинка: (i32, i32)) -> bool {
 /// Режим cycle отдаёт не места, а раскладку плиток для того же шейдера,
 /// которым рисуется кадр (`blur::Сцена::Мозаика`).
 fn wallpaper_screen_place(
-    state: &Parallax,
+    state: &mut Parallax,
     renderer: &mut GlesRenderer,
     output: &Output,
     экран: Size<i32, Physical>,
 ) -> crate::blur::Сцена {
     use crate::blur::Сцена;
-    if !state.lua_config.infinite_wallpaper && !state.обои_цикл {
+    if !state.lua_config.infinite_wallpaper && !state.обои_плиткой() {
         return Сцена::Плитки(Vec::new());
     }
     // Слой берём тот же, что и сам кадр (`build_wallpaper_backdrop`): свой у
@@ -4325,13 +4332,23 @@ fn wallpaper_screen_place(
     // Размер — по ПОВЕРХНОСТИ, ровно как в build_wallpaper_backdrop, и отсчёт
     // от ДОМА своего монитора: оба расчёта обязаны совпадать до пикселя.
     let размер = вид.dst;
-    if state.обои_цикл {
+    if state.обои_плиткой() {
         use smithay::backend::renderer::Texture as _;
         let раскладка = wallpaper_cycle_for(
             state, output, (текстура.width() as i32, текстура.height() as i32), (экран.w, экран.h),
         );
-        if let (Some(раскладка), Some(шейдер)) = (раскладка, state.обои_цикл_шейдер.as_ref()) {
-            return Сцена::Мозаика { программа: шейдер.программа().clone(), раскладка };
+        if let (Some(раскладка), Some(программа)) =
+            (раскладка, state.обои_цикл_шейдер.as_ref().map(|ш| ш.программа().clone()))
+        {
+            // Плитки big picture размываются вместе с обзором: под окном с
+            // блюром иначе лежала бы мутная растянутая копия. Сразу в полную
+            // силу, без проявления: ключ кэша блюра меняется с заливкой
+            // плитки, а не с её альфой, и полупрозрачная так бы и осталась.
+            let поверх = куски_больших_обоев(state, &раскладка)
+                .into_iter()
+                .map(|к| (к.текстура, к.место, 1.0))
+                .collect();
+            return Сцена::Мозаика { программа, раскладка, поверх };
         }
     }
     let дом = state.монитор_дом();
@@ -5220,7 +5237,7 @@ fn build_wallpaper_backdrop(
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Option<Vec<OutputRenderElements>> {
-    if !state.lua_config.infinite_wallpaper && !state.обои_цикл {
+    if !state.lua_config.infinite_wallpaper && !state.обои_плиткой() {
         return None;
     }
     let mode = output.current_mode()?;
@@ -5256,7 +5273,12 @@ fn build_wallpaper_backdrop(
     if state.обои_едут() {
         state.request_redraw();
     }
-    if state.обои_цикл {
+    if state.обои_плиткой() {
+        // Плитки big picture, распакованные потоками, — в текстуры. Заливать
+        // можно только здесь: в кадре есть рендерер.
+        if state.обои_большие.as_mut().is_some_and(|б| б.залить(renderer)) {
+            state.request_redraw();
+        }
         if let Some(кадр) = build_wallpaper_cycle(state, output, ctx.clone(), текстура.clone(), экран) {
             return Some(кадр);
         }
@@ -5331,7 +5353,7 @@ fn build_wallpaper_cycle(
     let id = state.обои_цикл_id.get_or_insert_with(Id::new).clone();
     let el = TextureRenderElement::from_texture_with_damage(
         id,
-        ctx,
+        ctx.clone(),
         Point::<f64, Physical>::from((0.0, 0.0)),
         текстура,
         1,
@@ -5365,9 +5387,61 @@ fn build_wallpaper_cycle(
         запись.2.increment();
     }
     let коммит = запись.2;
-    Some(vec![OutputRenderElements::ОбоиПлиткой(crate::плитка_обоев::Плитка::new(
+    // Big picture: поверх обзора — плитки пирамиды (см. src/большие_обои.rs).
+    // Список идёт от переднего плана к заднему, поэтому они раньше подложки.
+    let mut кадр = куски_больших_обоев(state, &раскладка)
+        .into_iter()
+        .filter_map(|кусок| wallpaper_piece_element(ctx.clone(), кусок, экран))
+        .collect::<Vec<_>>();
+    кадр.push(OutputRenderElements::ОбоиПлиткой(crate::плитка_обоев::Плитка::new(
         el, &шейдер, &раскладка, коммит,
-    ))])
+    )));
+    Some(кадр)
+}
+
+/// Плитки big picture для этой раскладки; пусто — big picture выключен или
+/// хватает обзора.
+fn куски_больших_обоев(
+    state: &mut Parallax,
+    раскладка: &crate::плитка_обоев::Раскладка,
+) -> Vec<crate::большие_обои::Кусок> {
+    let Some(б) = state.обои_большие.as_mut() else { return Vec::new() };
+    let (куски, проявляются) = б.кадр(раскладка);
+    if проявляются {
+        state.request_redraw();
+    }
+    куски
+}
+
+/// Одна плитка big picture как элемент кадра. Своя у каждой плитки Id и
+/// неизменная текстура — damage tracker перерисует её, только когда она
+/// сдвинулась или проявляется.
+fn wallpaper_piece_element(
+    ctx: smithay::backend::renderer::ContextId<GlesTexture>,
+    кусок: crate::большие_обои::Кусок,
+    экран: (i32, i32),
+) -> Option<OutputRenderElements> {
+    use smithay::backend::renderer::Texture as _;
+    let (tw, th) = (кусок.текстура.width() as i32, кусок.текстура.height() as i32);
+    let место = кусок.место;
+    let el = TextureRenderElement::from_static_texture(
+        кусок.id,
+        ctx,
+        Point::<f64, Physical>::from((место.loc.x as f64, место.loc.y as f64)),
+        кусок.текстура,
+        1,
+        Transform::Normal,
+        Some(кусок.альфа),
+        Some(Rectangle::<f64, Logical>::new((0.0, 0.0).into(), (tw as f64, th as f64).into())),
+        Some(Size::<i32, Logical>::from((место.size.w, место.size.h))),
+        // Непрозрачна целиком, но без точки по краю: при растяжении край
+        // округляется вверх, и заявленная непрозрачность залезла бы на
+        // соседнюю, ещё не доехавшую плитку — там не нарисовалась бы подложка.
+        (tw > 2 && th > 2).then(|| vec![Rectangle::new((1, 1).into(), (tw - 2, th - 2).into())]),
+        Kind::Unspecified,
+    );
+    let кадр = Rectangle::<i32, Physical>::new((0, 0).into(), экран.into());
+    CropRenderElement::from_element(el, 1.0, кадр).map(OutputRenderElements::Wallpaper)
 }
 
 /// Дать что-нибудь сделать с ГЛАВНЫМ рендерером вне пути отрисовки.
@@ -5691,6 +5765,9 @@ pub struct БлюрКлюч {
     экран: (i32, i32),
     /// Режим cycle раскладывает обои иначе — смена режима обязана пересчитать.
     цикл: bool,
+    /// Big picture: номер картинки и сколько раз менялся набор залитых плиток
+    /// — новая плитка меняет то, что лежит под блюром.
+    большие: (u64, u64),
 }
 
 pub fn пересчитать_блюр(
@@ -5720,6 +5797,10 @@ pub fn пересчитать_блюр(
                 ),
                 зум: (state.viewport.zoom * 100.0).round() as i64,
                 цикл: state.обои_цикл,
+                большие: (
+                    state.обои_большие_поколение,
+                    state.обои_большие.as_ref().map_or(0, |б| б.версия),
+                ),
                 экран: (mode.size.w, mode.size.h),
             };
             let имя = output.name();

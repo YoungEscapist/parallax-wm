@@ -191,7 +191,7 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
              widget [list | on|off [app_id] | move X Y [app_id]] | \
              icon [list | add имя [cmd=…] [image=…] [x=…] [y=…] [size=…] [desktop=…] | rm имя | move имя X Y | desktop имя N] | \
              desk [list | add clock|calendar|system|note [x=…] [y=…] [scale=…] [text=…] [desktop=…] | rm N | move N X Y | desktop N СТОЛ] | \
-             picture drop X Y <uri|путь> | wallpaper [cycle on|off|toggle]",
+             picture drop X Y <uri|путь> | wallpaper [cycle on|off|toggle | big <каталог>|off]",
             "shot <path> | action <name> [k=v ...] | windows | pointer | cube | carousel | \
              mouse to X Y | mouse move DX DY | mouse down|up|click [left|right|middle] | \
              mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
@@ -206,7 +206,7 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
              widget [list | on|off [app_id] | move X Y [app_id]] | \
              icon [list | add name [cmd=…] [image=…] [x=…] [y=…] [size=…] [desktop=…] | rm name | move name X Y | desktop name N] | \
              desk [list | add clock|calendar|system|note [x=…] [y=…] [scale=…] [text=…] [desktop=…] | rm N | move N X Y | desktop N СТОЛ] | \
-             picture drop X Y <uri|path> | wallpaper [cycle on|off|toggle]"
+             picture drop X Y <uri|path> | wallpaper [cycle on|off|toggle | big <dir>|off]"
         )
         .into(),
         иное => тф!("ошибка: не знаю команду '{}'", "error: unknown command '{}'", иное),
@@ -862,20 +862,35 @@ fn код_клавиши(имя: &str) -> Option<u32> {
 /// `wallpaper cycle on|off|toggle` — бесконечные обои плиткой по холсту. Шлёт
 /// plx-wall, когда в его меню ставят или снимают галочку «cycle» и когда
 /// применяют обои. Без аргументов — нынешнее состояние.
+///
+/// `wallpaper big <каталог>|off` — big picture: огромная картинка пирамидой
+/// плиток, которую нарезал plx-wall (см. src/большие_обои.rs). Каталог — весь
+/// остаток строки: в пути бывают пробелы.
 fn обои(хвост: &str, state: &mut Parallax) -> String {
     let слова: Vec<&str> = хвост.split_whitespace().collect();
     match слова.as_slice() {
-        [] | ["cycle"] => {}
+        [] | ["cycle"] | ["big"] => {}
         ["cycle", "on"] => state.обои_цикл = true,
         ["cycle", "off"] => state.обои_цикл = false,
         ["cycle", "toggle"] => state.обои_цикл = !state.обои_цикл,
+        ["big", "off"] => state.обои_большие = None,
+        ["big", ..] => {
+            let каталог = хвост.strip_prefix("big").unwrap_or_default().trim();
+            if let Err(e) = crate::большие_обои::включить(state, std::path::Path::new(каталог)) {
+                return тф!("ошибка: {}", "error: {}", e);
+            }
+        }
         _ => return т!(
-            "ошибка: wallpaper [cycle on|off|toggle]",
-            "error: wallpaper [cycle on|off|toggle]"
+            "ошибка: wallpaper [cycle on|off|toggle | big <каталог>|off]",
+            "error: wallpaper [cycle on|off|toggle | big <dir>|off]"
         ).into(),
     }
     state.request_redraw();
-    format!("cycle={}", if state.обои_цикл { "on" } else { "off" })
+    format!(
+        "cycle={} big={}",
+        if state.обои_цикл { "on" } else { "off" },
+        state.обои_большие.as_ref().map_or("off".into(), |б| б.каталог.display().to_string()),
+    )
 }
 
 fn куб(state: &mut Parallax) -> String {

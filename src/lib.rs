@@ -108,6 +108,10 @@ mod rounded;
 /// Режим cycle: обои плиткой по холсту, как `tile` у driftwm.
 #[path = "плитка_обоев.rs"]
 mod плитка_обоев;
+/// Режим big picture: огромная картинка пирамидой плиток, как gigapixel-обои
+/// driftwm.
+#[path = "большие_обои.rs"]
+mod большие_обои;
 mod screencopy;
 mod selection;
 #[cfg(feature = "share")]
