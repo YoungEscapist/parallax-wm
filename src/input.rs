@@ -560,6 +560,15 @@ impl Parallax {
                         разобрать_клавишу(state, modifiers, handle, pressed, false)
                     },
                 );
+                // Alt+Shift из `grp:alt_shift_toggle` переключает раскладку в
+                // самом xkb, мимо `layout_next`, и панель показывала бы прежнюю
+                // до щелчка по ней. Группа уже лежит в состоянии модификаторов —
+                // сверить одно число на клавишу дёшево.
+                let группа = self.seat.get_keyboard().unwrap()
+                    .modifier_state().serialized.layout_effective;
+                if группа != self.bar_kb_group {
+                    self.refresh_kb_layout();
+                }
                 // Любое нажатие клавиши → обновляем экран (переключение тегов не лагает)
                 self.request_redraw();
             }

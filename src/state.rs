@@ -684,6 +684,10 @@ pub struct Parallax {
     /// Короткое имя активной раскладки («RU»); пусто — раскладка одна.
     /// Обновляется в `Parallax::refresh_kb_layout`.
     pub bar_kb: String,
+    /// Группа xkb, по которой посчитан `bar_kb`. Сверяется на каждой клавише
+    /// (см. `process_input_event`): переключатель из `xkb{ options }`
+    /// меняет раскладку в самом xkb, мимо `layout_next`.
+    pub bar_kb_group: u32,
     /// Идущий прямо сейчас перебор стопки по Alt+Tab (см. switcher.rs).
     /// Живёт, пока держат Alt.
     pub alt_tab: Option<crate::switcher::AltTab>,
@@ -1682,6 +1686,7 @@ impl Parallax {
             bar_clock: crate::bar::clock_text(),
             bar_date: crate::bar::date_text(),
             bar_kb: String::new(),
+            bar_kb_group: 0,
             alt_tab: None,
             search: None,
             tag_cameras: HashMap::new(),

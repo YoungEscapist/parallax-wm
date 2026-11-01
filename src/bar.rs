@@ -834,6 +834,7 @@ impl crate::state::Parallax {
         // Одна раскладка — показывать нечего.
         if раскладки.len() < 2 {
             self.bar_kb = String::new();
+            self.bar_kb_group = 0;
             return;
         }
         let Some(kb) = self.seat.get_keyboard() else { return };
@@ -842,6 +843,7 @@ impl crate::state::Parallax {
         let индекс = kb.with_xkb_state(self, |ctx| {
             ctx.xkb().lock().map(|x| x.active_layout().0 as usize).unwrap_or(0)
         });
+        self.bar_kb_group = индекс as u32;
         self.bar_kb = раскладки.get(индекс).cloned().unwrap_or_default();
     }
 
