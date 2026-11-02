@@ -16,13 +16,19 @@
 //! выбирает сам (меню, тултипы), переводятся обратно через [`Parallax::x11_to_canvas`].
 //! Сами окна от этого не двигаются: на холсте их рисуем мы.
 
+use std::collections::VecDeque;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use smithay::{
     delegate_xwayland_shell,
     desktop::Window,
     input::pointer::Focus,
-    reexports::calloop::EventLoop,
+    reexports::calloop::{
+        generic::Generic,
+        timer::{TimeoutAction, Timer},
+        Interest, LoopHandle, Mode, PostAction, RegistrationToken,
+    },
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Size},
     wayland::{
         selection::{
@@ -45,11 +51,84 @@ use crate::{
     state::Parallax,
     xwin,
 };
+use crate::т;
+
+/// Пауза между смертью сервера и новым запуском: дать smithay подобрать
+/// процесс и закрыть его клиента.
+const ПАУЗА_ПЕРЕД_ЗАПУСКОМ: Duration = Duration::from_secs(1);
+/// Сами поднимаем не чаще раза в столько (от прошлого запуска).
+const МИН_ШАГ_ЗАПУСКОВ: Duration = Duration::from_secs(10);
+/// Сдаёмся, если сервер пришлось поднимать сам [`ПРЕДЕЛ_ПЕРЕЗАПУСКОВ`] раз за
+/// столько: значит, он падает сразу, и крутить его по кругу незачем.
+const ОКНО_ПЕРЕЗАПУСКОВ: Duration = Duration::from_secs(300);
+const ПРЕДЕЛ_ПЕРЕЗАПУСКОВ: usize = 5;
+
+/// Жизнь процесса Xwayland: источники в цикле и счёт перезапусков.
+///
+/// Перезапуск нужен с 02.11.2026: после того как сторож (`сторож_x11.rs`) или
+/// человек убил зависший сервер, X11-программы раньше не работали до
+/// перезапуска всего композитора — `start` звался только при старте.
+#[derive(Default)]
+pub struct ЖизньX {
+    /// Источник нынешнего `XWayland` в цикле. Пока он там, занят `:N`: lock и
+    /// сокет дисплея smithay снимает только при drop, — и после смерти сервера
+    /// он ещё и крутил бы цикл вхолостую (EOF на displayfd smithay считает
+    /// «ещё не готов», а источник уровневый). Поэтому перед новым запуском его
+    /// из цикла вон.
+    источник: Option<RegistrationToken>,
+    /// pidfd нынешнего процесса — узнать о смерти, даже если XWM так и не
+    /// поднялся (тогда и `disconnected` не будет).
+    смерть: Option<RegistrationToken>,
+    /// Отложенный запуск.
+    отложен: Option<RegistrationToken>,
+    /// Когда поднимали последний раз.
+    запущен: Option<Instant>,
+    /// Автоматические перезапуски за последние [`ОКНО_ПЕРЕЗАПУСКОВ`].
+    недавние: VecDeque<Instant>,
+    /// Следующий запуск попросил человек: без паузы и мимо счёта.
+    ручной: bool,
+    /// Сами больше не поднимаем (сервер падает раз за разом).
+    сдались: bool,
+    /// Сколько раз поднимали заново.
+    перезапусков: u32,
+    /// XWM умерших серверов. Выбрасывать их нельзя: smithay зовёт `xwm_state`
+    /// с id старого XWM и после его смерти — из хука коммита поверхностей
+    /// умершего клиента (его запросы ещё лежат в нашем буфере), из источников
+    /// передачи буфера обмена, — и `unwrap` нынешнего ронял композитор (замер
+    /// харнессом 02.11: паника в `xwm_state` через 0 мс после ухода XWM).
+    /// Сокет у них уже оборван, всё, что они пишут, сразу возвращает ошибку.
+    мёртвые_wm: Vec<X11Wm>,
+}
+
+/// Сколько мёртвых XWM держать (см. `ЖизньX::мёртвые_wm`).
+const МЁРТВЫХ_WM: usize = 4;
 
 /// Запустить XWayland. Всё асинхронно: процесс поднимается сразу, а XWM
 /// стартует уже по событию `Ready` — до этого X11-клиенты просто не смогут
 /// подключиться.
-pub fn start(event_loop: &mut EventLoop<'static, Parallax>, state: &mut Parallax) {
+pub fn start(state: &mut Parallax) {
+    crate::сторож_x11::поднять();
+    запустить(state, false);
+}
+
+fn запустить(state: &mut Parallax, перезапуск: bool) {
+    сбросить_прежний(state);
+    if перезапуск {
+        // Свежий глобал xwayland_shell. smithay сопоставляет X11-окно с его
+        // wl_surface по serial'у и держит таблицу serial → поверхность, которую
+        // никогда не чистит (`XWaylandShellState::by_serial`), а новый Xwayland
+        // считает serial'ы снова с единицы. Со старой таблицей его окна
+        // сопоставлялись с мёртвыми поверхностями прежнего сервера и так и
+        // оставались без буфера (замер харнессом 02.11: после перезапуска
+        // `buffer=—` у каждого нового X11-окна). Новый сервер видит только новый
+        // глобал — старый снимаем до запуска.
+        let старый = std::mem::replace(
+            &mut state.xwayland_shell_state,
+            XWaylandShellState::new::<Parallax>(&state.display_handle),
+        );
+        state.display_handle.remove_global::<Parallax>(старый.global());
+    }
+    state.жизнь_x.запущен = Some(Instant::now());
     // Окружение Xwayland smithay ЧИСТИТ, оставляя только PATH и
     // XDG_RUNTIME_DIR (см. `xserver.rs`: `command.env_clear()`), а всё
     // остальное берёт из этого итератора. Тема курсора туда не попадала вовсе,
@@ -60,57 +139,235 @@ pub fn start(event_loop: &mut EventLoop<'static, Parallax>, state: &mut Parallax
         .into_iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect();
-    let (xwayland, client) = match XWayland::spawn(
-        &state.display_handle,
-        None,
-        курсорные,
-        true,
-        Stdio::null(),
-        Stdio::null(),
-        |_| (),
-    ) {
+    let породить = |дисплей: Option<u32>| {
+        XWayland::spawn(
+            &state.display_handle,
+            дисплей,
+            курсорные.clone(),
+            true,
+            Stdio::null(),
+            Stdio::null(),
+            |_| (),
+        )
+    };
+    // Тот же номер дисплея, что был: DISPLAY уже разошёлся по оболочкам сеанса,
+    // и программа, запущенная из терминала, должна попасть в новый сервер.
+    // Занят (старый процесс застрял в ядре и держит абстрактный сокет) —
+    // берём другой и экспортируем его заново.
+    let mut попытка = породить(state.xdisplay);
+    if let (Err(err), Some(n)) = (&попытка, state.xdisplay) {
+        tracing::warn!("plx/xwayland: display :{n} is not free ({err}), taking another one");
+        попытка = породить(None);
+    }
+    let (xwayland, client) = match попытка {
         Ok(v) => v,
         Err(err) => {
             // Не фатально: без XWayland parallax просто остаётся чисто
             // wayland-компоситором.
             tracing::warn!("plx/xwayland: could not start Xwayland: {}", err);
+            if перезапуск {
+                запланировать(state, "Xwayland did not start");
+            }
             return;
         }
     };
 
-    let handle = event_loop.handle();
+    let номер = xwayland.display_number();
+    let pid = crate::сторож_x11::найти_xwayland(номер);
+    if pid.is_none() {
+        tracing::warn!(
+            "plx/xwayland: could not find the Xwayland process of :{номер} — the watchdog can \
+             only cut its sockets, not kill it"
+        );
+    }
+    tracing::info!("plx/xwayland: Xwayland {pid:?} spawned on :{номер}");
+    if let Some(pidfd) = crate::сторож_x11::процесс_xwayland(pid) {
+        let r = state.петля.insert_source(
+            Generic::new(pidfd, Interest::READ, Mode::Level),
+            move |_, _, state| {
+                процесс_умер(state, pid);
+                Ok(PostAction::Remove)
+            },
+        );
+        state.жизнь_x.смерть = r.ok();
+    }
+
+    let handle = state.петля.clone();
     let display_handle = state.display_handle.clone();
-    let ret = handle.clone().insert_source(xwayland, move |event, _, state| match event {
+    let ret = state.петля.insert_source(xwayland, move |event, _, state| match event {
         XWaylandEvent::Ready {
             x11_socket,
             display_number,
-        } => {
-            let wm = match X11Wm::start_wm(handle.clone(), &display_handle, x11_socket, client.clone())
-            {
-                Ok(wm) => wm,
-                Err(err) => {
-                    tracing::error!("plx/xwayland: could not start the XWM: {}", err);
-                    return;
-                }
-            };
-            state.xwm = Some(wm);
-            state.xdisplay = Some(display_number);
-            // DISPLAY нужен всему, что мы запускаем из компоситора (спавн
-            // терминала по Super+Enter и т.п.), иначе X11-клиенты пойдут в
-            // чужой сервер или никуда.
-            unsafe { std::env::set_var("DISPLAY", format!(":{display_number}")) };
-            tracing::info!("plx/xwayland: XWM ready, DISPLAY=:{}", display_number);
-            // Повторяем экспорт уже с DISPLAY: порталу он нужен, чтобы X11-часть
-            // (например файловый диалог из Xwayland-клиента) шла в НАШ сервер.
-            crate::export_session_env();
-        }
+        } => готов(state, &handle, &display_handle, &client, x11_socket, display_number),
         XWaylandEvent::Error => {
+            // Процесс умер до готовности; его смерть увидит pidfd
+            // (`процесс_умер`), оттуда и новый запуск.
             tracing::warn!("plx/xwayland: Xwayland failed to start");
         }
     });
-    if let Err(err) = ret {
-        tracing::error!("plx/xwayland: insert_source: {}", err);
+    match ret {
+        Ok(token) => state.жизнь_x.источник = Some(token),
+        Err(err) => tracing::error!("plx/xwayland: insert_source: {}", err),
     }
+}
+
+/// Сервер ответил, что готов: поднять XWM.
+fn готов(
+    state: &mut Parallax,
+    handle: &LoopHandle<'static, Parallax>,
+    display_handle: &smithay::reexports::wayland_server::DisplayHandle,
+    client: &smithay::reexports::wayland_server::Client,
+    x11_socket: std::os::unix::net::UnixStream,
+    display_number: u32,
+) {
+    use std::os::fd::AsRawFd as _;
+    // Сторожу — до start_wm: тот делает с сервером несколько обменов подряд.
+    crate::сторож_x11::сокет_x(x11_socket.as_raw_fd(), "XWM");
+    let wm = match X11Wm::start_wm(handle.clone(), display_handle, x11_socket, client.clone()) {
+        Ok(wm) => wm,
+        Err(err) => {
+            tracing::error!("plx/xwayland: could not start the XWM: {}", err);
+            // Сокет уже закрыт (его съел start_wm) — номер забыть ДО обрыва.
+            // Сервер без WM никому не нужен: снимаем, его смерть поднимет новый.
+            crate::сторож_x11::забыть_сокеты();
+            crate::сторож_x11::снять("the XWM did not start");
+            return;
+        }
+    };
+    let прежний = state.xdisplay;
+    state.xwm = Some(wm);
+    state.xdisplay = Some(display_number);
+    let перезапусков = state.жизнь_x.перезапусков;
+    // DISPLAY нужен всему, что мы запускаем из компоситора (спавн
+    // терминала по Super+Enter и т.п.), иначе X11-клиенты пойдут в
+    // чужой сервер или никуда.
+    unsafe { std::env::set_var("DISPLAY", format!(":{display_number}")) };
+    if перезапусков == 0 {
+        tracing::info!("plx/xwayland: XWM ready, DISPLAY=:{}", display_number);
+    } else {
+        tracing::warn!(
+            "plx/xwayland: Xwayland is back (restart #{перезапусков}), XWM ready, DISPLAY=:{display_number}"
+        );
+    }
+    // Повторяем экспорт уже с DISPLAY: порталу он нужен, чтобы X11-часть
+    // (например файловый диалог из Xwayland-клиента) шла в НАШ сервер. После
+    // перезапуска на прежнем номере экспортировать нечего.
+    if прежний != Some(display_number) {
+        crate::export_session_env();
+    }
+    // Связь значков — сразу, пока сервер точно отвечает (см. icons.rs).
+    crate::icons::x11_связать(display_number, crate::сторож_x11::сокет_x);
+}
+
+/// Процесс Xwayland кончился (по pidfd).
+fn процесс_умер(state: &mut Parallax, pid: Option<i32>) {
+    state.жизнь_x.смерть = None;
+    if crate::сторож_x11::pid() != pid {
+        return; // давно сменённый
+    }
+    tracing::warn!("plx/xwayland: the Xwayland process {pid:?} exited");
+    crate::сторож_x11::процесс_xwayland(None);
+    if state.xwm.is_some() {
+        // XWM об этом узнает сам: его поток событий увидит обрыв и позовёт
+        // `disconnected`, оттуда и перезапуск. Снимать XWM раньше нельзя: в
+        // канале ещё могут лежать его события, а `xwm_state` без него упадёт.
+        return;
+    }
+    запланировать(state, "Xwayland exited before its XWM came up");
+}
+
+/// Убрать из цикла всё, что осталось от прежнего экземпляра.
+fn сбросить_прежний(state: &mut Parallax) {
+    let ж = &mut state.жизнь_x;
+    let токены = [ж.смерть.take(), ж.источник.take(), ж.отложен.take()];
+    // Процесс к этому времени обычно мёртв; если нет (застрял, а WM уже
+    // отвалился) — он держит дисплей и никому не нужен.
+    if crate::сторож_x11::pid().is_some() {
+        crate::сторож_x11::снять("replaced by a new Xwayland");
+    }
+    crate::сторож_x11::процесс_xwayland(None);
+    for токен in токены.into_iter().flatten() {
+        state.петля.remove(токен);
+    }
+}
+
+/// Поднять сервер заново чуть позже — с паузой и пределом на частоту.
+fn запланировать(state: &mut Parallax, причина: &str) {
+    if state.exit.is_some() || state.жизнь_x.отложен.is_some() {
+        return;
+    }
+    let ж = &mut state.жизнь_x;
+    let пауза = if ж.ручной {
+        Duration::from_millis(200)
+    } else {
+        if ж.сдались {
+            tracing::warn!("plx/xwayland: {причина} — not starting it again (gave up; ctl `xwayland restart` or the xwayland_restart action)");
+            return;
+        }
+        let сейчас = Instant::now();
+        ж.недавние.retain(|t| сейчас.duration_since(*t) < ОКНО_ПЕРЕЗАПУСКОВ);
+        if ж.недавние.len() >= ПРЕДЕЛ_ПЕРЕЗАПУСКОВ {
+            ж.сдались = true;
+            tracing::error!(
+                "plx/xwayland: {причина} — it was restarted {} times in {} s already, giving up \
+                 (ctl `xwayland restart` or the xwayland_restart action starts it again)",
+                ж.недавние.len(),
+                ОКНО_ПЕРЕЗАПУСКОВ.as_secs()
+            );
+            return;
+        }
+        let с_запуска = ж.запущен.map_or(Duration::MAX, |t| t.elapsed());
+        ПАУЗА_ПЕРЕД_ЗАПУСКОМ.max(МИН_ШАГ_ЗАПУСКОВ.saturating_sub(с_запуска))
+    };
+    tracing::warn!("plx/xwayland: {причина} — starting it again in {:.1} s", пауза.as_secs_f32());
+    let r = state.петля.insert_source(Timer::from_duration(пауза), |_, _, state| {
+        state.жизнь_x.отложен = None;
+        if !std::mem::take(&mut state.жизнь_x.ручной) {
+            state.жизнь_x.недавние.push_back(Instant::now());
+        }
+        state.жизнь_x.перезапусков += 1;
+        запустить(state, true);
+        TimeoutAction::Drop
+    });
+    state.жизнь_x.отложен = r.ok();
+}
+
+/// Перезапустить Xwayland по просьбе человека (ctl `xwayland restart`, действие
+/// `xwayland_restart`): снять нынешний — дальше всё как при его смерти, только
+/// без паузы и мимо счёта; если сервера нет вовсе — поднять сразу. Заодно
+/// снимает «сдались».
+pub fn перезапустить(state: &mut Parallax) -> String {
+    let ж = &mut state.жизнь_x;
+    ж.ручной = true;
+    ж.сдались = false;
+    ж.недавние.clear();
+    if state.xwm.is_some() || crate::сторож_x11::pid().is_some() {
+        crate::сторож_x11::снять("restart requested");
+        т!("ok: Xwayland снят, поднимется заново", "ok: Xwayland was killed and will be started again").into()
+    } else {
+        if let Some(t) = state.жизнь_x.отложен.take() {
+            state.петля.remove(t);
+        }
+        state.жизнь_x.ручной = false;
+        state.жизнь_x.перезапусков += 1;
+        запустить(state, true);
+        т!("ok: Xwayland запускается", "ok: starting Xwayland").into()
+    }
+}
+
+/// Состояние для ctl `xwayland status`.
+pub fn состояние(state: &Parallax) -> String {
+    let ж = &state.жизнь_x;
+    format!(
+        "xwayland: pid={} display={} xwm={} restarts={} watchdog_kills={} pending={} gave_up={}",
+        crate::сторож_x11::pid().map_or("-".into(), |p| p.to_string()),
+        state.xdisplay.map_or("-".into(), |n| format!(":{n}")),
+        if state.xwm.is_some() { "up" } else { "down" },
+        ж.перезапусков,
+        crate::сторож_x11::снятий(),
+        ж.отложен.is_some(),
+        ж.сдались,
+    )
 }
 
 impl XWaylandShellHandler for Parallax {
@@ -355,15 +612,12 @@ fn show_iconic_later(state: &mut Parallax, surface: X11Surface, delay: std::time
 /// Соединение XWM у smithay наружу не отдаётся, пишем своим (`icons.rs`).
 fn withdraw_wm_state(window: u32) {
     use smithay::reexports::x11rb::{connection::Connection as _, protocol::xproto::ConnectionExt as _};
-    static WM_STATE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    let Some((conn, _)) = crate::icons::x11_связь() else { return };
-    let Some(atom) = *WM_STATE.get_or_init(|| {
-        conn.intern_atom(false, b"WM_STATE").ok()?.reply().ok().map(|r| r.atom)
-    }) else {
+    let Some(связь) = crate::icons::x11_связь() else { return };
+    let Some(atom) = связь.wm_state() else {
         return;
     };
-    let _ = conn.delete_property(window, atom);
-    let _ = conn.flush();
+    let _ = связь.conn.delete_property(window, atom);
+    let _ = связь.conn.flush();
 }
 
 impl Parallax {
@@ -394,8 +648,23 @@ impl Parallax {
 }
 
 impl XwmHandler for Parallax {
-    fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
-        self.xwm.as_mut().unwrap()
+    fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {
+        // Нынешний — по id; иначе умерший с этим id (см. `ЖизньX::мёртвые_wm`);
+        // иначе хоть какой-то, лишь бы не паника.
+        if self.xwm.as_ref().is_none_or(|w| w.id() != xwm) {
+            if let Some(i) = self.жизнь_x.мёртвые_wm.iter().position(|w| w.id() == xwm) {
+                tracing::debug!("plx/xwayland: xwm_state for the dead XWM {xwm:?}");
+                return &mut self.жизнь_x.мёртвые_wm[i];
+            }
+        }
+        match self.xwm.as_mut() {
+            Some(w) => w,
+            None => self
+                .жизнь_x
+                .мёртвые_wm
+                .last_mut()
+                .expect("xwm_state: no XWM has ever been started"),
+        }
     }
 
     fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
@@ -632,9 +901,50 @@ impl XwmHandler for Parallax {
         }
     }
 
-    fn disconnected(&mut self, _xwm: XwmId) {
+    fn disconnected(&mut self, xwm: XwmId) {
         tracing::warn!("plx/xwayland: the XWM went away");
-        self.xwm = None;
+        if self.xwm.as_ref().map(|w| w.id()) != Some(xwm) {
+            return; // не нынешний — его уже сменили
+        }
+        // Окна этого сервера сами уже не закроются: destroy/unmap от него не
+        // придут. Без этого в раскладке оставались пустые слоты мёртвых окон.
+        let мёртвые: Vec<Window> = self
+            .tagged_windows
+            .iter()
+            .map(|tw| &tw.window)
+            .chain(self.space.elements())
+            .filter(|w| w.x11_surface().is_some_and(|s| s.xwm_id() == Some(xwm)))
+            .cloned()
+            .fold(Vec::new(), |mut все, w| {
+                if !все.contains(&w) {
+                    все.push(w);
+                }
+                все
+            });
+        if !мёртвые.is_empty() {
+            tracing::info!("plx/xwayland: dropping {} window(s) of the dead X server", мёртвые.len());
+        }
+        for w in &мёртвые {
+            self.forget_window(w);
+        }
+        self.x11_iconic.retain(|s| s.xwm_id() != Some(xwm));
+        if let Some(wm) = self.xwm.take() {
+            let мёртвые = &mut self.жизнь_x.мёртвые_wm;
+            мёртвые.push(wm);
+            if мёртвые.len() > МЁРТВЫХ_WM {
+                мёртвые.remove(0);
+            }
+        }
+        crate::сторож_x11::забыть_сокеты();
+        crate::icons::x11_сбросить();
+        // Процесс мог пережить свой WM (обрыв сторожем, WM упал сам): без WM он
+        // никому не нужен, а держит дисплей.
+        if crate::сторож_x11::pid().is_some() {
+            crate::сторож_x11::снять("its XWM went away");
+        }
+        // Смерть этого процесса уже обработана здесь — pidfd пусть промолчит.
+        crate::сторож_x11::процесс_xwayland(None);
+        запланировать(self, "the XWM went away");
     }
 }
 

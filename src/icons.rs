@@ -433,25 +433,93 @@ pub fn имя_значка_приложения(app_id: &str) -> Option<String> 
 /// Соединение с Xwayland под чтение свойств — своё, а не то, которым правит
 /// окнами XWM (оно у smithay внутри и наружу не отдаётся).
 ///
-/// Заводится один раз и живёт до конца сеанса; `DISPLAY` к моменту первого
-/// окна уже выставлен (`xwayland.rs`). Ошибку соединения запоминаем как
-/// «нет X11» — повторять попытку на каждое окно незачем.
-pub(crate) fn x11_связь() -> Option<&'static (
-    smithay::reexports::x11rb::rust_connection::RustConnection,
-    u32,
-)> {
-    use smithay::reexports::x11rb::{self, protocol::xproto::ConnectionExt as _};
-    static СВЯЗЬ: std::sync::OnceLock<Option<(
-        x11rb::rust_connection::RustConnection,
-        u32,
-    )>> = std::sync::OnceLock::new();
-    СВЯЗЬ.get_or_init(|| {
-        let (conn, _) = x11rb::connect(None)
-            .map_err(|e| tracing::debug!("plx/icons: X11 is unavailable for icons: {e}"))
-            .ok()?;
-        let atom = conn.intern_atom(false, b"_NET_WM_ICON").ok()?.reply().ok()?.atom;
-        Some((conn, atom))
-    }).as_ref()
+/// Заводится по готовности сервера ([`x11_связать`], `xwayland.rs`) и живёт,
+/// пока жив сервер: перезапущенный Xwayland — это новый сервер, со старым
+/// сокетом и старыми номерами атомов (их сервер раздаёт сам, в порядке
+/// запросов) ему делать нечего, поэтому атомы лежат здесь же, а не в своих
+/// `static`. Заранее, а не по первому окну — затем, чтобы сторож зависания
+/// (`сторож_x11.rs`) знал и этот сокет: `get_property().reply()` на
+/// зависшем X блокирует главный поток точно так же, как запись XWM.
+pub(crate) struct СвязьX11 {
+    pub conn: smithay::reexports::x11rb::rust_connection::RustConnection,
+    pub net_wm_icon: u32,
+    net_wm_pid: std::sync::OnceLock<Option<u32>>,
+    wm_state: std::sync::OnceLock<Option<u32>>,
+}
+
+impl СвязьX11 {
+    fn атом(&self, ячейка: &std::sync::OnceLock<Option<u32>>, имя: &[u8]) -> Option<u32> {
+        use smithay::reexports::x11rb::protocol::xproto::ConnectionExt as _;
+        *ячейка.get_or_init(|| {
+            self.conn.intern_atom(false, имя).ok()?.reply().ok().map(|отв| отв.atom)
+        })
+    }
+    pub fn wm_state(&self) -> Option<u32> {
+        self.атом(&self.wm_state, b"WM_STATE")
+    }
+    fn net_wm_pid(&self) -> Option<u32> {
+        self.атом(&self.net_wm_pid, b"_NET_WM_PID")
+    }
+}
+
+static СВЯЗЬ_X11: std::sync::Mutex<Option<std::sync::Arc<СвязьX11>>> = std::sync::Mutex::new(None);
+
+/// Нынешняя связь с X-сервером, если сервер поднят.
+pub(crate) fn x11_связь() -> Option<std::sync::Arc<СвязьX11>> {
+    СВЯЗЬ_X11.lock().unwrap().clone()
+}
+
+/// Подключиться к только что поднятому серверу `:дисплей`. Возвращает fd
+/// сокета — для сторожа. Сокет открываем сами и до рукопожатия: зависни сервер
+/// ровно сейчас, сторож уже знает, на чём стоит главный поток.
+pub(crate) fn x11_связать(дисплей: u32, сторожу: impl Fn(std::os::fd::RawFd, &'static str)) -> bool {
+    use smithay::reexports::x11rb::{
+        protocol::xproto::ConnectionExt as _,
+        rust_connection::{DefaultStream, RustConnection},
+    };
+    use std::os::fd::AsRawFd as _;
+    x11_сбросить();
+    let путь = format!("/tmp/.X11-unix/X{дисплей}");
+    let поток = match std::os::unix::net::UnixStream::connect(&путь) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("plx/icons: X11 is unavailable for icons ({путь}): {e}");
+            return false;
+        }
+    };
+    сторожу(поток.as_raw_fd(), "icons");
+    let связь = DefaultStream::from_unix_stream(поток)
+        .map_err(|e| e.to_string())
+        .and_then(|(s, _)| RustConnection::connect_to_stream(s, 0).map_err(|e| e.to_string()))
+        .and_then(|conn| {
+            let atom = conn
+                .intern_atom(false, b"_NET_WM_ICON")
+                .map_err(|e| e.to_string())?
+                .reply()
+                .map_err(|e| e.to_string())?
+                .atom;
+            Ok(СвязьX11 {
+                conn,
+                net_wm_icon: atom,
+                net_wm_pid: Default::default(),
+                wm_state: Default::default(),
+            })
+        });
+    match связь {
+        Ok(с) => {
+            *СВЯЗЬ_X11.lock().unwrap() = Some(std::sync::Arc::new(с));
+            true
+        }
+        Err(e) => {
+            tracing::debug!("plx/icons: X11 is unavailable for icons: {e}");
+            false
+        }
+    }
+}
+
+/// Сервер ушёл — его связь больше ни на что не годится.
+pub(crate) fn x11_сбросить() {
+    СВЯЗЬ_X11.lock().unwrap().take();
 }
 
 /// Значок, который окно принесло с собой в `_NET_WM_ICON`.
@@ -469,10 +537,10 @@ pub(crate) fn x11_связь() -> Option<&'static (
 /// растягивать), иначе самую крупную из мелких.
 pub fn значок_окна_x11(окно: u32, цель: u32) -> Option<Icon> {
     use smithay::reexports::x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
-    let (conn, atom) = x11_связь()?;
+    let связь = x11_связь()?;
     // Длина в 32-битных словах: 4 МиБ пикселей с запасом хватает на любой
     // набор размеров (256×256 — это 64 Ки слов).
-    let ответ = conn.get_property(false, окно, *atom, AtomEnum::CARDINAL, 0, 1 << 20)
+    let ответ = связь.conn.get_property(false, окно, связь.net_wm_icon, AtomEnum::CARDINAL, 0, 1 << 20)
         .ok()?.reply().ok()?;
     let данные: Vec<u32> = ответ.value32()?.collect();
     разобрать_net_wm_icon(&данные, цель)
@@ -488,12 +556,10 @@ pub fn значок_окна_x11(окно: u32, цель: u32) -> Option<Icon> {
 /// X11-окна принадлежат одному процессу, самому Xwayland.
 pub fn pid_окна_x11(окно: u32) -> Option<u32> {
     use smithay::reexports::x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
-    let (conn, _) = x11_связь()?;
-    static АТОМ: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    let atom = (*АТОМ.get_or_init(|| {
-        conn.intern_atom(false, b"_NET_WM_PID").ok()?.reply().ok().map(|отв| отв.atom)
-    }))?;
-    let ответ = conn
+    let связь = x11_связь()?;
+    let atom = связь.net_wm_pid()?;
+    let ответ = связь
+        .conn
         .get_property(false, окно, atom, AtomEnum::CARDINAL, 0, 1)
         .ok()?
         .reply()

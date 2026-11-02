@@ -149,6 +149,9 @@
 --   vt_switch        vt = 1-12
 --   layout_next / layout_prev   (cycle keyboard layout)
 --   reload_config
+--   xwayland_restart   (снять Xwayland и поднять заново — когда X11-окна
+--                        замерли, а сам parallax жив; зависший X, из-за
+--                        которого встал parallax, снимается и сам)
 --   group_selected     (собрать выделение в созвездие: раскладка «мастер и
 --                        стопка» из halley — мастеру 60% ширины во всю высоту,
 --                        остальным правая колонка; только Float. Штатно это

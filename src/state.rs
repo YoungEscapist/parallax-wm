@@ -378,6 +378,8 @@ pub struct Parallax {
     /// когда клиент попросит Normal или сработает страховка (см. xwayland.rs,
     /// `показать_свёрнутое`).
     pub x11_iconic: Vec<smithay::xwayland::X11Surface>,
+    /// Процесс Xwayland: источники в цикле, перезапуски (см. xwayland.rs).
+    pub жизнь_x: crate::xwayland::ЖизньX,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
     // parallax state
@@ -1598,6 +1600,7 @@ impl Parallax {
             xwm: None,
             xdisplay: None,
             x11_iconic: Vec::new(),
+            жизнь_x: Default::default(),
             popups: PopupManager::default(),
             seat,
             viewport: Viewport::default(),

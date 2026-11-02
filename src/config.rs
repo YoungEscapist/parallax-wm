@@ -89,6 +89,9 @@ pub enum Action {
     LayoutNext,
     LayoutPrev,
     ReloadConfig,
+    /// Снять Xwayland и поднять заново (см. xwayland.rs) — когда X11-окна
+    /// замерли, а сам композитор жив.
+    XwaylandRestart,
     /// Собрать текущее rubber-band выделение в "созвездие" (двигается/ресайзится
     /// как единое целое, см. selection.rs).
     GroupSelected,
@@ -1163,6 +1166,7 @@ fn action_from_lua(action: &str, tbl: &Table) -> Option<Action> {
         "layout_next" => LayoutNext,
         "layout_prev" => LayoutPrev,
         "reload_config" => ReloadConfig,
+        "xwayland_restart" => XwaylandRestart,
         "group_selected" => GroupSelected,
         "ungroup_selected" => UngroupSelected,
         "pin_bookmark_at_cursor" => PinBookmarkAtCursor,
@@ -2786,6 +2790,10 @@ impl Parallax {
             LayoutNext => self.cycle_xkb_layout(true),
             LayoutPrev => self.cycle_xkb_layout(false),
             ReloadConfig => self.reload_config(),
+            XwaylandRestart => {
+                let ответ = crate::xwayland::перезапустить(self);
+                tracing::info!("plx: xwayland_restart — {ответ}");
+            }
             GroupSelected => self.group_selected_into_constellation(),
             UngroupSelected => self.ungroup_focused_constellation(),
             PinBookmarkAtCursor => self.pin_bookmark_at_cursor(),

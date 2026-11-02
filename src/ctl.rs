@@ -23,6 +23,8 @@
 //!                                раскладка панелей, что и где висит;
 //! windows                     — список окон: id, класс, стол, монитор, слот,
 //!                               буфер, запрошено
+//! xwayland [status|restart]   — X-сервер: pid, дисплей, перезапуски; снять
+//!                               и поднять заново (доступно и в живом сеансе)
 //! ```
 
 use std::io::{BufRead, BufReader, Write};
@@ -112,10 +114,12 @@ fn обслужить(stream: UnixStream, state: &mut Parallax, полный: bo
                 }
                 // Живой сеанс без PLX_CTL: только раскладка обоев от plx-wall,
                 // остальное (spawn, mouse, key…) — та самая дыра из шапки.
-                if !полный && s.split_whitespace().next() != Some("wallpaper") {
+                // `xwayland` тоже: снять X-сервер своего же сеанса процесс того же
+                // пользователя может и так (`kill`), а перезапуск без него — нет.
+                if !полный && !matches!(s.split_whitespace().next(), Some("wallpaper" | "xwayland")) {
                     ответ.push_str(т!(
-                        "ошибка: в живом сеансе доступно только wallpaper (PLX_CTL=1 — всё)",
-                        "error: only wallpaper is available in a live session (PLX_CTL=1 for all)"
+                        "ошибка: в живом сеансе доступны только wallpaper и xwayland (PLX_CTL=1 — всё)",
+                        "error: only wallpaper and xwayland are available in a live session (PLX_CTL=1 for all)"
                     ));
                 } else {
                     ответ.push_str(&выполнить(s, state));
@@ -176,6 +180,18 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
         "desk" => стол_виджеты(хвост, state),
         "picture" => картинка(хвост, state),
         "wallpaper" => обои(хвост, state),
+        "xwayland" => match хвост {
+            "" | "status" => crate::xwayland::состояние(state),
+            "restart" => {
+                tracing::info!("plx/ctl: xwayland restart");
+                crate::xwayland::перезапустить(state)
+            }
+            иное => тф!(
+                "ошибка: xwayland [status|restart], а не '{}'",
+                "error: xwayland [status|restart], not '{}'",
+                иное
+            ),
+        },
         "help" => т!(
             "shot <путь> | action <имя> [k=v ...] | windows | pointer | cube | carousel | \
              mouse to X Y | mouse move DX DY | mouse down|up|click [левая|правая|средняя] | \
@@ -191,7 +207,8 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
              widget [list | on|off [app_id] | move X Y [app_id]] | \
              icon [list | add имя [cmd=…] [image=…] [x=…] [y=…] [size=…] [desktop=…] | rm имя | move имя X Y | desktop имя N] | \
              desk [list | add clock|calendar|system|note [x=…] [y=…] [scale=…] [text=…] [desktop=…] | rm N | move N X Y | desktop N СТОЛ] | \
-             picture drop X Y <uri|путь> | wallpaper [cycle on|off|toggle | big <каталог>|off]",
+             picture drop X Y <uri|путь> | wallpaper [cycle on|off|toggle | big <каталог>|off] | \
+             xwayland [status|restart]",
             "shot <path> | action <name> [k=v ...] | windows | pointer | cube | carousel | \
              mouse to X Y | mouse move DX DY | mouse down|up|click [left|right|middle] | \
              mouse drag X1 Y1 X2 Y2 | mouse scroll N | \
@@ -206,7 +223,8 @@ fn выполнить(строка: &str, state: &mut Parallax) -> String {
              widget [list | on|off [app_id] | move X Y [app_id]] | \
              icon [list | add name [cmd=…] [image=…] [x=…] [y=…] [size=…] [desktop=…] | rm name | move name X Y | desktop name N] | \
              desk [list | add clock|calendar|system|note [x=…] [y=…] [scale=…] [text=…] [desktop=…] | rm N | move N X Y | desktop N СТОЛ] | \
-             picture drop X Y <uri|path> | wallpaper [cycle on|off|toggle | big <dir>|off]"
+             picture drop X Y <uri|path> | wallpaper [cycle on|off|toggle | big <dir>|off] | \
+             xwayland [status|restart]"
         )
         .into(),
         иное => тф!("ошибка: не знаю команду '{}'", "error: unknown command '{}'", иное),

@@ -153,6 +153,9 @@
 --   vt_switch        vt = 1-12
 --   layout_next / layout_prev   (cycle keyboard layout)
 --   reload_config
+--   xwayland_restart   (kill Xwayland and start it again, for when the X11
+--                        windows froze but parallax itself is alive; a hung
+--                        X server that stops parallax is killed by itself)
 --   group_selected     (bind the selection into a constellation: the "master
 --                        and stack" layout from halley — the master takes 60%
 --                        of the width at full height, the rest share the right
