@@ -18,6 +18,15 @@
 //! заблокирован в системном вызове на одном из сокетов X-сервера (poll/ppoll —
 //! по самим `struct pollfd`, read/write/sendmsg — по первому аргументу; всё это
 //! видно в `/proc/self/task/<tid>/syscall`), то зависание именно то самое.
+//!
+//! **Второй вид (04.11.2026, Dota 2).** Тот же сбой nouveau, но главный поток
+//! стоял не на сокете, а на futex: соединение XWM держал другой поток, вечно
+//! ждавший ответа в `ppoll(POLLIN)`, а у Xwayland в приёмной очереди лежали
+//! непрочитанные 236 байт наших запросов. Смотреть просто «чей-то поток на
+//! X-сокете» нельзя — поток событий XWM и в покое всё время ждёт там. Поэтому
+//! второй признак — сама очередь: `TIOCOUTQ` нашего конца (байты, которые
+//! сервер ещё не прочёл) больше нуля и за весь срок не убывает. Живой X
+//! вычитывает её за миллисекунды.
 //! Тогда он убивает Xwayland (SIGKILL через pidfd — чужой процесс с тем же pid
 //! не заденет) и делает `shutdown()` своих концов X-сокетов: даже если сервер
 //! застрял в ядре в непрерываемом ожидании и SIGKILL до него ещё не дошёл,
@@ -202,6 +211,7 @@ fn сторожить(главный: i32) {
     let mut прошлый = о.пульс.load(Ordering::Relaxed);
     let mut стоит_с = Instant::now();
     let mut на_x = 0u32;
+    let mut очередь_до: Vec<(RawFd, i32)> = Vec::new();
     loop {
         std::thread::sleep(ШАГ);
         let п = о.пульс.load(Ordering::Relaxed);
@@ -209,6 +219,7 @@ fn сторожить(главный: i32) {
             прошлый = п;
             стоит_с = Instant::now();
             на_x = 0;
+            очередь_до.clear();
             continue;
         }
         let сокеты = о.сокеты.lock().unwrap().clone();
@@ -217,7 +228,17 @@ fn сторожить(главный: i32) {
             continue;
         }
         let номера: Vec<RawFd> = сокеты.iter().map(|(f, _)| *f).collect();
-        let Some((вызов, fd)) = ждёт_на(&путь, память.as_ref(), &номера) else {
+        // Непрочитанное сервером в наших сокетах; запоминается на каждом
+        // замере, чтобы видеть, убывает ли оно.
+        let очередь: Vec<(RawFd, i32)> = номера.iter().map(|&f| (f, не_прочтено(f))).collect();
+        let застряло = очередь
+            .iter()
+            .find(|(f, n)| *n > 0 && очередь_до.iter().any(|(g, m)| g == f && n >= m && *m > 0))
+            .map(|&(f, _)| f);
+        очередь_до = очередь;
+        let Some((вызов, fd)) = ждёт_на(&путь, память.as_ref(), &номера)
+            .or_else(|| застряло.map(|f| (-1, f)))
+        else {
             на_x = 0;
             continue;
         };
@@ -231,10 +252,14 @@ fn сторожить(главный: i32) {
             continue;
         }
         let чей = сокеты.iter().find(|(f, _)| *f == fd).map_or("?", |(_, ч)| *ч);
+        let где = if вызов < 0 {
+            format!("while the X server left our requests unread ({} bytes queued)", не_прочтено(fd))
+        } else {
+            format!("inside syscall {вызов} on the X server socket")
+        };
         tracing::error!(
-            "plx/xwatch: the main loop has stood still for {:.1} s inside syscall {вызов} on the X \
-             server socket (fd {fd}, {чей}) — Xwayland is not answering; killing it. Xwayland \
-             threads: {}",
+            "plx/xwatch: the main loop has stood still for {:.1} s {где} (fd {fd}, {чей}) — \
+             Xwayland is not answering; killing it. Xwayland threads: {}",
             стоит.as_secs_f32(),
             потоки_xwayland()
         );
@@ -269,6 +294,14 @@ fn потоки_xwayland() -> String {
         .collect();
     все.sort();
     format!("{pid} [{}]", все.join(" "))
+}
+
+/// Сколько отправленного в сокет `fd` сервер ещё не прочёл (`TIOCOUTQ`; для
+/// unix-сокета — память очереди у другого конца вместе с заголовками, то есть
+/// не точные байты, но 0 ровно тогда, когда всё прочитано). 0 — если не узнать.
+fn не_прочтено(fd: RawFd) -> i32 {
+    let mut n: libc::c_int = 0;
+    if unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut n) } == 0 { n } else { 0 }
 }
 
 /// На каком из `сокеты` главный поток стоит прямо сейчас: (номер вызова, fd).
@@ -407,5 +440,21 @@ mod tests {
         assert!(ждёт_на(&путь, память.as_ref(), &[fd + 1000]).is_none());
         drop(_b);
         поток.join().unwrap();
+    }
+
+    /// Непрочитанное другим концом видно в `TIOCOUTQ` и пропадает, когда он
+    /// прочёл.
+    #[test]
+    fn видит_непрочитанное() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        assert_eq!(не_прочтено(a.as_raw_fd()), 0);
+        a.write_all(&[0u8; 236]).unwrap();
+        // Счёт идёт по памяти очереди (с заголовками skb), а не по байтам данных.
+        assert!(не_прочтено(a.as_raw_fd()) >= 236);
+        let mut буфер = [0u8; 236];
+        b.read_exact(&mut буфер).unwrap();
+        assert_eq!(не_прочтено(a.as_raw_fd()), 0);
     }
 }
